@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Virtual environment
+venv/
+
+# Secrets / local config
+.env
+.env.example
+
+# TLS dev certificates
+*.pem
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
