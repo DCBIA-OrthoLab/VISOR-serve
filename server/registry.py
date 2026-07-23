@@ -1,29 +1,44 @@
 """Auto-discovery of Tool subclasses under the tools/ package.
 
-Each tool is a folder under tools/ (e.g. tools/example_tool/), with an
-__init__.py (can be empty) and one or more .py files defining a Tool
-subclass. Discovery recurses into every subpackage and is agnostic to the
-internal file name -- only the Tool subclass itself matters.
+Each tool is a folder under tools/ (e.g. tools/example_tool/) containing
+exactly one recognized file: tools/example_tool/example_tool.py -- the file
+name must match the folder name. That file defines one or more Tool
+subclasses. Any other file in the folder (helpers, data, ...) is ignored by
+discovery, though the recognized file is free to import from them.
 
-Adding a tool = dropping a new folder in tools/. No central list to edit,
-no route to add.
+Adding a tool = dropping a new folder in tools/ with its <name>/<name>.py
+file. No central list to edit, no route to add.
 """
 
 import importlib
-import pkgutil
+import os
 
 import tools as tools_package
 from base import Tool
 
 
 def _discover_tool_classes() -> list:
-    seen = set()
-    for _, module_name, _ in pkgutil.walk_packages(tools_package.__path__, tools_package.__name__ + "."):
+    classes = []
+    package_dir = tools_package.__path__[0]
+
+    for entry in sorted(os.listdir(package_dir)):
+        folder_path = os.path.join(package_dir, entry)
+        if not os.path.isdir(folder_path) or entry.startswith("_") or entry.startswith("."):
+            continue
+
+        expected_file = os.path.join(folder_path, f"{entry}.py")
+        if not os.path.isfile(expected_file):
+            raise RuntimeError(
+                f"Tool folder 'tools/{entry}/' is missing its 'tools/{entry}/{entry}.py' file."
+            )
+
+        module_name = f"{tools_package.__name__}.{entry}.{entry}"
         module = importlib.import_module(module_name)
         for attr in vars(module).values():
             if isinstance(attr, type) and issubclass(attr, Tool) and attr is not Tool:
-                seen.add(attr)
-    return list(seen)
+                classes.append(attr)
+
+    return classes
 
 
 def _build_registry() -> dict:

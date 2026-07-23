@@ -3,9 +3,10 @@ method. Arguments are validated against the schema before run() is called,
 so run() can always trust its inputs.
 
 # TODO to add a new tool: create a folder tools/<name>/ with an __init__.py
-# (can be empty) and a .py file subclassing Tool; set `name` and `arguments`,
-# implement `run`. Nothing else needs to change -- see tools/test_tool/ for a
-# minimal example and registry.py for how it gets picked up automatically.
+# (can be empty) and a tools/<name>/<name>.py file (must match the folder
+# name) subclassing Tool; set `name` and `arguments`, implement `run`.
+# Nothing else needs to change -- see tools/test_tool/ for a minimal example
+# and registry.py for how it gets picked up automatically.
 """
 
 from abc import ABC, abstractmethod
