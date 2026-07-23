@@ -94,40 +94,46 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
-    # Generic argument collection: whatever scalar fields and/or file the
-    # caller sends, regardless of which tool it targets. The tool's own
-    # schema (validated in tool.invoke) decides what is actually accepted.
+    # Generic argument collection: whatever scalar fields and/or files the
+    # caller sends, regardless of which tool it targets. Each uploaded file
+    # is matched to the tool's argument of the same name (a tool can declare
+    # several "file"-typed arguments, e.g. "fixed_image" + "moving_image").
+    # The tool's own schema (validated in tool.invoke) decides what is
+    # actually accepted.
     form = await request.form()
     args: dict = {}
-    uploaded_file: Optional[UploadFile] = None
+    uploaded_files: dict = {}
     for key, value in form.multi_items():
         if isinstance(value, StarletteUploadFile):
-            uploaded_file = value
+            uploaded_files[key] = value
         else:
             args[key] = value
 
     work_dir = None
-    input_path = None
+    input_paths = []
     size = 0
 
-    if uploaded_file is not None and uploaded_file.filename:
-        extension = _matched_extension(uploaded_file.filename)
-        if extension is None:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unsupported file extension. Allowed: {settings.ALLOWED_EXTENSIONS}",
-            )
+    if uploaded_files:
         work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
-        input_path = os.path.join(work_dir, f"input{extension}")
-        try:
-            size = await _stream_to_disk(uploaded_file, input_path)
-        except _UploadTooLargeError:
-            shutil.rmtree(work_dir, ignore_errors=True)
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail=f"File exceeds the {settings.MAX_UPLOAD_MB} MB limit.",
-            )
-        args["file"] = input_path
+        for field_name, upload in uploaded_files.items():
+            extension = _matched_extension(upload.filename or "")
+            if extension is None:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Unsupported file extension for '{field_name}'. Allowed: {settings.ALLOWED_EXTENSIONS}",
+                )
+            input_path = os.path.join(work_dir, f"{field_name}{extension}")
+            try:
+                size += await _stream_to_disk(upload, input_path)
+            except _UploadTooLargeError:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"File exceeds the {settings.MAX_UPLOAD_MB} MB limit.",
+                )
+            args[field_name] = input_path
+            input_paths.append(input_path)
 
     try:
         result = tool.invoke(args)
@@ -141,9 +147,10 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             shutil.rmtree(work_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail="Tool execution failed.")
     finally:
-        # The uploaded input is never needed again past this point.
-        if input_path and os.path.exists(input_path):
-            os.remove(input_path)
+        # Uploaded inputs are never needed again past this point.
+        for input_path in input_paths:
+            if os.path.exists(input_path):
+                os.remove(input_path)
 
     duration = time.monotonic() - start_time
     logger.info(

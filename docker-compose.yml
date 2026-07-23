@@ -9,7 +9,7 @@ services:
     working_dir: /workspace/server
     volumes:
       - ./server:/workspace/server
-      - /data/models:/models:ro
+      - ./models:/models:ro
     ports:
       - "8000:8000"
     command: >
