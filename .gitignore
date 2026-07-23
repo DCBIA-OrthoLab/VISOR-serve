@@ -9,7 +9,6 @@ venv/
 
 # Secrets / local config
 .env
-.env.example
 
 # TLS dev certificates
 *.pem
