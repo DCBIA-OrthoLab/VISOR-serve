@@ -59,12 +59,14 @@ the tool as the `file` argument.
 
 ## How to add a new tool
 
-1. Create `tools/<your_tool>.py`.
+1. Create a folder `tools/<your_tool>/` with an `__init__.py` (can be empty)
+   and a `.py` file inside it (name doesn't matter, e.g. `<your_tool>.py`).
 2. Subclass `Tool` (from `base.py`), set a unique `name`, declare `arguments`
    as a dict of `ArgSpec` (type, required, description), implement `run(**kwargs)`.
-3. That's it — `registry.py` auto-discovers it at startup, `/tools` lists it,
-   and `/run/<your_tool>` becomes available immediately. No route to add, no
-   registration list to update. See `tools/test_tool.py` for a minimal example.
+3. That's it — `registry.py` recursively auto-discovers it at startup, `/tools`
+   lists it, and `/run/<your_tool>` becomes available immediately. No route to
+   add, no registration list to update. See `tools/test_tool/` for a minimal
+   example.
 
 Duplicate tool names, or a tool missing its `name`, fail loudly at server
 startup rather than silently overwriting each other.

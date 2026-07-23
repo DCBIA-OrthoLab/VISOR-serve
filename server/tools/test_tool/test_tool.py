@@ -1,8 +1,8 @@
 """Minimal tool: proves the client -> server -> client round trip.
 
-# TODO: to add a new tool, copy this file, rename the class, give it a
-# unique `name`, declare its `arguments`, and implement `run`. Drop it in
-# this tools/ package -- registry.py will pick it up automatically at
+# TODO: to add a new tool, copy this whole folder (tools/test_tool/), rename
+# it, rename the class inside, give it a unique `name`, declare its
+# `arguments`, and implement `run`. registry.py picks it up automatically at
 # startup. No changes needed anywhere else (no new route, no manual list).
 """
 

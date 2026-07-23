@@ -2,8 +2,8 @@
 
 Shows how to declare a "file" argument (its value is the path where main.py
 already streamed the upload to disk) alongside plain scalar arguments, and how
-optional arguments with a default work. Copy this file as a starting point
-for a real tool.
+optional arguments with a default work. Copy this whole folder as a starting
+point for a real tool.
 
 # NOTE: the file extension whitelist is enforced centrally in config.py
 # (ALLOWED_EXTENSIONS), not per-tool. If this tool needs to accept mesh
