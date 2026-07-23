@@ -87,3 +87,61 @@ def test_run_example_tool_with_file(tmp_path):
 
     assert response.status_code == 200
     assert response.json()["result"].startswith("label=case_1")
+
+
+def test_run_tool_with_two_named_files(monkeypatch):
+    """A tool can declare more than one "file"-typed argument; each uploaded
+    file is matched to the tool argument with the same field name."""
+    import base
+    import registry
+
+    class TwoFileTestTool(base.Tool):
+        name = "two_file_test_tool"
+        arguments = {
+            "fixed_image": base.ArgSpec(type="file", required=True),
+            "moving_image": base.ArgSpec(type="file", required=True),
+        }
+        output_kind = "text"
+
+        def run(self, fixed_image: str, moving_image: str) -> str:
+            return f"{os.path.getsize(fixed_image)}:{os.path.getsize(moving_image)}"
+
+    monkeypatch.setitem(registry.TOOLS, "two_file_test_tool", TwoFileTestTool())
+
+    response = client.post(
+        "/run/two_file_test_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={
+            "fixed_image": ("a.nii.gz", b"aaa", "application/gzip"),
+            "moving_image": ("b.nii.gz", b"bbbbb", "application/gzip"),
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"result": "3:5"}
+
+
+def test_run_tool_with_two_named_files_missing_one_is_422(monkeypatch):
+    import base
+    import registry
+
+    class TwoFileTestTool(base.Tool):
+        name = "two_file_test_tool_2"
+        arguments = {
+            "fixed_image": base.ArgSpec(type="file", required=True),
+            "moving_image": base.ArgSpec(type="file", required=True),
+        }
+        output_kind = "text"
+
+        def run(self, fixed_image: str, moving_image: str) -> str:
+            return "unused"
+
+    monkeypatch.setitem(registry.TOOLS, "two_file_test_tool_2", TwoFileTestTool())
+
+    response = client.post(
+        "/run/two_file_test_tool_2",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"fixed_image": ("a.nii.gz", b"aaa", "application/gzip")},
+    )
+
+    assert response.status_code == 422
