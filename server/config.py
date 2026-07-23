@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     TEMP_DIR: str = "/tmp/inference_server"
 
     # File extensions accepted for uploaded files. Anything else is rejected with 400.
-    ALLOWED_EXTENSIONS: tuple[str, ...] = (".nii", ".nii.gz")
+    ALLOWED_EXTENSIONS: tuple[str, ...] = (".nii", ".nii.gz", ".zip", ".csv", ".xlsx", ".ods")
 
 
 settings = Settings()

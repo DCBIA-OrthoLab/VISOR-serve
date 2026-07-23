@@ -2,3 +2,8 @@ fastapi
 uvicorn[standard]
 python-multipart
 pydantic-settings
+pandas
+scikit-learn
+joblib
+openpyxl
+odfpy

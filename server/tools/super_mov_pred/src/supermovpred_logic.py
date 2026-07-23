@@ -5,7 +5,6 @@ import sys
 import os
 import glob
 import re
-import tempfile
 import warnings
 import zipfile
 from pathlib import Path
@@ -110,7 +109,11 @@ class LoadData:
     def extract_model(model_zip_path: str) -> dict:
         """Extracts the model zip archive and loads every 'stacking_package.pkl' file found inside."""
         logger.info(f"Extracting model package: {model_zip_path}")
-        extract_dir = tempfile.mkdtemp(prefix="super_mov_pred_model_")
+        # Extract next to the uploaded zip (inside the request's own work dir) so
+        # it is cleaned up by main.py along with the rest of that directory,
+        # instead of leaking a separate system-wide temp folder.
+        extract_dir = os.path.join(os.path.dirname(model_zip_path), "model_extracted")
+        os.makedirs(extract_dir, exist_ok=True)
         with zipfile.ZipFile(model_zip_path, 'r') as zf:
             zf.extractall(extract_dir)
         return LoadData._load_model_packages(extract_dir)
@@ -273,7 +276,7 @@ def save_results(df: pd.DataFrame, output_folder: str) -> str:
 
 class Super_mov_pred:
     @staticmethod
-    def main(model: str, input: str, output: str) -> str:
+    def main(model: str, input: str) -> str:
         try:
             logger.info("=== Surgical Movements Prediction Engine (Stacking Deploy) ===")
 
@@ -296,8 +299,12 @@ class Super_mov_pred:
             df_results = predict_all_targets(df_input, packages)
             df_results.insert(0, 'IDPatient', id_values.values)
 
-            # 5. Save
-            output_path = save_results(df_results, output)
+            # 5. Save into a subfolder of the request's own work dir (where `model`
+            # and `input` were uploaded). main.py already schedules that whole
+            # directory for cleanup after the response is streamed, so the output
+            # is removed automatically without needing its own cleanup hook.
+            output_dir = os.path.join(os.path.dirname(input), "output")
+            output_path = save_results(df_results, output_dir)
 
             logger.info("=== Process completed successfully ===")
             return output_path
