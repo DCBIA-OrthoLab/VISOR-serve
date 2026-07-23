@@ -17,3 +17,8 @@ venv/
 .vscode/
 .idea/
 .DS_Store
+
+# Models
+*.pth
+*.pt
+models/
