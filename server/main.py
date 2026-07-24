@@ -5,6 +5,7 @@
 # this server never logs file contents, argument values, or patient metadata.
 
 import logging
+import mimetypes
 import os
 import shutil
 import tempfile
@@ -200,9 +201,12 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         if work_dir is None:
             work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
         background_tasks.add_task(shutil.rmtree, work_dir, ignore_errors=True)
+        media_type, _ = mimetypes.guess_type(str(result))
+        if media_type is None:
+            media_type = "application/gzip" if str(result).endswith(".gz") else "application/octet-stream"
         return FileResponse(
             result,
-            media_type="application/gzip" if str(result).endswith(".gz") else "application/octet-stream",
+            media_type=media_type,
             filename=os.path.basename(result),
             background=background_tasks,
         )

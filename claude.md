@@ -246,3 +246,36 @@ Provide a small, generic client mirroring the server:
 - Real GPU inference (the test tool is trivial).
 - Model/GPU memory management (note it for later, don't build it).
 - Concurrency / scaling / database.
+
+## Changelog
+
+### 2026-07-24 — Correct `Content-Type` for file-kind tool outputs
+**Problem:** `POST /run/{tool_name}` responses with `output_kind in ("file",
+"segmentation")` always sent `media_type="application/octet-stream"` (or
+`application/gzip` for `.gz` files), regardless of the output's real format. The
+new `surg_mov_pred` tool returns a `.xlsx` file, and since an `.xlsx` is
+internally a zip container (`PK\x03\x04` signature), a client that decides
+whether to unzip a downloaded "file" result by sniffing magic bytes instead of
+trusting `Content-Type` could not tell it apart from an actual zip archive —
+it silently extracted the Excel file's internal XML parts instead of saving
+the `.xlsx` itself.
+
+**Fix (`server/main.py`):** the `FileResponse` for file-kind outputs now
+derives `media_type` from the output file's extension via
+`mimetypes.guess_type()`, falling back to the previous
+`application/gzip`/`application/octet-stream` logic only when the type can't
+be guessed (still the case for bare `.gz` files, e.g. `.nii.gz` segmentation
+outputs — unchanged behavior). This makes `.xlsx` responses carry the correct
+`application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+`Content-Type`, and also fixes `.zip` (`application/zip`), `.csv`
+(`text/csv`), `.ods` (`application/vnd.oasis.opendocument.spreadsheet`), etc.
+`Content-Disposition`'s `filename` was already correct (`os.path.basename(result)`,
+carrying the real extension) and is unchanged.
+
+**Client-side follow-up (not part of this repo):** if the Slicer client (see
+`SlicerAutomatedDentalTools`, e.g. the `SurgMovPred` module) decides whether to
+unzip a downloaded tool result by sniffing the response body's magic bytes
+rather than reading `Content-Type` / `Content-Disposition`, it must be updated
+to trust those headers instead — magic-byte sniffing can never distinguish a
+real `.xlsx`/`.docx`/`.pptx`/`.ods` file from an actual zip archive, since
+those formats are zip containers by design.
