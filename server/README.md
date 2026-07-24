@@ -109,3 +109,22 @@ the shared helpers in `file_utils.py` (`extract_zip`, `load_tabular_file`,
 A tool folder missing its `<name>.py` file, duplicate tool names, or a tool
 missing its `name`, all fail loudly at server
 startup rather than silently overwriting each other.
+
+## Testing
+
+```bash
+./venv/bin/pip install -r requirements-dev.txt   # pytest, httpx
+./venv/bin/pytest                                 # everything
+./venv/bin/pytest tests/                          # HTTP layer only (main.py, routing, auth)
+./venv/bin/pytest tools/surg_mov_pred/test/        # one tool's own logic, in isolation
+```
+
+For a tool with non-trivial internal logic (its own `src/` folder), add a
+sibling `test/` folder next to it (`tools/<name>/test/test_<name>_logic.py`)
+that imports directly from `tools.<name>.src.<name>_logic` and exercises its
+functions without going through HTTP at all. `registry.py` only scans the
+immediate children of `tools/` for a `<name>/<name>.py` file, so a nested
+`test/` folder is invisible to tool discovery — it's picked up by pytest only.
+See `tools/surg_mov_pred/test/` for an example covering column-name cleaning,
+patient-ID detection, zip extraction, prediction, and the full pipeline
+end-to-end with synthetic data.
