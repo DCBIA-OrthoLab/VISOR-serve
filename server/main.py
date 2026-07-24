@@ -16,7 +16,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, U
 from fastapi.responses import FileResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from base import ToolArgumentError
+from base import FILE_TYPES, ToolArgumentError
 from config import settings
 from registry import TOOLS, get_tool
 from security import verify_token
@@ -36,9 +36,45 @@ class _UploadTooLargeError(Exception):
     pass
 
 
-def _matched_extension(filename: str) -> Optional[str]:
+_ACCEPT_ALL_EXTENSIONS = "*"
+
+
+def _extract_extension(filename: str) -> str:
+    """Return the file's extension, preserving compound extensions like .nii.gz."""
     lower = filename.lower()
-    for extension in settings.ALLOWED_EXTENSIONS:
+    parts = lower.split(".")
+    if len(parts) >= 3 and parts[-1] in ("gz", "bz2", "xz"):
+        return "." + ".".join(parts[-2:])
+    if len(parts) >= 2:
+        return "." + parts[-1]
+    return ""
+
+
+def _expected_extensions(tool, field_name: str) -> Optional[tuple]:
+    """Return the specific extensions expected for this argument, if the tool
+    declares a specific file type for it (see base.FILE_TYPES). None means
+    "no specific type declared" -- fall back to settings.ALLOWED_EXTENSIONS.
+    """
+    spec = tool.arguments.get(field_name)
+    if spec is None:
+        return None
+    return FILE_TYPES.get(spec.type)
+
+
+def _matched_extension(filename: str, expected: Optional[tuple]) -> Optional[str]:
+    """Return the extension to use for the saved file, or None to reject it.
+
+    `expected` is the specific extension tuple for this argument (from the
+    tool's own schema) if any; otherwise settings.ALLOWED_EXTENSIONS is used.
+    "*" in either list accepts every extension, preserved as-is.
+    """
+    candidates = expected if expected is not None else settings.ALLOWED_EXTENSIONS
+
+    if _ACCEPT_ALL_EXTENSIONS in candidates:
+        return _extract_extension(filename)
+
+    lower = filename.lower()
+    for extension in candidates:
         if lower.endswith(extension):
             return extension
     return None
@@ -116,12 +152,14 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     if uploaded_files:
         work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
         for field_name, upload in uploaded_files.items():
-            extension = _matched_extension(upload.filename or "")
+            expected = _expected_extensions(tool, field_name)
+            extension = _matched_extension(upload.filename or "", expected)
             if extension is None:
                 shutil.rmtree(work_dir, ignore_errors=True)
+                allowed = expected if expected is not None else settings.ALLOWED_EXTENSIONS
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Unsupported file extension for '{field_name}'. Allowed: {settings.ALLOWED_EXTENSIONS}",
+                    detail=f"Unsupported file extension for '{field_name}'. Allowed: {allowed}",
                 )
             input_path = os.path.join(work_dir, f"{field_name}{extension}")
             try:

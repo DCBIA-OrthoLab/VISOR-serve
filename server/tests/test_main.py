@@ -145,3 +145,30 @@ def test_run_tool_with_two_named_files_missing_one_is_422(monkeypatch):
     )
 
     assert response.status_code == 422
+
+
+def test_run_tool_rejects_wrong_extension_for_specific_file_type(monkeypatch):
+    """A "zip_file"-typed argument only accepts .zip, regardless of the
+    generic config.ALLOWED_EXTENSIONS fallback list."""
+    import base
+    import registry
+
+    class ZipOnlyTestTool(base.Tool):
+        name = "zip_only_test_tool"
+        arguments = {
+            "archive": base.ArgSpec(type="zip_file", required=True),
+        }
+        output_kind = "text"
+
+        def run(self, archive: str) -> str:
+            return "unused"
+
+    monkeypatch.setitem(registry.TOOLS, "zip_only_test_tool", ZipOnlyTestTool())
+
+    response = client.post(
+        "/run/zip_only_test_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"archive": ("data.csv", b"a,b\n1,2", "text/csv")},
+    )
+
+    assert response.status_code == 400

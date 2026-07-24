@@ -3,14 +3,14 @@
 
 import sys
 import os
-import glob
 import re
 import warnings
-import zipfile
 from pathlib import Path
 import logging
 import pandas as pd
 import joblib
+
+import file_utils
 
 # The deployed sklearn version commonly differs from the one used to train the models.
 # This is expected (models are tested for compatibility before being shipped) and not
@@ -103,7 +103,13 @@ def find_id_column(columns) -> str:
 
 
 class LoadData:
-    """Extracts the model package and loads the input data used by SuperMovPred."""
+    """Extracts the model package and loads the input data used by SuperMovPred.
+
+    Zip extraction and CSV/XLSX/ODS loading are generic concerns, factored out
+    into file_utils.py so other tools can reuse them; only the
+    "find stacking_package.pkl inside the extracted model" part is specific
+    to this tool and stays here.
+    """
 
     @staticmethod
     def extract_model(model_zip_path: str) -> dict:
@@ -112,10 +118,9 @@ class LoadData:
         # Extract next to the uploaded zip (inside the request's own work dir) so
         # it is cleaned up by main.py along with the rest of that directory,
         # instead of leaking a separate system-wide temp folder.
-        extract_dir = os.path.join(os.path.dirname(model_zip_path), "model_extracted")
-        os.makedirs(extract_dir, exist_ok=True)
-        with zipfile.ZipFile(model_zip_path, 'r') as zf:
-            zf.extractall(extract_dir)
+        extract_dir = file_utils.extract_zip(
+            model_zip_path, os.path.join(os.path.dirname(model_zip_path), "model_extracted")
+        )
         return LoadData._load_model_packages(extract_dir)
 
     @staticmethod
@@ -142,57 +147,14 @@ class LoadData:
         return packages
 
     @staticmethod
-    def load_input(input_path: str) -> pd.DataFrame:
-        """Loads the input data, whether it's a single file or a folder of CSV/XLSX/ODS files."""
-        if os.path.isdir(input_path):
-            return LoadData._load_directory(input_path)
-        return LoadData._load_file(input_path)
-
-    @staticmethod
-    def _load_directory(directory_path: str) -> pd.DataFrame:
-        logger.info(f"Scanning directory for data files: {directory_path}")
-
-        extensions = ['*.csv', '*.xlsx', '*.ods']
-        all_files = []
-        for ext in extensions:
-            all_files.extend(glob.glob(os.path.join(directory_path, ext)))
-            all_files.extend(glob.glob(os.path.join(directory_path, ext.upper())))
-        all_files = list(set(all_files))
-
-        if not all_files:
-            raise FileNotFoundError(f"No valid CSV, XLSX, or ODS files found in: {directory_path}")
-
-        logger.info(f"Found {len(all_files)} file(s) to process.")
-
-        df_list = []
-        for file_path in all_files:
-            try:
-                df_list.append(LoadData._load_file(file_path))
-            except Exception:
-                logger.exception(f"Failed to load file {file_path}")
-
-        if not df_list:
-            raise RuntimeError(f"No data could be successfully loaded from any of the {len(all_files)} file(s) found in {directory_path}.")
-
-        combined_df = pd.concat(df_list, ignore_index=True)
-        logger.info(f"All files combined successfully. Total: {len(combined_df)} rows")
-        return combined_df
-
-    @staticmethod
-    def _load_file(file_path: str) -> pd.DataFrame:
-        logger.info(f"Loading file: {file_path}")
-        ext = os.path.splitext(file_path)[1].lower()
-
-        if ext == '.csv':
-            df = pd.read_csv(file_path)
-        elif ext == '.xlsx':
-            df = pd.read_excel(file_path)
-        elif ext == '.ods':
-            df = pd.read_excel(file_path, engine='odf')
-        else:
-            raise ValueError(f"Unsupported file extension '{ext}' for input file: {file_path}")
-
-        logger.info(f"Successfully loaded {file_path} ({len(df)} rows)")
+    def load_input(input_zip_path: str) -> pd.DataFrame:
+        """Extracts the input zip archive (a folder of CSV/XLSX/ODS files) and loads it."""
+        logger.info(f"Extracting input data: {input_zip_path}")
+        extract_dir = file_utils.extract_zip(
+            input_zip_path, os.path.join(os.path.dirname(input_zip_path), "input_extracted")
+        )
+        df = file_utils.load_tabular_directory(extract_dir)
+        logger.info(f"Input data loaded: {len(df)} rows")
         return df
 
 
@@ -274,7 +236,8 @@ def save_results(df: pd.DataFrame, output_folder: str) -> str:
     return str(excel_output)
 
 
-class Super_mov_pred:
+
+class Surg_mov_pred:
     @staticmethod
     def main(model: str, input: str) -> str:
         try:

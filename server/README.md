@@ -53,9 +53,39 @@ curl -k -X POST https://localhost:8000/run/test_tool \
 `-k` disables certificate verification and is only acceptable against the
 self-signed dev certificate above — never use it against a production server.
 
-A tool that also expects a file just adds `-F "file=@/path/to/volume.nii.gz"`
-to the same call; the server streams it to a temp dir and passes its path to
-the tool as the `file` argument.
+A tool argument can also expect a file: add `-F "model=@/path/to/model.zip"`
+(field name = argument name) to the same call; the server streams it to a
+temp dir and passes its path to the tool under that argument name. A tool can
+declare more than one file-typed argument (e.g. `model` + `input`), each
+uploaded as its own multipart field in the same request.
+
+## File-typed arguments
+
+Instead of a single server-wide extension whitelist, each file-typed argument
+declares its own specific **file type** in `ArgSpec`, from the registry in
+`base.py`:
+
+```python
+FILE_TYPES = {
+    "file": None,              # generic -- falls back to config.ALLOWED_EXTENSIONS
+    "zip_file": (".zip",),
+    "csv_file": (".csv",),
+    "xlsx_file": (".xlsx",),
+    "ods_file": (".ods",),
+    "nifti_file": (".nii", ".nii.gz"),
+}
+```
+
+```python
+"model": ArgSpec(type="zip_file", required=True, description="..."),
+```
+
+This is what both the server (extension check on upload) and the client
+(`GET /tools`, which reports `"type": "zip_file"` per argument) use to know
+exactly what's expected — no shared global list to keep in sync as tools with
+different file needs are added. To accept a new kind of file, add an entry to
+`FILE_TYPES` in `base.py`. Only arguments left as generic `"file"` fall back
+to `config.ALLOWED_EXTENSIONS`.
 
 ## How to add a new tool
 
@@ -66,9 +96,15 @@ the tool as the `file` argument.
    your main file is free to import from them.
 2. Subclass `Tool` (from `base.py`), set a unique `name`, declare `arguments`
    as a dict of `ArgSpec` (type, required, description), implement `run(**kwargs)`.
+   For a file argument, pick a type from `base.FILE_TYPES` (or add a new one).
 3. That's it — `registry.py` auto-discovers it at startup, `/tools` lists it,
    and `/run/<your_tool>` becomes available immediately. No route to add, no
-   registration list to update. See `tools/test_tool/` for a minimal example.
+   registration list to update. See `tools/test_tool/` for a minimal example,
+   or `tools/example_tool/` for one with a file argument.
+
+If your tool needs to unzip an upload and/or load CSV/XLSX/ODS files, reuse
+the shared helpers in `file_utils.py` (`extract_zip`, `load_tabular_file`,
+`load_tabular_directory`) instead of reimplementing them.
 
 A tool folder missing its `<name>.py` file, duplicate tool names, or a tool
 missing its `name`, all fail loudly at server

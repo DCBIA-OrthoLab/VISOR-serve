@@ -13,10 +13,25 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Union
 
+# File-typed arguments declare a specific kind here instead of a generic
+# "file", so both the server (extension check) and the client (GET /tools)
+# know exactly what's expected for that argument -- no shared global
+# whitelist to keep in sync across unrelated tools.
+# "file" is kept as a generic passthrough: None means "fall back to the
+# server-wide config.ALLOWED_EXTENSIONS whitelist" instead of a fixed list.
+FILE_TYPES: dict = {
+    "file": None,
+    "zip_file": (".zip",),
+    "csv_file": (".csv",),
+    "xlsx_file": (".xlsx",),
+    "ods_file": (".ods",),
+    "nifti_file": (".nii", ".nii.gz"),
+}
+
 
 @dataclass
 class ArgSpec:
-    type: Union[type, str]  # str, int, float, bool, or "file"
+    type: Union[type, str]  # str, int, float, bool, or one of FILE_TYPES's keys
     required: bool = True
     description: str = ""
 
@@ -55,7 +70,7 @@ class Tool(ABC):
         return cleaned
 
     def _coerce(self, arg_name: str, value: Any, spec: ArgSpec) -> Any:
-        if spec.type == "file":
+        if spec.type in FILE_TYPES:
             # The file has already been streamed to disk by main.py; value is its path.
             return value
         if spec.type is str:

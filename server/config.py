@@ -25,8 +25,11 @@ class Settings(BaseSettings):
     # here is deleted once a request has been served.
     TEMP_DIR: str = "/tmp/inference_server"
 
-    # File extensions accepted for uploaded files. Anything else is rejected with 400.
-    ALLOWED_EXTENSIONS: tuple[str, ...] = (".nii", ".nii.gz", ".zip", ".csv", ".xlsx", ".ods")
+    # Fallback whitelist, only used for arguments with a generic "file" type
+    # (see base.FILE_TYPES). Arguments with a specific type (e.g. "zip_file")
+    # are validated against that type's own extensions instead, regardless
+    # of this list. "*" accepts everything for the generic fallback.
+    ALLOWED_EXTENSIONS: tuple[str, ...] = (".nii", ".nii.gz")
 
 
 settings = Settings()

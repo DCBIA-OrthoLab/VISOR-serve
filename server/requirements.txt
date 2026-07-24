@@ -4,6 +4,7 @@ python-multipart
 pydantic-settings
 pandas
 scikit-learn
+lightgbm
 joblib
 openpyxl
 odfpy
