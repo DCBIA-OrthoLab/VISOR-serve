@@ -14,8 +14,11 @@ the server core, no new route, no manual registration list to keep in sync.
 **The data is confidential medical imaging.** Confidentiality and transport security
 (TLS, auth, temp-file cleanup) are first-class requirements.
 
-This first version is **synchronous** (blocking request/response). Do **not** add
-Celery/Redis/async jobs yet.
+The HTTP contract is **blocking request/response** (the client gets its result in
+the same response), but the server itself executes tools **in parallel**: each
+`tool.invoke` runs in a worker thread, capped by `MAX_CONCURRENT_TOOLS` (see
+`config.py`), so a long inference never freezes the event loop or other requests.
+Do **not** add Celery/Redis/async job queues yet.
 
 ## Core design: a `Tool` base class
 
@@ -270,9 +273,35 @@ Provide a small, generic client mirroring the server:
 - Job queue / Celery / Redis / async polling.
 - Real GPU inference (the test tool is trivial).
 - Model/GPU memory management (note it for later, don't build it).
-- Concurrency / scaling / database.
+- Scaling (multi-process / multi-machine) / database. (In-process parallelism IS
+  implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-07-27 — Parallel request handling (threadpool execution of tools)
+**Motivation:** `run_tool` called `tool.invoke(args)` synchronously inside an
+`async def` endpoint, i.e. directly on the uvicorn event loop. Any inference in
+progress froze the entire server — a second `/run`, or even `/health`, could not
+be answered until it finished. The server was effectively serial.
+
+**Design (`server/main.py`, `server/config.py`):** `tool.invoke` now runs via
+`anyio.to_thread.run_sync(...)` in a worker thread, with a dedicated
+`anyio.CapacityLimiter` capping simultaneous tool executions at
+`MAX_CONCURRENT_TOOLS` (new setting, default 4) — excess requests wait for a
+slot instead of piling unbounded work onto RAM/CPU/GPU. The limiter is created
+lazily (anyio needs a running event loop) and is dedicated to tool runs so
+queued inference can't starve the default threadpool used by sync endpoints.
+This is safe because tools are stateless (everything arrives via `args`), each
+request has its own `work_dir`, and `DATA_DIR` is read-only. The HTTP contract
+is unchanged: still blocking request/response, no job queue.
+
+**Test (`server/tests/test_main.py::test_concurrent_requests_run_in_parallel`):**
+registers a probe tool whose `run()` blocks on a 2-party `threading.Barrier`,
+then fires two requests through ONE shared event loop (`TestClient` as context
+manager — two bare `client.post` calls from separate threads would each get
+their own loop and pass even against a serial server). The barrier only opens
+if both requests are inside `run()` at the same time; serial execution times it
+out and fails the test.
 
 ### 2026-07-27 — surg_mov_pred: the model is server-side only, selected by name
 **Motivation:** the client still had to provide the model as a zip upload (or

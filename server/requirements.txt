@@ -1,4 +1,5 @@
 fastapi
+anyio
 uvicorn[standard]
 python-multipart
 pydantic-settings

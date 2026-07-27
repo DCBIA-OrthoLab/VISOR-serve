@@ -1,8 +1,17 @@
 # Inference server (tool-registry architecture)
 
-Synchronous FastAPI server exposing a generic `/run/{tool_name}` endpoint.
+FastAPI server exposing a generic `/run/{tool_name}` endpoint.
 Tools are self-contained classes auto-discovered from `tools/` at startup —
 adding a tool never requires touching the server core.
+
+Requests are served **in parallel**: each tool execution runs in a worker
+thread (never on the event loop), so a long inference never blocks other
+requests — `/health`, `/tools` and other `/run` calls all stay responsive
+while a tool is working. The number of tool executions allowed to run
+simultaneously is capped by `MAX_CONCURRENT_TOOLS` (env var, default 4);
+requests beyond the cap wait for a free slot. The HTTP call itself remains
+blocking request/response: the client sends a request and gets the result in
+the same response (no job queue / polling).
 
 ## Installation
 

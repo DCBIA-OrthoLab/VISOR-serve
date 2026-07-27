@@ -210,6 +210,51 @@ def test_run_resolves_scalar_server_selectable_model_by_name(monkeypatch, tmp_pa
     assert response.json() == {"result": "stacking_v2.zip:11"}
 
 
+def test_concurrent_requests_run_in_parallel(monkeypatch):
+    """Two /run requests must execute their tools at the same time, not one
+    after the other. Each run() blocks on a 2-party barrier: it can only pass
+    if BOTH requests are inside run() simultaneously. If tool execution ever
+    goes back to blocking the event loop (serial execution), the barrier
+    times out and the test fails instead of deadlocking forever."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    import base
+    import registry
+
+    barrier = threading.Barrier(2, timeout=15)
+
+    class ParallelProbeTool(base.Tool):
+        name = "parallel_probe_tool"
+        arguments = {"text": base.ArgSpec(type=str, required=True)}
+        output_kind = "text"
+
+        def run(self, text: str) -> str:
+            barrier.wait()
+            return text
+
+    monkeypatch.setitem(registry.TOOLS, "parallel_probe_tool", ParallelProbeTool())
+
+    # A single TestClient entered as a context manager routes every request
+    # through ONE shared event loop -- exactly like uvicorn in production.
+    # (Two bare client.post calls from two threads would each spin up their
+    # own loop, which would pass even with a blocking server.)
+    with TestClient(app) as shared_client:
+
+        def call(index: int):
+            return shared_client.post(
+                "/run/parallel_probe_tool",
+                headers={"Authorization": f"Bearer {TOKEN}"},
+                data={"text": f"req_{index}"},
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            responses = list(pool.map(call, range(2)))
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert {response.json()["result"] for response in responses} == {"req_0", "req_1"}
+
+
 def test_run_tool_rejects_wrong_extension_for_specific_file_type(monkeypatch):
     """A "zip_file"-typed argument only accepts .zip, regardless of the
     generic config.ALLOWED_EXTENSIONS fallback list."""

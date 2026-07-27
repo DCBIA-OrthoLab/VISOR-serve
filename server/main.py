@@ -12,6 +12,7 @@ import tempfile
 import time
 from typing import Optional
 
+import anyio.to_thread
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse
@@ -39,6 +40,20 @@ class _UploadTooLargeError(Exception):
 
 
 _ACCEPT_ALL_EXTENSIONS = "*"
+
+# Caps how many tool executions run at once (see settings.MAX_CONCURRENT_TOOLS).
+# Dedicated to tool runs only, so waiting inference jobs can never starve the
+# threadpool used for everything else (sync endpoints, background cleanup).
+# Created lazily on first use: anyio requires a running event loop to
+# instantiate a CapacityLimiter, so it can't be built at import time.
+_tool_limiter: Optional[anyio.CapacityLimiter] = None
+
+
+def _get_tool_limiter() -> anyio.CapacityLimiter:
+    global _tool_limiter
+    if _tool_limiter is None:
+        _tool_limiter = anyio.CapacityLimiter(settings.MAX_CONCURRENT_TOOLS)
+    return _tool_limiter
 
 
 def _extract_extension(filename: str) -> str:
@@ -241,7 +256,16 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         resolved_files.append(resolved)
 
     try:
-        result = tool.invoke(args)
+        # Run the tool in a worker thread, NOT on the event loop: tool.invoke
+        # is synchronous CPU-bound work (model loading, inference) and would
+        # otherwise freeze the whole server -- even /health -- for its entire
+        # duration. Offloaded like this, requests are served fully in
+        # parallel, bounded by MAX_CONCURRENT_TOOLS. Tools are safe to run
+        # concurrently: they are stateless (everything arrives via args),
+        # each request gets its own work_dir, and DATA_DIR is read-only.
+        result = await anyio.to_thread.run_sync(
+            tool.invoke, args, limiter=_get_tool_limiter()
+        )
     except ToolArgumentError as exc:
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)

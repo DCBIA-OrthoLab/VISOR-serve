@@ -25,6 +25,13 @@ class Settings(BaseSettings):
     # here is deleted once a request has been served.
     TEMP_DIR: str = "/tmp/inference_server"
 
+    # Maximum number of tool executions allowed to run at the same time.
+    # Tool runs happen in worker threads (see main.py) so the server stays
+    # responsive while inference is in progress; this caps how many run
+    # concurrently -- requests beyond the cap simply wait for a free slot
+    # instead of piling unbounded work onto RAM/CPU/GPU.
+    MAX_CONCURRENT_TOOLS: int = 4
+
     # Fallback whitelist, only used for arguments with a generic "file" type
     # (see base.FILE_TYPES). Arguments with a specific type (e.g. "zip_file")
     # are validated against that type's own extensions instead, regardless
