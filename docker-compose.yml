@@ -3,13 +3,13 @@ services:
     image: ghcr.io/jules-gp/lab-ai:2026.07
     environment:
       - API_TOKEN=${API_TOKEN:-dev-token}
-      - MODELS_DIR=/models
+      - DATA_DIR=/data
       - DEVICE=cpu
     shm_size: 8gb
     working_dir: /workspace/server
     volumes:
       - ./server:/workspace/server
-      - ./models:/models:ro
+      - ./DATA:/data:ro
     ports:
       - "8000:8000"
     command: >

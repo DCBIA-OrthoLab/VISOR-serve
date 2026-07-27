@@ -120,6 +120,7 @@ change to the core. Include `# TODO` guidance showing how to add another tool.
 │   ├── main.py              # FastAPI app: generic /run/{tool_name} endpoint
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError
 │   ├── registry.py          # auto-discovery of Tool subclasses in tools/
+│   ├── data_store.py        # DataStore interface + LocalDataStore (server-side models/testfiles)
 │   ├── security.py          # Bearer token verification
 │   ├── config.py            # config from environment variables
 │   ├── tools/
@@ -128,6 +129,7 @@ change to the core. Include `# TODO` guidance showing how to add another tool.
 │   ├── requirements.txt
 │   ├── .env.example
 │   └── README.md
+├── DATA/                    # DATA_DIR mount, read-only: <tool_name>/{models,testfiles}/
 └── slicer_client/
     └── inference_client.py  # generic client used by every Slicer module
 ```
@@ -153,6 +155,29 @@ change to the core. Include `# TODO` guidance showing how to add another tool.
 - Raises on duplicate names.
 - `get_tool(name) -> Tool` raises a not-found error (→ `404`) for unknown names.
 
+### `data_store.py` — server-side models and test files
+Lets a tool argument be satisfied by a file already present on the server (an AI
+model, a reference test dataset) instead of the client uploading it every call.
+- `ArgSpec.server_selectable: Optional[str]` — `"model"` or `"testfile"` on a
+  file-typed argument opts it into this; `None` (default) means upload-only.
+- Layout on disk: `DATA_DIR/<tool_name>/models/` and
+  `DATA_DIR/<tool_name>/testfiles/` (`DATA_DIR` from config, mounted **read-only**).
+- `GET /tools/{tool_name}/data` (Bearer-protected) lists the available file names
+  in both folders, so a client can present them (e.g. a dropdown) instead of a file
+  picker.
+- In `POST /run/{tool_name}`, a `server_selectable` argument sent as a plain form
+  value (the file name) instead of an upload is resolved against `data_store`
+  rather than streamed to a temp dir.
+- **Backend abstraction (`DataStore`):** `main.py` and every `Tool` only ever call
+  `data_store.list_models/list_testfiles/resolve_model/resolve_testfile` — never
+  the filesystem directly. `LocalDataStore` is the only implementation today. To
+  swap to an external database or object store later: add a new `DataStore`
+  subclass in `data_store.py` returning a `ResolvedFile(path, is_temporary)` from
+  each `resolve_*` (`is_temporary=True` if the backend had to materialize a temp
+  copy, so `main.py`'s cleanup deletes it — persistent local paths must never be
+  deleted), then select it in `build_data_store()` via `settings.DATA_BACKEND`.
+  No change needed anywhere else.
+
 ### `tools/test_tool.py`
 - Defines `TestTool(Tool)` with `name = "test_tool"`, the two required string args,
   and a `run` returning a str. Serves as the copy-paste template for future tools.
@@ -175,7 +200,7 @@ change to the core. Include `# TODO` guidance showing how to add another tool.
 ### `security.py`, `config.py`
 - Bearer token from env (`API_TOKEN`), constant-time compare, `401` on failure.
 - Config from env: `API_TOKEN`, `DEVICE`, `MAX_UPLOAD_MB`, `TEMP_DIR`,
-  `ALLOWED_EXTENSIONS`. Sensible dev defaults.
+  `ALLOWED_EXTENSIONS`, `DATA_DIR`, `DATA_BACKEND`. Sensible dev defaults.
 
 ### Security / confidentiality — hard requirements
 - **TLS mandatory**; README documents HTTPS + self-signed cert for dev, real cert
@@ -248,6 +273,39 @@ Provide a small, generic client mirroring the server:
 - Concurrency / scaling / database.
 
 ## Changelog
+
+### 2026-07-24 — Server-side data store: models and test files without re-upload
+**Motivation:** tools like `surg_mov_pred` required the client to re-upload the
+same model package on every single call, and there was no way for a client to
+say "run this against the server's reference test data" instead of streaming
+its own file. Confidential-data constraints rule out a generic upload cache, so
+this needed to be explicit, per-tool, read-only server-side storage instead.
+
+**Design:** `server/data_store.py` introduces a `DataStore` interface
+(`list_models`, `list_testfiles`, `resolve_model`, `resolve_testfile`) with a
+`LocalDataStore` implementation reading `DATA_DIR/<tool_name>/{models,testfiles}/`
+(new `DATA_DIR`/`DATA_BACKEND` settings in `config.py`). `ArgSpec` gained
+`server_selectable: Optional[str]` (`"model"` | `"testfile"`); a new
+`GET /tools/{tool_name}/data` endpoint lists what's available so a client can
+offer a selection instead of a file picker. In `POST /run/{tool_name}`, a
+`server_selectable` argument sent as a plain form value (a file name) rather
+than an upload is resolved through `data_store` and excluded from the temp-file
+cleanup that applies to genuine uploads (`server/main.py`). `surg_mov_pred`'s
+`model` and `input` arguments now both opt in.
+
+**Deliberately abstracted for a future external database/object store:** neither
+`main.py` nor any `Tool` touches the filesystem directly — only `data_store`.
+Each `resolve_*` returns a `ResolvedFile(path, is_temporary)`; `is_temporary`
+lets a future backend that must materialize a remote blob to a local temp copy
+(e.g. downloaded from a DB or S3) mark it for cleanup, while `LocalDataStore`'s
+persistent paths are never deleted. Swapping backends later is a change
+contained entirely to `data_store.py` (a new `DataStore` subclass, wired up in
+`build_data_store()` via `settings.DATA_BACKEND`) — see the `# TODO` there.
+
+**Also:** `docker-compose.yml` now mounts a single `./DATA:/data:ro` (previously
+two inconsistent mounts, `./models:/models` and `./data:/data`, the latter not
+matching the `DATA/` folder actually used on disk); `.gitignore` excludes `DATA/`
+so model weights and test datasets are never committed.
 
 ### 2026-07-24 — Correct `Content-Type` for file-kind tool outputs
 **Problem:** `POST /run/{tool_name}` responses with `output_kind in ("file",

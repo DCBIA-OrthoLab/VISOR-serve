@@ -11,7 +11,7 @@ so run() can always trust its inputs.
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 # File-typed arguments declare a specific kind here instead of a generic
 # "file", so both the server (extension check) and the client (GET /tools)
@@ -34,6 +34,11 @@ class ArgSpec:
     type: Union[type, str]  # str, int, float, bool, or one of FILE_TYPES's keys
     required: bool = True
     description: str = ""
+    # For file-typed arguments only: lets the caller pick a file already
+    # present on the server (see data_store.py) instead of uploading one.
+    # "model" -> DATA_DIR/<tool_name>/models/, "testfile" ->
+    # DATA_DIR/<tool_name>/testfiles/. None (default) means upload-only.
+    server_selectable: Optional[str] = None
 
 
 class ToolArgumentError(Exception):

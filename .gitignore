@@ -22,3 +22,7 @@ venv/
 *.pth
 *.pt
 models/
+
+# DATA
+data/
+DATA/

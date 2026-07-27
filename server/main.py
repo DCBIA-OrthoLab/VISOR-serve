@@ -19,6 +19,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from base import FILE_TYPES, ToolArgumentError
 from config import settings
+from data_store import DataNotFoundError, data_store
 from registry import TOOLS, get_tool
 from security import verify_token
 
@@ -113,6 +114,7 @@ def list_tools() -> list:
                     "type": _type_name(spec.type),
                     "required": spec.required,
                     "description": spec.description,
+                    "server_selectable": spec.server_selectable,
                 }
                 for arg_name, spec in tool.arguments.items()
             },
@@ -120,6 +122,22 @@ def list_tools() -> list:
         }
         for tool in TOOLS.values()
     ]
+
+
+@app.get("/tools/{tool_name}/data", dependencies=[Depends(verify_token)])
+def list_tool_data(tool_name: str) -> dict:
+    """List models and test files available on the server for this tool, so
+    a client can pick one instead of uploading its own (see ArgSpec.server_selectable).
+    """
+    try:
+        tool = get_tool(tool_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    return {
+        "models": data_store.list_models(tool.name),
+        "testfiles": data_store.list_testfiles(tool.name),
+    }
 
 
 @app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
@@ -146,8 +164,20 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         else:
             args[key] = value
 
+    # An argument declared with ArgSpec(server_selectable=...) can be sent as
+    # a plain form value (the file name) instead of an upload -- resolved
+    # below into a path already present on the server (see data_store.py).
+    # Pulled out of `args` before the upload loop below so a genuinely
+    # uploaded file for the same field name is never mistaken for one.
+    server_file_args: dict = {}
+    for field_name in list(args):
+        spec = tool.arguments.get(field_name)
+        if spec is not None and spec.server_selectable:
+            server_file_args[field_name] = args.pop(field_name)
+
     work_dir = None
     input_paths = []
+    resolved_files = []
     size = 0
 
     if uploaded_files:
@@ -174,6 +204,18 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             args[field_name] = input_path
             input_paths.append(input_path)
 
+    for field_name, filename in server_file_args.items():
+        spec = tool.arguments[field_name]
+        resolver = data_store.resolve_model if spec.server_selectable == "model" else data_store.resolve_testfile
+        try:
+            resolved = resolver(tool.name, filename)
+        except DataNotFoundError as exc:
+            if work_dir:
+                shutil.rmtree(work_dir, ignore_errors=True)
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        args[field_name] = resolved.path
+        resolved_files.append(resolved)
+
     try:
         result = tool.invoke(args)
     except ToolArgumentError as exc:
@@ -190,6 +232,12 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         for input_path in input_paths:
             if os.path.exists(input_path):
                 os.remove(input_path)
+        # Server-side data (DATA_DIR) is persistent and must never be
+        # deleted; only backend-materialized temp copies are (see
+        # ResolvedFile.is_temporary in data_store.py).
+        for resolved in resolved_files:
+            if resolved.is_temporary and os.path.exists(resolved.path):
+                os.remove(resolved.path)
 
     duration = time.monotonic() - start_time
     logger.info(

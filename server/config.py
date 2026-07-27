@@ -31,5 +31,16 @@ class Settings(BaseSettings):
     # of this list. "*" accepts everything for the generic fallback.
     ALLOWED_EXTENSIONS: tuple[str, ...] = (".nii", ".nii.gz")
 
+    # Root directory for read-only server-side data (AI models, test files),
+    # organized as DATA_DIR/<tool_name>/{models,testfiles}/. Mounted
+    # read-only in docker-compose.yml; tools never write here.
+    DATA_DIR: str = "/data"
+
+    # Backend serving models/test files declared via
+    # ArgSpec(server_selectable=...). "local" reads DATA_DIR from disk --
+    # see data_store.py to plug in another backend (e.g. a database or
+    # object store) without changing main.py or any tool.
+    DATA_BACKEND: str = "local"
+
 
 settings = Settings()
