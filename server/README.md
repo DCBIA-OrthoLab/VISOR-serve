@@ -119,6 +119,13 @@ startup rather than silently overwriting each other.
 ./venv/bin/pytest tools/surg_mov_pred/test/        # one tool's own logic, in isolation
 ```
 
+Or, without installing anything locally, run the exact same suite in Docker
+(see "Pre-push tests" below for why this is the recommended way):
+
+```bash
+docker compose run --rm test
+```
+
 For a tool with non-trivial internal logic (its own `src/` folder), add a
 sibling `test/` folder next to it (`tools/<name>/test/test_<name>_logic.py`)
 that imports directly from `tools.<name>.src.<name>_logic` and exercises its
@@ -128,3 +135,37 @@ immediate children of `tools/` for a `<name>/<name>.py` file, so a nested
 See `tools/surg_mov_pred/test/` for an example covering column-name cleaning,
 patient-ID detection, zip extraction, prediction, and the full pipeline
 end-to-end with synthetic data.
+
+### Testing against real data (`tests/test_data_integration.py`)
+
+The tests above only ever use synthetic/fabricated data. `tests/test_data_integration.py`
+additionally runs each tool that supports server-side data (`ArgSpec(server_selectable=...)`,
+see `data_store.py`) against whatever **real** file a maintainer has placed
+under `../DATA/<tool_name>/{models,testfiles}/` at the repo root.
+
+`DATA/` is gitignored — it holds confidential medical data and must never be
+committed — so those files only ever exist locally. Accordingly, a tool with
+no matching file under `DATA/` is **skipped**, not failed: a machine without
+the confidential dataset can still run the suite and push. To turn a skip
+into a real run, drop a file in the relevant folder, e.g.
+`DATA/surg_mov_pred/testfiles/my_real_input.zip` (and
+`DATA/surg_mov_pred/models/my_real_model.zip` if you want the real model
+exercised too, instead of leaving that argument unfulfilled and the test skipped).
+
+### Pre-push tests
+
+A git hook runs the full suite above (via `docker compose run --rm test`,
+so nothing needs installing locally) before every `git push`, and blocks the
+push if any test fails. It is **not active by default** — enable it once per
+clone with:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+To push without running the suite (e.g. Docker unavailable, or a
+documentation-only change), use git's built-in bypass for a single push:
+
+```bash
+git push --no-verify
+```

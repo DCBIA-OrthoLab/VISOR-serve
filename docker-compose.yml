@@ -24,3 +24,21 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # Runs the pytest suite in the same environment as `inference`, without the
+  # GPU reservation (tests don't need one, and requiring it would make the
+  # pre-push hook fail on machines without an nvidia GPU). See .githooks/pre-push.
+  # Invoke with: docker compose run --rm test
+  test:
+    image: ghcr.io/jules-gp/lab-ai:2026.07
+    environment:
+      - API_TOKEN=test-token
+      - DATA_DIR=/data
+      - DEVICE=cpu
+    working_dir: /workspace/server
+    volumes:
+      - ./server:/workspace/server
+      - ./DATA:/data:ro
+    command: >
+      sh -c "pip install --no-cache-dir --user -r requirements.txt -r requirements-dev.txt &&
+             python -m pytest"

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Runs the server test suite in Docker before allowing a push, so a broken
+# tool or a regression never reaches the remote. Enabled per clone with:
+#   git config core.hooksPath .githooks
+#
+# To push without running the tests (e.g. a documentation-only change, or
+# Docker unavailable), use git's built-in bypass: `git push --no-verify`.
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if docker compose version >/dev/null 2>&1; then
+    compose=(docker compose)
+elif command -v docker-compose >/dev/null 2>&1; then
+    compose=(docker-compose)
+else
+    echo "pre-push: no docker compose (v2 plugin or standalone) found -- cannot run the test suite." >&2
+    echo "Install Docker Compose, or bypass this check with: git push --no-verify" >&2
+    exit 1
+fi
+
+echo "pre-push: running server test suite (${compose[*]} run --rm test)..."
+"${compose[@]}" run --rm test

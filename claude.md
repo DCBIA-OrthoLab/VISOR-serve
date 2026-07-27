@@ -274,6 +274,31 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-07-27 — Pre-push test gate + real-data integration tests
+**Motivation:** the test suite (`server/tests/`, `server/tools/*/test/`) only ran
+on synthetic fixtures and only when someone remembered to invoke it manually.
+Nothing stopped a regression from being pushed, and there was no way to
+exercise a tool against a real testfile without writing one-off scripts.
+
+**Design:** a new `docker-compose.yml` service, `test`, runs the exact same
+image as `inference` (so no local Python environment to install/maintain)
+without its GPU `deploy` reservation, installs `requirements.txt` +
+`requirements-dev.txt`, and runs `python -m pytest`
+(`docker compose run --rm test`). A git hook, `.githooks/pre-push`, runs that
+service before every push and blocks it on any test failure; it is opt-in per
+clone via `git config core.hooksPath .githooks` (git hooks aren't versioned
+by default), and can be bypassed for a single push with git's built-in
+`git push --no-verify`.
+
+`server/tests/test_data_integration.py` complements the synthetic tests: for
+every registered tool whose required arguments are all `server_selectable`
+(see the 2026-07-24 entry below), it looks up real files via `data_store`
+under `DATA/<tool_name>/{models,testfiles}/` and runs the tool end-to-end
+against them. `DATA/` is gitignored (confidential medical data), so a tool
+with no matching file present is **skipped**, never failed — a clone without
+the dataset can still push. A maintainer turns a skip into a real run by
+dropping a file under the relevant `DATA/<tool_name>/...` folder locally.
+
 ### 2026-07-24 — Server-side data store: models and test files without re-upload
 **Motivation:** tools like `surg_mov_pred` required the client to re-upload the
 same model package on every single call, and there was no way for a client to
