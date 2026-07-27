@@ -53,11 +53,31 @@ curl -k -X POST https://localhost:8000/run/test_tool \
 `-k` disables certificate verification and is only acceptable against the
 self-signed dev certificate above — never use it against a production server.
 
-A tool argument can also expect a file: add `-F "model=@/path/to/model.zip"`
+A tool argument can also expect a file: add `-F "input=@/path/to/data.zip"`
 (field name = argument name) to the same call; the server streams it to a
 temp dir and passes its path to the tool under that argument name. A tool can
-declare more than one file-typed argument (e.g. `model` + `input`), each
-uploaded as its own multipart field in the same request.
+declare more than one file-typed argument, each uploaded as its own multipart
+field in the same request.
+
+An argument declared with `ArgSpec(server_selectable=...)` can instead be
+satisfied by a file already hosted on the server (under
+`DATA_DIR/<tool>/{models,testfiles}/`): send the file's *name* as a plain form
+value. On a scalar (non-file-typed) argument that is the only option — e.g.
+`surg_mov_pred`'s `model` (`ArgSpec(type=str, server_selectable="model")`) is
+always picked by name, never uploaded (an upload for it is rejected with a 400):
+
+```bash
+# List the models/testfiles hosted server-side for a tool (Bearer-protected)
+curl -k https://localhost:8000/tools/surg_mov_pred/data \
+  -H "Authorization: Bearer change-me-to-a-long-random-secret"
+# -> {"models": ["stacking_v2.zip"], "testfiles": ["demo_measurements.zip"]}
+
+# Run it: the model is a name, the input is a genuine upload
+curl -k -X POST https://localhost:8000/run/surg_mov_pred \
+  -H "Authorization: Bearer change-me-to-a-long-random-secret" \
+  -F "model=stacking_v2.zip" \
+  -F "input=@/path/to/measurements.zip"
+```
 
 ## File-typed arguments
 
@@ -77,7 +97,7 @@ FILE_TYPES = {
 ```
 
 ```python
-"model": ArgSpec(type="zip_file", required=True, description="..."),
+"input": ArgSpec(type="zip_file", required=True, description="..."),
 ```
 
 This is what both the server (extension check on upload) and the client

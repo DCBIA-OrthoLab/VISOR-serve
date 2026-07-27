@@ -274,6 +274,38 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-07-27 — surg_mov_pred: the model is server-side only, selected by name
+**Motivation:** the client still had to provide the model as a zip upload (or
+optionally pick a server-side one). The model should live exclusively in the
+server's data store: the client asks for the list of available models
+(`GET /tools/surg_mov_pred/data`, already existing) and sends only the *name*
+of the chosen one — no model package ever travels from the client.
+
+**Design (`server/tools/surg_mov_pred/surg_mov_pred.py`):** the `model`
+argument changed from `ArgSpec(type="zip_file", server_selectable="model")` to
+`ArgSpec(type=str, server_selectable="model")`. The resolution path is
+unchanged — `main.py` already resolves any `server_selectable` argument sent
+as a plain form value through `data_store`, so `run()` still receives a local
+path to the model zip. What changed is the contract: a scalar (non-file) type
+means "name only". To enforce it, `main.py` now rejects with a 400 any file
+*upload* targeting a non-file-typed argument (previously the uploaded temp
+path would have been silently passed through as the argument's string value).
+`base.py`'s `server_selectable` comment documents the two flavors: on a
+file-typed argument the client may still upload its own file (e.g.
+`surg_mov_pred`'s `input`); on a scalar argument the server-side file is the
+only option. `GET /tools` needs no change — it already exposes `type` and
+`server_selectable`, which is all a client needs to render a dropdown of
+server-side model names instead of a file picker (the Slicer client's
+`ServerToolsCoreLib` does exactly that; see `SlicerAutomatedDentalToolsCloud`'s
+ARCHITECTURE.md).
+
+**Tests (`server/tests/test_main.py`):** an upload for `surg_mov_pred`'s
+`model` is a 400; an unknown model name is a 404; a synthetic tool with a
+str-typed `server_selectable="model"` argument resolves the name through
+`data_store` and `run()` gets the file's path. The real-data integration test
+(`test_data_integration.py`) already sent names as form values and covers the
+new schema unchanged.
+
 ### 2026-07-27 — Pre-push test gate + real-data integration tests
 **Motivation:** the test suite (`server/tests/`, `server/tools/*/test/`) only ran
 on synthetic fixtures and only when someone remembered to invoke it manually.

@@ -34,10 +34,14 @@ class ArgSpec:
     type: Union[type, str]  # str, int, float, bool, or one of FILE_TYPES's keys
     required: bool = True
     description: str = ""
-    # For file-typed arguments only: lets the caller pick a file already
-    # present on the server (see data_store.py) instead of uploading one.
+    # Lets the caller pick a file already present on the server (see
+    # data_store.py) by sending its name as a plain form value.
     # "model" -> DATA_DIR/<tool_name>/models/, "testfile" ->
     # DATA_DIR/<tool_name>/testfiles/. None (default) means upload-only.
+    # On a file-typed argument the caller may still upload its own file
+    # instead; on a scalar (str) argument the server-side file is the ONLY
+    # option -- uploads for non-file arguments are rejected (see main.py).
+    # Either way run() receives a local path to the resolved file.
     server_selectable: Optional[str] = None
 
 

@@ -147,6 +147,69 @@ def test_run_tool_with_two_named_files_missing_one_is_422(monkeypatch):
     assert response.status_code == 422
 
 
+def test_run_rejects_upload_for_scalar_argument():
+    """surg_mov_pred's "model" is a server-side-only selection (type str +
+    server_selectable): sending it as a file upload must be rejected outright,
+    not silently passed through as a temp path."""
+    response = client.post(
+        "/run/surg_mov_pred",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"model": ("model.zip", b"PK\x03\x04fake", "application/zip")},
+    )
+
+    assert response.status_code == 400
+    assert "model" in response.json()["detail"]
+
+
+def test_run_unknown_server_model_name_is_404():
+    response = client.post(
+        "/run/surg_mov_pred",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={"model": "does_not_exist.zip"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_run_resolves_scalar_server_selectable_model_by_name(monkeypatch, tmp_path):
+    """A str-typed server_selectable argument sent as a plain form value (the
+    model's name) is resolved through data_store; run() receives a local path."""
+    import base
+    import main
+    import registry
+    from data_store import ResolvedFile
+
+    model_file = tmp_path / "stacking_v2.zip"
+    model_file.write_bytes(b"model-bytes")
+
+    class ServerModelTestTool(base.Tool):
+        name = "server_model_test_tool"
+        arguments = {
+            "model": base.ArgSpec(type=str, required=True, server_selectable="model"),
+        }
+        output_kind = "text"
+
+        def run(self, model: str) -> str:
+            with open(model, "rb") as fh:
+                return f"{os.path.basename(model)}:{len(fh.read())}"
+
+    monkeypatch.setitem(registry.TOOLS, "server_model_test_tool", ServerModelTestTool())
+    monkeypatch.setattr(
+        main.data_store,
+        "resolve_model",
+        lambda tool_name, filename: ResolvedFile(path=str(model_file)),
+    )
+
+    response = client.post(
+        "/run/server_model_test_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={"model": "stacking_v2.zip"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"result": "stacking_v2.zip:11"}
+
+
 def test_run_tool_rejects_wrong_extension_for_specific_file_type(monkeypatch):
     """A "zip_file"-typed argument only accepts .zip, regardless of the
     generic config.ALLOWED_EXTENSIONS fallback list."""

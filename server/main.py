@@ -183,6 +183,18 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     if uploaded_files:
         work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
         for field_name, upload in uploaded_files.items():
+            # A scalar-typed argument must never arrive as an upload -- e.g. a
+            # server-side-only model (ArgSpec(type=str, server_selectable="model"))
+            # is selected by name, never sent by the client. Without this check
+            # the uploaded file's temp path would be silently passed through as
+            # the argument's string value.
+            spec = tool.arguments.get(field_name)
+            if spec is not None and spec.type not in FILE_TYPES:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Argument '{field_name}' expects a plain value, not an uploaded file.",
+                )
             expected = _expected_extensions(tool, field_name)
             extension = _matched_extension(upload.filename or "", expected)
             if extension is None:
