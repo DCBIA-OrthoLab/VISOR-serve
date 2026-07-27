@@ -4,6 +4,7 @@
 import sys
 import os
 import re
+import tempfile
 import warnings
 from pathlib import Path
 import logging
@@ -112,14 +113,23 @@ class LoadData:
     """
 
     @staticmethod
-    def extract_model(model_zip_path: str) -> dict:
-        """Extracts the model zip archive and loads every 'stacking_package.pkl' file found inside."""
-        logger.info(f"Extracting model package: {model_zip_path}")
-        # Extract next to the uploaded zip (inside the request's own work dir) so
-        # it is cleaned up by main.py along with the rest of that directory,
-        # instead of leaking a separate system-wide temp folder.
+    def extract_model(model_path: str, scratch_dir: str = None) -> dict:
+        """Loads every 'stacking_package.pkl' found under `model_path`.
+
+        `model_path` is either a model folder served directly from the data
+        store (no archive step, the usual case) or a zip archive that first
+        needs extracting (e.g. a legacy packaged model). A zip is extracted
+        into `scratch_dir` when given (the model itself may live in the
+        read-only data store), next to the archive otherwise.
+        """
+        if os.path.isdir(model_path):
+            logger.info(f"Loading model package from folder: {model_path}")
+            return LoadData._load_model_packages(model_path)
+
+        logger.info(f"Extracting model package: {model_path}")
+        base_dir = scratch_dir or os.path.dirname(model_path)
         extract_dir = file_utils.extract_zip(
-            model_zip_path, os.path.join(os.path.dirname(model_zip_path), "model_extracted")
+            model_path, os.path.join(base_dir, "model_extracted")
         )
         return LoadData._load_model_packages(extract_dir)
 
@@ -147,13 +157,24 @@ class LoadData:
         return packages
 
     @staticmethod
-    def load_input(input_zip_path: str) -> pd.DataFrame:
-        """Extracts the input zip archive (a folder of CSV/XLSX/ODS files) and loads it."""
-        logger.info(f"Extracting input data: {input_zip_path}")
-        extract_dir = file_utils.extract_zip(
-            input_zip_path, os.path.join(os.path.dirname(input_zip_path), "input_extracted")
-        )
-        df = file_utils.load_tabular_directory(extract_dir)
+    def load_input(input_path: str, scratch_dir: str = None) -> pd.DataFrame:
+        """Loads the input data: a zip archive of CSV/XLSX/ODS files, a folder
+        of such files (e.g. served from the data store), or a single file.
+
+        A zip is extracted into `scratch_dir` when given (the input may live
+        in the read-only data store), next to the archive otherwise.
+        """
+        logger.info(f"Loading input data: {input_path}")
+        if os.path.isdir(input_path):
+            df = file_utils.load_tabular_directory(input_path)
+        elif input_path.lower().endswith(".zip"):
+            base_dir = scratch_dir or os.path.dirname(input_path)
+            extract_dir = file_utils.extract_zip(
+                input_path, os.path.join(base_dir, "input_extracted")
+            )
+            df = file_utils.load_tabular_directory(extract_dir)
+        else:
+            df = file_utils.load_tabular_file(input_path)
         logger.info(f"Input data loaded: {len(df)} rows")
         return df
 
@@ -243,11 +264,25 @@ class Surg_mov_pred:
         try:
             logger.info("=== Surgical Movements Prediction Engine (Stacking Deploy) ===")
 
-            # 1. Extract the model zip and load every model package it contains
-            packages = LoadData.extract_model(model)
+            # Scratch space for extraction and outputs. Preferably a subfolder
+            # of the request's upload work dir (cleaned up by main.py with the
+            # rest of that directory); when every input was served straight
+            # from the read-only data store that dir isn't writable, so fall
+            # back to a fresh TEMP_DIR folder (also cleaned up by main.py --
+            # see file_utils.make_scratch_dir). Writability is probed by
+            # actually creating the folder: os.access() is not reliable for
+            # read-only mounts when running as root.
+            try:
+                scratch_dir = tempfile.mkdtemp(prefix="run_", dir=os.path.dirname(input))
+            except OSError:
+                scratch_dir = file_utils.make_scratch_dir("SurgMovPred_")
 
-            # 2. Load the input data (single file or folder of CSV / Excel / ODS files)
-            df_input = LoadData.load_input(input)
+            # 1. Load every model package (a folder served from the data store,
+            # or a zip archive to extract first)
+            packages = LoadData.extract_model(model, scratch_dir)
+
+            # 2. Load the input data (zip archive, folder, or single CSV / Excel / ODS file)
+            df_input = LoadData.load_input(input, scratch_dir)
 
             # 3. Recover the patient identifier from the input so it can be carried over to the output
             id_column = find_id_column(df_input.columns)
@@ -262,11 +297,10 @@ class Surg_mov_pred:
             df_results = predict_all_targets(df_input, packages)
             df_results.insert(0, 'IDPatient', id_values.values)
 
-            # 5. Save into a subfolder of the request's own work dir (where `model`
-            # and `input` were uploaded). main.py already schedules that whole
-            # directory for cleanup after the response is streamed, so the output
-            # is removed automatically without needing its own cleanup hook.
-            output_dir = os.path.join(os.path.dirname(input), "output")
+            # 5. Save into the scratch dir chosen above; main.py schedules its
+            # containing directory for cleanup after the response is streamed,
+            # so the output is removed automatically without its own hook.
+            output_dir = os.path.join(scratch_dir, "output")
             output_path = save_results(df_results, output_dir)
 
             logger.info("=== Process completed successfully ===")

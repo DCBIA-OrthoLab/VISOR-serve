@@ -98,6 +98,18 @@ def _type_name(arg_type) -> str:
     return arg_type if isinstance(arg_type, str) else arg_type.__name__
 
 
+def _temp_root_of(path: str) -> Optional[str]:
+    """Top-level folder under settings.TEMP_DIR containing `path`, or None if
+    `path` lives outside TEMP_DIR. Used to clean up a tool's own scratch dir
+    (see file_utils.make_scratch_dir) once its output has been streamed."""
+    temp_dir = os.path.realpath(settings.TEMP_DIR)
+    resolved = os.path.realpath(path)
+    if os.path.commonpath([temp_dir, resolved]) != temp_dir or resolved == temp_dir:
+        return None
+    relative = os.path.relpath(resolved, temp_dir)
+    return os.path.join(temp_dir, relative.split(os.sep)[0])
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -261,6 +273,13 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         if work_dir is None:
             work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
         background_tasks.add_task(shutil.rmtree, work_dir, ignore_errors=True)
+        # A tool whose inputs all came from the read-only data store writes
+        # its output in its own scratch dir under TEMP_DIR instead of the
+        # upload work dir (see file_utils.make_scratch_dir): clean that
+        # folder up too once the response has been streamed.
+        result_root = _temp_root_of(os.path.dirname(str(result)))
+        if result_root is not None and result_root != os.path.realpath(work_dir):
+            background_tasks.add_task(shutil.rmtree, result_root, ignore_errors=True)
         media_type, _ = mimetypes.guess_type(str(result))
         if media_type is None:
             media_type = "application/gzip" if str(result).endswith(".gz") else "application/octet-stream"

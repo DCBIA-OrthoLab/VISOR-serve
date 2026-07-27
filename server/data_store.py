@@ -65,9 +65,16 @@ class DataStore(ABC):
 class LocalDataStore(DataStore):
     """Reads models/test files from DATA_DIR/<tool_name>/{models,testfiles}/.
 
+    An entry can be a single file (e.g. a zip archive) or a whole folder
+    (e.g. an unpacked model directory): both are listed and resolved the
+    same way, and the tool receives the resolved path either way.
+
     DATA_DIR is expected to be mounted read-only (see docker-compose.yml):
     this store never writes to it.
     """
+
+    # Junk that archive tools and macOS leave behind; never listed as data.
+    _IGNORED_NAMES = ("__MACOSX",)
 
     def __init__(self, root: str):
         self._root = root
@@ -91,7 +98,7 @@ class LocalDataStore(DataStore):
         return sorted(
             entry
             for entry in os.listdir(directory)
-            if os.path.isfile(os.path.join(directory, entry))
+            if not entry.startswith(".") and entry not in self._IGNORED_NAMES
         )
 
     def _resolve(self, tool_name: str, kind: str, filename: str) -> str:
@@ -106,7 +113,7 @@ class LocalDataStore(DataStore):
         # Second line of defense: a bare name could still resolve outside
         # `directory` via a symlink planted under DATA_DIR. Confirm the
         # resolved path stays contained in the expected directory.
-        if os.path.commonpath([directory, candidate]) != directory or not os.path.isfile(candidate):
+        if os.path.commonpath([directory, candidate]) != directory or not os.path.exists(candidate):
             raise DataNotFoundError(f"No such {kind[:-1]} '{filename}' for tool '{tool_name}'")
         return candidate
 

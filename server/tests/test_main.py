@@ -148,11 +148,11 @@ def test_run_tool_with_two_named_files_missing_one_is_422(monkeypatch):
 
 
 def test_run_rejects_upload_for_scalar_argument():
-    """surg_mov_pred's "model" is a server-side-only selection (type str +
+    """SurgMovPred's "model" is a server-side-only selection (type str +
     server_selectable): sending it as a file upload must be rejected outright,
     not silently passed through as a temp path."""
     response = client.post(
-        "/run/surg_mov_pred",
+        "/run/SurgMovPred",
         headers={"Authorization": f"Bearer {TOKEN}"},
         files={"model": ("model.zip", b"PK\x03\x04fake", "application/zip")},
     )
@@ -163,9 +163,9 @@ def test_run_rejects_upload_for_scalar_argument():
 
 def test_run_unknown_server_model_name_is_404():
     response = client.post(
-        "/run/surg_mov_pred",
+        "/run/SurgMovPred",
         headers={"Authorization": f"Bearer {TOKEN}"},
-        data={"model": "does_not_exist.zip"},
+        data={"model": "does_not_exist", "input": "does_not_exist.zip"},
     )
 
     assert response.status_code == 404

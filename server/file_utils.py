@@ -5,9 +5,24 @@ logic instead of each reimplementing zip extraction and tabular loading.
 
 import glob
 import os
+import tempfile
 import zipfile
 
 import pandas as pd
+
+from config import settings
+
+
+def make_scratch_dir(prefix: str = "tool_") -> str:
+    """Fresh writable scratch dir under settings.TEMP_DIR for one request.
+
+    For tools whose inputs all come from the read-only data store: there is
+    no upload work dir to write next to, so extraction/output files go here
+    instead. main.py deletes this directory once the response has been
+    streamed (it cleans up the TEMP_DIR folder containing the tool's output).
+    """
+    os.makedirs(settings.TEMP_DIR, exist_ok=True)
+    return tempfile.mkdtemp(prefix=prefix, dir=settings.TEMP_DIR)
 
 
 def extract_zip(zip_path: str, extract_dir: str = None) -> str:

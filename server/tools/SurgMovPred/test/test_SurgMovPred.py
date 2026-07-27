@@ -1,9 +1,9 @@
-"""Unit tests for surg_mov_pred_logic.py -- exercises the tool's own logic
-directly (column cleaning, ID detection, zip/model loading, prediction,
+"""Unit tests for SurgMovPredLogic.py -- exercises the tool's own logic
+directly (column cleaning, ID detection, model loading, prediction,
 saving), independently of the HTTP layer.
 
 Run just this module's tests:
-    cd server && ./venv/bin/pytest tools/surg_mov_pred/test/
+    cd server && ./venv/bin/pytest tools/SurgMovPred/test/
 Or as part of the full suite:
     cd server && ./venv/bin/pytest
 """
@@ -11,13 +11,17 @@ Or as part of the full suite:
 import os
 import zipfile
 
+# Set before anything imports config.Settings() (file_utils does, via the
+# tool logic), so the suite runs regardless of the local environment.
+os.environ.setdefault("API_TOKEN", "test-token")
+
 import joblib
 import pandas as pd
 import pytest
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
 
-from tools.surg_mov_pred.src.surg_mov_pred_logic import (
+from tools.SurgMovPred.src.SurgMovPredLogic import (
     LoadData,
     Surg_mov_pred,
     clean_name,
@@ -97,6 +101,24 @@ def test_extract_model_loads_valid_package(tmp_path):
     assert packages["SomeTarget_Pred"]["target_name"] == "SomeTarget_Pred"
 
 
+def test_extract_model_loads_from_folder(tmp_path):
+    """A model served directly from the data store is a plain folder: it must
+    be loaded as-is, without any zip extraction step."""
+    package = {
+        "target_name": "SomeTarget_Pred",
+        "features_names": ["f1"],
+        "scaler": StandardScaler(),
+        "model": LinearRegression(),
+    }
+    model_dir = tmp_path / "SomeTarget_Pred"
+    model_dir.mkdir()
+    joblib.dump(package, model_dir / "stacking_package.pkl")
+
+    packages = LoadData.extract_model(str(model_dir))
+
+    assert list(packages.keys()) == ["SomeTarget_Pred"]
+
+
 def test_extract_model_raises_when_no_package_found(tmp_path):
     zip_path = tmp_path / "empty.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
@@ -127,6 +149,18 @@ def test_load_input_reads_csv_from_zip(tmp_path):
     zip_path = _make_input_zip(tmp_path, df)
 
     loaded = LoadData.load_input(zip_path)
+
+    assert list(loaded.columns) == ["PatientID", "f1"]
+    assert len(loaded) == 2
+
+
+def test_load_input_reads_bare_tabular_file(tmp_path):
+    """A server-side test file may be a single CSV/XLSX/ODS, not a zip."""
+    df = pd.DataFrame({"PatientID": [1, 2], "f1": [10, 20]})
+    xlsx_path = tmp_path / "patients.xlsx"
+    df.to_excel(xlsx_path, index=False)
+
+    loaded = LoadData.load_input(str(xlsx_path))
 
     assert list(loaded.columns) == ["PatientID", "f1"]
     assert len(loaded) == 2
@@ -202,3 +236,47 @@ def test_main_full_pipeline(tmp_path):
     assert "IDPatient" in result_df.columns
     assert "f1_Pred" in result_df.columns
     assert list(result_df["IDPatient"]) == [1, 2, 3]
+
+
+def test_main_full_pipeline_with_server_side_data(tmp_path, monkeypatch):
+    """Data-store layout: the model is a plain folder and the input a bare
+    XLSX, both served read-only -- nothing is zipped, and the output must land
+    outside the (read-only) input directory."""
+    import file_utils
+    from config import settings
+
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path / "server_tmp"))
+
+    scaler = StandardScaler().fit([[0], [10], [20]])
+    model = LinearRegression().fit(scaler.transform([[0], [10], [20]]), [5, 15, 25])
+    package = {
+        "target_name": "f1_Pred",
+        "features_names": ["f1"],
+        "scaler": scaler,
+        "model": model,
+    }
+    model_dir = tmp_path / "DATA" / "models" / "f1_Pred"
+    model_dir.mkdir(parents=True)
+    joblib.dump(package, model_dir / "stacking_package.pkl")
+
+    testfiles_dir = tmp_path / "DATA" / "testfiles"
+    testfiles_dir.mkdir()
+    input_path = testfiles_dir / "patients.xlsx"
+    pd.DataFrame({"PatientID": [1, 2, 3], "f1": [0, 10, 20]}).to_excel(
+        input_path, index=False
+    )
+
+    # Simulate the read-only DATA mount so the tool has to fall back to its
+    # TEMP_DIR scratch dir. When running as root (e.g. in the Docker test
+    # container) the chmod has no effect and the scratch simply lands next to
+    # the input; the assertions hold either way.
+    testfiles_dir.chmod(0o555)
+    try:
+        output_path = Surg_mov_pred.main(str(model_dir), str(input_path))
+
+        assert os.path.exists(output_path)
+        result_df = pd.read_excel(output_path, index_col=0)
+        assert "f1_Pred" in result_df.columns
+        assert list(result_df["IDPatient"]) == [1, 2, 3]
+    finally:
+        testfiles_dir.chmod(0o755)
