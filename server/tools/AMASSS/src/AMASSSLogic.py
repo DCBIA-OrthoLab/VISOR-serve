@@ -22,13 +22,13 @@ See the module-level comments marked "FIX:" for the specific defects of the
 original CLI that are corrected here.
 """
 
+import glob
 import json
 import logging
 import os
 import re
 import shutil
 import sys
-import tempfile
 import time
 import zipfile
 
@@ -36,6 +36,7 @@ import numpy as np
 import SimpleITK as sitk
 
 import file_utils
+from base import ToolArgumentError
 
 from . import nnunet_runner, vtk_export
 
@@ -136,13 +137,72 @@ MERGING_ORDER = (
 )
 
 MERGE_MODES = ("MERGED", "SEPARATE")
-MERGE_MODE_GROUPS = {
-    "Output": {
-        "One merged segmentation file": "MERGED",
-        "Separated segmentation files": "SEPARATE",
-    }
-}
 DEFAULT_MERGE_MODES = ("MERGED",)
+
+MERGE_MODE_NAMES = {
+    "One merged segmentation file": "MERGED",
+    "Separated segmentation files": "SEPARATE",
+}
+
+
+# ---------------------------------------------------------------------------
+# What the schema publishes -- {option name: on by default}
+# ---------------------------------------------------------------------------
+# A "multichoice" argument declares its options as human-readable names, and
+# those names are what the client renders as check-box labels and sends back.
+# Built from the catalog above so the two can never disagree, and in group
+# order (Bones, then Soft tissue, then Masks) since a Selection preserves
+# declaration order and the client renders them in it.
+#
+# NOTE: the client renders one flat list -- the "choice" / "multichoice" schema
+# has no notion of option groups, so the former Bones / Soft tissue / Masks
+# tabs are only preserved as ordering here. Restoring real group boxes would
+# need a grouping key in the schema plus formgen support; it is deliberately
+# NOT faked with prefixed labels, which would end up inside the option names
+# the server validates against.
+
+STRUCTURE_NAMES = {
+    display_name: code
+    for group in STRUCTURE_GROUPS.values()
+    for display_name, code in group.items()
+}
+
+STRUCTURE_CHOICES = {
+    display_name: code in DEFAULT_STRUCTURES for display_name, code in STRUCTURE_NAMES.items()
+}
+
+MERGE_CHOICES = {
+    display_name: code in DEFAULT_MERGE_MODES for display_name, code in MERGE_MODE_NAMES.items()
+}
+
+
+def _codes_from(selection, name_to_code: dict, fallback: tuple) -> tuple:
+    """Turn what `run()` received for a multichoice argument into tool codes.
+
+    Accepts the three shapes that legitimately reach here:
+
+    * a `base.Selection` / dict `{option name: bool}` -- the normal HTTP path;
+    * `None` -- an omitted optional argument, which must fall back to the
+      declared defaults (see the note in AMASSS.py about ArgSpec.default);
+    * an iterable of codes already -- so `segment()` stays directly callable
+      by another server-side tool without going through the schema.
+    """
+    if selection is None:
+        return fallback
+    if isinstance(selection, dict):
+        codes = tuple(
+            name_to_code[name] for name, enabled in selection.items() if enabled and name in name_to_code
+        )
+        return codes
+    return tuple(selection)
+
+
+def structure_codes(selection) -> tuple:
+    return _codes_from(selection, STRUCTURE_NAMES, DEFAULT_STRUCTURES)
+
+
+def merge_modes(selection) -> tuple:
+    return _codes_from(selection, MERGE_MODE_NAMES, DEFAULT_MERGE_MODES)
 
 # FIX: .gipl / .gipl.gz were advertised by the Slicer UI and the README but
 # rejected by the CLI, which accepted only .nii/.nii.gz/.nrrd/.nrrd.gz. They
@@ -343,8 +403,8 @@ def _write_segmentation(array: np.ndarray, reference: sitk.Image, output_path: s
 def segment(
     input_path: str,
     model_path: str,
-    structures=DEFAULT_STRUCTURES,
-    merge=DEFAULT_MERGE_MODES,
+    structures=None,
+    merge=None,
     prediction_ID: str = "Pred",
     generate_surface: bool = False,
     surface_smoothing: int = 5,
@@ -361,8 +421,11 @@ def segment(
 
     started_at = time.monotonic()
 
-    structures = tuple(structures or DEFAULT_STRUCTURES)
-    merge = tuple(merge or DEFAULT_MERGE_MODES)
+    # None means "not specified" and takes the defaults; an EMPTY selection is
+    # a different thing entirely -- the caller unchecked every box -- and must
+    # be reported rather than silently turned back into the defaults.
+    structures = tuple(DEFAULT_STRUCTURES if structures is None else structures)
+    merge = tuple(DEFAULT_MERGE_MODES if merge is None else merge)
     prediction_ID = (prediction_ID or "Pred").strip() or "Pred"
 
     unknown = [code for code in structures if code not in STRUCTURE_CODES]
@@ -370,6 +433,16 @@ def segment(
         raise ValueError(
             f"Unknown structure code(s): {', '.join(unknown)}. "
             f"Known: {', '.join(STRUCTURE_CODES)}"
+        )
+
+    # Constraints the schema cannot express: every box unchecked is a perfectly
+    # valid Selection. ToolArgumentError is what makes main.py answer 422 with
+    # these messages rather than a blank 500.
+    if not structures:
+        raise ToolArgumentError("Select at least one structure to segment.")
+    if not merge:
+        raise ToolArgumentError(
+            "Select at least one output form (merged and/or separated segmentations)."
         )
 
     if scratch_dir is None:
@@ -391,7 +464,10 @@ def segment(
         len(scans), len(models), device,
     )
 
-    output_dir = os.path.join(scratch_dir, "output")
+    # Named after the run, not "output": with output_kind = "files", main.py
+    # names the archive it streams back after this directory, so the client
+    # receives AMASSS_Pred.zip rather than output.zip.
+    output_dir = os.path.join(scratch_dir, f"AMASSS_{prediction_ID}")
     os.makedirs(output_dir, exist_ok=True)
 
     # Convert every scan once into the single folder nnUNet reads. Predicting
@@ -588,53 +664,48 @@ def _assemble_scan_outputs(record, predictions, output_dir, scratch_dir, predict
 def main(
     input: str,
     model: str,
-    structures=DEFAULT_STRUCTURES,
-    merge=DEFAULT_MERGE_MODES,
+    structures=None,
+    merge=None,
     prediction_ID: str = "Pred",
     generate_surface: bool = False,
     surface_smoothing: int = 5,
 ) -> str:
-    """HTTP adapter: run `segment()` and pack its output folder into one zip.
+    """Schema adapter: translate the declared option names into tool codes, run
+    `segment()`, and return the folder holding the results.
 
-    Scratch space follows the same rule as SurgMovPred: prefer a subfolder of
-    the request's upload work dir (main.py deletes it with the rest), and fall
-    back to a fresh TEMP_DIR folder when every input came from the read-only
-    data store and there is no writable upload dir to sit next to. Writability
-    is probed by actually creating the folder, since os.access() is unreliable
-    for read-only mounts when running as root.
+    `structures` and `merge` arrive as `base.Selection` mappings keyed by the
+    human-readable names the schema published; `segment()` speaks structure
+    codes, and keeps doing so, because that is the API another server-side tool
+    calls (see the module docstring). `_codes_from` bridges the two and also
+    accepts plain code sequences, so a direct caller never has to know the
+    display names exist.
 
-    # NOTE for the multi-output work in progress: this zip exists only
-    # because one HTTP response carries one blob. `segment()` above already
-    # returns the individual files (SegmentationRun.segmentation_files /
-    # .surface_files). Once the server can return several files, this
-    # function is the ONLY place that needs to change -- swap the
-    # zip_directory call for the new multi-file response and return the run's
-    # file list. Nothing in segment() assumes a zip.
+    Returning a DIRECTORY rather than an archive is deliberate: with
+    `output_kind = "files"`, main.py bundles it and streams the zip, so no zip
+    code lives in this tool. Scratch space always comes from
+    `file_utils.make_scratch_dir`, which registers it for cleanup even if the
+    run raises half-way -- patient data must never survive a crash.
     """
-    try:
-        scratch_dir = tempfile.mkdtemp(prefix="run_", dir=os.path.dirname(input))
-    except OSError:
-        scratch_dir = file_utils.make_scratch_dir("AMASSS_")
+    scratch_dir = file_utils.make_scratch_dir("AMASSS_")
 
     run = segment(
         input_path=input,
         model_path=model,
-        structures=structures,
-        merge=merge,
+        structures=structure_codes(structures),
+        merge=merge_modes(merge),
         prediction_ID=prediction_ID,
         generate_surface=generate_surface,
         surface_smoothing=surface_smoothing,
         scratch_dir=scratch_dir,
     )
 
-    archive_dir = os.path.join(scratch_dir, "archive")
-    os.makedirs(archive_dir, exist_ok=True)
-    zip_path = os.path.join(archive_dir, f"AMASSS_{prediction_ID or 'Pred'}.zip")
-    file_utils.zip_directory(run.output_dir, zip_path)
-
-    # The intermediate nnUNet folders can be large; drop them before the
-    # response is streamed rather than waiting for main.py's cleanup.
-    for temporary in ("nnunet_input", "surface_tmp"):
+    # The intermediate nnUNet folders can be large (one predicted volume per
+    # scan and per structure); free them before the response is streamed
+    # rather than holding the disk until main.py's cleanup runs. They sit
+    # beside output_dir, never inside it, so the archive is unaffected.
+    for temporary in ("nnunet_input", "surface_tmp", "input_extracted", "model_extracted"):
         shutil.rmtree(os.path.join(scratch_dir, temporary), ignore_errors=True)
+    for structure_output in glob.glob(os.path.join(scratch_dir, "pred_*")):
+        shutil.rmtree(structure_output, ignore_errors=True)
 
-    return zip_path
+    return run.output_dir
