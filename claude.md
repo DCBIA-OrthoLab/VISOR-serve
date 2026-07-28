@@ -202,13 +202,16 @@ model, a reference test dataset) instead of the client uploading it every call.
 
 ### `security.py`, `config.py`
 - Bearer token from env (`API_TOKEN`), constant-time compare, `401` on failure.
-- Config from env: `API_TOKEN`, `DEVICE`, `MAX_UPLOAD_MB`, `TEMP_DIR`,
-  `ALLOWED_EXTENSIONS`, `DATA_DIR`, `DATA_BACKEND`. Sensible dev defaults.
+- Config from env: `API_TOKEN`, `DEVICE`, `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
+  `TEMP_DIR`, `ALLOWED_EXTENSIONS`, `DATA_DIR`, `DATA_BACKEND`. Sensible dev
+  defaults.
 
 ### Security / confidentiality — hard requirements
 - **TLS mandatory**; README documents HTTPS + self-signed cert for dev, real cert
   for prod, never plain HTTP.
 - Upload size limit (`MAX_UPLOAD_MB` → `413`).
+- Client archives extracted for `"folder"` arguments are untrusted: zip slip,
+  symlink members, and zip bombs (`MAX_EXTRACTED_MB`) all rejected with `400`.
 - Delete all temp files after processing.
 - Never log file contents, arguments values, or patient metadata. Logs limited to
   timestamp, endpoint, tool name, status, duration, size.
@@ -379,14 +382,14 @@ their own loop and pass even against a serial server). The barrier only opens
 if both requests are inside `run()` at the same time; serial execution times it
 out and fails the test.
 
-### 2026-07-27 — surg_mov_pred: the model is server-side only, selected by name
+### 2026-07-27 — surgMovPred: the model is server-side only, selected by name
 **Motivation:** the client still had to provide the model as a zip upload (or
 optionally pick a server-side one). The model should live exclusively in the
 server's data store: the client asks for the list of available models
-(`GET /tools/surg_mov_pred/data`, already existing) and sends only the *name*
+(`GET /tools/surgMovPred/data`, already existing) and sends only the *name*
 of the chosen one — no model package ever travels from the client.
 
-**Design (`server/tools/surg_mov_pred/surg_mov_pred.py`):** the `model`
+**Design (`server/tools/surgMovPred/surgMovPred.py`):** the `model`
 argument changed from `ArgSpec(type="zip_file", server_selectable="model")` to
 `ArgSpec(type=str, server_selectable="model")`. The resolution path is
 unchanged — `main.py` already resolves any `server_selectable` argument sent
@@ -397,14 +400,14 @@ means "name only". To enforce it, `main.py` now rejects with a 400 any file
 path would have been silently passed through as the argument's string value).
 `base.py`'s `server_selectable` comment documents the two flavors: on a
 file-typed argument the client may still upload its own file (e.g.
-`surg_mov_pred`'s `input`); on a scalar argument the server-side file is the
+`surgMovPred`'s `input`); on a scalar argument the server-side file is the
 only option. `GET /tools` needs no change — it already exposes `type` and
 `server_selectable`, which is all a client needs to render a dropdown of
 server-side model names instead of a file picker (the Slicer client's
 `ServerToolsCoreLib` does exactly that; see `SlicerAutomatedDentalToolsCloud`'s
 ARCHITECTURE.md).
 
-**Tests (`server/tests/test_main.py`):** an upload for `surg_mov_pred`'s
+**Tests (`server/tests/test_main.py`):** an upload for `surgMovPred`'s
 `model` is a 400; an unknown model name is a 404; a synthetic tool with a
 str-typed `server_selectable="model"` argument resolves the name through
 `data_store` and `run()` gets the file's path. The real-data integration test
@@ -437,7 +440,7 @@ the dataset can still push. A maintainer turns a skip into a real run by
 dropping a file under the relevant `DATA/<tool_name>/...` folder locally.
 
 ### 2026-07-24 — Server-side data store: models and test files without re-upload
-**Motivation:** tools like `surg_mov_pred` required the client to re-upload the
+**Motivation:** tools like `surgMovPred` required the client to re-upload the
 same model package on every single call, and there was no way for a client to
 say "run this against the server's reference test data" instead of streaming
 its own file. Confidential-data constraints rule out a generic upload cache, so
@@ -452,7 +455,7 @@ this needed to be explicit, per-tool, read-only server-side storage instead.
 offer a selection instead of a file picker. In `POST /run/{tool_name}`, a
 `server_selectable` argument sent as a plain form value (a file name) rather
 than an upload is resolved through `data_store` and excluded from the temp-file
-cleanup that applies to genuine uploads (`server/main.py`). `surg_mov_pred`'s
+cleanup that applies to genuine uploads (`server/main.py`). `surgMovPred`'s
 `model` and `input` arguments now both opt in.
 
 **Deliberately abstracted for a future external database/object store:** neither
@@ -473,7 +476,7 @@ so model weights and test datasets are never committed.
 **Problem:** `POST /run/{tool_name}` responses with `output_kind in ("file",
 "segmentation")` always sent `media_type="application/octet-stream"` (or
 `application/gzip` for `.gz` files), regardless of the output's real format. The
-new `surg_mov_pred` tool returns a `.xlsx` file, and since an `.xlsx` is
+new `surgMovPred` tool returns a `.xlsx` file, and since an `.xlsx` is
 internally a zip container (`PK\x03\x04` signature), a client that decides
 whether to unzip a downloaded "file" result by sniffing magic bytes instead of
 trusting `Content-Type` could not tell it apart from an actual zip archive —

@@ -4,6 +4,7 @@
 # De-identification of patient data happens on the client side before upload;
 # this server never logs file contents, argument values, or patient metadata.
 
+import functools
 import logging
 import mimetypes
 import os
@@ -18,7 +19,8 @@ from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, U
 from fastapi.responses import FileResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from base import FILE_TYPES, ToolArgumentError
+import file_utils
+from base import FOLDER_TYPE, ResolvedPath, ToolArgumentError
 from config import settings
 from data_store import DataNotFoundError, data_store
 from registry import TOOLS, get_tool
@@ -33,6 +35,7 @@ app = FastAPI()
 
 _CHUNK_SIZE_BYTES = 1024 * 1024  # read/write in 1 MB chunks, never load the full file into RAM
 _MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_MB * 1024 * 1024
+_MAX_EXTRACTED_BYTES = settings.MAX_EXTRACTED_MB * 1024 * 1024
 
 
 class _UploadTooLargeError(Exception):
@@ -68,14 +71,14 @@ def _extract_extension(filename: str) -> str:
 
 
 def _expected_extensions(tool, field_name: str) -> Optional[tuple]:
-    """Return the specific extensions expected for this argument, if the tool
-    declares a specific file type for it (see base.FILE_TYPES). None means
-    "no specific type declared" -- fall back to settings.ALLOWED_EXTENSIONS.
+    """Return the specific extensions expected for this argument, across every
+    file type it declares (see base.FILE_TYPES). None means "no specific type
+    declared" -- fall back to settings.ALLOWED_EXTENSIONS.
     """
     spec = tool.arguments.get(field_name)
-    if spec is None:
+    if spec is None or not spec.is_file:
         return None
-    return FILE_TYPES.get(spec.type)
+    return spec.extensions
 
 
 def _matched_extension(filename: str, expected: Optional[tuple]) -> Optional[str]:
@@ -113,6 +116,34 @@ def _type_name(arg_type) -> str:
     return arg_type if isinstance(arg_type, str) else arg_type.__name__
 
 
+def _resolved_kind(spec, path: str) -> str:
+    """Which declared type a path on disk corresponds to, for ResolvedPath.kind."""
+    if os.path.isdir(path):
+        return FOLDER_TYPE
+    if not spec.is_file:
+        return "file"
+    return spec.match_type(_extract_extension(os.path.basename(path)))
+
+
+def _extract_folder_argument(spec, archive_path: str, work_dir: str, field_name: str) -> str:
+    """Extract an archive sent for a "folder"-typed argument, so run() gets a
+    directory. HTTP has no notion of a folder: the client zips it, the server
+    unpacks it here, and the tool never sees the archive step at all.
+    """
+    try:
+        return file_utils.extract_zip(
+            archive_path,
+            os.path.join(work_dir, f"{field_name}_folder"),
+            strip_single_root=True,
+            max_total_bytes=_MAX_EXTRACTED_BYTES,
+        )
+    except file_utils.BadArchiveError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Argument '{field_name}': {exc}",
+        )
+
+
 def _temp_root_of(path: str) -> Optional[str]:
     """Top-level folder under settings.TEMP_DIR containing `path`, or None if
     `path` lives outside TEMP_DIR. Used to clean up a tool's own scratch dir
@@ -123,6 +154,35 @@ def _temp_root_of(path: str) -> Optional[str]:
         return None
     relative = os.path.relpath(resolved, temp_dir)
     return os.path.join(temp_dir, relative.split(os.sep)[0])
+
+
+def _output_paths(result) -> list:
+    """Normalize what run() returned into a list of output paths. Empty when
+    the returned value isn't path-shaped at all."""
+    if isinstance(result, (str, os.PathLike)):
+        return [str(result)]
+    if isinstance(result, (list, tuple)):
+        return [str(path) for path in result]
+    return []
+
+
+def _discard(work_dir: Optional[str], scratch_dirs: list) -> None:
+    """Remove everything this request created, right now. Used on the error
+    paths, where no response will ever stream and background tasks won't run."""
+    for directory in ([work_dir] if work_dir else []) + list(scratch_dirs):
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _output_roots(outputs: list, work_dir: str) -> set:
+    """TEMP_DIR folders holding the tool's outputs, excluding the request's own
+    work dir (already scheduled for cleanup by the caller)."""
+    work_dir_real = os.path.realpath(work_dir)
+    roots = set()
+    for path in outputs:
+        root = _temp_root_of(path if os.path.isdir(path) else os.path.dirname(path))
+        if root is not None and root != work_dir_real:
+            roots.add(root)
+    return roots
 
 
 @app.get("/health")
@@ -162,7 +222,19 @@ def list_tools() -> list:
         {
             "name": tool.name,
             "arguments": {
-                arg_name: _describe_argument(spec)
+                arg_name: {
+                    # "type" stays a single string for clients that predate
+                    # multi-type arguments; "types" is the full list and is
+                    # what a client should read to build its file picker.
+                    "type": _type_name(spec.types[0]),
+                    "types": [_type_name(declared) for declared in spec.types],
+                    "required": spec.required,
+                    "description": spec.description,
+                    "server_selectable": spec.server_selectable,
+                    # For "choice"/"multichoice": the options to render, each
+                    # with its initial state. None for every other type.
+                    "choices": spec.choices,
+                }
                 for arg_name, spec in tool.arguments.items()
             },
             "output_kind": tool.output_kind,
@@ -236,7 +308,7 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             # the uploaded file's temp path would be silently passed through as
             # the argument's string value.
             spec = tool.arguments.get(field_name)
-            if spec is not None and spec.type not in FILE_TYPES:
+            if spec is not None and not spec.is_file:
                 shutil.rmtree(work_dir, ignore_errors=True)
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -260,8 +332,26 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail=f"File exceeds the {settings.MAX_UPLOAD_MB} MB limit.",
                 )
-            args[field_name] = input_path
             input_paths.append(input_path)
+
+            # An argument can accept several types (e.g. ("csv_file", "folder")):
+            # decide here which one this upload actually is, and hand run() a
+            # path tagged with it. A "folder" arrives zipped and is unpacked
+            # now, so the tool only ever sees a directory.
+            kind = spec.match_type(extension) if spec is not None and spec.is_file else "file"
+            if kind == FOLDER_TYPE:
+                try:
+                    extracted = await anyio.to_thread.run_sync(
+                        functools.partial(
+                            _extract_folder_argument, spec, input_path, work_dir, field_name
+                        )
+                    )
+                except HTTPException:
+                    shutil.rmtree(work_dir, ignore_errors=True)
+                    raise
+                args[field_name] = ResolvedPath(extracted, FOLDER_TYPE)
+            else:
+                args[field_name] = ResolvedPath(input_path, kind)
 
     for field_name, filename in server_file_args.items():
         spec = tool.arguments[field_name]
@@ -272,8 +362,30 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             if work_dir:
                 shutil.rmtree(work_dir, ignore_errors=True)
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-        args[field_name] = resolved.path
         resolved_files.append(resolved)
+
+        # Server-side data can be a real folder or a single file; tag it the
+        # same way as an upload so run() branches on .kind either way. An
+        # archive standing in for a "folder" argument is unpacked here too, so
+        # the two routes stay indistinguishable from the tool's point of view.
+        kind = _resolved_kind(spec, resolved.path)
+        path = resolved.path
+        if kind == FOLDER_TYPE and not os.path.isdir(path):
+            # DATA_DIR is read-only: extract into the request's own work dir.
+            if work_dir is None:
+                work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
+            try:
+                path = await anyio.to_thread.run_sync(
+                    functools.partial(_extract_folder_argument, spec, path, work_dir, field_name)
+                )
+            except HTTPException:
+                shutil.rmtree(work_dir, ignore_errors=True)
+                raise
+        args[field_name] = ResolvedPath(path, kind)
+
+    # Anything the tool creates through file_utils.make_scratch_dir() lands
+    # here, so it can be removed even if run() raises before returning a path.
+    scratch_dirs = file_utils.track_scratch_dirs()
 
     try:
         # Run the tool in a worker thread, NOT on the event loop: tool.invoke
@@ -287,13 +399,11 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             tool.invoke, args, limiter=_get_tool_limiter()
         )
     except ToolArgumentError as exc:
-        if work_dir:
-            shutil.rmtree(work_dir, ignore_errors=True)
+        _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
     except Exception:
         logger.exception("endpoint=/run/%s status=500", tool_name)
-        if work_dir:
-            shutil.rmtree(work_dir, ignore_errors=True)
+        _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=500, detail="Tool execution failed.")
     finally:
         # Uploaded inputs are never needed again past this point.
@@ -312,18 +422,47 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         "endpoint=/run/%s status=200 duration=%.2fs size=%dB", tool_name, duration, size
     )
 
-    if tool.output_kind in ("file", "segmentation"):
-        # `result` is expected to be a path to the output file written by the tool.
+    if tool.output_kind in ("file", "segmentation", "files"):
+        # `result` is a path to the output file the tool wrote -- or, for
+        # "files", a list of paths / a single directory to bundle into a zip.
         if work_dir is None:
             work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
+
+        # A tool whose inputs all came from the read-only data store writes its
+        # output in its own scratch dir under TEMP_DIR instead of the upload
+        # work dir: those folders have to be cleaned up as well, whether the
+        # response goes out or the packing below fails. `scratch_dirs` covers
+        # everything requested through file_utils.make_scratch_dir();
+        # _output_roots also catches a tool that wrote under TEMP_DIR by hand.
+        try:
+            outputs = _output_paths(result)
+            if not outputs:
+                raise ValueError(
+                    f"Tool '{tool.name}' declares output_kind={tool.output_kind!r} but "
+                    f"run() returned {type(result).__name__}, not a path (or a list of paths)."
+                )
+            output_roots = _output_roots(outputs, work_dir) | set(scratch_dirs)
+            if tool.output_kind == "files":
+                # Built inside work_dir, never inside the tool's own scratch
+                # dir: the archive has to outlive the files it was made from,
+                # right up until the response has finished streaming.
+                archive_name = (
+                    f"{os.path.basename(outputs[0].rstrip(os.sep))}.zip"
+                    if len(outputs) == 1 and os.path.isdir(outputs[0])
+                    else f"{tool.name}_output.zip"
+                )
+                result = await anyio.to_thread.run_sync(
+                    file_utils.make_zip, outputs, os.path.join(work_dir, archive_name)
+                )
+        except Exception:
+            logger.exception("endpoint=/run/%s status=500 (packing output)", tool_name)
+            _discard(work_dir, _output_roots(_output_paths(result), work_dir) | set(scratch_dirs))
+            raise HTTPException(status_code=500, detail="Tool execution failed.")
+
         background_tasks.add_task(shutil.rmtree, work_dir, ignore_errors=True)
-        # A tool whose inputs all came from the read-only data store writes
-        # its output in its own scratch dir under TEMP_DIR instead of the
-        # upload work dir (see file_utils.make_scratch_dir): clean that
-        # folder up too once the response has been streamed.
-        result_root = _temp_root_of(os.path.dirname(str(result)))
-        if result_root is not None and result_root != os.path.realpath(work_dir):
-            background_tasks.add_task(shutil.rmtree, result_root, ignore_errors=True)
+        for output_root in output_roots:
+            background_tasks.add_task(shutil.rmtree, output_root, ignore_errors=True)
+
         media_type, _ = mimetypes.guess_type(str(result))
         if media_type is None:
             media_type = "application/gzip" if str(result).endswith(".gz") else "application/octet-stream"
@@ -334,8 +473,9 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             background=background_tasks,
         )
 
-    if work_dir:
-        background_tasks.add_task(shutil.rmtree, work_dir, ignore_errors=True)
+    # A "text" tool can still have written scratch files along the way.
+    for directory in ([work_dir] if work_dir else []) + list(scratch_dirs):
+        background_tasks.add_task(shutil.rmtree, directory, ignore_errors=True)
     return {"result": result}
 
 

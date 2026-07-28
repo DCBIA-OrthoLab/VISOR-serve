@@ -21,6 +21,12 @@ class Settings(BaseSettings):
     # with 413 before the file is fully received.
     MAX_UPLOAD_MB: int = 500
 
+    # Cap on the UNCOMPRESSED size of an archive the server extracts on behalf
+    # of a "folder"-typed argument (see base.FILE_TYPES). Without it a small
+    # upload passing MAX_UPLOAD_MB could still expand to hundreds of GB and
+    # fill TEMP_DIR. Archives over this are rejected with a 400.
+    MAX_EXTRACTED_MB: int = 2000
+
     # Directory used for temporary input/output files. Every file written
     # here is deleted once a request has been served.
     TEMP_DIR: str = "/tmp/inference_server"
