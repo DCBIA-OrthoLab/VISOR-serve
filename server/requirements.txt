@@ -14,3 +14,6 @@ odfpy
 # requirements-amasss.txt which is imported lazily.
 numpy
 SimpleITK
+vtk
+torch
+nnunetv2
