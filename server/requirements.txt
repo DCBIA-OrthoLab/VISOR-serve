@@ -9,3 +9,8 @@ lightgbm
 joblib
 openpyxl
 odfpy
+# Medical image I/O and resampling (AMASSS, and any future imaging tool).
+# Imported at module load, unlike the heavy inference stack in
+# requirements-amasss.txt which is imported lazily.
+numpy
+SimpleITK

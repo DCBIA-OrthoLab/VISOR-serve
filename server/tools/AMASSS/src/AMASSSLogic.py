@@ -1,0 +1,640 @@
+"""AMASSS -- Automatic Multi-Anatomical Skull Structure Segmentation.
+
+Ported from SlicerAutomatedDentalTools/AMASSS_CLI/AMASSS_CLI.py. The business
+logic (nnUNet per structure, binary masks, optional multi-label merge,
+optional surfaces) is preserved; the CLI envelope is not -- `sys.argv`
+parsing, `sys.exit()`, the `<filter-progress>` Slicer CLI protocol, the
+caller-supplied `temp_fold` that got `rmtree`'d on startup, and the
+caller-supplied `output_folder` are all gone. On this server, scratch space
+and cleanup belong to main.py, and a failure must be an exception (a
+`SystemExit` raised inside a worker thread does not surface as a clean 500).
+
+Two entry points, on purpose:
+
+* `segment(...)` -> `SegmentationRun`. The real API. Returns the output
+  directory plus a structured report. **This is what other server-side tools
+  should call** (e.g. a future AREG tool needing AMASSS masks): it hands back
+  the files themselves, with no zip/unzip round trip.
+* `main(...)` -> path to a zip. The thin HTTP adapter used by AMASSS.py,
+  because one HTTP response can only carry one blob.
+
+See the module-level comments marked "FIX:" for the specific defects of the
+original CLI that are corrected here.
+"""
+
+import json
+import logging
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+import zipfile
+
+import numpy as np
+import SimpleITK as sitk
+
+import file_utils
+
+from . import nnunet_runner, vtk_export
+
+logger = logging.getLogger("AMASSS")
+if not logger.handlers:
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(
+        logging.Formatter("%(name)s - %(levelname)s - (%(filename)s:%(lineno)d) - %(message)s")
+    )
+    logger.addHandler(_handler)
+
+
+# ---------------------------------------------------------------------------
+# Structure catalog -- the single source of truth, published to clients
+# ---------------------------------------------------------------------------
+# The server owns both the grouping and the human-readable names, so the
+# Slicer module (and any other client) renders its checkbox groups straight
+# from GET /tools instead of keeping its own copy in sync. This is exported
+# through ArgSpec.choice_groups in AMASSS.py.
+#
+# FIX: "Teeth" (TEETH), "Root canal" (RC) and "Mandibular canal" (MCAN) are
+# deliberately ABSENT. They were offered by the Slicer UI while sitting in
+# UNAVAILABLE_MODELS, had no entry in the LARGE label table, and produced
+# either a KeyError during surface export or a silent collision onto label 1
+# (= mandible) during merge. Offering a structure with no model is worse than
+# not offering it; they come back here the day a model ships, in one place.
+STRUCTURE_GROUPS = {
+    "Bones": {
+        "Mandible": "MAND",
+        "Maxilla": "MAX",
+        "Cranial base": "CB",
+        "Cervical vertebra": "CV",
+    },
+    "Soft tissue": {
+        "Upper airway": "UAW",
+        "Skin": "SKIN",
+    },
+    "Masks": {
+        "Cranial base (Mask)": "CBMASK",
+        "Mandible (Mask)": "MANDMASK",
+        "Maxilla (Mask)": "MAXMASK",
+    },
+}
+
+STRUCTURE_CODES = tuple(
+    code for group in STRUCTURE_GROUPS.values() for code in group.values()
+)
+
+DEFAULT_STRUCTURES = ("MAND", "MAX", "CB", "CV", "UAW")
+
+# Label values in the merged multi-label volume. Unchanged from the original
+# LABELS["LARGE"], because AREG and existing datasets depend on them.
+LABELS = {
+    "MAND": 1,
+    "CB": 2,
+    "UAW": 3,
+    "MAX": 4,
+    "CV": 5,
+    "SKIN": 6,
+    "CBMASK": 7,
+    "MANDMASK": 8,
+    "MAXMASK": 9,
+}
+NAMES_FROM_LABELS = {value: code for code, value in LABELS.items()}
+
+# FIX: the original color table stopped at label 6, so the three mask
+# structures fell back to white, and label 3 (upper airway) was pure black --
+# invisible against a dark 3D view.
+LABEL_COLORS = {
+    1: (216, 101, 79),
+    2: (128, 174, 128),
+    3: (0, 151, 206),
+    4: (230, 220, 70),
+    5: (111, 184, 210),
+    6: (172, 122, 101),
+    7: (144, 190, 144),
+    8: (230, 130, 110),
+    9: (240, 232, 120),
+}
+
+# Order in which structures are painted into the merged volume: later entries
+# overwrite earlier ones where they overlap.
+# FIX: the original list contained "CAN", a code that exists nowhere else
+# (the mandibular canal is "MCAN") -- so that entry could never match. Dead
+# entries removed rather than left as decoration.
+MERGING_ORDER = (
+    "SKIN",
+    "CV",
+    "UAW",
+    "CB",
+    "MAX",
+    "MAND",
+    "CBMASK",
+    "MANDMASK",
+    "MAXMASK",
+)
+
+MERGE_MODES = ("MERGED", "SEPARATE")
+MERGE_MODE_GROUPS = {
+    "Output": {
+        "One merged segmentation file": "MERGED",
+        "Separated segmentation files": "SEPARATE",
+    }
+}
+DEFAULT_MERGE_MODES = ("MERGED",)
+
+# FIX: .gipl / .gipl.gz were advertised by the Slicer UI and the README but
+# rejected by the CLI, which accepted only .nii/.nii.gz/.nrrd/.nrrd.gz. They
+# are genuinely supported now: every input goes through a real SimpleITK
+# read/write conversion (see _convert_to_nifti) instead of being renamed.
+SCAN_EXTENSIONS = (".nii.gz", ".nrrd.gz", ".gipl.gz", ".nii", ".nrrd", ".gipl")
+
+
+class SegmentationRun:
+    """Result of `segment()`: where the files are, and what actually happened.
+
+    Returned instead of a bare path so a calling module gets the per-scan
+    outputs directly (no zip to unpack) and can tell a partial run from a
+    complete one -- which the original CLI made impossible, since a structure
+    whose model was missing was skipped with nothing but a log line.
+    """
+
+    def __init__(self, output_dir: str, report: dict, scans: list):
+        self.output_dir = output_dir
+        self.report = report
+        self.scans = scans
+
+    @property
+    def segmentation_files(self) -> list:
+        return [path for scan in self.scans for path in scan.get("segmentations", [])]
+
+    @property
+    def surface_files(self) -> list:
+        return [path for scan in self.scans for path in scan.get("surfaces", [])]
+
+
+# ---------------------------------------------------------------------------
+# Input discovery
+# ---------------------------------------------------------------------------
+
+def split_scan_extension(filename: str):
+    """('scan.nii.gz') -> ('scan', '.nii.gz'), compound extensions preserved."""
+    lower = filename.lower()
+    for extension in SCAN_EXTENSIONS:
+        if lower.endswith(extension):
+            return filename[: -len(extension)], filename[-len(extension):]
+    return os.path.splitext(filename)
+
+
+def is_previous_output(filename: str, prediction_id: str) -> bool:
+    """True if this file looks like a segmentation AMASSS itself produced.
+
+    FIX: the original only excluded names containing "MASK", so running twice
+    on the same folder fed the first run's outputs back in as input scans --
+    a snowball the Slicer UI avoided (it excluded "Pred"/"Seg") but the CLI
+    did not, leaving the two disagreeing about how many scans even existed.
+    Outputs are recognized here by the suffixes AMASSS actually writes.
+    """
+    base, _extension = split_scan_extension(os.path.basename(filename))
+
+    if prediction_id and f"_{prediction_id}_" in f"{base}_":
+        return True
+    if base.endswith("_MERGED"):
+        return True
+    for code in STRUCTURE_CODES:
+        if base.endswith(f"_{code}"):
+            return True
+    return bool(re.search(r"_Seg(Out)?$", base))
+
+
+def discover_scans(input_path: str, prediction_id: str, scratch_dir: str) -> list:
+    """Resolve the `input` argument into a list of scan files.
+
+    Accepts the three shapes a single schema argument can carry: one scan
+    file, a zip archive of a folder of scans, or a folder served straight
+    from the read-only data store.
+
+    FIX: folder scanning is RECURSIVE. The Slicer UI counted scans
+    recursively while the CLI listed only the top level, so on any nested
+    dataset the UI announced N scans and the CLI silently processed a subset.
+    """
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input path not found: {input_path}")
+
+    if os.path.isfile(input_path) and input_path.lower().endswith(".zip"):
+        if not zipfile.is_zipfile(input_path):
+            raise ValueError(f"Input has a .zip extension but is not a zip archive: {input_path}")
+        input_path = file_utils.extract_zip(
+            input_path, os.path.join(scratch_dir, "input_extracted")
+        )
+
+    if os.path.isfile(input_path):
+        return [input_path]
+
+    scans = []
+    for root, _dirs, files in os.walk(input_path):
+        for name in files:
+            if not name.lower().endswith(SCAN_EXTENSIONS):
+                continue
+            if is_previous_output(name, prediction_id):
+                logger.info("Skipping %s: looks like a previous AMASSS output", name)
+                continue
+            scans.append(os.path.join(root, name))
+
+    if not scans:
+        # FIX: the original called sys.exit(1) here. Inside a server worker
+        # thread that does not produce a clean error response.
+        raise FileNotFoundError(
+            f"No scan found in {input_path}. Supported extensions: "
+            f"{', '.join(SCAN_EXTENSIONS)}"
+        )
+    return sorted(scans)
+
+
+def resolve_models(model_path: str, structures, scratch_dir: str):
+    """Map each requested structure to its nnUNet model folder.
+
+    Returns (available, missing). A model bundle is normally a folder served
+    from the data store; a zip archive is extracted first, mirroring how
+    SurgMovPred handles its own model argument.
+    """
+    if os.path.isfile(model_path) and model_path.lower().endswith(".zip"):
+        model_path = file_utils.extract_zip(
+            model_path, os.path.join(scratch_dir, "model_extracted")
+        )
+
+    if not os.path.isdir(model_path):
+        raise FileNotFoundError(f"Model bundle is not a directory: {model_path}")
+
+    # A bundle may be wrapped in a single top-level folder (a zip of
+    # "AMASSS_Models/" rather than of its contents). Descend into it so both
+    # layouts work.
+    if not any(os.path.isdir(os.path.join(model_path, code)) for code in STRUCTURE_CODES):
+        entries = [
+            os.path.join(model_path, name)
+            for name in sorted(os.listdir(model_path))
+            if os.path.isdir(os.path.join(model_path, name)) and name != "__MACOSX"
+        ]
+        if len(entries) == 1:
+            model_path = entries[0]
+
+    available, missing = {}, []
+    for code in structures:
+        model_folder = nnunet_runner.find_model_folder(model_path, code)
+        if model_folder is None:
+            logger.warning("No usable model for structure '%s' in %s", code, model_path)
+            missing.append(code)
+        else:
+            available[code] = model_folder
+
+    if not available:
+        raise nnunet_runner.ModelNotFoundError(
+            f"No nnUNet model found in '{os.path.basename(model_path)}' for any of the "
+            f"requested structures ({', '.join(structures)}). Expected "
+            f"<bundle>/<CODE>/**/*__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth"
+        )
+    return available, missing
+
+
+# ---------------------------------------------------------------------------
+# Image helpers
+# ---------------------------------------------------------------------------
+
+def _convert_to_nifti(scan_path: str, destination: str) -> None:
+    """Real format conversion into the NIfTI file nnUNet will read.
+
+    FIX: the original did `shutil.copy(volume_file, "p_XXX_0000.nii.gz")` --
+    an NRRD renamed to .nii.gz, handed to a reader that picks its format from
+    the extension. NRRD is Slicer's own default format, so "supported" input
+    was in practice only reliable for NIfTI. A read + write actually converts.
+    """
+    image = sitk.ReadImage(scan_path)
+    sitk.WriteImage(sitk.Cast(image, sitk.sitkFloat32), destination)
+
+
+def _match_reference_geometry(mask_image: sitk.Image, reference: sitk.Image) -> sitk.Image:
+    """Put a predicted mask back onto the original scan's exact grid."""
+    same_geometry = (
+        mask_image.GetSize() == reference.GetSize()
+        and np.allclose(mask_image.GetSpacing(), reference.GetSpacing())
+        and np.allclose(mask_image.GetOrigin(), reference.GetOrigin())
+        and np.allclose(mask_image.GetDirection(), reference.GetDirection())
+    )
+    if not same_geometry:
+        mask_image = sitk.Resample(
+            mask_image, reference, sitk.Transform(), sitk.sitkNearestNeighbor, 0,
+            mask_image.GetPixelID(),
+        )
+    return sitk.Cast(mask_image, sitk.sitkInt16)
+
+
+def _write_segmentation(array: np.ndarray, reference: sitk.Image, output_path: str) -> str:
+    image = sitk.GetImageFromArray(array.astype(np.int16))
+    image.CopyInformation(reference)
+    sitk.WriteImage(_match_reference_geometry(image, reference), output_path)
+    return output_path
+
+
+# ---------------------------------------------------------------------------
+# Main pipeline
+# ---------------------------------------------------------------------------
+
+def segment(
+    input_path: str,
+    model_path: str,
+    structures=DEFAULT_STRUCTURES,
+    merge=DEFAULT_MERGE_MODES,
+    prediction_ID: str = "Pred",
+    generate_surface: bool = False,
+    surface_smoothing: int = 5,
+    device: str = None,
+    scratch_dir: str = None,
+) -> SegmentationRun:
+    """Segment one scan or a batch, and return where the results are.
+
+    This is the reusable API: another server-side tool imports this function
+    and gets the produced files directly. `main()` below is only the HTTP
+    adapter that packs the same output into a zip.
+    """
+    from config import settings
+
+    started_at = time.monotonic()
+
+    structures = tuple(structures or DEFAULT_STRUCTURES)
+    merge = tuple(merge or DEFAULT_MERGE_MODES)
+    prediction_ID = (prediction_ID or "Pred").strip() or "Pred"
+
+    unknown = [code for code in structures if code not in STRUCTURE_CODES]
+    if unknown:
+        raise ValueError(
+            f"Unknown structure code(s): {', '.join(unknown)}. "
+            f"Known: {', '.join(STRUCTURE_CODES)}"
+        )
+
+    if scratch_dir is None:
+        scratch_dir = file_utils.make_scratch_dir("AMASSS_")
+    os.makedirs(scratch_dir, exist_ok=True)
+
+    if generate_surface and not vtk_export.is_available():
+        raise RuntimeError(
+            "generate_surface=true but VTK is not installed on the server. "
+            "Install requirements-amasss.txt, or run with generate_surface=false."
+        )
+
+    device = nnunet_runner.resolve_device(device or settings.DEVICE)
+
+    scans = discover_scans(input_path, prediction_ID, scratch_dir)
+    models, missing_structures = resolve_models(model_path, structures, scratch_dir)
+    logger.info(
+        "AMASSS: %d scan(s), %d structure(s) available, device=%s",
+        len(scans), len(models), device,
+    )
+
+    output_dir = os.path.join(scratch_dir, "output")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Convert every scan once into the single folder nnUNet reads. Predicting
+    # per structure over the whole folder loads each checkpoint once, instead
+    # of once per (scan x structure) as the original did.
+    nnunet_input = os.path.join(scratch_dir, "nnunet_input")
+    os.makedirs(nnunet_input, exist_ok=True)
+
+    scan_records = []
+    for index, scan_path in enumerate(scans):
+        case_id = f"p_{index:03d}"
+        record = {
+            "case_id": case_id,
+            "input": os.path.basename(scan_path),
+            "input_path": scan_path,
+            "status": "pending",
+            "predicted_structures": [],
+            "segmentations": [],
+            "surfaces": [],
+        }
+        try:
+            _convert_to_nifti(scan_path, os.path.join(nnunet_input, f"{case_id}_0000.nii.gz"))
+        except Exception as exc:
+            logger.exception("Could not read scan %s", scan_path)
+            record["status"] = "failed"
+            record["error"] = f"Unreadable input: {exc}"
+        scan_records.append(record)
+
+    readable = [record for record in scan_records if record["status"] != "failed"]
+    if not readable:
+        raise ValueError("None of the input scans could be read as a medical volume.")
+
+    # --- Inference: one model load per structure --------------------------
+    predictions = {}
+    failed_structures = {}
+    for code, model_folder in models.items():
+        structure_output = os.path.join(scratch_dir, f"pred_{code}")
+        try:
+            logger.info("Predicting %s on %s", code, device)
+            nnunet_runner.predict_folder(model_folder, nnunet_input, structure_output, device)
+            predictions[code] = structure_output
+        except Exception as exc:
+            # One structure failing must not lose the others.
+            logger.exception("Prediction failed for structure %s", code)
+            failed_structures[code] = str(exc)
+
+    if not predictions:
+        raise RuntimeError(
+            "Every structure failed to predict: "
+            + "; ".join(f"{code}: {error}" for code, error in failed_structures.items())
+        )
+
+    # --- Assemble per-scan outputs ----------------------------------------
+    for record in readable:
+        scan_started = time.monotonic()
+        try:
+            _assemble_scan_outputs(
+                record=record,
+                predictions=predictions,
+                output_dir=output_dir,
+                scratch_dir=scratch_dir,
+                prediction_ID=prediction_ID,
+                merge=merge,
+                generate_surface=generate_surface,
+                surface_smoothing=surface_smoothing,
+            )
+            record["status"] = "ok"
+        except Exception as exc:
+            # FIX: the original re-raised on the LAST scan only, so a batch
+            # could abort at the very end and lose everything already
+            # produced. Every failure is recorded; the run continues.
+            logger.exception("Failed to assemble outputs for %s", record["input"])
+            record["status"] = "failed"
+            record["error"] = str(exc)
+        record["duration_seconds"] = round(time.monotonic() - scan_started, 2)
+        record.pop("input_path", None)
+
+    processed = [record for record in scan_records if record["status"] == "ok"]
+    if not processed:
+        raise RuntimeError(
+            "AMASSS produced no output for any scan. First error: "
+            + str(next((r.get("error") for r in scan_records if r.get("error")), "unknown"))
+        )
+
+    report = {
+        "tool": "AMASSS",
+        "device": device,
+        "prediction_ID": prediction_ID,
+        "merge_modes": list(merge),
+        "generate_surface": bool(generate_surface),
+        "requested_structures": list(structures),
+        "predicted_structures": sorted(predictions, key=lambda c: STRUCTURE_CODES.index(c)),
+        # FIX: a structure whose model was missing used to vanish with nothing
+        # but a logger.warning -- invisible in a 200-scan batch. It is now
+        # reported explicitly, next to the results.
+        "structures_without_model": missing_structures,
+        "structures_failed": failed_structures,
+        "scans": scan_records,
+        "summary": {
+            "total": len(scan_records),
+            "processed": len(processed),
+            "failed": len(scan_records) - len(processed),
+        },
+        "duration_seconds": round(time.monotonic() - started_at, 2),
+    }
+
+    with open(os.path.join(output_dir, "AMASSS_report.json"), "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2)
+
+    logger.info(
+        "AMASSS finished: %d/%d scan(s) in %.1fs",
+        len(processed), len(scan_records), report["duration_seconds"],
+    )
+    return SegmentationRun(output_dir=output_dir, report=report, scans=scan_records)
+
+
+def _assemble_scan_outputs(record, predictions, output_dir, scratch_dir, prediction_ID,
+                           merge, generate_surface, surface_smoothing) -> None:
+    """Turn one scan's per-structure nnUNet masks into its final files."""
+    scan_path = record["input_path"]
+    case_id = record["case_id"]
+    base, extension = split_scan_extension(os.path.basename(scan_path))
+
+    reference = sitk.ReadImage(scan_path)
+
+    masks = {}
+    for code, structure_output in predictions.items():
+        predicted_file = os.path.join(structure_output, f"{case_id}.nii.gz")
+        if not os.path.isfile(predicted_file):
+            logger.warning("No %s prediction for %s", code, record["input"])
+            continue
+        array = sitk.GetArrayFromImage(sitk.ReadImage(predicted_file))
+        masks[code] = (array > 0).astype(np.uint8)
+
+    if not masks:
+        raise FileNotFoundError(f"nnUNet produced no prediction for {record['input']}")
+
+    record["predicted_structures"] = sorted(masks, key=lambda c: STRUCTURE_CODES.index(c))
+
+    scan_dir = os.path.join(output_dir, f"{base}_{prediction_ID}_SegOut")
+    os.makedirs(scan_dir, exist_ok=True)
+    surface_temp = os.path.join(scratch_dir, "surface_tmp")
+    os.makedirs(surface_temp, exist_ok=True)
+
+    # Separate files: requested, or unavoidable when there is only one
+    # structure (a "merged" volume of one structure is just that structure).
+    if "SEPARATE" in merge or len(masks) == 1:
+        for code, mask in masks.items():
+            output_path = os.path.join(scan_dir, f"{base}_{prediction_ID}_{code}{extension}")
+            record["segmentations"].append(
+                _write_segmentation(mask, reference, output_path)
+            )
+            if generate_surface:
+                record["surfaces"].append(
+                    vtk_export.write_separate_surface(
+                        mask=mask,
+                        reference=reference,
+                        # FIX: the code is passed explicitly instead of being
+                        # parsed back out of the file name (original KeyError).
+                        structure_code=code,
+                        label_colors=LABEL_COLORS,
+                        labels=LABELS,
+                        temp_dir=surface_temp,
+                        smoothing=surface_smoothing,
+                        output_path=os.path.join(
+                            scan_dir, f"{base}_{prediction_ID}_{code}.vtk"
+                        ),
+                    )
+                )
+
+    if "MERGED" in merge and len(masks) > 1:
+        shape = next(iter(masks.values())).shape
+        merged = np.zeros(shape, dtype=np.int16)
+        for code in MERGING_ORDER:
+            if code in masks:
+                merged = np.where(masks[code] == 1, LABELS[code], merged)
+
+        output_path = os.path.join(scan_dir, f"{base}_{prediction_ID}_MERGED{extension}")
+        record["segmentations"].append(_write_segmentation(merged, reference, output_path))
+        if generate_surface:
+            surface = vtk_export.write_merged_surface(
+                merged=merged,
+                reference=reference,
+                names_from_labels=NAMES_FROM_LABELS,
+                label_colors=LABEL_COLORS,
+                temp_dir=surface_temp,
+                smoothing=surface_smoothing,
+                output_path=os.path.join(scan_dir, f"{base}_{prediction_ID}_MERGED.vtk"),
+            )
+            if surface:
+                record["surfaces"].append(surface)
+
+
+def main(
+    input: str,
+    model: str,
+    structures=DEFAULT_STRUCTURES,
+    merge=DEFAULT_MERGE_MODES,
+    prediction_ID: str = "Pred",
+    generate_surface: bool = False,
+    surface_smoothing: int = 5,
+) -> str:
+    """HTTP adapter: run `segment()` and pack its output folder into one zip.
+
+    Scratch space follows the same rule as SurgMovPred: prefer a subfolder of
+    the request's upload work dir (main.py deletes it with the rest), and fall
+    back to a fresh TEMP_DIR folder when every input came from the read-only
+    data store and there is no writable upload dir to sit next to. Writability
+    is probed by actually creating the folder, since os.access() is unreliable
+    for read-only mounts when running as root.
+
+    # NOTE for the multi-output work in progress: this zip exists only
+    # because one HTTP response carries one blob. `segment()` above already
+    # returns the individual files (SegmentationRun.segmentation_files /
+    # .surface_files). Once the server can return several files, this
+    # function is the ONLY place that needs to change -- swap the
+    # zip_directory call for the new multi-file response and return the run's
+    # file list. Nothing in segment() assumes a zip.
+    """
+    try:
+        scratch_dir = tempfile.mkdtemp(prefix="run_", dir=os.path.dirname(input))
+    except OSError:
+        scratch_dir = file_utils.make_scratch_dir("AMASSS_")
+
+    run = segment(
+        input_path=input,
+        model_path=model,
+        structures=structures,
+        merge=merge,
+        prediction_ID=prediction_ID,
+        generate_surface=generate_surface,
+        surface_smoothing=surface_smoothing,
+        scratch_dir=scratch_dir,
+    )
+
+    archive_dir = os.path.join(scratch_dir, "archive")
+    os.makedirs(archive_dir, exist_ok=True)
+    zip_path = os.path.join(archive_dir, f"AMASSS_{prediction_ID or 'Pred'}.zip")
+    file_utils.zip_directory(run.output_dir, zip_path)
+
+    # The intermediate nnUNet folders can be large; drop them before the
+    # response is streamed rather than waiting for main.py's cleanup.
+    for temporary in ("nnunet_input", "surface_tmp"):
+        shutil.rmtree(os.path.join(scratch_dir, temporary), ignore_errors=True)
+
+    return zip_path

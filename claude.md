@@ -278,6 +278,82 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-07-28 — AMASSS tool + grouped selection arguments
+
+**Motivation:** port `AMASSS_CLI.py` (CBCT skull structure segmentation,
+nnUNet v2) from the Slicer extension to this server. AMASSS is the first
+tool that is genuinely an *API*: AREG already calls it programmatically
+today, and more modules will. It is also the first to need an argument the
+schema could not express — "pick several structures from a list" — and the
+first with a GPU deep-learning stack.
+
+**Core additions (`base.py`, `main.py`):**
+
+- `SELECTION_TYPE`, plus `ArgSpec.choices` / `choice_groups` / `multiple` /
+  `default`. A selection argument publishes both its valid values **and its
+  presentation** (`choice_groups`: `{group label: {display name: value}}`),
+  so a client renders grouped checkboxes straight from `GET /tools` with no
+  structure list of its own. `Tool._coerce_selection` accepts every shape the
+  wire can carry — `"MAND,MAX"`, a JSON list, `{"MAND": true}`, or
+  `{"Mandible": true}` using the display names the server itself published —
+  and normalizes them to one canonical list, ordered as the tool declared.
+  Invalid values are a 422 naming what is allowed. `default` is advisory
+  (exposed for pre-filling); the server does not apply it, so `run()`'s own
+  Python defaults stay the single source of truth.
+  This is a change to the *type system*, made once, not a per-tool change —
+  the same category as adding a `FILE_TYPES` entry. Adding a structure the
+  day its model ships is a one-line server edit with no client release.
+- `FILE_TYPES["volume_or_zip_file"]`: one argument accepting either a single
+  volume or a zip of a folder of them, since the schema cannot express
+  "exactly one of these two arguments". Existing `is_file_type()` on the
+  client (`endswith("_file")`) picks it up with no change.
+- `file_utils.zip_directory`, the counterpart of `extract_zip`.
+
+**The tool (`tools/AMASSS/`):** `AMASSS.py` declares the schema;
+`src/AMASSSLogic.py` holds the pipeline; `src/nnunet_runner.py` isolates
+inference; `src/vtk_export.py` handles surfaces. `segment()` is the reusable
+API (returns a `SegmentationRun` with the produced files and a report);
+`main()` is the thin HTTP adapter that zips it, and carries a note pointing
+at itself as the only thing to change once multi-file responses land.
+
+Three defects mattered specifically *because* this is a shared server, and
+are fixed by construction rather than patched:
+
+- the CLI set `os.environ['nnUNet_results']` before shelling out to
+  `nnUNetv2_predict`. Tools run concurrently in worker threads and
+  `os.environ` is process-global, so two overlapping AMASSS requests would
+  have silently swapped model paths. `initialize_from_trained_model_folder`
+  takes an explicit path — the race cannot occur.
+- the CLI polled the output file's size and killed the predictor once it
+  stopped growing for 3s, which could interrupt nnUNet mid-postprocessing.
+  The Python API just returns.
+- GPU work is serialized by AMASSS's own semaphore (`AMASSS_MAX_GPU_JOBS`,
+  default 1), independently of `MAX_CONCURRENT_TOOLS` — four concurrent
+  3d_fullres inferences do not fit on one card.
+
+Also corrected in the port: NRRD/GIPL inputs are now really converted via
+SimpleITK instead of being renamed to `.nii.gz`; folder scanning is recursive
+and excludes AMASSS's own previous outputs (the CLI re-ingested them on a
+second run); structures with no shipped model (RC/TEETH/MCAN) are no longer
+offered at all; a missing or failed structure is reported in
+`AMASSS_report.json` instead of vanishing into a log line; `sys.exit()` is
+gone. Inference now loads each checkpoint once per structure instead of once
+per (scan x structure).
+
+**Dependencies:** `numpy` + `SimpleITK` go in `requirements.txt` (imported at
+module load). `torch`/`nnunetv2`/`vtk` go in a separate
+`requirements-amasss.txt` and are imported **lazily**: `registry.py` imports
+every tool at startup, so a missing heavy stack must not stop the server from
+booting. It doesn't — only AMASSS fails, with an actionable message. The
+deployment image already ships torch built against its CUDA version, which is
+the other reason not to let a compose-time `pip install` shadow it.
+
+**Tests (`tools/AMASSS/test/test_AMASSS.py`):** 35 tests with
+`nnunet_runner.predict_folder` stubbed, so no GPU and no real models are
+needed; everything around inference (discovery, output filtering, model
+resolution, conversion, label merging, naming, report, and every accepted
+selection wire format) runs for real.
+
 ### 2026-07-27 — Parallel request handling (threadpool execution of tools)
 **Motivation:** `run_tool` called `tool.invoke(args)` synchronously inside an
 `async def` endpoint, i.e. directly on the uvicorn event loop. Any inference in

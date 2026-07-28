@@ -102,8 +102,15 @@ FILE_TYPES = {
     "xlsx_file": (".xlsx",),
     "ods_file": (".ods",),
     "nifti_file": (".nii", ".nii.gz"),
+    "volume_or_zip_file": (".nii", ".nii.gz", ".nrrd", ".nrrd.gz",
+                           ".gipl", ".gipl.gz", ".zip"),
 }
 ```
+
+`volume_or_zip_file` is the pattern for a tool that works on one scan *or* a
+batch: the schema cannot express "exactly one of these two arguments", so a
+single argument accepts both and the tool dispatches on what it received
+(file / zip / folder). `AMASSS` uses it.
 
 ```python
 "input": ArgSpec(type="zip_file", required=True, description="..."),
@@ -115,6 +122,40 @@ exactly what's expected — no shared global list to keep in sync as tools with
 different file needs are added. To accept a new kind of file, add an entry to
 `FILE_TYPES` in `base.py`. Only arguments left as generic `"file"` fall back
 to `config.ALLOWED_EXTENSIONS`.
+
+## Selection arguments (pick one or several from a server-defined list)
+
+An argument typed `SELECTION_TYPE` (`base.py`) lets a tool publish both the
+valid values **and how they should be presented**, so a client renders the
+widget entirely from `GET /tools` with nothing hardcoded:
+
+```python
+"structures": ArgSpec(
+    type=SELECTION_TYPE, required=True, multiple=True,
+    choices=("MAND", "MAX", "CB"),
+    choice_groups={"Bones": {"Mandible": "MAND", "Maxilla": "MAX",
+                             "Cranial base": "CB"}},
+    default=("MAND", "MAX"),
+),
+```
+
+`GET /tools` reports `choices`, `choice_groups`, `multiple` and `default` for
+every argument. A client builds one group box per `choice_groups` entry, with
+one checkbox per display name, and sends back whichever of these it likes —
+all are accepted and normalized to the same canonical list, in the order the
+tool declared:
+
+```bash
+-F 'structures=MAND,MAX'                                   # separated list
+-F 'structures=["MAND","MAX"]'                             # JSON list
+-F 'structures={"MAND":true,"MAX":true,"CB":false}'        # values
+-F 'structures={"Mandible":true,"Maxilla":true}'           # display names
+```
+
+The last form is what a grouped-checkbox UI produces naturally: the client
+echoes back the labels the server gave it and never needs a translation table.
+An invalid value is a `422` naming what is allowed. Adding a choice is a
+one-line server change with no client release.
 
 ## How to add a new tool
 
@@ -131,9 +172,58 @@ to `config.ALLOWED_EXTENSIONS`.
    registration list to update. See `tools/test_tool/` for a minimal example,
    or `tools/example_tool/` for one with a file argument.
 
-If your tool needs to unzip an upload and/or load CSV/XLSX/ODS files, reuse
-the shared helpers in `file_utils.py` (`extract_zip`, `load_tabular_file`,
+If your tool needs to unzip an upload, zip its results, and/or load
+CSV/XLSX/ODS files, reuse the shared helpers in `file_utils.py`
+(`extract_zip`, `zip_directory`, `load_tabular_file`,
 `load_tabular_directory`) instead of reimplementing them.
+
+### Heavy or optional dependencies
+
+`requirements.txt` must stay installable on every deployment, because
+`registry.py` imports **every** tool at startup: a tool whose module-level
+imports fail takes the whole server down with it. A tool needing a heavy or
+optional stack should therefore import it **lazily, inside the functions that
+use it**, and ship its own requirements file. `AMASSS` does this for
+torch/nnunetv2/vtk (`requirements-amasss.txt`): until those are installed the
+server starts normally, every other tool works, and only AMASSS fails — with a
+message saying what to install.
+
+## AMASSS: CBCT skull structure segmentation
+
+```bash
+# What model bundles / test scans are hosted server-side
+curl -k https://localhost:8000/tools/AMASSS/data \
+  -H "Authorization: Bearer $API_TOKEN"
+
+# One scan, mandible + maxilla, merged output
+curl -k -X POST https://localhost:8000/run/AMASSS \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F "model=AMASSS_Models" \
+  -F "input=@/path/to/scan.nii.gz" \
+  -F 'structures={"Mandible":true,"Maxilla":true}' \
+  -F "merge=MERGED" \
+  --output result.zip
+```
+
+Models live under `DATA/AMASSS/models/<bundle>/<CODE>/**/*__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth`
+(one subfolder per structure code) and are selected **by name** — they never
+travel from the client. `input` takes either one scan or a zip of a folder of
+scans for a batch.
+
+The response is a zip: one `<scan>_<ID>_SegOut/` folder per scan plus an
+`AMASSS_report.json` listing what was predicted, what was skipped for lack of
+a model, and what failed — a structure without a model used to disappear with
+nothing but a log line, which is invisible in a 200-scan batch.
+
+**Calling AMASSS from another server-side tool**: import
+`tools.AMASSS.src.AMASSSLogic.segment()` directly. It returns a
+`SegmentationRun` exposing the produced files (`segmentation_files`,
+`surface_files`) and the report, with no zip round trip. The zip only exists
+because one HTTP response carries one blob.
+
+Two knobs, both environment variables: `AMASSS_MAX_GPU_JOBS` (default 1) caps
+how many AMASSS inferences touch the GPU at once, independently of
+`MAX_CONCURRENT_TOOLS`; `DEVICE` selects cuda/cpu.
 
 A tool folder missing its `<name>.py` file, duplicate tool names, or a tool
 missing its `name`, all fail loudly at server
