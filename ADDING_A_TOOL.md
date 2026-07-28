@@ -296,7 +296,7 @@ def run(self, scan: str, threshold: float, iterations: int = 10) -> str:
 ### Keeping `run()` thin
 
 If the tool has real logic, put it in `src/` and keep `my_tool.py` as a
-declaration-plus-delegation shim. This is what `surg_mov_pred` does, and it's
+declaration-plus-delegation shim. This is what `surgMovPred` does, and it's
 what makes the logic unit-testable without HTTP:
 
 ```python
@@ -483,7 +483,7 @@ Add `tools/<name>/test/test_<name>_logic.py` importing directly from
 `tools.<name>.src.<name>_logic`. No HTTP, no server, synthetic data only —
 this is where you cover the actual algorithm. `registry.py` only looks for
 `<name>/<name>.py`, so a nested `test/` folder is invisible to discovery and
-picked up by pytest alone. See `tools/surg_mov_pred/test/` for a worked
+picked up by pytest alone. See `tools/surgMovPred/test/` for a worked
 example.
 
 ### HTTP layer

@@ -258,7 +258,7 @@ def save_results(df: pd.DataFrame, output_folder: str) -> str:
 
 
 
-class Surg_mov_pred:
+class SurgMovPred:
     @staticmethod
     def main(model: str, input: str) -> str:
         try:

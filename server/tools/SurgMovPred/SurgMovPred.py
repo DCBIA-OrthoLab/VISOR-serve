@@ -1,5 +1,5 @@
 from base import Tool, ArgSpec
-from .src.SurgMovPredLogic import Surg_mov_pred as smp
+from .src.SurgMovPredLogic import SurgMovPred as smp
 
 
 class SurgMovPredTool(Tool):
