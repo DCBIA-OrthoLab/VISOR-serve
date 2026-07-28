@@ -285,8 +285,17 @@ def discover_scans(input_path: str, prediction_id: str, scratch_dir: str) -> lis
     if os.path.isfile(input_path) and input_path.lower().endswith(".zip"):
         if not zipfile.is_zipfile(input_path):
             raise ValueError(f"Input has a .zip extension but is not a zip archive: {input_path}")
+        # A batch arrives here as an archive rather than pre-extracted by
+        # main.py (the schema declares "volume_or_zip_file" first, see
+        # AMASSS.py), so the zip-bomb cap main.py would have applied is applied
+        # here instead -- this is untrusted client input either way.
+        from config import settings
+
         input_path = file_utils.extract_zip(
-            input_path, os.path.join(scratch_dir, "input_extracted")
+            input_path,
+            os.path.join(scratch_dir, "input_extracted"),
+            strip_single_root=True,
+            max_total_bytes=settings.MAX_EXTRACTED_MB * 1024 * 1024,
         )
 
     if os.path.isfile(input_path):
