@@ -348,6 +348,29 @@ def test_tools_reports_every_declared_type():
     assert single_typed["types"] == ["str"]
 
 
+def test_tools_publishes_the_extensions_of_every_file_type():
+    """A type name does not reliably spell out its extensions ("nifti_file" is
+    .nii/.nii.gz, "volume_or_zip_file" is seven of them), so /tools sends
+    FILE_TYPES' entry for each declared file type. Without it a client has to
+    keep a copy of that table, and drifts every time it changes here."""
+    tools = {tool["name"]: tool for tool in client.get("/tools").json()}
+
+    example_input = tools["example_tool"]["arguments"]["input"]
+    # Keyed by type, not flattened: "folder"'s .zip is what a zipped folder may
+    # be uploaded as, not something a file picker should offer.
+    assert example_input["extensions"] == {"csv_file": [".csv"], "folder": [".zip"]}
+
+    # An argument taking no file at all says so.
+    assert tools["example_tool"]["arguments"]["label"]["extensions"] is None
+
+    for tool in tools.values():
+        for argument in tool["arguments"].values():
+            for type_name, extensions in (argument["extensions"] or {}).items():
+                # null = declared but deliberately unrestricted (the generic
+                # "file", which falls back to ALLOWED_EXTENSIONS at upload time).
+                assert extensions is None or all(e.startswith(".") for e in extensions), type_name
+
+
 def test_run_declaration_order_decides_zip_vs_folder(monkeypatch):
     """("zip_file", "folder") hands the archive over untouched; ("folder",
     "zip_file") extracts it first. Same upload, different kind."""

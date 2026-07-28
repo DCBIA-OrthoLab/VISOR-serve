@@ -20,7 +20,7 @@ from fastapi.responses import FileResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 import file_utils
-from base import FOLDER_TYPE, ResolvedPath, ToolArgumentError
+from base import FILE_TYPES, FOLDER_TYPE, ResolvedPath, ToolArgumentError
 from config import settings
 from data_store import DataNotFoundError, data_store
 from registry import TOOLS, get_tool
@@ -215,6 +215,27 @@ def _describe_argument(spec) -> dict:
     }
 
 
+def _extensions_of(spec) -> Optional[dict]:
+    """{type name: [extension, ...]} for every file type an argument accepts.
+
+    Published so a client never has to mirror FILE_TYPES: a type name does not
+    reliably spell out its extensions ("nifti_file" is .nii/.nii.gz,
+    "volume_or_zip_file" is seven of them), so a client guessing from the name
+    alone gets them wrong the moment a type is added here.
+
+    Keyed by type rather than flattened because the caller needs the split:
+    the extensions of "folder" are what a zipped folder may be uploaded as,
+    not what its file picker should offer.
+    """
+    per_type = {}
+    for declared in spec.types:
+        name = _type_name(declared)
+        if name in FILE_TYPES:
+            extensions = FILE_TYPES[name]
+            per_type[name] = list(extensions) if extensions else None
+    return per_type or None
+
+
 @app.get("/tools")
 def list_tools() -> list:
     """Let clients discover every registered tool and its expected arguments."""
@@ -234,6 +255,14 @@ def list_tools() -> list:
                     # For "choice"/"multichoice": the options to render, each
                     # with its initial state. None for every other type.
                     "choices": spec.choices,
+                    # {type name: accepted extensions} for the file types
+                    # above, so a client can build a file dialog's filters
+                    # without a copy of FILE_TYPES hardcoded on its side --
+                    # and without drifting when this table changes. null for
+                    # a type the server does not restrict (the generic
+                    # "file", which falls back to ALLOWED_EXTENSIONS), and
+                    # None for an argument that takes no file at all.
+                    "extensions": _extensions_of(spec),
                 }
                 for arg_name, spec in tool.arguments.items()
             },
