@@ -202,13 +202,16 @@ model, a reference test dataset) instead of the client uploading it every call.
 
 ### `security.py`, `config.py`
 - Bearer token from env (`API_TOKEN`), constant-time compare, `401` on failure.
-- Config from env: `API_TOKEN`, `DEVICE`, `MAX_UPLOAD_MB`, `TEMP_DIR`,
-  `ALLOWED_EXTENSIONS`, `DATA_DIR`, `DATA_BACKEND`. Sensible dev defaults.
+- Config from env: `API_TOKEN`, `DEVICE`, `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
+  `TEMP_DIR`, `ALLOWED_EXTENSIONS`, `DATA_DIR`, `DATA_BACKEND`. Sensible dev
+  defaults.
 
 ### Security / confidentiality — hard requirements
 - **TLS mandatory**; README documents HTTPS + self-signed cert for dev, real cert
   for prod, never plain HTTP.
 - Upload size limit (`MAX_UPLOAD_MB` → `413`).
+- Client archives extracted for `"folder"` arguments are untrusted: zip slip,
+  symlink members, and zip bombs (`MAX_EXTRACTED_MB`) all rejected with `400`.
 - Delete all temp files after processing.
 - Never log file contents, arguments values, or patient metadata. Logs limited to
   timestamp, endpoint, tool name, status, duration, size.

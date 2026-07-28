@@ -49,6 +49,9 @@ def _build_registry() -> dict:
             raise RuntimeError(f"Tool class '{cls.__name__}' has no 'name' set.")
         if instance.name in registry:
             raise RuntimeError(f"Duplicate tool name detected: '{instance.name}'")
+        # Catch a malformed argument declaration here, at import time, rather
+        # than on the first request that happens to reach that tool.
+        instance.check_schema()
         registry[instance.name] = instance
     return registry
 
