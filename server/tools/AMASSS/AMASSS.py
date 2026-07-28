@@ -31,15 +31,15 @@ class AMASSSTool(Tool):
         # -- resolves as a folder and is unpacked by main.py before run(), the
         # tool then receiving a real directory. Anything else falls through to
         # the volume types.
-        "input": ArgSpec(
-            type=("folder", "volume_or_zip_file"),
-            required=True,
-            server_selectable="testfile",
-            description=(
-                "A CBCT scan (.nii/.nii.gz/.nrrd/.nrrd.gz/.gipl/.gipl.gz), or a folder of "
-                "scans for batch segmentation (sent as a .zip archive)."
-            ),
-        ),
+        # "input": ArgSpec(
+        #     type=("folder", "volume_or_zip_file"),
+        #     required=True,
+        #     server_selectable="testfile",
+        #     description=(
+        #         "A CBCT scan (.nii/.nii.gz/.nrrd/.nrrd.gz/.gipl/.gipl.gz), or a folder of "
+        #         "scans for batch segmentation (sent as a .zip archive)."
+        #     ),
+        # ),
         # Server-side only: the client sends the NAME of a model bundle hosted
         # on the server, never the models themselves. A bundle is a folder
         # holding one subfolder per structure code (MAND/, MAX/, ...).
