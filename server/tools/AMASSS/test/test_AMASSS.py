@@ -10,6 +10,7 @@ Run just this module:
     cd server && ./venv/bin/pytest tools/AMASSS/test/
 """
 
+import glob
 import json
 import os
 import zipfile
@@ -22,7 +23,8 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from base import SELECTION_TYPE, ArgSpec, Tool, ToolArgumentError
+from base import Selection, ToolArgumentError
+from tools.AMASSS.AMASSS import AMASSSTool
 from tools.AMASSS.src import AMASSSLogic, nnunet_runner
 
 
@@ -299,85 +301,105 @@ def test_segment_rejects_unknown_structure(tmp_path):
         )
 
 
-def test_main_returns_a_zip_of_the_outputs(tmp_path, stub_predictor):
+def test_main_returns_the_output_directory(tmp_path, stub_predictor, monkeypatch):
+    """output_kind = "files": run() hands back a folder and main.py zips it."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path / "server_tmp"))
     _write_scan(tmp_path / "input" / "patient01.nii.gz")
     bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
 
-    zip_path = AMASSSLogic.main(
+    output_dir = AMASSSLogic.main(
         input=str(tmp_path / "input"),
         model=bundle,
         structures=("MAND", "MAX"),
         merge=("MERGED",),
     )
 
-    assert zipfile.is_zipfile(zip_path)
-    with zipfile.ZipFile(zip_path) as zf:
-        names = zf.namelist()
-        assert "AMASSS_report.json" in names
-        assert any(name.endswith("patient01_Pred_MERGED.nii.gz") for name in names)
-        report = json.loads(zf.read("AMASSS_report.json"))
-    assert report["summary"]["processed"] == 1
+    assert os.path.isdir(output_dir)
+    # main.py names the streamed archive after this folder, so it must carry
+    # the run's identity rather than a generic "output".
+    assert os.path.basename(output_dir) == "AMASSS_Pred"
+
+    produced = os.listdir(output_dir)
+    assert "AMASSS_report.json" in produced
+    assert os.path.isfile(
+        os.path.join(output_dir, "patient01_Pred_SegOut", "patient01_Pred_MERGED.nii.gz")
+    )
+    with open(os.path.join(output_dir, "AMASSS_report.json")) as handle:
+        assert json.load(handle)["summary"]["processed"] == 1
+
+    # The bulky nnUNet intermediates are dropped before the response streams.
+    scratch_dir = os.path.dirname(output_dir)
+    assert not os.path.exists(os.path.join(scratch_dir, "nnunet_input"))
+    assert not glob.glob(os.path.join(scratch_dir, "pred_*"))
 
 
 # ---------------------------------------------------------------------------
-# schema: the grouped selection argument
+# schema: the multichoice arguments
 # ---------------------------------------------------------------------------
 
-class _SelectionProbe(Tool):
-    name = "_selection_probe"
-    arguments = {
-        "structures": ArgSpec(
-            type=SELECTION_TYPE,
-            required=True,
-            multiple=True,
-            choices=AMASSSLogic.STRUCTURE_CODES,
-            choice_groups=AMASSSLogic.STRUCTURE_GROUPS,
-        ),
-    }
+def test_schema_is_valid():
+    """registry.py runs this at startup; a malformed declaration must not be
+    discovered by the first request that happens to hit the tool."""
+    AMASSSTool().check_schema()
 
-    def run(self, structures):
-        return structures
+
+def test_structure_choices_are_display_names_with_declared_defaults():
+    spec = AMASSSTool.arguments["structures"]
+    assert spec.choices["Mandible"] is True
+    assert spec.choices["Skin"] is False
+    # Structures with no shipped model must not be offered at all.
+    assert not {"Teeth", "Root canal", "Mandibular canal"} & set(spec.choices)
+    # Declaration order is what the client renders, and it follows the
+    # anatomical grouping (Bones, Soft tissue, Masks).
+    assert list(spec.choices)[:2] == ["Mandible", "Maxilla"]
+    assert list(spec.choices)[-1] == "Maxilla (Mask)"
 
 
 @pytest.mark.parametrize(
-    "sent",
+    "sent, expected",
     [
-        "MAND,MAX",
-        "MAND MAX",
-        '["MAND", "MAX"]',
-        '{"MAND": true, "MAX": true, "CB": false}',
-        # The shape a grouped-checkbox UI produces naturally: display names,
-        # exactly as the server published them in choice_groups.
-        '{"Mandible": true, "Maxilla": true, "Cranial base": false}',
-        '{"Mandible": "true", "Maxilla": "1", "Skin": "0"}',
+        ('{"Mandible": true, "Maxilla": true}', ("MAND", "MAX")),
+        ("Mandible,Maxilla", ("MAND", "MAX")),
+        # Whatever arrives is the complete selection: an option left out is
+        # off, whatever its declared default.
+        ('{"Skin": true}', ("SKIN",)),
     ],
 )
-def test_selection_accepts_every_wire_shape(sent):
-    assert _SelectionProbe().validate({"structures": sent}) == {"structures": ["MAND", "MAX"]}
+def test_structures_reach_run_as_codes(sent, expected):
+    cleaned = AMASSSTool().validate(
+        {"input": "/fake/scan.nii.gz", "model": "bundle", "structures": sent}
+    )
+    assert AMASSSLogic.structure_codes(cleaned["structures"]) == expected
 
 
-def test_selection_result_follows_declared_order():
+def test_validate_rejects_an_unknown_structure():
+    with pytest.raises(ToolArgumentError, match="Mandibule"):
+        AMASSSTool().validate(
+            {"input": "/fake/scan.nii.gz", "model": "bundle", "structures": "Mandibule"}
+        )
+
+
+def test_selection_maps_to_codes_in_declaration_order():
     """Deterministic downstream behavior, whatever order the client sent."""
-    cleaned = _SelectionProbe().validate({"structures": "SKIN,MAND,CV"})
-    assert cleaned["structures"] == ["MAND", "CV", "SKIN"]
+    selection = Selection({"Skin": True, "Mandible": True, "Cervical vertebra": True})
+    assert AMASSSLogic.structure_codes(selection) == ("SKIN", "MAND", "CV")
 
 
-def test_selection_rejects_unknown_value():
-    with pytest.raises(ToolArgumentError, match="MANDD"):
-        _SelectionProbe().validate({"structures": "MANDD"})
+def test_omitted_optional_merge_falls_back_to_the_default():
+    """`merge` is optional; None must not silently disable merging."""
+    assert AMASSSLogic.merge_modes(None) == AMASSSLogic.DEFAULT_MERGE_MODES
+    assert AMASSSLogic.merge_modes(Selection(AMASSSLogic.MERGE_CHOICES)) == ("MERGED",)
 
 
-def test_selection_rejects_empty_required_selection():
-    with pytest.raises(ToolArgumentError, match="at least one"):
-        _SelectionProbe().validate({"structures": '{"Mandible": false}'})
-
-
-def test_amasss_schema_publishes_groups_and_defaults():
-    """The client builds its checkbox groups from this and nothing else."""
-    from tools.AMASSS.AMASSS import AMASSSTool
-
-    spec = AMASSSTool.arguments["structures"]
-    assert spec.choice_groups["Bones"]["Mandible"] == "MAND"
-    assert set(spec.default) <= set(spec.choices)
-    # Structures with no shipped model must not be offered at all.
-    assert not {"RC", "TEETH", "MCAN"} & set(spec.choices)
+def test_segment_rejects_an_empty_selection(tmp_path):
+    """Every box unchecked is a valid Selection, so the schema cannot catch it."""
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    with pytest.raises(ToolArgumentError, match="at least one structure"):
+        AMASSSLogic.segment(
+            input_path=str(tmp_path / "input"),
+            model_path=str(tmp_path),
+            structures=(),
+            scratch_dir=str(tmp_path / "scratch"),
+        )
