@@ -23,7 +23,7 @@ from sklearn.preprocessing import StandardScaler
 
 from tools.SurgMovPred.src.SurgMovPredLogic import (
     LoadData,
-    surgMovPred,
+    SurgMovPred,
     clean_name,
     find_id_column,
     predict_all_targets,
@@ -212,7 +212,7 @@ def test_save_results_writes_excel_and_csv(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# surgMovPred.main -- full pipeline, model.zip + input.zip -> result file
+# SurgMovPred.main -- full pipeline, model.zip + input.zip -> result file
 # ---------------------------------------------------------------------------
 
 def test_main_full_pipeline(tmp_path):
@@ -229,7 +229,7 @@ def test_main_full_pipeline(tmp_path):
     df = pd.DataFrame({"PatientID": [1, 2, 3], "f1": [0, 10, 20]})
     input_zip = _make_input_zip(tmp_path, df)
 
-    output_path = surgMovPred.main(model_zip, input_zip)
+    output_path = SurgMovPred.main(model_zip, input_zip)
 
     assert os.path.exists(output_path)
     result_df = pd.read_excel(output_path, index_col=0)
@@ -272,7 +272,7 @@ def test_main_full_pipeline_with_server_side_data(tmp_path, monkeypatch):
     # the input; the assertions hold either way.
     testfiles_dir.chmod(0o555)
     try:
-        output_path = surgMovPred.main(str(model_dir), str(input_path))
+        output_path = SurgMovPred.main(str(model_dir), str(input_path))
 
         assert os.path.exists(output_path)
         result_df = pd.read_excel(output_path, index_col=0)

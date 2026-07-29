@@ -56,14 +56,43 @@ server/tools/my_tool/
     └── test_my_tool_logic.py
 ```
 
-Three rules, all enforced loudly at startup (the server refuses to boot rather
-than silently misbehaving):
+Three rules, all checked at startup:
 
 | Rule | What happens if you break it |
 | --- | --- |
-| `tools/X/` must contain `X.py` | `RuntimeError: Tool folder 'tools/X/' is missing its 'tools/X/X.py' file.` |
-| Every `Tool` subclass must set a non-empty `name` | `RuntimeError: Tool class 'MyTool' has no 'name' set.` |
-| Tool `name`s must be unique across the whole registry | `RuntimeError: Duplicate tool name detected: 'my_tool'` |
+| `tools/X/` must contain `X.py` | `Tool folder 'tools/X/' is missing its 'tools/X/X.py' file.` |
+| Every `Tool` subclass must set a non-empty `name` | `Tool class 'MyTool' has no 'name' set.` |
+| Tool `name`s must be unique across the whole registry | `Duplicate tool name detected: 'my_tool'` |
+
+### When a tool fails to load
+
+Breaking one of those rules — or a missing dependency, a syntax error, an
+invalid `ArgSpec` — does **not** take the server down. With 15+ tools, one
+unavailable model must not block all the others. The tool is skipped and the
+failure is printed as a banner with its full traceback, then summarised again
+at the very end of startup so it survives the wall of uvicorn output:
+
+```
+==============================================================================
+  TOOL FAILED TO LOAD:  AMASSS
+  ModuleNotFoundError: No module named 'SimpleITK'
+
+  This tool is NOT registered. Every other tool still works.
+------------------------------------------------------------------------------
+Traceback (most recent call last):
+  ...
+==============================================================================
+```
+
+The tool is then absent from `GET /tools`, and `POST /run/<name>` answers
+**404** with `failed to load at server startup` rather than `Unknown tool` —
+so a client developer isn't sent hunting for a typo.
+
+`registry.FAILED_TOOLS` maps each failed folder to its reason. Because a
+skipped tool is otherwise silent, `tests/test_registry.py` asserts that map is
+empty: that test is what turns a silently missing tool back into a red build.
+If it fails with a `ModuleNotFoundError`, the environment is usually just
+stale — `pip install -r requirements.txt`.
 
 Everything else in the folder (`src/`, `test/`, data, helpers) is invisible to
 discovery — but `my_tool.py` is free to import from it. Folders starting with
