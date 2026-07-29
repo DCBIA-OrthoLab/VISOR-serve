@@ -258,11 +258,13 @@ class ArgSpec:
     # True -> run() receives a list of values; False -> exactly one value.
     multiple: bool = False
 
-    # Advisory default, exposed through GET /tools so a client can pre-fill
-    # the widget. The server does NOT apply it: an omitted optional argument
-    # simply falls through to run()'s own Python default, which stays the
-    # single source of truth for what actually happens.
-    default: Any = None
+    # NOTE: do not declare a `default` FIELD here. `default` is the @property
+    # defined above, which derives the value from `choices`; a field of the
+    # same name silently shadows it (the class body is evaluated top to bottom,
+    # and @dataclass turns the later assignment into an instance attribute
+    # defaulting to None). Every optional choice/multichoice argument then
+    # reaches run() as None instead of its declared default -- which is exactly
+    # what broke AMASSS's `merge` and example_tool's `outputs`.
 
 
 class ToolArgumentError(Exception):

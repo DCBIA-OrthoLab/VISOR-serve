@@ -492,13 +492,44 @@ is what leaks when a tool crashes.
 
 ## 7. Dependencies
 
-Extra Python packages go in `server/requirements.txt`. Both the `inference`
-and `test` services install it at container start, so a rebuild isn't needed —
-but pin versions for anything where a silent upgrade could change numerical
-results.
+Dependencies are split by **how they install**, not by which tool wants them.
+There is no per-tool requirements mechanism: only `requirements.txt` is
+installed automatically, by the `inference` service's command.
 
-The base image (`ghcr.io/jules-gp/lab-ai:2026.07`) already carries the heavy
-CUDA/ML stack; only add what's genuinely missing.
+| File | Holds | Installed |
+| --- | --- | --- |
+| `requirements.txt` | pure wheels — `fastapi`, `pandas`, `numpy`, `SimpleITK` … | every container start; **must never fail** |
+| `requirements-ml.txt` | the shared DL stack — `monai`, `itk`, `vtk`, `nnunetv2` | once, baked into the image |
+| `requirements-pytorch3d.txt` | `pytorch3d` alone | separately: no PyPI distribution, needs a source build matching the installed torch + CUDA |
+
+**Never `pip install torch`.** The base image
+(`ghcr.io/jules-gp/lab-ai:2026.07`) ships `2.5.1+cu124`; a plain install
+shadows it with a CPU-only wheel and every GPU tool silently drops to CPU. Pin
+versions for anything where a silent upgrade could change numerical results.
+
+### Import heavy dependencies lazily
+
+Anything outside `requirements.txt` must be imported **inside the function
+that uses it**, not at module level:
+
+```python
+def _import_torch():
+    try:
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(f"This tool needs torch: {_INSTALL_HINT}") from exc
+    return torch
+```
+
+This is not a style preference. A module-level `import torch` in a tool whose
+dependency is missing raises at **discovery** time; `registry.py` then skips
+the whole tool (§2). Deferring the import means the tool still loads, still
+publishes its schema through `GET /tools`, and only an actual run fails — with
+a message naming what to install. `tools/AMASSS/src/nnunet_runner.py` is the
+reference implementation.
+
+The same applies to a `src/` module other tools import: keep the heavy imports
+inside functions so importing the module never drags in the stack.
 
 ---
 

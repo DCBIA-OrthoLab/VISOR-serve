@@ -4,7 +4,7 @@ services:
     environment:
       - API_TOKEN=${API_TOKEN:-dev-token}
       - DATA_DIR=/data
-      - DEVICE=cpu
+      - DEVICE=${DEVICE:-cuda}
     shm_size: 8gb
     working_dir: /workspace/server
     volumes:
