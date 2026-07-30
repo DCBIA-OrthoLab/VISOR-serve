@@ -173,6 +173,46 @@ def _discard(work_dir: Optional[str], scratch_dirs: list) -> None:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def _human_bytes(size: int) -> str:
+    """Byte count in the largest unit that keeps it readable.
+
+    Logged alongside the exact figure, never instead of it: the round number
+    is what a human scans for, the exact one is what stays greppable and
+    comparable across requests.
+    """
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1024
+
+
+def _log_served(tool_name: str, start_time: float, received: int, sent: Optional[int]) -> None:
+    """One line per successfully served request.
+
+    Called at each return point rather than before them, so `duration` covers
+    packing the response too -- zipping a multi-GB segmentation is not free,
+    and a duration that stopped at the end of run() understated the request by
+    however long that took.
+
+    `sent` is None for a "text" tool: its result travels as JSON and no output
+    file exists to measure. Nothing here may name a file, an argument value,
+    or any patient metadata (see the note at the top of this module).
+    """
+    duration = time.monotonic() - start_time
+    sent_field = (
+        "" if sent is None else f" sent={sent}B ({_human_bytes(sent)})"
+    )
+    logger.info(
+        "endpoint=/run/%s status=200 duration=%.2fs received=%dB (%s)%s",
+        tool_name,
+        duration,
+        received,
+        _human_bytes(received),
+        sent_field,
+    )
+
+
 def _output_roots(outputs: list, work_dir: str) -> set:
     """TEMP_DIR folders holding the tool's outputs, excluding the request's own
     work dir (already scheduled for cleanup by the caller)."""
@@ -427,11 +467,6 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             if resolved.is_temporary and os.path.exists(resolved.path):
                 os.remove(resolved.path)
 
-    duration = time.monotonic() - start_time
-    logger.info(
-        "endpoint=/run/%s status=200 duration=%.2fs size=%dB", tool_name, duration, size
-    )
-
     if tool.output_kind in ("file", "segmentation", "files"):
         # `result` is a path to the output file the tool wrote -- or, for
         # "files", a list of paths / a single directory to bundle into a zip.
@@ -476,6 +511,10 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         media_type, _ = mimetypes.guess_type(str(result))
         if media_type is None:
             media_type = "application/gzip" if str(result).endswith(".gz") else "application/octet-stream"
+        # The size of the file about to be streamed. Measured rather than
+        # accumulated: for output_kind="files" what goes out is the archive
+        # built just above, not the sum of what run() produced.
+        _log_served(tool_name, start_time, size, os.path.getsize(result))
         return FileResponse(
             result,
             media_type=media_type,
@@ -486,6 +525,7 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     # A "text" tool can still have written scratch files along the way.
     for directory in ([work_dir] if work_dir else []) + list(scratch_dirs):
         background_tasks.add_task(shutil.rmtree, directory, ignore_errors=True)
+    _log_served(tool_name, start_time, size, None)
     return {"result": result}
 
 

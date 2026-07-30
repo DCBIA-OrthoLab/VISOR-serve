@@ -929,3 +929,75 @@ def test_concurrent_requests_do_not_share_scratch_tracking(monkeypatch):
     assert seen["a"][2] == [seen["a"][0]]
     assert seen["b"][2] == [seen["b"][0]]
     assert set(os.listdir(settings.TEMP_DIR)) == before  # both cleaned up after
+
+
+def test_served_request_is_logged_with_both_sizes(caplog, tmp_path):
+    """One log line per served request, carrying the bytes in AND the bytes out.
+
+    `sent` is what makes a run diagnosable after the fact: `received` alone
+    says nothing about a segmentation that came back empty. It is measured on
+    the response file, so for output_kind="files" it is the size of the
+    archive actually streamed, not of what run() produced before zipping.
+    """
+    csv_file = tmp_path / "measures.csv"
+    csv_file.write_text("a,b\n1,2\n3,4\n")
+
+    with caplog.at_level("INFO", logger="inference_server"):
+        with open(csv_file, "rb") as file_obj:
+            response = client.post(
+                "/run/example_tool",
+                headers={"Authorization": f"Bearer {TOKEN}"},
+                data={"label": "case_1", "threshold": "0.5"},
+                files={"input": ("measures.csv", file_obj, "text/csv")},
+            )
+
+    assert response.status_code == 200
+    line = next(
+        message for message in caplog.messages if message.startswith("endpoint=/run/example_tool")
+    )
+    assert f"received={csv_file.stat().st_size}B" in line
+    assert f"sent={len(response.content)}B" in line
+    assert "(12 B)" in line  # the human-readable form sits beside the exact one
+    assert "status=200" in line
+
+
+def test_text_output_is_logged_without_a_sent_size(caplog):
+    """A "text" tool's result travels as JSON: there is no output file to
+    measure, so the field is omitted rather than reported as a bogus zero."""
+    with caplog.at_level("INFO", logger="inference_server"):
+        response = client.post(
+            "/run/test_tool",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            data={"text_1": "hello", "text_2": "world"},
+        )
+
+    assert response.status_code == 200
+    line = next(
+        message for message in caplog.messages if message.startswith("endpoint=/run/test_tool")
+    )
+    assert "received=0B (0 B)" in line
+    assert "sent=" not in line
+
+
+def test_log_line_carries_no_file_name_or_argument_value(caplog, tmp_path):
+    """The server handles confidential medical data: logs stay limited to
+    timestamp, endpoint, tool, status, duration and sizes (see main.py's
+    header). A file name or an argument value in there would be a leak."""
+    csv_file = tmp_path / "patient_ident_0042.csv"
+    csv_file.write_text("a,b\n1,2\n")
+
+    with caplog.at_level("INFO", logger="inference_server"):
+        with open(csv_file, "rb") as file_obj:
+            response = client.post(
+                "/run/example_tool",
+                headers={"Authorization": f"Bearer {TOKEN}"},
+                data={"label": "secret_patient_label", "threshold": "0.5"},
+                files={"input": (csv_file.name, file_obj, "text/csv")},
+            )
+
+    assert response.status_code == 200
+    line = next(
+        message for message in caplog.messages if message.startswith("endpoint=/run/example_tool")
+    )
+    assert "patient_ident_0042" not in line
+    assert "secret_patient_label" not in line
