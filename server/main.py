@@ -190,31 +190,6 @@ def health() -> dict:
     return {"status": "ok"}
 
 
-def _describe_argument(spec) -> dict:
-    """Everything a client needs to render one argument, schema-driven only.
-
-    `choices`/`choice_groups`/`multiple` describe SELECTION_TYPE arguments and
-    are None elsewhere. `choice_groups` is what lets a client build grouped
-    checkboxes (e.g. AMASSS's Bones / Soft tissue / Masks) with the group
-    labels and display names coming from the server -- no structure list
-    hardcoded client-side, and no drift when the server's list changes.
-    """
-    return {
-        "type": _type_name(spec.type),
-        "required": spec.required,
-        "description": spec.description,
-        "server_selectable": spec.server_selectable,
-        "choices": list(spec.choices) if spec.choices else None,
-        "choice_groups": (
-            {group: dict(entries) for group, entries in spec.choice_groups.items()}
-            if spec.choice_groups
-            else None
-        ),
-        "multiple": spec.multiple,
-        "default": list(spec.default) if isinstance(spec.default, (list, tuple, set)) else spec.default,
-    }
-
-
 def _extensions_of(spec) -> Optional[dict]:
     """{type name: [extension, ...]} for every file type an argument accepts.
 

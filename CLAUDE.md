@@ -88,16 +88,20 @@ package at startup — e.g. import all modules in `tools/`, collect every subcla
 - Detect and reject **duplicate tool names** at startup with a clear error.
 - Expose the registry as `name -> Tool instance` (or class).
 
-## The one tool that exists now
+## The registered tools
 
-Only a single **test tool** exists for now:
-- name: `"test_tool"`
-- arguments: `text_1` (str, required), `text_2` (str, required)
-- `run(text_1, text_2) -> str`: returns some simple combination (e.g. concatenation
-  or an echo), enough to prove the round trip. Output kind: `"text"`.
+(Originally only `test_tool` existed; see the changelog for how the rest arrived.)
 
-All other ~14+ tools are future work; the architecture must accommodate them without
-change to the core. Include `# TODO` guidance showing how to add another tool.
+- `test_tool` — two required strings in, their concatenation out. Proves the
+  round trip and serves as the minimal copy-paste template.
+- `example_tool` — the feature showcase: multi-type input (`csv_file` or
+  `folder`), `choice`/`multichoice` arguments, `output_kind = "files"`.
+- `SurgMovPred` — surgical movement prediction from tabular measurements
+  (stacking models, server-side model bundles).
+- `AMASSS` — CBCT skull structure segmentation (nnUNet v2, GPU).
+
+The extension will eventually expose ~15+ tools; the architecture must
+accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 
 ## Target architecture
 
@@ -114,28 +118,37 @@ change to the core. Include `# TODO` guidance showing how to add another tool.
                                                           └──────────────────────────┘
 ```
 
-## Expected repo structure
+## Repo structure
 
 ```
 .
 ├── CLAUDE.md
+├── ADDING_A_TOOL.md         # the full contract for writing a tool
+├── docker-compose.yml       # inference service + test service (profile "test")
+├── .githooks/pre-push       # runs `docker compose run --rm test` before a push
 ├── server/
 │   ├── main.py              # FastAPI app: generic /run/{tool_name} endpoint
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError
 │   ├── registry.py          # auto-discovery of Tool subclasses in tools/
 │   ├── data_store.py        # DataStore interface + LocalDataStore (server-side models/testfiles)
+│   ├── file_utils.py        # shared helpers: zip extraction/creation, tabular loading
 │   ├── security.py          # Bearer token verification
 │   ├── config.py            # config from environment variables
-│   ├── tools/
-│   │   ├── __init__.py
-│   │   └── test_tool.py     # the only tool for now
+│   ├── tools/               # one folder per tool: tools/<name>/<name>.py (+ src/, test/)
+│   │   ├── test_tool/
+│   │   ├── example_tool/
+│   │   ├── SurgMovPred/
+│   │   └── AMASSS/
+│   ├── tests/               # HTTP-layer + integration tests
 │   ├── requirements.txt
+│   ├── requirements-dev.txt
 │   ├── .env.example
 │   └── README.md
-├── DATA/                    # DATA_DIR mount, read-only: <tool_name>/{models,testfiles}/
-└── slicer_client/
-    └── inference_client.py  # generic client used by every Slicer module
+└── DATA/                    # DATA_DIR mount, read-only, gitignored: <tool_name>/{models,testfiles}/
 ```
+
+The Slicer client (thin modules + the generic inference client) lives in its
+own repo, `SlicerAutomatedDentalToolsCloud` — not here.
 
 ---
 
@@ -280,6 +293,29 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-07-30 — Dead-code and duplication cleanup
+
+- `base.py` had an entire block (`FOLDER_TYPE`, `SCALAR_TYPES`,
+  `CHOICE_TYPES`, `Selection`, `ResolvedPath`) declared TWICE, plus the
+  remnants of the retired `SELECTION_TYPE` API (the constant, a second
+  shadowing `choices` field, `choice_groups`, `multiple`,
+  `_TRUE_TOKENS`/`_FALSE_TOKENS`). All removed. **The current API is
+  `"choice"`/`"multichoice"`** (one `choices` dict of option → default);
+  the 2026-07-28 entry below describes the interim design it replaced.
+- `main.py._describe_argument` (unused, referenced the removed fields) and
+  `file_utils.zip_directory` (unused duplicate of `make_zip`) removed.
+- `requirements-amasss.txt` removed: torch/nnunetv2/vtk had been added to
+  `requirements.txt` ("FIX : AMASSS functional"), leaving the file a pure
+  duplicate. The heavy stack stays lazily imported, and torch stays unpinned
+  so the image's CUDA build is never shadowed.
+- The `test` service in `docker-compose.yml` (commented out earlier) is back
+  under a `profiles: ["test"]` guard: `docker compose up` ignores it, the
+  pre-push hook's `docker compose run --rm test` works again.
+- Docs realigned with the code: `claude.md` → `CLAUDE.md`, `surgMovPred` →
+  `SurgMovPred` (post-rename casing), README's selection-argument section
+  rewritten for `choice`/`multichoice`, `ADDING_A_TOOL.md` §7 now describes
+  the real requirements layout.
 
 ### 2026-07-28 — AMASSS tool + grouped selection arguments
 

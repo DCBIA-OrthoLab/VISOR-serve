@@ -168,23 +168,6 @@ def _add_to_zip(zf: zipfile.ZipFile, file_path: str, arcname: str, written: set)
     zf.write(file_path, arcname)
 
 
-def zip_directory(source_dir: str, zip_path: str) -> str:
-    """Zip the whole contents of `source_dir` into `zip_path`.
-
-    Paths inside the archive are relative to `source_dir`, so unzipping it
-    reproduces the folder's contents (not the folder itself nested one level
-    deeper). Used by tools whose result is several files but whose HTTP
-    response can only carry one blob.
-    """
-    os.makedirs(os.path.dirname(os.path.abspath(zip_path)), exist_ok=True)
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, _dirs, files in os.walk(source_dir):
-            for name in sorted(files):
-                absolute = os.path.join(root, name)
-                zf.write(absolute, os.path.relpath(absolute, source_dir))
-    return zip_path
-
-
 def load_tabular_file(file_path: str) -> pd.DataFrame:
     """Load a single CSV, XLSX, or ODS file into a DataFrame."""
     ext = os.path.splitext(file_path)[1].lower()

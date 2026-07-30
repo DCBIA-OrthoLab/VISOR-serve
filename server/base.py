@@ -46,71 +46,6 @@ FILE_TYPES: dict = {
     ),
 }
 
-# Argument type for "pick one or several values from a server-defined list".
-# The server owns both the valid values (`choices`) and how they should be
-# presented (`choice_groups`: group label -> {display name: value}), so a
-# client can render grouped checkboxes without hardcoding anything --
-# see ArgSpec below and Tool._coerce_selection for the accepted wire formats.
-SELECTION_TYPE = "selection"
-
-_TRUE_TOKENS = ("true", "1", "yes", "on", "checked")
-_FALSE_TOKENS = ("false", "0", "no", "off", "unchecked", "")
-
-# The type whose resolved path is a directory rather than a file.
-FOLDER_TYPE = "folder"
-
-SCALAR_TYPES = (str, int, float, bool)
-
-# Types picking from a fixed set of named options the tool declares in
-# ArgSpec.choices. They exist so the client can render the right widget without
-# any tool-specific code, and so an out-of-range value is caught by validate()
-# instead of reaching run():
-#   "choice"      -> exactly one option        -> combo box  -> run() gets a str
-#   "multichoice" -> any number of options     -> check boxes -> run() gets a Selection
-CHOICE_TYPE = "choice"
-MULTICHOICE_TYPE = "multichoice"
-CHOICE_TYPES = (CHOICE_TYPE, MULTICHOICE_TYPE)
-
-
-class Selection(dict):
-    """What run() receives for a "multichoice" argument: every option the tool
-    declared, mapped to True/False, in declaration order.
-
-    Being a plain dict means `selection["mandible"]` works and no option is
-    ever missing, so a tool never needs `.get(name, False)`. `.selected` is
-    there for the common case of looping over what's enabled.
-    """
-
-    @property
-    def selected(self) -> tuple:
-        """The enabled option names, in declaration order."""
-        return tuple(name for name, enabled in self.items() if enabled)
-
-
-class ResolvedPath(str):
-    """Local path handed to Tool.run() for a file/folder argument, tagged with
-    the declared type it was actually resolved as.
-
-    This is what makes an argument accepting SEVERAL types usable: a tool
-    declaring `type=("csv_file", "folder")` branches on `input.kind` instead
-    of guessing from the extension or probing the filesystem.
-
-    It subclasses `str`, so it stays a plain path everywhere else -- `open()`,
-    `os.path.*`, `pandas.read_csv()` all work unchanged, and a tool that
-    declares a single type can keep ignoring `.kind` entirely.
-    """
-
-    kind: str
-
-    def __new__(cls, path: str, kind: str) -> "ResolvedPath":
-        resolved = super().__new__(cls, path)
-        resolved.kind = kind
-        return resolved
-
-    @property
-    def is_folder(self) -> bool:
-        return self.kind == FOLDER_TYPE
-
 # The type whose resolved path is a directory rather than a file.
 FOLDER_TYPE = "folder"
 
@@ -243,20 +178,6 @@ class ArgSpec:
             if allowed is None or extension in allowed:
                 return declared
         return self.types[0]
-
-    # --- SELECTION_TYPE arguments only (ignored otherwise) ------------------
-    # The canonical values this argument accepts, e.g. ("MAND", "MAX", "CB").
-    # Anything else is rejected with a ToolArgumentError naming what's valid.
-    choices: Optional[tuple] = None
-    # Presentation metadata owned by the SERVER, so the client never hardcodes
-    # a structure list: {group label: {human-readable name: canonical value}}.
-    # e.g. {"Bones": {"Mandible": "MAND", "Maxilla": "MAX"}, "Masks": {...}}.
-    # A client renders one box per group with one checkbox per entry, and may
-    # send back {"Mandible": true, "Maxilla": false} -- display names are
-    # accepted as aliases of their value on the way in.
-    choice_groups: Optional[dict] = None
-    # True -> run() receives a list of values; False -> exactly one value.
-    multiple: bool = False
 
     # NOTE: do not declare a `default` FIELD here. `default` is the @property
     # defined above, which derives the value from `choices`; a field of the
