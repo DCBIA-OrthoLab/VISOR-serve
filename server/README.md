@@ -72,17 +72,17 @@ An argument declared with `ArgSpec(server_selectable=...)` can instead be
 satisfied by a file already hosted on the server (under
 `DATA_DIR/<tool>/{models,testfiles}/`): send the file's *name* as a plain form
 value. On a scalar (non-file-typed) argument that is the only option — e.g.
-`surgMovPred`'s `model` (`ArgSpec(type=str, server_selectable="model")`) is
+`SurgMovPred`'s `model` (`ArgSpec(type=str, server_selectable="model")`) is
 always picked by name, never uploaded (an upload for it is rejected with a 400):
 
 ```bash
 # List the models/testfiles hosted server-side for a tool (Bearer-protected)
-curl -k https://localhost:8000/tools/surgMovPred/data \
+curl -k https://localhost:8000/tools/SurgMovPred/data \
   -H "Authorization: Bearer change-me-to-a-long-random-secret"
 # -> {"models": ["stacking_v2.zip"], "testfiles": ["demo_measurements.zip"]}
 
 # Run it: the model is a name, the input is a genuine upload
-curl -k -X POST https://localhost:8000/run/surgMovPred \
+curl -k -X POST https://localhost:8000/run/SurgMovPred \
   -H "Authorization: Bearer change-me-to-a-long-random-secret" \
   -F "model=stacking_v2.zip" \
   -F "input=@/path/to/measurements.zip"
@@ -123,39 +123,35 @@ different file needs are added. To accept a new kind of file, add an entry to
 `FILE_TYPES` in `base.py`. Only arguments left as generic `"file"` fall back
 to `config.ALLOWED_EXTENSIONS`.
 
-## Selection arguments (pick one or several from a server-defined list)
+## Choice arguments (pick one or several from a server-defined list)
 
-An argument typed `SELECTION_TYPE` (`base.py`) lets a tool publish both the
-valid values **and how they should be presented**, so a client renders the
-widget entirely from `GET /tools` with nothing hardcoded:
+An argument typed `"choice"` (combo box, exactly one option) or
+`"multichoice"` (check boxes, any number of options) declares its options —
+and their defaults — in one `choices` dict, so a client renders the widget
+entirely from `GET /tools` with nothing hardcoded:
 
 ```python
 "structures": ArgSpec(
-    type=SELECTION_TYPE, required=True, multiple=True,
-    choices=("MAND", "MAX", "CB"),
-    choice_groups={"Bones": {"Mandible": "MAND", "Maxilla": "MAX",
-                             "Cranial base": "CB"}},
-    default=("MAND", "MAX"),
+    type="multichoice", required=False,
+    choices={"Mandible": True, "Maxilla": True, "Skull": False},
+    description="Anatomical structures to segment",
 ),
 ```
 
-`GET /tools` reports `choices`, `choice_groups`, `multiple` and `default` for
-every argument. A client builds one group box per `choice_groups` entry, with
-one checkbox per display name, and sends back whichever of these it likes —
-all are accepted and normalized to the same canonical list, in the order the
-tool declared:
+`GET /tools` reports `choices` for every argument. On the wire, `"choice"` is
+just the option name; `"multichoice"` accepts a JSON object or a
+comma-separated shorthand of the enabled options:
 
 ```bash
--F 'structures=MAND,MAX'                                   # separated list
--F 'structures=["MAND","MAX"]'                             # JSON list
--F 'structures={"MAND":true,"MAX":true,"CB":false}'        # values
--F 'structures={"Mandible":true,"Maxilla":true}'           # display names
+-F 'structures={"Mandible":true,"Maxilla":true,"Skull":false}'   # JSON object
+-F 'structures=Mandible,Maxilla'                                  # equivalent
 ```
 
-The last form is what a grouped-checkbox UI produces naturally: the client
-echoes back the labels the server gave it and never needs a translation table.
-An invalid value is a `422` naming what is allowed. Adding a choice is a
-one-line server change with no client release.
+Either form is the complete selection; omitting the argument entirely falls
+back to the declared defaults. An invalid option is a `422` naming what is
+allowed. Adding an option is a one-line server change with no client release.
+See [`ADDING_A_TOOL.md`](../ADDING_A_TOOL.md) for the full contract,
+including what `run()` receives (`base.Selection`).
 
 ## How to add a new tool
 
@@ -174,19 +170,19 @@ one-line server change with no client release.
 
 If your tool needs to unzip an upload, zip its results, and/or load
 CSV/XLSX/ODS files, reuse the shared helpers in `file_utils.py`
-(`extract_zip`, `zip_directory`, `load_tabular_file`,
+(`extract_zip`, `make_zip`, `make_scratch_dir`, `load_tabular_file`,
 `load_tabular_directory`) instead of reimplementing them.
 
 ### Heavy or optional dependencies
 
-`requirements.txt` must stay installable on every deployment, because
-`registry.py` imports **every** tool at startup: a tool whose module-level
-imports fail takes the whole server down with it. A tool needing a heavy or
-optional stack should therefore import it **lazily, inside the functions that
-use it**, and ship its own requirements file. `AMASSS` does this for
-torch/nnunetv2/vtk (`requirements-amasss.txt`): until those are installed the
-server starts normally, every other tool works, and only AMASSS fails — with a
-message saying what to install.
+`registry.py` imports **every** tool at startup, so a tool whose module-level
+imports fail is skipped (see `ADDING_A_TOOL.md`). A tool needing a heavy or
+optional stack must therefore import it **lazily, inside the functions that
+use it**. `AMASSS` does this for torch/nnunetv2/vtk: those packages are listed
+in `requirements.txt` (the deployment image already ships torch built against
+its CUDA version, so pip skips it there), but on a machine where they are
+missing the server still starts normally, every other tool works, and only
+AMASSS fails — with a message saying what to install.
 
 ## AMASSS: CBCT skull structure segmentation
 
@@ -235,7 +231,7 @@ startup rather than silently overwriting each other.
 ./venv/bin/pip install -r requirements-dev.txt   # pytest, httpx
 ./venv/bin/pytest                                 # everything
 ./venv/bin/pytest tests/                          # HTTP layer only (main.py, routing, auth)
-./venv/bin/pytest tools/surgMovPred/test/        # one tool's own logic, in isolation
+./venv/bin/pytest tools/SurgMovPred/test/        # one tool's own logic, in isolation
 ```
 
 Or, without installing anything locally, run the exact same suite in Docker
@@ -251,7 +247,7 @@ that imports directly from `tools.<name>.src.<name>_logic` and exercises its
 functions without going through HTTP at all. `registry.py` only scans the
 immediate children of `tools/` for a `<name>/<name>.py` file, so a nested
 `test/` folder is invisible to tool discovery — it's picked up by pytest only.
-See `tools/surgMovPred/test/` for an example covering column-name cleaning,
+See `tools/SurgMovPred/test/` for an example covering column-name cleaning,
 patient-ID detection, zip extraction, prediction, and the full pipeline
 end-to-end with synthetic data.
 
@@ -267,8 +263,8 @@ committed — so those files only ever exist locally. Accordingly, a tool with
 no matching file under `DATA/` is **skipped**, not failed: a machine without
 the confidential dataset can still run the suite and push. To turn a skip
 into a real run, drop a file in the relevant folder, e.g.
-`DATA/surgMovPred/testfiles/my_real_input.zip` (and
-`DATA/surgMovPred/models/my_real_model.zip` if you want the real model
+`DATA/SurgMovPred/testfiles/my_real_input.zip` (and
+`DATA/SurgMovPred/models/my_real_model.zip` if you want the real model
 exercised too, instead of leaving that argument unfulfilled and the test skipped).
 
 ### Pre-push tests

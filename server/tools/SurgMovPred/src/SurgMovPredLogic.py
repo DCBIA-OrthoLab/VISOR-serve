@@ -23,7 +23,7 @@ except ImportError:
     pass
 
 # ===== Logging Configuration =====
-logger = logging.getLogger("SurgMovPred_CLI")
+logger = logging.getLogger("SurgMovPred")
 logger.setLevel(logging.INFO)
 logger.propagate = False
 if logger.handlers:
@@ -34,7 +34,7 @@ formatter = logging.Formatter('%(name)s - %(levelname)s - (%(filename)s:%(lineno
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-logger.info("SurgMovPred_CLI.py initialization")
+logger.info("SurgMovPredLogic initialization")
 
 
 def clean_name(name: str) -> str:
@@ -104,7 +104,7 @@ def find_id_column(columns) -> str:
 
 
 class LoadData:
-    """Extracts the model package and loads the input data used by SuperMovPred.
+    """Extracts the model package and loads the input data used by SurgMovPred.
 
     Zip extraction and CSV/XLSX/ODS loading are generic concerns, factored out
     into file_utils.py so other tools can reuse them; only the

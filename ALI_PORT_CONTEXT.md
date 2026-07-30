@@ -141,34 +141,26 @@ Until `CrownSeg` exists, ALI's IOS mode refuses an unsegmented mesh with a
 discovery returns "segmented" and "unsegmented" lists; the unsegmented branch
 raises today and calls `CrownSeg` tomorrow. Nothing else changes.
 
-### 3.3 Dependency tiers, not per-tool requirements files
+### 3.3 One requirements file plus lazy imports — no per-tool files
 
-There is **no per-tool requirements mechanism**. Nothing reads
-`requirements-amasss.txt` automatically; only `requirements.txt` is installed,
-by the `inference` service command in `docker-compose.yml`. Everything else is
-baked into the image by hand.
+There is **no per-tool requirements mechanism**: `requirements.txt` is the
+single dependency list, installed by the `inference` service command in
+`docker-compose.yml` at every container start. It includes the heavy DL stack
+(`vtk`, `torch`, `nnunetv2`), unpinned on purpose: the image already ships
+torch built against its CUDA version, so pip sees the entry satisfied and
+leaves it untouched. (`requirements-amasss.txt` duplicated exactly those
+three lines and has been removed.) `requirements-dev.txt` adds pytest/httpx
+for the test suite. `ADDING_A_TOOL.md` §7 documents this layout.
 
-Agreed restructuring — three files total, regardless of how many tools exist,
-split by *installability*, not by tool:
-
-| File | Contents | Installed |
-| --- | --- | --- |
-| `requirements.txt` | fastapi, pandas, numpy, SimpleITK … pure wheels | every container start, must never fail |
-| `requirements-ml.txt` | torch, monai, itk, vtk, nnunetv2 — the shared DL stack | once, in the image |
-| `requirements-pytorch3d.txt` | pytorch3d alone | separate: needs a source build matching torch+CUDA |
-
-`requirements-amasss.txt` is renamed to `requirements-ml.txt` and gains
-monai/itk. ALI introduces no new file.
+ALI introduces no new file: monai/itk go into `requirements.txt`. pytorch3d
+has no PyPI distribution at all and must be baked into the image (see §4) —
+never added to `requirements.txt`.
 
 The rule that makes this work, and that ALI must follow: **a heavy or optional
 dependency is imported lazily, inside the function that uses it**, raising an
 actionable message when absent. See `tools/AMASSS/src/nnunet_runner.py`
 (`_import_torch`, `_import_predictor`, `_INSTALL_HINT`) for the exact pattern.
 Consequence for ALI: CBCT must work on a server with no pytorch3d.
-
-`ADDING_A_TOOL.md` §7 still says "extra packages go in requirements.txt" and
-mentions neither lazy imports nor the tiering. `server/README.md` (l. 182-189)
-documents it correctly. **Update §7 as part of this work.**
 
 ---
 
@@ -290,7 +282,7 @@ receives paths, not MRML nodes.
 
 ## 7. Hard constraints, restated
 
-From `ADDING_A_TOOL.md` and `claude.md`, the ones easiest to violate here:
+From `ADDING_A_TOOL.md` and `CLAUDE.md`, the ones easiest to violate here:
 
 - **Nothing outside `tools/ALI/` may be edited**, except a new `FILE_TYPES`
   entry in `base.py` if one is genuinely needed. No route, no registry entry.
