@@ -33,15 +33,19 @@ import logging
 import os
 import threading
 
+from config import settings
+
 logger = logging.getLogger("AMASSS.nnunet")
 
 CHECKPOINT_NAME = "checkpoint_final.pth"
 PLANS_FOLDER_PATTERN = "*__nnUNetPlans__3d_fullres"
 
-# How many AMASSS inferences may touch the GPU at the same time. One by
-# default: a 3d_fullres model plus its sliding-window buffers already fills a
-# typical card. Raise it only on hardware you have actually measured.
-_MAX_GPU_JOBS = max(1, int(os.getenv("AMASSS_MAX_GPU_JOBS", "1")))
+# How many AMASSS inferences may touch the GPU at the same time -- see
+# settings.AMASSS_MAX_GPU_JOBS for what a higher value does and does not buy.
+# Read through config like every other setting rather than straight from
+# os.getenv, so the whole server configuration stays discoverable in one file
+# (and documented in .env.example).
+_MAX_GPU_JOBS = max(1, int(settings.AMASSS_MAX_GPU_JOBS))
 _GPU_SEMAPHORE = threading.BoundedSemaphore(_MAX_GPU_JOBS)
 
 _INSTALL_HINT = (

@@ -46,13 +46,6 @@ FILE_TYPES: dict = {
     ),
 }
 
-# Argument type for "pick one or several values from a server-defined list".
-# The server owns both the valid values (`choices`) and how they should be
-# presented (`choice_groups`: group label -> {display name: value}), so a
-# client can render grouped checkboxes without hardcoding anything --
-# see ArgSpec below and Tool._coerce_selection for the accepted wire formats.
-SELECTION_TYPE = "selection"
-
 _TRUE_TOKENS = ("true", "1", "yes", "on", "checked")
 _FALSE_TOKENS = ("false", "0", "no", "off", "unchecked", "")
 
@@ -140,6 +133,20 @@ class ArgSpec:
     # doesn't send the argument, so defaults never live in two places.
     # "choice" declares exactly one True: the initially selected option.
     choices: Optional[dict] = None
+    # SCALAR arguments only (int/float/bool/str): the value a client should
+    # pre-fill its widget with. Published through GET /tools, so a spin box
+    # starts at the value the tool means rather than at Qt's 0 -- which is what
+    # sent surface_smoothing=0 on every AMASSS run whose user never touched the
+    # field, silently disabling the smoothing whose default reads 5 in run().
+    #
+    # Advisory, and NOT applied server-side: an omitted optional argument still
+    # falls through to run()'s own Python default, which stays the single source
+    # of truth for what happens. Keep the two equal.
+    #
+    # A choice/multichoice argument must NOT use this -- its initial state is
+    # already in `choices`, and `default` derives from it (check_schema rejects
+    # the combination).
+    initial: Any = None
 
     @property
     def types(self) -> tuple:
@@ -190,20 +197,6 @@ class ArgSpec:
             if allowed is None or extension in allowed:
                 return declared
         return self.types[0]
-
-    # --- SELECTION_TYPE arguments only (ignored otherwise) ------------------
-    # The canonical values this argument accepts, e.g. ("MAND", "MAX", "CB").
-    # Anything else is rejected with a ToolArgumentError naming what's valid.
-    choices: Optional[tuple] = None
-    # Presentation metadata owned by the SERVER, so the client never hardcodes
-    # a structure list: {group label: {human-readable name: canonical value}}.
-    # e.g. {"Bones": {"Mandible": "MAND", "Maxilla": "MAX"}, "Masks": {...}}.
-    # A client renders one box per group with one checkbox per entry, and may
-    # send back {"Mandible": true, "Maxilla": false} -- display names are
-    # accepted as aliases of their value on the way in.
-    choice_groups: Optional[dict] = None
-    # True -> run() receives a list of values; False -> exactly one value.
-    multiple: bool = False
 
     # NOTE: do not declare a `default` FIELD here. `default` is the @property
     # defined above, which derives the value from `choices`; a field of the
@@ -264,7 +257,20 @@ class Tool(ABC):
                 raise ToolSchemaError(
                     f"{where}: 'choices' only applies to {sorted(CHOICE_TYPES)} arguments."
                 )
+            if spec.initial is not None and spec.is_file:
+                raise ToolSchemaError(
+                    f"{where}: 'initial' only applies to scalar arguments, not file ones."
+                )
             return
+
+        # A choice argument's initial state is the True entry (or entries) of
+        # `choices`; a second declaration would be the two-places-for-one-default
+        # problem `initial` exists to remove.
+        if spec.initial is not None:
+            raise ToolSchemaError(
+                f"{where}: 'initial' does not apply to {sorted(CHOICE_TYPES)} arguments -- "
+                f"declare the initial state in 'choices' instead."
+            )
 
         if not isinstance(spec.choices, dict) or not spec.choices:
             raise ToolSchemaError(

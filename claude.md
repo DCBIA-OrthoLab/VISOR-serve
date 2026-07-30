@@ -203,8 +203,15 @@ model, a reference test dataset) instead of the client uploading it every call.
 ### `security.py`, `config.py`
 - Bearer token from env (`API_TOKEN`), constant-time compare, `401` on failure.
 - Config from env: `API_TOKEN`, `DEVICE`, `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
-  `TEMP_DIR`, `ALLOWED_EXTENSIONS`, `DATA_DIR`, `DATA_BACKEND`. Sensible dev
-  defaults.
+  `TEMP_DIR`, `MAX_CONCURRENT_TOOLS`, `AMASSS_MAX_GPU_JOBS`, `ALLOWED_EXTENSIONS`,
+  `DATA_DIR`, `DATA_BACKEND`. Sensible dev defaults.
+- **Every setting goes through `config.Settings`** — no tool reads `os.getenv`
+  directly, even for a knob only it uses, so the whole configuration stays
+  discoverable in one file and documented in `.env.example`.
+- A setting a tool reads must be reachable: an argument default like
+  `device: str = "cpu"` in a function signature short-circuits
+  `device or settings.DEVICE` and makes the environment variable dead. Default
+  such parameters to `None` and let the setting be the single source of truth.
 
 ### Security / confidentiality — hard requirements
 - **TLS mandatory**; README documents HTTPS + self-signed cert for dev, real cert
@@ -281,6 +288,86 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-07-30 — Defaults reach the tool: one source of truth per setting
+
+**Motivation:** the architecture states everywhere that a default lives in one
+place, and the comments assert it — but the mechanism meant to enforce it was
+broken in three independent ways, each silently. A default that is declared and
+not applied is worse than no default: it reads as intentional in review.
+
+**`ArgSpec.default` was shadowed (`base.py`).** `default` is a `@property`
+deriving the value from `choices`, and the leftover `SELECTION_TYPE` block
+below it declared `default: Any = None` as a **field**. `@dataclass` turns the
+later annotation into an instance attribute, replacing the property object, so
+`spec.default` was always `None`. `validate()` hands that to `run()` for any
+omitted optional choice argument (`base.py`, "hand that over rather than making
+the tool repeat it in `run()`'s signature") — so `example_tool` answered **500**
+(`'NoneType' object has no attribute 'selected'`) when `outputs` was omitted,
+and AMASSS survived only because `_codes_from` happens to treat `None` as
+"unspecified". The leftover block is gone, with a `NOTE` at the spot so the
+field is not reintroduced. `SELECTION_TYPE`, `choice_groups` and `multiple`
+went with it: no tool ever used them, they were read only by dead code, and
+`check_schema` *rejects* the `SELECTION_TYPE` declaration that `server/README.md`
+documented as the way to write a selection argument.
+
+**Scalar defaults never reached the widget — new `ArgSpec.initial`.** A form
+sends every widget it rendered, so an untouched field still travels: the Slicer
+panel's spin box started at Qt's own `0` and sent `0`, and `run()`'s
+`surface_smoothing: int = 5` was never reached. Every AMASSS surface generated
+through the UI came out with **zero smoothing iterations** while both the schema
+description and the signature said otherwise. `initial` is the scalar
+counterpart of `choices`: declared by the tool, published by `GET /tools`,
+applied by the client's `formgen` to int/float/bool/str widgets. It is advisory
+and *not* applied server-side — an omitted argument still falls through to
+`run()`'s Python default, which stays the single source of truth for what
+happens; `initial` only keeps the widget agreeing with it. `check_schema`
+rejects `initial` on a choice argument (its initial state is already in
+`choices`) and on a file argument.
+
+Note the split this fixes: `default` is what `validate()` gives `run()`;
+`initial` is what a client pre-fills. Naming both `default` is what caused the
+shadowing above.
+
+**`DEVICE` was unreachable (`AMASSSLogic.segment`).** The signature declared
+`device: str = "cpu"` and the body did `resolve_device(device or settings.DEVICE)`
+— a truthy default short-circuits the `or`, so **`settings.DEVICE` was never
+read** and `DEVICE=cuda` in the environment did nothing. The parameter now
+defaults to `None`. Same class of bug as the two above: a default written in a
+second place, winning over the one that is supposed to be authoritative.
+
+**`AMASSS_MAX_GPU_JOBS` joined the config.** It was the one setting read
+straight from `os.getenv`, absent from `config.py` and `.env.example`, while
+`config.py`'s own docstring claims the configuration is "loaded entirely from
+environment variables". It is now `settings.AMASSS_MAX_GPU_JOBS`, documented
+next to `MAX_CONCURRENT_TOOLS` (which was also missing from `.env.example`),
+with what a higher value does and does not buy: AMASSS predicts its structures
+**sequentially**, so one request never exceeds one GPU job — the semaphore only
+arbitrates between concurrent *requests*, and is therefore pointless above
+`MAX_CONCURRENT_TOOLS`. Raising it also means raising `docker-compose.yml`'s
+`shm_size`: nnUNet's worker processes pass whole volumes through shared memory,
+and exhausting it surfaces as a SIGBUS in a worker, not as a clean OOM.
+
+**Also removed:** `main.py::_describe_argument`, a second schema serializer that
+was never called and published a different set of keys than the live
+`list_tools` — the reason `default` existed as a field but never reached any
+client. `server/README.md`'s selection-arguments section was rewritten on the
+real API (its example crashed `check_schema`, and the JSON-list wire form it
+documented is a 422).
+
+**Tests:** `test_main.py` gains coverage that `GET /tools` publishes `initial`
+and that `check_schema` rejects it on choice/file arguments; the client's
+`test_formgen.py` gains a `ScalarInitialValueTest` asserting an untouched form
+collects the tool's own defaults rather than Qt's. 110 server tests, 130 client
+tests.
+
+**Note for future sessions:** run the suite in a disposable container
+(`docker run --rm -v ./server:/workspace/server ...`), not in the live
+`inference` one — the tests write `tools/zz_*_probe/` into the mounted volume,
+which sends `uvicorn --reload` into a reload loop. Also export
+`API_TOKEN=test-token`: `config.settings` is instantiated at first import, so
+`test_main.py`'s module-level `os.environ` assignment loses to whatever the
+container already had, and every authenticated test 401s.
+
 ### 2026-07-28 — AMASSS tool + grouped selection arguments
 
 **Motivation:** port `AMASSS_CLI.py` (CBCT skull structure segmentation,
@@ -292,20 +379,23 @@ first with a GPU deep-learning stack.
 
 **Core additions (`base.py`, `main.py`):**
 
-- `SELECTION_TYPE`, plus `ArgSpec.choices` / `choice_groups` / `multiple` /
-  `default`. A selection argument publishes both its valid values **and its
-  presentation** (`choice_groups`: `{group label: {display name: value}}`),
-  so a client renders grouped checkboxes straight from `GET /tools` with no
-  structure list of its own. `Tool._coerce_selection` accepts every shape the
-  wire can carry — `"MAND,MAX"`, a JSON list, `{"MAND": true}`, or
-  `{"Mandible": true}` using the display names the server itself published —
-  and normalizes them to one canonical list, ordered as the tool declared.
-  Invalid values are a 422 naming what is allowed. `default` is advisory
-  (exposed for pre-filling); the server does not apply it, so `run()`'s own
-  Python defaults stay the single source of truth.
+- Choice arguments: `ArgSpec.choices`, with the `"choice"` (exactly one) and
+  `"multichoice"` (any number) types. One `{option name: on by default}` dict
+  declares the options **and** their initial state, so a client renders the
+  widget straight from `GET /tools` with no structure list of its own, and the
+  defaults are written down once. Accepted on the wire as `"MAND,MAX"` or
+  `{"MAND": true}`; an invalid option is a 422 naming what is allowed.
   This is a change to the *type system*, made once, not a per-tool change —
   the same category as adding a `FILE_TYPES` entry. Adding a structure the
   day its model ships is a one-line server edit with no client release.
+
+  > **Superseded — see the 2026-07-30 entry.** This shipped as a
+  > `SELECTION_TYPE` type with `choice_groups` / `multiple` / `default` fields
+  > and a `Tool._coerce_selection` coercer accepting a JSON-list form. None of
+  > that survived: the grouped-presentation metadata was never rendered, the
+  > coercer was never written, the JSON-list form 422s, and the `default`
+  > **field** silently shadowed the `default` **property** that `validate()`
+  > relies on. The text above describes what the server actually does today.
 - `FILE_TYPES["volume_or_zip_file"]`: one argument accepting either a single
   volume or a zip of a folder of them, since the schema cannot express
   "exactly one of these two arguments". Existing `is_file_type()` on the
@@ -332,7 +422,8 @@ are fixed by construction rather than patched:
   The Python API just returns.
 - GPU work is serialized by AMASSS's own semaphore (`AMASSS_MAX_GPU_JOBS`,
   default 1), independently of `MAX_CONCURRENT_TOOLS` — four concurrent
-  3d_fullres inferences do not fit on one card.
+  3d_fullres inferences do not fit on one card. (Read straight from
+  `os.getenv` here; moved into `config.Settings` on 2026-07-30.)
 
 Also corrected in the port: NRRD/GIPL inputs are now really converted via
 SimpleITK instead of being renamed to `.nii.gz`; folder scanning is recursive

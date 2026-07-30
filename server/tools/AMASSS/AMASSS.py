@@ -66,16 +66,23 @@ class AMASSSTool(Tool):
         "prediction_ID": ArgSpec(
             type=str,
             required=False,
+            initial="Pred",
             description="Suffix used in output file names, e.g. scan_Pred_MAND.nii.gz",
         ),
         "generate_surface": ArgSpec(
             type=bool,
             required=False,
+            initial=False,
             description="Also export a 3D surface (.vtk) alongside each segmentation",
         ),
+        # `initial` is what the client's spin box starts at. Without it the box
+        # starts at 0 and, since a form always sends its widgets, run()'s own
+        # default of 5 was never reached -- every surface came out unsmoothed.
+        # Keep the two in step.
         "surface_smoothing": ArgSpec(
             type=int,
             required=False,
+            initial=5,
             description="Smoothing iterations for the surfaces (0-95), ignored without generate_surface",
         ),
     }

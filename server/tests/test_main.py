@@ -680,6 +680,30 @@ def test_tools_exposes_choices():
     assert arguments["threshold"]["choices"] is None
 
 
+def test_tools_publishes_the_initial_value_of_scalar_arguments():
+    """A scalar argument's `initial` is what a client pre-fills its widget with.
+
+    It matters because a form sends every widget it rendered: a spin box left at
+    Qt's own 0 sends 0, and the tool's Python default never applies. Publishing
+    `initial` is what keeps the widget and run()'s signature agreeing.
+    """
+    tools = {tool["name"]: tool for tool in client.get("/tools").json()}
+
+    amasss = tools.get("AMASSS")
+    if amasss is not None:  # skipped when the nnUNet stack isn't installed
+        assert amasss["arguments"]["surface_smoothing"]["initial"] == 5
+        assert amasss["arguments"]["generate_surface"]["initial"] is False
+
+    # None when the tool declares none -- example_tool's `iterations` means
+    # "unset", and must not be coerced to 0 client-side.
+    assert tools["example_tool"]["arguments"]["iterations"]["initial"] is None
+
+
+    # None when the tool declares none -- example_tool's `iterations` means
+    # "unset", and must not be coerced to 0 client-side.
+    assert tools["example_tool"]["arguments"]["iterations"]["initial"] is None
+
+
 def _run_example(**extra):
     return client.post(
         "/run/example_tool",
@@ -761,6 +785,12 @@ def test_choice_schema_is_validated_at_startup():
         "non-boolean state": spec(type="multichoice", choices={"a": "yes"}),
         "two defaults for a combo box": spec(type="choice", choices={"a": True, "b": True}),
         "no default for a combo box": spec(type="choice", choices={"a": False}),
+        # `choices` already carries the initial state; a second declaration
+        # would be the two-places-for-one-default problem `initial` removes.
+        "initial alongside choices": spec(
+            type="choice", choices={"a": True, "b": False}, initial="a"
+        ),
+        "initial on a file argument": spec(type="csv_file", initial="/tmp/x.csv"),
     }
 
     for reason, arguments in invalid.items():

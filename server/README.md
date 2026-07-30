@@ -123,39 +123,53 @@ different file needs are added. To accept a new kind of file, add an entry to
 `FILE_TYPES` in `base.py`. Only arguments left as generic `"file"` fall back
 to `config.ALLOWED_EXTENSIONS`.
 
-## Selection arguments (pick one or several from a server-defined list)
+## Choice arguments (pick one or several from a server-defined list)
 
-An argument typed `SELECTION_TYPE` (`base.py`) lets a tool publish both the
-valid values **and how they should be presented**, so a client renders the
-widget entirely from `GET /tools` with nothing hardcoded:
+Two types let a tool publish a fixed set of named options, so a client renders
+the widget entirely from `GET /tools` with nothing hardcoded:
+
+* `"choice"` — exactly one option. Rendered as a combo box; `run()` gets a `str`.
+* `"multichoice"` — any number of them. Rendered as check boxes; `run()` gets a
+  `base.Selection`.
+
+A single `choices` dict declares the options **and** their initial state, so the
+defaults are written down exactly once:
 
 ```python
 "structures": ArgSpec(
-    type=SELECTION_TYPE, required=True, multiple=True,
-    choices=("MAND", "MAX", "CB"),
-    choice_groups={"Bones": {"Mandible": "MAND", "Maxilla": "MAX",
-                             "Cranial base": "CB"}},
-    default=("MAND", "MAX"),
+    type="multichoice", required=False,
+    choices={"Mandible": True, "Maxilla": True, "Cranial base": False},
+    description="Anatomical structures to segment",
 ),
 ```
 
-`GET /tools` reports `choices`, `choice_groups`, `multiple` and `default` for
-every argument. A client builds one group box per `choice_groups` entry, with
-one checkbox per display name, and sends back whichever of these it likes —
-all are accepted and normalized to the same canonical list, in the order the
-tool declared:
+The option names are what the client displays *and* what it sends back, so a
+tool speaking internal codes translates them itself (see AMASSS's `_codes_from`)
+rather than pushing a translation table to the client. Adding an option is a
+one-line server change with no client release.
+
+`GET /tools` reports `choices` verbatim — option name to initial state. Two wire
+formats are accepted for a `multichoice`:
 
 ```bash
--F 'structures=MAND,MAX'                                   # separated list
--F 'structures=["MAND","MAX"]'                             # JSON list
--F 'structures={"MAND":true,"MAX":true,"CB":false}'        # values
--F 'structures={"Mandible":true,"Maxilla":true}'           # display names
+-F 'structures=Mandible,Maxilla'                        # the enabled ones
+-F 'structures={"Mandible":true,"Maxilla":false}'       # explicit JSON object
 ```
 
-The last form is what a grouped-checkbox UI produces naturally: the client
-echoes back the labels the server gave it and never needs a translation table.
-An invalid value is a `422` naming what is allowed. Adding a choice is a
-one-line server change with no client release.
+A `"choice"` argument takes the bare option name: `-F 'preview_format=csv'`. An
+unknown option is a `422` naming what is allowed.
+
+Whatever arrives **is** the complete selection: an option absent from the
+payload counts as unchecked, whatever its declared default. Omitting the
+argument entirely is the different request that applies the declared defaults —
+`validate()` then hands `run()` the value of `ArgSpec.default`, derived from
+`choices`. That is why `run()` should not repeat those defaults in its own
+signature.
+
+> `ArgSpec.default` is a **`@property`**, deliberately not a field. Declaring a
+> field of the same name shadows it, and every omitted optional choice argument
+> then reaches `run()` as `None`. There is a `NOTE` in `base.py` at the spot
+> where that trap was.
 
 ## How to add a new tool
 

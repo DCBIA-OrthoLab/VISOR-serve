@@ -38,6 +38,22 @@ class Settings(BaseSettings):
     # instead of piling unbounded work onto RAM/CPU/GPU.
     MAX_CONCURRENT_TOOLS: int = 4
 
+    # How many AMASSS inferences may touch the GPU at the same time. One by
+    # default: a 3d_fullres model plus its sliding-window buffers already fills
+    # a typical card. Raise it only on hardware you have actually measured.
+    #
+    # Two things bound what a higher value buys. AMASSS predicts its structures
+    # sequentially, so a single request never exceeds one GPU job -- this only
+    # arbitrates between CONCURRENT requests, and there are never more than
+    # MAX_CONCURRENT_TOOLS of those. And nnUNet's worker processes pass whole
+    # volumes through shared memory, so raising this without raising
+    # docker-compose's `shm_size` fails as a SIGBUS in a worker, not as a clean
+    # out-of-memory error.
+    #
+    # Read once, when AMASSS's nnunet_runner module is imported (the semaphore
+    # it sizes is a module global), so a change needs a server restart.
+    AMASSS_MAX_GPU_JOBS: int = 1
+
     # Fallback whitelist, only used for arguments with a generic "file" type
     # (see base.FILE_TYPES). Arguments with a specific type (e.g. "zip_file")
     # are validated against that type's own extensions instead, regardless

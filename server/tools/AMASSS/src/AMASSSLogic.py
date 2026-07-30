@@ -54,10 +54,14 @@ if not logger.handlers:
 # ---------------------------------------------------------------------------
 # Structure catalog -- the single source of truth, published to clients
 # ---------------------------------------------------------------------------
-# The server owns both the grouping and the human-readable names, so the
-# Slicer module (and any other client) renders its checkbox groups straight
-# from GET /tools instead of keeping its own copy in sync. This is exported
-# through ArgSpec.choice_groups in AMASSS.py.
+# The server owns the human-readable names, so the Slicer module (and any other
+# client) renders its check boxes straight from GET /tools instead of keeping its
+# own copy in sync. STRUCTURE_CHOICES below is what AMASSS.py publishes as the
+# `choices` of its "structures" argument.
+#
+# The grouping (Bones / Soft tissue / Masks) is owned here too, but survives only
+# as ORDERING -- see the note above STRUCTURE_NAMES for why the client renders
+# one flat list.
 #
 # FIX: "Teeth" (TEETH), "Root canal" (RC) and "Mandibular canal" (MCAN) are
 # deliberately ABSENT. They were offered by the Slicer UI while sitting in
