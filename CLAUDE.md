@@ -126,6 +126,11 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 ├── ADDING_A_TOOL.md         # the full contract for writing a tool
 ├── docker-compose.yml       # inference service + test service (profile "test")
 ├── .githooks/pre-push       # runs `docker compose run --rm test` before a push
+├── scripts/                 # populate DATA/ from the public GitHub releases
+│   ├── setup-models.sh      #   curl-pipeable entry points
+│   ├── setup-testfiles.sh
+│   ├── fetch_data.py        #   the engine (stdlib only)
+│   └── data-manifest.yml    #   what to download, and where it goes
 ├── server/
 │   ├── main.py              # FastAPI app: generic /run/{tool_name} endpoint
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError

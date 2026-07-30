@@ -1,0 +1,932 @@
+# Server-side data: what to download, and where it goes.
+#
+# Read by scripts/fetch_data.py (and therefore by setup-models.sh /
+# setup-testfiles.sh). Every entry lands under the layout server/data_store.py
+# reads, so a file fetched here shows up in GET /tools/<tool>/data with no
+# further step:
+#
+#     DATA/<tool>/models/<name>
+#     DATA/<tool>/testfiles/<name>
+#
+# ---------------------------------------------------------------------------
+# Entry format
+# ---------------------------------------------------------------------------
+#   name      REQUIRED  the file name to download (a bare name, no path)
+#   url       REQUIRED  direct download URL
+#   sha256    optional  verified after download; the file is discarded on a
+#                       mismatch. Absent means "not pinned yet" -- fetch_data.py
+#                       prints the hash it got, which is what you paste here.
+#   size      optional  bytes, for the size report before a run. Informational.
+#   extract   optional  true -> unpack the zip and keep the FOLDER, dropping
+#                       the archive. A single top-level folder inside the
+#                       archive is stripped, so DATA/<tool>/models/<bundle>/
+#                       always holds the real content directly.
+#   dest      optional  path under DATA/<tool>/<kind>/ overriding `name`.
+#                       Two uses: giving several files that share a name their
+#                       own folder (every nnUNet bundle ships a file literally
+#                       called checkpoint_final.pth), and grouping many
+#                       archives into ONE bundle folder -- which matters
+#                       because `server_selectable="model"` shows one dropdown
+#                       entry per top-level name, and the tool receives one.
+#
+# ---------------------------------------------------------------------------
+# Sizes -- read this before running the whole thing
+# ---------------------------------------------------------------------------
+# Everything together is about 23 GB, and ALI's 112 per-landmark models are
+# 12 GB of it. Fetch one tool at a time unless you really want all of it:
+#
+#     ./scripts/setup-models.sh --tool AMASSS
+#     python3 scripts/fetch_data.py --list        # sizes per tool, downloads nothing
+#
+# Anything already on disk is skipped, so re-running only fetches what is
+# missing and an interrupted run resumes by simply being restarted.
+#
+# ---------------------------------------------------------------------------
+# Status of each tool
+# ---------------------------------------------------------------------------
+# AMASSS and SurgMovPred are the tools that exist on the server today; their
+# entries are known-good against the current code. Everything below them is
+# staged for a port that has not happened yet (see ALI_PORT_CONTEXT.md), so
+# treat those paths as a proposal: the URLs are verified live, but which files
+# the future tool will actually want is not settled.
+
+tools:
+
+  # =========================================================================
+  # AMASSS -- CBCT skull structure segmentation. LIVE on the server.
+  # =========================================================================
+  AMASSS:
+    models:
+      # Verified to contain exactly the 9 codes AMASSSLogic.STRUCTURE_CODES
+      # declares -- CB, CBMASK, CV, MAND, MANDMASK, MAX, MAXMASK, SKIN, UAW --
+      # one folder each, which is the <bundle>/<CODE>/ layout resolve_models
+      # expects. lucanchling/AMASSS_CBCT's separate Masks_Models.zip is
+      # therefore redundant and deliberately not listed.
+      - name: AMASSS_Models.zip
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AMASSS_CBCT/AMASSS_Models.zip
+        size: 2078744372
+        extract: true
+    testfiles:
+      - name: MG_test_scan.nii.gz
+        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        size: 98611496
+
+  # =========================================================================
+  # SurgMovPred -- surgical movement prediction. LIVE on the server.
+  # =========================================================================
+  SurgMovPred:
+    models:
+      # Unpacks to one <target>_Pred/ folder per predicted measurement, each
+      # holding a stacking_package.pkl -- which is what LoadData.extract_model
+      # globs for recursively.
+      - name: all_models.zip
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/SurgMovPred/all_models.zip
+        size: 740183656
+        extract: true
+    testfiles:
+      - name: TestFiles.zip
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/SurgMovPred/TestFiles.zip
+        sha256: 9d7e8dc9b419de34f4977e84faca2793c7723379cfcb914be604198fe56c0f11
+        size: 3405824
+        extract: true
+
+  # =========================================================================
+  # ALI -- landmark identification. NOT PORTED YET (see ALI_PORT_CONTEXT.md).
+  #
+  # The CBCT half is 112 archives, one per landmark, 12 GB in total. Each
+  # unpacks to <scale>/<LM>_Net_<scale>.pth for the two spacings the agent
+  # uses (1 mm, then 0.3 mm), and `dest` files them all under a single
+  # ALI_CBCT_Models/ bundle: the client picks ONE model name from the dropdown,
+  # so 112 top-level entries would be unusable. The result is the
+  # <landmark>/<scale>/*.pth tree ALI_PORT_CONTEXT.md §6 asks about.
+  #
+  #     python3 scripts/fetch_data.py --kind models --tool ALI
+  # =========================================================================
+  ALI:
+    models:
+      # --- IOS: 4 weight files, Upper/Lower x O(cclusal)/C(ervical) ---------
+      # Identical content to HUTIN1/ASO's identification_landmark_ios_model.zip
+      # (same four files, same size); listed once, from ALI's own release.
+      - name: Models.zip
+        dest: ALI_IOS_Models
+        url: https://github.com/baptistebaquero/ALIDDM/releases/download/v1.0.3/Models.zip
+        size: 189452566
+        extract: true
+      # --- CBCT: one archive per landmark ----------------------------------
+      - name: A.zip
+        dest: ALI_CBCT_Models/A
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/A.zip
+        size: 108124641
+        extract: true
+      - name: ANS.zip
+        dest: ALI_CBCT_Models/ANS
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/ANS.zip
+        size: 108232911
+        extract: true
+      - name: B.zip
+        dest: ALI_CBCT_Models/B
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/B.zip
+        size: 108135475
+        extract: true
+      - name: Ba.zip
+        dest: ALI_CBCT_Models/Ba
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/Ba.zip
+        size: 108211992
+        extract: true
+      - name: Gn.zip
+        dest: ALI_CBCT_Models/Gn
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/Gn.zip
+        size: 108111372
+        extract: true
+      - name: IF.zip
+        dest: ALI_CBCT_Models/IF
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/IF.zip
+        size: 108238019
+        extract: true
+      - name: LAE.zip
+        dest: ALI_CBCT_Models/LAE
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LAE.zip
+        size: 108120087
+        extract: true
+      - name: LAF.zip
+        dest: ALI_CBCT_Models/LAF
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LAF.zip
+        size: 108115419
+        extract: true
+      - name: LARa.zip
+        dest: ALI_CBCT_Models/LARa
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LARa.zip
+        size: 108119438
+        extract: true
+      - name: LCo.zip
+        dest: ALI_CBCT_Models/LCo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LCo.zip
+        size: 108131178
+        extract: true
+      - name: LGo.zip
+        dest: ALI_CBCT_Models/LGo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LGo.zip
+        size: 108128509
+        extract: true
+      - name: LInfOr.zip
+        dest: ALI_CBCT_Models/LInfOr
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LInfOr.zip
+        size: 108119810
+        extract: true
+      - name: LL1O.zip
+        dest: ALI_CBCT_Models/LL1O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL1O.zip
+        size: 108131059
+        extract: true
+      - name: LL1R.zip
+        dest: ALI_CBCT_Models/LL1R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL1R.zip
+        size: 108134521
+        extract: true
+      - name: LL2O.zip
+        dest: ALI_CBCT_Models/LL2O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL2O.zip
+        size: 108110626
+        extract: true
+      - name: LL2R.zip
+        dest: ALI_CBCT_Models/LL2R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL2R.zip
+        size: 108112166
+        extract: true
+      - name: LL3O.zip
+        dest: ALI_CBCT_Models/LL3O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL3O.zip
+        size: 108133821
+        extract: true
+      - name: LL3R.zip
+        dest: ALI_CBCT_Models/LL3R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL3R.zip
+        size: 108136870
+        extract: true
+      - name: LL4O.zip
+        dest: ALI_CBCT_Models/LL4O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL4O.zip
+        size: 108117406
+        extract: true
+      - name: LL4R.zip
+        dest: ALI_CBCT_Models/LL4R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL4R.zip
+        size: 108117566
+        extract: true
+      - name: LL5O.zip
+        dest: ALI_CBCT_Models/LL5O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL5O.zip
+        size: 108120803
+        extract: true
+      - name: LL5R.zip
+        dest: ALI_CBCT_Models/LL5R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL5R.zip
+        size: 108115090
+        extract: true
+      - name: LL6DB.zip
+        dest: ALI_CBCT_Models/LL6DB
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL6DB.zip
+        size: 108118339
+        extract: true
+      - name: LL6MB.zip
+        dest: ALI_CBCT_Models/LL6MB
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL6MB.zip
+        size: 108109006
+        extract: true
+      - name: LL6O.zip
+        dest: ALI_CBCT_Models/LL6O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL6O.zip
+        size: 108136290
+        extract: true
+      - name: LL6R.zip
+        dest: ALI_CBCT_Models/LL6R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LL6R.zip
+        size: 108139790
+        extract: true
+      - name: LLCo.zip
+        dest: ALI_CBCT_Models/LLCo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LLCo.zip
+        size: 108119811
+        extract: true
+      - name: LMCo.zip
+        dest: ALI_CBCT_Models/LMCo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LMCo.zip
+        size: 108120537
+        extract: true
+      - name: LMZyg.zip
+        dest: ALI_CBCT_Models/LMZyg
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LMZyg.zip
+        size: 108107060
+        extract: true
+      - name: LMeF.zip
+        dest: ALI_CBCT_Models/LMeF
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LMeF.zip
+        size: 108117989
+        extract: true
+      - name: LNC.zip
+        dest: ALI_CBCT_Models/LNC
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LNC.zip
+        size: 108151165
+        extract: true
+      - name: LOr.zip
+        dest: ALI_CBCT_Models/LOr
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LOr.zip
+        size: 108211595
+        extract: true
+      - name: LPF.zip
+        dest: ALI_CBCT_Models/LPF
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LPF.zip
+        size: 108114211
+        extract: true
+      - name: LPRa.zip
+        dest: ALI_CBCT_Models/LPRa
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LPRa.zip
+        size: 108134646
+        extract: true
+      - name: LPo.zip
+        dest: ALI_CBCT_Models/LPo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LPo.zip
+        size: 108189434
+        extract: true
+      - name: LR1O.zip
+        dest: ALI_CBCT_Models/LR1O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR1O.zip
+        size: 108138441
+        extract: true
+      - name: LR1R.zip
+        dest: ALI_CBCT_Models/LR1R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR1R.zip
+        size: 108133849
+        extract: true
+      - name: LR2O.zip
+        dest: ALI_CBCT_Models/LR2O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR2O.zip
+        size: 108118403
+        extract: true
+      - name: LR2R.zip
+        dest: ALI_CBCT_Models/LR2R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR2R.zip
+        size: 108118158
+        extract: true
+      - name: LR3O.zip
+        dest: ALI_CBCT_Models/LR3O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR3O.zip
+        size: 108132066
+        extract: true
+      - name: LR3R.zip
+        dest: ALI_CBCT_Models/LR3R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR3R.zip
+        size: 108131098
+        extract: true
+      - name: LR4O.zip
+        dest: ALI_CBCT_Models/LR4O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR4O.zip
+        size: 108118921
+        extract: true
+      - name: LR4R.zip
+        dest: ALI_CBCT_Models/LR4R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR4R.zip
+        size: 108115466
+        extract: true
+      - name: LR5O.zip
+        dest: ALI_CBCT_Models/LR5O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR5O.zip
+        size: 108120041
+        extract: true
+      - name: LR5R.zip
+        dest: ALI_CBCT_Models/LR5R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR5R.zip
+        size: 108116284
+        extract: true
+      - name: LR6DB.zip
+        dest: ALI_CBCT_Models/LR6DB
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR6DB.zip
+        size: 108117410
+        extract: true
+      - name: LR6MB.zip
+        dest: ALI_CBCT_Models/LR6MB
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR6MB.zip
+        size: 108121568
+        extract: true
+      - name: LR6O.zip
+        dest: ALI_CBCT_Models/LR6O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR6O.zip
+        size: 108133207
+        extract: true
+      - name: LR6R.zip
+        dest: ALI_CBCT_Models/LR6R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR6R.zip
+        size: 108134459
+        extract: true
+      - name: LR7O.zip
+        dest: ALI_CBCT_Models/LR7O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR7O.zip
+        size: 108117964
+        extract: true
+      - name: LR7R.zip
+        dest: ALI_CBCT_Models/LR7R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LR7R.zip
+        size: 108112257
+        extract: true
+      - name: LSig.zip
+        dest: ALI_CBCT_Models/LSig
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LSig.zip
+        size: 108118048
+        extract: true
+      - name: Me.zip
+        dest: ALI_CBCT_Models/Me
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/Me.zip
+        size: 108132553
+        extract: true
+      - name: N.zip
+        dest: ALI_CBCT_Models/N
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/N.zip
+        size: 108237024
+        extract: true
+      - name: PNS.zip
+        dest: ALI_CBCT_Models/PNS
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/PNS.zip
+        size: 108238885
+        extract: true
+      - name: Pog.zip
+        dest: ALI_CBCT_Models/Pog
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/Pog.zip
+        size: 108128677
+        extract: true
+      - name: PogL.zip
+        dest: ALI_CBCT_Models/PogL
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/PogL.zip
+        size: 108116613
+        extract: true
+      - name: RAE.zip
+        dest: ALI_CBCT_Models/RAE
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RAE.zip
+        size: 108115584
+        extract: true
+      - name: RAF.zip
+        dest: ALI_CBCT_Models/RAF
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RAF.zip
+        size: 108119100
+        extract: true
+      - name: RARa.zip
+        dest: ALI_CBCT_Models/RARa
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RARa.zip
+        size: 108132080
+        extract: true
+      - name: RCo.zip
+        dest: ALI_CBCT_Models/RCo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RCo.zip
+        size: 108125168
+        extract: true
+      - name: RGo.zip
+        dest: ALI_CBCT_Models/RGo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RGo.zip
+        size: 108129030
+        extract: true
+      - name: RInfOr.zip
+        dest: ALI_CBCT_Models/RInfOr
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RInfOr.zip
+        size: 108127029
+        extract: true
+      - name: RLCo.zip
+        dest: ALI_CBCT_Models/RLCo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RLCo.zip
+        size: 108121141
+        extract: true
+      - name: RMCo.zip
+        dest: ALI_CBCT_Models/RMCo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RMCo.zip
+        size: 108122056
+        extract: true
+      - name: RMZyg.zip
+        dest: ALI_CBCT_Models/RMZyg
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RMZyg.zip
+        size: 108118680
+        extract: true
+      - name: RMeF.zip
+        dest: ALI_CBCT_Models/RMeF
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RMeF.zip
+        size: 108122026
+        extract: true
+      - name: RNC.zip
+        dest: ALI_CBCT_Models/RNC
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RNC.zip
+        size: 108126325
+        extract: true
+      - name: ROr.zip
+        dest: ALI_CBCT_Models/ROr
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/ROr.zip
+        size: 108230408
+        extract: true
+      - name: RPF.zip
+        dest: ALI_CBCT_Models/RPF
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RPF.zip
+        size: 108126422
+        extract: true
+      - name: RPRa.zip
+        dest: ALI_CBCT_Models/RPRa
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RPRa.zip
+        size: 108131383
+        extract: true
+      - name: RPo.zip
+        dest: ALI_CBCT_Models/RPo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RPo.zip
+        size: 108190441
+        extract: true
+      - name: RSig.zip
+        dest: ALI_CBCT_Models/RSig
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RSig.zip
+        size: 108115286
+        extract: true
+      - name: S.zip
+        dest: ALI_CBCT_Models/S
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/S.zip
+        size: 108238247
+        extract: true
+      - name: UL1O.zip
+        dest: ALI_CBCT_Models/UL1O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL1O.zip
+        size: 108121947
+        extract: true
+      - name: UL1R.zip
+        dest: ALI_CBCT_Models/UL1R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL1R.zip
+        size: 108123043
+        extract: true
+      - name: UL2O.zip
+        dest: ALI_CBCT_Models/UL2O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL2O.zip
+        size: 108118509
+        extract: true
+      - name: UL2R.zip
+        dest: ALI_CBCT_Models/UL2R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL2R.zip
+        size: 108123076
+        extract: true
+      - name: UL3O.zip
+        dest: ALI_CBCT_Models/UL3O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL3O.zip
+        size: 108116765
+        extract: true
+      - name: UL3OI.zip
+        dest: ALI_CBCT_Models/UL3OI
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL3OI.zip
+        size: 108225947
+        extract: true
+      - name: UL3R.zip
+        dest: ALI_CBCT_Models/UL3R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL3R.zip
+        size: 108112126
+        extract: true
+      - name: UL3RI.zip
+        dest: ALI_CBCT_Models/UL3RI
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL3RI.zip
+        size: 108219365
+        extract: true
+      - name: UL4O.zip
+        dest: ALI_CBCT_Models/UL4O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL4O.zip
+        size: 108126892
+        extract: true
+      - name: UL4R.zip
+        dest: ALI_CBCT_Models/UL4R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL4R.zip
+        size: 108120712
+        extract: true
+      - name: UL5O.zip
+        dest: ALI_CBCT_Models/UL5O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL5O.zip
+        size: 108115129
+        extract: true
+      - name: UL5R.zip
+        dest: ALI_CBCT_Models/UL5R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL5R.zip
+        size: 108118060
+        extract: true
+      - name: UL6DB.zip
+        dest: ALI_CBCT_Models/UL6DB
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL6DB.zip
+        size: 108127683
+        extract: true
+      - name: UL6MB.zip
+        dest: ALI_CBCT_Models/UL6MB
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL6MB.zip
+        size: 108116735
+        extract: true
+      - name: UL6MP.zip
+        dest: ALI_CBCT_Models/UL6MP
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL6MP.zip
+        size: 108125557
+        extract: true
+      - name: UL6O.zip
+        dest: ALI_CBCT_Models/UL6O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL6O.zip
+        size: 108232581
+        extract: true
+      - name: UL6R.zip
+        dest: ALI_CBCT_Models/UL6R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL6R.zip
+        size: 108121683
+        extract: true
+      - name: UL7O.zip
+        dest: ALI_CBCT_Models/UL7O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL7O.zip
+        size: 108118618
+        extract: true
+      - name: UL7R.zip
+        dest: ALI_CBCT_Models/UL7R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UL7R.zip
+        size: 108123673
+        extract: true
+      - name: UR1O.zip
+        dest: ALI_CBCT_Models/UR1O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR1O.zip
+        size: 108237961
+        extract: true
+      - name: UR1R.zip
+        dest: ALI_CBCT_Models/UR1R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR1R.zip
+        size: 108118396
+        extract: true
+      - name: UR2O.zip
+        dest: ALI_CBCT_Models/UR2O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR2O.zip
+        size: 108122584
+        extract: true
+      - name: UR2R.zip
+        dest: ALI_CBCT_Models/UR2R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR2R.zip
+        size: 108123361
+        extract: true
+      - name: UR3O.zip
+        dest: ALI_CBCT_Models/UR3O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR3O.zip
+        size: 108120585
+        extract: true
+      - name: UR3OI.zip
+        dest: ALI_CBCT_Models/UR3OI
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR3OI.zip
+        size: 108231190
+        extract: true
+      - name: UR3R.zip
+        dest: ALI_CBCT_Models/UR3R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR3R.zip
+        size: 108117725
+        extract: true
+      - name: UR3RI.zip
+        dest: ALI_CBCT_Models/UR3RI
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR3RI.zip
+        size: 108206881
+        extract: true
+      - name: UR4O.zip
+        dest: ALI_CBCT_Models/UR4O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR4O.zip
+        size: 108125556
+        extract: true
+      - name: UR4R.zip
+        dest: ALI_CBCT_Models/UR4R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR4R.zip
+        size: 108122195
+        extract: true
+      - name: UR5O.zip
+        dest: ALI_CBCT_Models/UR5O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR5O.zip
+        size: 108123678
+        extract: true
+      - name: UR5R.zip
+        dest: ALI_CBCT_Models/UR5R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR5R.zip
+        size: 108123726
+        extract: true
+      - name: UR6DB.zip
+        dest: ALI_CBCT_Models/UR6DB
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR6DB.zip
+        size: 108122747
+        extract: true
+      - name: UR6MB.zip
+        dest: ALI_CBCT_Models/UR6MB
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR6MB.zip
+        size: 108124114
+        extract: true
+      - name: UR6MP.zip
+        dest: ALI_CBCT_Models/UR6MP
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR6MP.zip
+        size: 108131105
+        extract: true
+      - name: UR6O.zip
+        dest: ALI_CBCT_Models/UR6O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR6O.zip
+        size: 108238039
+        extract: true
+      - name: UR6R.zip
+        dest: ALI_CBCT_Models/UR6R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR6R.zip
+        size: 108121340
+        extract: true
+      - name: UR7O.zip
+        dest: ALI_CBCT_Models/UR7O
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR7O.zip
+        size: 108121926
+        extract: true
+      - name: UR7R.zip
+        dest: ALI_CBCT_Models/UR7R
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/UR7R.zip
+        size: 108127855
+        extract: true
+    testfiles:
+      - name: T1_01_U_segmented.vtk
+        url: https://github.com/baptistebaquero/ALIDDM/releases/download/v1.0.4/T1_01_U_segmented.vtk
+
+  # =========================================================================
+  # AREG -- automated registration. NOT PORTED YET.
+  # =========================================================================
+  AREG:
+    models:
+      - name: AREG_model.zip
+        url: https://github.com/HUTIN1/AREG/releases/download/v1.0.0/AREG_model.zip
+        size: 18014117
+        extract: true
+    testfiles:
+      - name: AREG_test_scans.zip
+        url: https://github.com/HUTIN1/AREG/releases/download/v1.0.0/AREG_test_scans.zip
+        size: 3700969
+        extract: true
+      - name: FullyAuto.zip
+        dest: CBCT_FullyAuto
+        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/FullyAuto.zip
+        size: 352211664
+        extract: true
+      - name: SemiAuto.zip
+        dest: CBCT_SemiAuto
+        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/SemiAuto.zip
+        size: 353120642
+        extract: true
+      - name: Or_FullyAuto.zip
+        dest: CBCT_Or_FullyAuto
+        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/Or_FullyAuto.zip
+        size: 278088796
+        extract: true
+      - name: RegTestFiles.zip
+        dest: IOSCBCT_RegTestFiles
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AREG_IOSCBCT/RegTestFiles.zip
+        size: 222374572
+        extract: true
+
+  # =========================================================================
+  # ASO -- automated slicer orientation. NOT PORTED YET.
+  # =========================================================================
+  ASO:
+    models:
+      - name: segmentation_model.zip
+        dest: IOS_segmentation_model
+        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.0/segmentation_model.zip
+        size: 6118943
+        extract: true
+      - name: Gold_file.zip
+        dest: IOS_Gold_file
+        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.0/Gold_file.zip
+        size: 5169472
+        extract: true
+      - name: PreASOModels.zip
+        dest: CBCT_PreASOModels
+        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_preASOmodels/PreASOModels.zip
+        size: 409801686
+        extract: true
+      - name: Occlusal_Midsagittal_Plane.zip
+        dest: CBCT_Gold_Occlusal_Midsagittal_Plane
+        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Occlusal_Midsagittal_Plane.zip
+        size: 55722763
+        extract: true
+      - name: Frankfurt_Horizontal_Midsagittal_Plane.zip
+        dest: CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane
+        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Frankfurt_Horizontal_Midsagittal_Plane.zip
+        size: 174378374
+        extract: true
+    testfiles:
+      - name: Test_file_Full-IOS.zip
+        dest: IOS_FullyAuto
+        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.1/Test_file_Full-IOS.zip
+        size: 2583991
+        extract: true
+      - name: Test_file_Semi-IOS.zip
+        dest: IOS_SemiAuto
+        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.2/Test_file_Semi-IOS.zip
+        size: 5994773
+        extract: true
+      - name: FullyAuto.zip
+        dest: CBCT_FullyAuto
+        url: https://github.com/lucanchling/ASO_CBCT/releases/download/TestFiles/FullyAuto.zip
+        size: 98233200
+        extract: true
+      - name: SemiAuto.zip
+        dest: CBCT_SemiAuto
+        url: https://github.com/lucanchling/ASO_CBCT/releases/download/TestFiles/SemiAuto.zip
+        size: 245337499
+        extract: true
+
+  # =========================================================================
+  # FlexReg -- surface registration. NOT PORTED YET.
+  # =========================================================================
+  FlexReg:
+    testfiles:
+      - name: TestFiles.zip
+        url: https://github.com/GaelleLeroux/SlicerAutomatedDentalTools/releases/download/testfileFlexReg/TestFiles.zip
+        sha256: 494b58bc73ec2e1162ac9e483fe11afb8160905a6f679ffce6f3b7117e3d69a8
+        size: 8892200
+        extract: true
+
+  # =========================================================================
+  # BATCHDENTALSEG -- nnUNet dental segmentation. NOT PORTED YET.
+  #
+  # Every bundle ships three files under the same three names
+  # (checkpoint_final.pth / dataset.json / plans.json), so each gets its own
+  # folder through `dest` -- without it they would overwrite each other.
+  # =========================================================================
+  BATCHDENTALSEG:
+    models:
+      - name: checkpoint_final.pth
+        dest: UniversalLab/checkpoint_final.pth
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/UNIVERSALLAB_MODEL/checkpoint_final.pth
+        size: 819880677
+      - name: dataset.json
+        dest: UniversalLab/dataset.json
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/UNIVERSALLAB_MODEL/dataset.json
+        size: 2423
+      - name: plans.json
+        dest: UniversalLab/plans.json
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/UNIVERSALLAB_MODEL/plans.json
+        size: 16102
+      - name: checkpoint_final.pth
+        dest: PediatricDentalSeg/checkpoint_final.pth
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/PEDIATRICDENTALSEG_MODEL/checkpoint_final.pth
+        size: 250280254
+      - name: dataset.json
+        dest: PediatricDentalSeg/dataset.json
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/PEDIATRICDENTALSEG_MODEL/dataset.json
+        sha256: fa1b5d5646454362d3a9245374028d7ded97746b2912a9bec1cbb53e90ce3b80
+        size: 283
+      - name: plans.json
+        dest: PediatricDentalSeg/plans.json
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/PEDIATRICDENTALSEG_MODEL/plans.json
+        sha256: 65c553cfc8da8108dfb73a9e289fe0de209822650ef8fde8c6c9e04766254238
+        size: 16053
+      - name: checkpoint_final.pth
+        dest: NasoMaxillaDentSeg/checkpoint_final.pth
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/NASOMAXILLADENTSEG_MODEL/checkpoint_final.pth
+        size: 1132459189
+      - name: dataset.json
+        dest: NasoMaxillaDentSeg/dataset.json
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/NASOMAXILLADENTSEG_MODEL/dataset.json
+        size: 305
+      - name: plans.json
+        dest: NasoMaxillaDentSeg/plans.json
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/NASOMAXILLADENTSEG_MODEL/plans.json
+        size: 11245
+      - name: checkpoint_final.pth
+        dest: TMJCrop/checkpoint_final.pth
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/TMJ_CROP_MODEL/checkpoint_final.pth
+        size: 1132326645
+      - name: dataset.json
+        dest: TMJCrop/dataset.json
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/TMJ_CROP_MODEL/dataset.json
+        size: 199
+      - name: plans.json
+        dest: TMJCrop/plans.json
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/TMJ_CROP_MODEL/plans.json
+        size: 17167
+      - name: Dataset111_453CT_v100.zip
+        dest: DentalSegmentator
+        url: https://github.com/gaudot/SlicerDentalSegmentator/releases/download/v1.0.0-alpha/Dataset111_453CT_v100.zip
+        size: 229698747
+        extract: true
+
+  # =========================================================================
+  # DOCShapeAXI -- shape classification. NOT PORTED YET.
+  # =========================================================================
+  DOCShapeAXI:
+    models:
+      - name: condyles_4_class.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/condyles_4_class.ckpt
+        size: 71890130
+      - name: airways_2_class.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/airways_2_class.ckpt
+        size: 71885763
+      - name: airways_4_class.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/airways_4_class.ckpt
+        size: 71898579
+      - name: airways_4_regress.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/airways_4_regress.ckpt
+        size: 71869063
+      - name: cleft_4_class.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/cleft_4_class.ckpt
+        size: 71891882
+
+  # =========================================================================
+  # CLIC -- NOT PORTED YET.
+  # =========================================================================
+  CLIC:
+    models:
+      - name: final_model.pth
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/CLIC_model/final_model.pth
+        size: 176269352
+
+  # =========================================================================
+  # MedX -- report analysis. NOT PORTED YET.
+  # =========================================================================
+  MedX:
+    models:
+      - name: BART.zip
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/MedX/BART.zip
+        size: 1508192833
+        extract: true
+
+  # =========================================================================
+  # VFACE -- NOT PORTED YET.
+  # =========================================================================
+  VFACE:
+    models:
+      - name: V_FACE_Models.zip
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/VFACE/V_FACE_Models.zip
+        sha256: da860a6267ade5d83f28de05c2e98870178a222035f8ecb1ef87713d3c8b8f83
+        size: 201281
+        extract: true
+      - name: DefaultList.zip
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/VFACE/DefaultList.zip
+        sha256: dfa63f809edb83e8672c189204cd53872e4b93816073a17da4e8b611e6a878a4
+        size: 21515
+        extract: true
+
+  # =========================================================================
+  # CNE -- Fly-by-CNN. NOT PORTED YET.
+  # =========================================================================
+  CNE:
+    models:
+      - name: 07-21-22_val-loss0.169.pth
+        url: https://github.com/DCBIA-OrthoLab/Fly-by-CNN/releases/download/3.0/07-21-22_val-loss0.169.pth
+        size: 6612456
+
+  # =========================================================================
+  # AutoMatrix -- matrix application. NOT PORTED YET (test data only).
+  # =========================================================================
+  AutoMatrix:
+    testfiles:
+      - name: AutoMatrixRelease1.zip
+        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixTag/AutoMatrixRelease1.zip
+        size: 247961348
+        extract: true
+      - name: AutoMatrixRelease2.zip
+        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixTag/AutoMatrixRelease2.zip
+        size: 247962104
+        extract: true
+      - name: AutoMatrixRelease3.zip
+        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixTag/AutoMatrixRelease3.zip
+        size: 254256972
+        extract: true
+      - name: AutoMatrixRelease4.zip
+        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixTag/AutoMatrixRelease4.zip
+        size: 787127578
+        extract: true
+      - name: Mirror.zip
+        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixMirror/Mirror.zip
+        size: 468
+        extract: true
