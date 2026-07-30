@@ -29,7 +29,7 @@ the repo root with the scripts in [`scripts/`](../scripts/README.md), which
 write the exact layout `data_store.py` reads:
 
 ```bash
-./scripts/setup-models.sh --tool AMASSS      # or omit --tool for everything (~23 GB)
+./scripts/setup-models.sh --tool AMASSS      # or omit --tool for everything (~29 GB)
 ./scripts/setup-testfiles.sh
 python3 scripts/fetch_data.py --list         # what's available, and how big
 ```
