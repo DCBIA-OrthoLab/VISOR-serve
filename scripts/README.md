@@ -31,7 +31,7 @@ detect `./scripts/` and use the local manifest, so a local edit takes effect):
 ./scripts/setup-testfiles.sh
 ```
 
-**Everything is about 23 GB**, 12 GB of which is ALI's 112 per-landmark
+**Everything is about 29 GB** across 14 tools, 12 GB of which is ALI's CBCT
 models. Ask for one tool at a time instead:
 
 ```bash
