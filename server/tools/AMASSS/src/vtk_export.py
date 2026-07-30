@@ -34,7 +34,7 @@ logger = logging.getLogger("AMASSS.vtk")
 
 _INSTALL_HINT = (
     "Surface generation needs VTK. Install it with "
-    "`pip install -r requirements-amasss.txt`, or run AMASSS with "
+    "`pip install -r requirements.txt`, or run AMASSS with "
     "generate_surface=false."
 )
 

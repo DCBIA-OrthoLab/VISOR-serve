@@ -50,7 +50,7 @@ _GPU_SEMAPHORE = threading.BoundedSemaphore(_MAX_GPU_JOBS)
 
 _INSTALL_HINT = (
     "AMASSS needs the nnUNet v2 inference stack. Install it with "
-    "`pip install -r requirements-amasss.txt` (see server/README.md)."
+    "`pip install -r requirements.txt` (see server/README.md)."
 )
 
 

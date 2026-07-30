@@ -10,10 +10,14 @@ joblib
 openpyxl
 odfpy
 # Medical image I/O and resampling (AMASSS, and any future imaging tool).
-# Imported at module load, unlike the heavy inference stack in
-# requirements-amasss.txt which is imported lazily.
 numpy
 SimpleITK
+# Heavy inference stack (AMASSS). Imported LAZILY inside the functions that
+# use it (see tools/AMASSS/src/nnunet_runner.py), so the server still boots
+# when it is missing -- only AMASSS fails, with an actionable message.
+# The deployment image already ships torch built against its CUDA version;
+# pip sees it satisfied and skips it. Never pin or force-reinstall torch here:
+# that would shadow the CUDA build with a CPU-only wheel.
 vtk
 torch
 nnunetv2
