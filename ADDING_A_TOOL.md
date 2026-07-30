@@ -399,6 +399,12 @@ Two constraints worth internalizing:
 - `DATA/` is gitignored — it holds confidential data and must never be
   committed. A clone without it still runs, with the relevant tests skipped.
 
+Public model bundles and reference test files are fetched by the scripts in
+[`scripts/`](scripts/README.md), driven by `scripts/data-manifest.yml`. If your
+tool has published weights, add an entry there rather than documenting a manual
+download — `./scripts/setup-models.sh --tool <your_tool>` then populates
+`DATA/<your_tool>/models/` for everyone.
+
 Path traversal is already handled by `data_store.py` (bare-name check plus a
 `realpath` containment check against symlinks); you don't need to re-validate.
 
