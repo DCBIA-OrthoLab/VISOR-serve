@@ -54,6 +54,40 @@ class Settings(BaseSettings):
     # it sizes is a module global), so a change needs a server restart.
     AMASSS_MAX_GPU_JOBS: int = 1
 
+    # Where AMASSS resamples volumes. nnUNet's stock resamplers are scipy spline
+    # interpolations that run single-threaded on the CPU, and on a CBCT they
+    # cost far more than the network they feed. Measured on a 512x512x365 scan
+    # at 0.33mm, for ONE structure: 14.6s to resample the input to the model's
+    # 0.4mm grid, 4.5s of actual GPU inference, 6.9s to resample the logits back
+    # -- the card sits idle for about seven eighths of the run.
+    #
+    # nnUNet ships torch equivalents of both (resample_torch_fornnunet). Running
+    # them on the GPU takes those two steps to 0.14s and 0.40s; the full default
+    # five-structure run on that scan goes from 195.9s to 77.0s.
+    #
+    # This is NOT free numerically. torch has no 3D cubic interpolation, so the
+    # input resampling drops from spline order 3 to order 1, and the masks move
+    # slightly. Measured against the scipy pipeline on that scan: MAND 0.998,
+    # UAW 0.997, MAX 0.995, CB 0.991, CV 0.978 Dice. The cervical vertebra is
+    # consistently the outlier -- it is the thinnest structure and the one
+    # closest to the edge of the field of view, so a boundary shift costs it
+    # proportionally more. Judge that against your own use before trusting it.
+    #
+    # Set to false to get bit-identical nnUNet behaviour back. Ignored when
+    # DEVICE is cpu, and skipped for any model bundle whose plans ask for a
+    # non-default resampler (see nnunet_runner._enable_gpu_resampling).
+    AMASSS_GPU_RESAMPLING: bool = True
+
+    # nnUNet's sliding-window overlap: the window advances by patch_size times
+    # this, so 0.5 covers a voxel roughly eight times over and 0.7 roughly
+    # three. Only the GPU share of a run scales with it (4.5s -> 2.0s per
+    # structure on the scan above), which is why it buys much less than
+    # AMASSS_GPU_RESAMPLING once that is on -- and unlike it, this DOES move the
+    # segmentation: 0.7 measures Dice 0.995 against 0.5.
+    #
+    # Left at nnUNet's own default. Raise it only after looking at the masks.
+    AMASSS_TILE_STEP_SIZE: float = 0.5
+
     # Fallback whitelist, only used for arguments with a generic "file" type
     # (see base.FILE_TYPES). Arguments with a specific type (e.g. "zip_file")
     # are validated against that type's own extensions instead, regardless

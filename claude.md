@@ -288,6 +288,72 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-07-30 — AMASSS: the GPU was idle seven eighths of the run
+
+**Motivation:** AMASSS looked GPU-bound and was not. Profiling one structure on
+a 512x512x365 CBCT at 0.33mm: **14.6s** resampling the input to the model's
+0.4mm grid, **4.5s** of actual inference, **6.9s** resampling the logits back.
+Both resamplings are scipy splines pinned to a single core. The card was doing
+an eighth of the work and holding 2.7GB of 48GB.
+
+**The tempting fix was the wrong one, and was measured before being discarded.**
+At a 128^3 patch the network already saturates the SMs at batch 1: throughput
+is flat at ~43 patches/s from batch 1 through batch 12. Cutting the GPU's work
+by 5x (`tile_step_size` 0.5 -> 1.0) moved the total from 37.3s to 34.5s and
+dropped utilisation from 36% to 11% — direct evidence the GPU was never the
+constraint. **Free VRAM is not convertible into speed here; idle time is.**
+
+**GPU resampling (`nnunet_runner._enable_gpu_resampling`, new setting
+`AMASSS_GPU_RESAMPLING`, default on).** nnUNet already ships torch versions of
+both resamplers, so nothing is reimplemented — only selected. It is selected by
+NAME: nnUNet resolves `resampling_fn_data` / `resampling_fn_probabilities` out
+of the configuration dict via `recursive_find_resampling_fn_by_name`, so
+rewriting those two strings redirects both ends with no monkeypatching. Two
+things make that mutation safe, and both would have been silent bugs:
+`PlansManager` hands out a `deepcopy` of the configuration, so it touches
+neither the shared plans nor a concurrent request — and consequently the
+`torch.device` placed in the kwargs never reaches the `plans.json` nnUNet writes
+beside its output, which `json.dump` could not serialize. The two properties are
+`@property @lru_cache`, so the swap clears them.
+
+The GPU path uses `predict_from_files_sequential`: `predict_from_files` fans
+preprocessing and export out to *spawned* processes, each of which would need
+its own CUDA context to run a GPU resampler. That trades away the CPU/GPU
+overlap on multi-scan batches — recovering it with a reader thread feeding the
+GPU is the obvious next step, and the reason `num_processes_*` were left at 2.
+
+**Measured end to end, real models, default five structures, one scan:
+195.9s -> 77.0s (2.5x).** Per structure 34.2s -> 13.2s.
+
+**It is not numerically free, and the defaults say so.** torch has no 3D cubic
+interpolation, so the input resampling drops from spline order 3 to order 1.
+Dice against the scipy pipeline: MAND 0.998, UAW 0.997, MAX 0.995, CB 0.991,
+**CV 0.978**. The cervical vertebra is consistently the outlier — thinnest
+structure, closest to the edge of the field of view. `AMASSS_GPU_RESAMPLING=false`
+restores bit-identical nnUNet output, and a bundle whose plans pin a non-default
+resampler opts itself out automatically. `AMASSS_report.json` now records
+`gpu_resampling` and `tile_step_size`, because a mask is only reproducible
+next to the values that produced it.
+
+**`AMASSS_TILE_STEP_SIZE` (default 0.5, unchanged).** The one knob here that
+moves the segmentation for a *pure* speed gain, so it is exposed rather than
+tuned: 0.7 measured Dice 0.995 against 0.5 and saves ~2.5s of GPU per structure.
+
+**`_convert_to_nifti` stopped casting to float32.** The cast was never what made
+the conversion real — the read and write are — and it doubled the bytes gzipped
+per scan and gunzipped again by nnUNet, costing 2.4s + 0.4s for nothing:
+nnUNet's reader casts to float32 itself, and int16 CBCT values are exact there.
+
+**`vtk_export` cleanups.** Cell colours are built in numpy instead of a
+`SetTuple` per cell (identical bytes, 32x, but only ~80ms on a mandible — the
+honest win is small). The marching-cubes temp file had a *fixed* name, so every
+surface in a run wrote over the same path; it is now unique per call and removed
+after use rather than held until request cleanup.
+
+**Tests:** 115 server tests (5 new, covering the cpu skip, the non-default-plans
+skip, the swap itself including cache invalidation, the report fields, and the
+preserved voxel type).
+
 ### 2026-07-30 — Defaults reach the tool: one source of truth per setting
 
 **Motivation:** the architecture states everywhere that a default lives in one

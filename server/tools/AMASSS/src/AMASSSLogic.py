@@ -381,9 +381,15 @@ def _convert_to_nifti(scan_path: str, destination: str) -> None:
     an NRRD renamed to .nii.gz, handed to a reader that picks its format from
     the extension. NRRD is Slicer's own default format, so "supported" input
     was in practice only reliable for NIfTI. A read + write actually converts.
+
+    The voxel type is left alone. Casting to float32 first, as this did, was
+    not what made the conversion real -- the read and write are -- and on a CBCT
+    it doubled the bytes to gzip on the way out and to gunzip on the way back
+    in, for 2.4s + 0.4s per scan buying nothing: nnUNet's reader casts to
+    float32 itself, and int16 CBCT values are exact in float32 either way.
     """
     image = sitk.ReadImage(scan_path)
-    sitk.WriteImage(sitk.Cast(image, sitk.sitkFloat32), destination)
+    sitk.WriteImage(image, destination)
 
 
 def _match_reference_geometry(mask_image: sitk.Image, reference: sitk.Image) -> sitk.Image:
@@ -568,6 +574,12 @@ def segment(
     report = {
         "tool": "AMASSS",
         "device": device,
+        # Both of these move the segmentation, so a mask is only reproducible
+        # alongside them (see settings.AMASSS_GPU_RESAMPLING for how much).
+        # This records what was ASKED for: a model bundle whose plans pin a
+        # non-default resampler opts itself out, and says so in the log.
+        "gpu_resampling": bool(settings.AMASSS_GPU_RESAMPLING) and device.startswith("cuda"),
+        "tile_step_size": float(settings.AMASSS_TILE_STEP_SIZE),
         "prediction_ID": prediction_ID,
         "merge_modes": list(merge),
         "generate_surface": bool(generate_surface),

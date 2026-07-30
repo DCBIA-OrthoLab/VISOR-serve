@@ -11,6 +11,7 @@ Run just this module:
 """
 
 import glob
+from functools import lru_cache
 import json
 import os
 import zipfile
@@ -24,6 +25,7 @@ import pytest
 import SimpleITK as sitk
 
 from base import Selection, ToolArgumentError
+from config import settings
 from tools.AMASSS.AMASSS import AMASSSTool
 from tools.AMASSS.src import AMASSSLogic, nnunet_runner
 
@@ -403,3 +405,115 @@ def test_segment_rejects_an_empty_selection(tmp_path):
             structures=(),
             scratch_dir=str(tmp_path / "scratch"),
         )
+
+
+# ---------------------------------------------------------------------------
+# GPU resampling (see settings.AMASSS_GPU_RESAMPLING)
+# ---------------------------------------------------------------------------
+
+class _FakeConfigurationManager:
+    """Stands in for nnUNet's, reproducing the one detail that can bite.
+
+    The real `resampling_fn_data` / `resampling_fn_probabilities` are
+    `@property @lru_cache`, so a value read before the swap outlives it unless
+    the cache is cleared. Declaring them the same way here means a version of
+    `_enable_gpu_resampling` that forgot `cache_clear()` fails the test below
+    instead of passing it.
+    """
+
+    def __init__(self, configuration):
+        self.configuration = configuration
+
+    @property
+    @lru_cache(maxsize=1)  # noqa: B019 - deliberately mirrors nnUNet's own shape
+    def resampling_fn_data(self):
+        return self.configuration["resampling_fn_data"]
+
+    @property
+    @lru_cache(maxsize=1)  # noqa: B019
+    def resampling_fn_probabilities(self):
+        return self.configuration["resampling_fn_probabilities"]
+
+
+def _fake_predictor(**overrides):
+    configuration = {
+        "resampling_fn_data": "resample_data_or_seg_to_shape",
+        "resampling_fn_data_kwargs": {"is_seg": False, "order": 3},
+        "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
+        "resampling_fn_probabilities_kwargs": {"is_seg": False, "order": 1},
+    }
+    configuration.update(overrides)
+
+    class _Predictor:
+        pass
+
+    predictor = _Predictor()
+    predictor.configuration_manager = _FakeConfigurationManager(configuration)
+    return predictor
+
+
+def test_gpu_resampling_is_skipped_on_cpu():
+    """No CUDA, nothing to move: the scipy resamplers must stay untouched."""
+    predictor = _fake_predictor()
+    assert nnunet_runner._enable_gpu_resampling(predictor, "cpu") is False
+    assert (
+        predictor.configuration_manager.configuration["resampling_fn_data"]
+        == "resample_data_or_seg_to_shape"
+    )
+
+
+def test_gpu_resampling_leaves_a_non_default_resampler_alone():
+    """A bundle pinning its own resampler configured its geometry on purpose."""
+    predictor = _fake_predictor(resampling_fn_data="no_resampling")
+    assert nnunet_runner._enable_gpu_resampling(predictor, "cuda") is False
+    assert predictor.configuration_manager.configuration["resampling_fn_data"] == "no_resampling"
+
+
+def test_gpu_resampling_redirects_both_ends_and_drops_the_memoized_value():
+    """Both resamplers move to the GPU, and the cached property does not survive."""
+    pytest.importorskip("torch")
+    predictor = _fake_predictor()
+    manager = predictor.configuration_manager
+
+    # Read one through the cache first: this is what the swap has to invalidate.
+    assert manager.resampling_fn_data == "resample_data_or_seg_to_shape"
+
+    assert nnunet_runner._enable_gpu_resampling(predictor, "cuda") is True
+
+    for key in ("resampling_fn_data", "resampling_fn_probabilities"):
+        assert manager.configuration[key] == "resample_torch_fornnunet"
+        kwargs = manager.configuration[f"{key}_kwargs"]
+        assert kwargs["mode"] == "linear"
+        assert str(kwargs["device"]).startswith("cuda")
+        # The scipy-only spline order must be gone, not merely overridden.
+        assert "order" not in kwargs
+
+    assert manager.resampling_fn_data == "resample_torch_fornnunet"
+
+
+def test_report_records_the_settings_that_move_the_masks(tmp_path, stub_predictor):
+    """GPU resampling and the step size both change the output, so a mask is
+    only reproducible next to the values that produced it."""
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+
+    run = AMASSSLogic.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        structures=("MAND",),
+        scratch_dir=str(tmp_path / "scratch"),
+    )
+
+    # resolve_device is stubbed to "cpu", where the GPU path cannot apply.
+    assert run.report["gpu_resampling"] is False
+    assert run.report["tile_step_size"] == float(settings.AMASSS_TILE_STEP_SIZE)
+
+
+def test_converted_input_keeps_its_voxel_type(tmp_path):
+    """Casting to float32 doubled the bytes gzipped per scan and bought nothing."""
+    source = _write_scan(tmp_path / "scan.nrrd")
+    destination = str(tmp_path / "p_000_0000.nii.gz")
+
+    AMASSSLogic._convert_to_nifti(source, destination)
+
+    assert sitk.ReadImage(destination).GetPixelID() == sitk.ReadImage(source).GetPixelID()

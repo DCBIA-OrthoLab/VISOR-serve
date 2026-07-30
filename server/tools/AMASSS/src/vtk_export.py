@@ -26,6 +26,7 @@ works) if it isn't installed.
 
 import logging
 import os
+import uuid
 
 import numpy as np
 import SimpleITK as sitk
@@ -59,33 +60,48 @@ def _mesh_from_mask(mask: np.ndarray, reference: sitk.Image, temp_dir: str,
                     smoothing: int, color_rgb):
     """Build a colored surface for one binary mask."""
     vtk = _import_vtk()
+    from vtk.util.numpy_support import numpy_to_vtk
 
     binary = sitk.GetImageFromArray(mask.astype(np.uint8))
     binary.CopyInformation(reference)
-    temp_nrrd = os.path.join(temp_dir, "surface_input.nrrd")
+    # Unique per call. The name used to be fixed, which made every surface in a
+    # run write over the same file -- harmless only for as long as surfaces are
+    # built one at a time, and a silent corruption the first time they are not.
+    temp_nrrd = os.path.join(temp_dir, f"surface_input_{uuid.uuid4().hex}.nrrd")
     sitk.WriteImage(binary, temp_nrrd)
 
-    reader = vtk.vtkNrrdReader()
-    reader.SetFileName(temp_nrrd)
-    reader.Update()
+    try:
+        reader = vtk.vtkNrrdReader()
+        reader.SetFileName(temp_nrrd)
+        reader.Update()
 
-    marching_cubes = vtk.vtkDiscreteMarchingCubes()
-    marching_cubes.SetInputConnection(reader.GetOutputPort())
-    marching_cubes.GenerateValues(1, 1, 1)
+        marching_cubes = vtk.vtkDiscreteMarchingCubes()
+        marching_cubes.SetInputConnection(reader.GetOutputPort())
+        marching_cubes.GenerateValues(1, 1, 1)
 
-    smoother = vtk.vtkSmoothPolyDataFilter()
-    smoother.SetInputConnection(marching_cubes.GetOutputPort())
-    smoother.SetNumberOfIterations(max(0, int(smoothing)))
-    smoother.Update()
+        smoother = vtk.vtkSmoothPolyDataFilter()
+        smoother.SetInputConnection(marching_cubes.GetOutputPort())
+        smoother.SetNumberOfIterations(max(0, int(smoothing)))
+        smoother.Update()
 
-    polydata = smoother.GetOutput()
+        polydata = smoother.GetOutput()
+    finally:
+        # The mask can be a few hundred MB; a batch would otherwise keep one
+        # copy per surface alive until the whole request is cleaned up.
+        try:
+            os.remove(temp_nrrd)
+        except OSError:
+            pass
 
-    colors = vtk.vtkUnsignedCharArray()
+    # One flat colour for every cell, built in numpy and handed over once
+    # rather than a Python-level SetTuple per cell. Same bytes either way; the
+    # loop was only ~80ms on a mandible's 590k cells, so this is tidiness and a
+    # bounded cost on the bigger structures, not a headline saving.
+    cell_colors = np.tile(
+        np.asarray(color_rgb, dtype=np.uint8), (polydata.GetNumberOfCells(), 1)
+    )
+    colors = numpy_to_vtk(cell_colors, deep=True, array_type=vtk.VTK_UNSIGNED_CHAR)
     colors.SetName("Colors")
-    colors.SetNumberOfComponents(3)
-    colors.SetNumberOfTuples(polydata.GetNumberOfCells())
-    for cell_index in range(polydata.GetNumberOfCells()):
-        colors.SetTuple(cell_index, color_rgb)
     polydata.GetCellData().SetScalars(colors)
     return polydata
 
