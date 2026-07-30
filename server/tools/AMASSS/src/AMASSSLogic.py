@@ -417,7 +417,7 @@ def segment(
     prediction_ID: str = "Pred",
     generate_surface: bool = False,
     surface_smoothing: int = 5,
-    device: str = "cuda",
+    device: str = None,
     scratch_dir: str = None,
 ) -> SegmentationRun:
     """Segment one scan or a batch, and return where the results are.

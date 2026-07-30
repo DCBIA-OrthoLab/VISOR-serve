@@ -56,60 +56,7 @@ SELECTION_TYPE = "selection"
 _TRUE_TOKENS = ("true", "1", "yes", "on", "checked")
 _FALSE_TOKENS = ("false", "0", "no", "off", "unchecked", "")
 
-# The type whose resolved path is a directory rather than a file.
-FOLDER_TYPE = "folder"
 
-SCALAR_TYPES = (str, int, float, bool)
-
-# Types picking from a fixed set of named options the tool declares in
-# ArgSpec.choices. They exist so the client can render the right widget without
-# any tool-specific code, and so an out-of-range value is caught by validate()
-# instead of reaching run():
-#   "choice"      -> exactly one option        -> combo box  -> run() gets a str
-#   "multichoice" -> any number of options     -> check boxes -> run() gets a Selection
-CHOICE_TYPE = "choice"
-MULTICHOICE_TYPE = "multichoice"
-CHOICE_TYPES = (CHOICE_TYPE, MULTICHOICE_TYPE)
-
-
-class Selection(dict):
-    """What run() receives for a "multichoice" argument: every option the tool
-    declared, mapped to True/False, in declaration order.
-
-    Being a plain dict means `selection["mandible"]` works and no option is
-    ever missing, so a tool never needs `.get(name, False)`. `.selected` is
-    there for the common case of looping over what's enabled.
-    """
-
-    @property
-    def selected(self) -> tuple:
-        """The enabled option names, in declaration order."""
-        return tuple(name for name, enabled in self.items() if enabled)
-
-
-class ResolvedPath(str):
-    """Local path handed to Tool.run() for a file/folder argument, tagged with
-    the declared type it was actually resolved as.
-
-    This is what makes an argument accepting SEVERAL types usable: a tool
-    declaring `type=("csv_file", "folder")` branches on `input.kind` instead
-    of guessing from the extension or probing the filesystem.
-
-    It subclasses `str`, so it stays a plain path everywhere else -- `open()`,
-    `os.path.*`, `pandas.read_csv()` all work unchanged, and a tool that
-    declares a single type can keep ignoring `.kind` entirely.
-    """
-
-    kind: str
-
-    def __new__(cls, path: str, kind: str) -> "ResolvedPath":
-        resolved = super().__new__(cls, path)
-        resolved.kind = kind
-        return resolved
-
-    @property
-    def is_folder(self) -> bool:
-        return self.kind == FOLDER_TYPE
 
 # The type whose resolved path is a directory rather than a file.
 FOLDER_TYPE = "folder"
