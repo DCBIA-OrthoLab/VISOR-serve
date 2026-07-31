@@ -46,11 +46,6 @@ FILE_TYPES: dict = {
     ),
 }
 
-_TRUE_TOKENS = ("true", "1", "yes", "on", "checked")
-_FALSE_TOKENS = ("false", "0", "no", "off", "unchecked", "")
-
-
-
 # The type whose resolved path is a directory rather than a file.
 FOLDER_TYPE = "folder"
 

@@ -53,7 +53,7 @@ server/tools/my_tool/
 │   ├── __init__.py
 │   └── my_tool_logic.py
 └── test/                  # optional: your unit tests (invisible to discovery)
-    └── test_my_tool_logic.py
+    └── test_my_tool.py
 ```
 
 Three rules, all checked at startup:
@@ -325,7 +325,7 @@ def run(self, scan: str, threshold: float, iterations: int = 10) -> str:
 ### Keeping `run()` thin
 
 If the tool has real logic, put it in `src/` and keep `my_tool.py` as a
-declaration-plus-delegation shim. This is what `surgMovPred` does, and it's
+declaration-plus-delegation shim. This is what `SurgMovPred` does, and it's
 what makes the logic unit-testable without HTTP:
 
 ```python
@@ -398,6 +398,12 @@ Two constraints worth internalizing:
 - `DATA_DIR` is mounted **read-only** (`./DATA:/data:ro`). Never write there.
 - `DATA/` is gitignored — it holds confidential data and must never be
   committed. A clone without it still runs, with the relevant tests skipped.
+
+Public model bundles and reference test files are fetched by the scripts in
+[`scripts/`](scripts/README.md), driven by `scripts/data-manifest.yml`. If your
+tool has published weights, add an entry there rather than documenting a manual
+download — `./scripts/setup-models.sh --tool <your_tool>` then populates
+`DATA/<your_tool>/models/` for everyone.
 
 Path traversal is already handled by `data_store.py` (bare-name check plus a
 `realpath` containment check against symlinks); you don't need to re-validate.
@@ -492,25 +498,29 @@ is what leaks when a tool crashes.
 
 ## 7. Dependencies
 
-Dependencies are split by **how they install**, not by which tool wants them.
-There is no per-tool requirements mechanism: only `requirements.txt` is
-installed automatically, by the `inference` service's command.
+There is no per-tool requirements mechanism — two files, whatever the number
+of tools:
 
 | File | Holds | Installed |
 | --- | --- | --- |
-| `requirements.txt` | pure wheels — `fastapi`, `pandas`, `numpy`, `SimpleITK` … | every container start; **must never fail** |
-| `requirements-ml.txt` | the shared DL stack — `monai`, `itk`, `vtk`, `nnunetv2` | once, baked into the image |
-| `requirements-pytorch3d.txt` | `pytorch3d` alone | separately: no PyPI distribution, needs a source build matching the installed torch + CUDA |
+| `requirements.txt` | everything the server and its tools import — `fastapi`, `pandas`, `numpy`, `SimpleITK`, and the heavy DL stack (`vtk`, `torch`, `nnunetv2`) | every container start, by the `inference` service's command |
+| `requirements-dev.txt` | `pytest`, `httpx` | only where the test suite runs |
 
-**Never `pip install torch`.** The base image
-(`ghcr.io/jules-gp/lab-ai:2026.07`) ships `2.5.1+cu124`; a plain install
-shadows it with a CPU-only wheel and every GPU tool silently drops to CPU. Pin
-versions for anything where a silent upgrade could change numerical results.
+**Never pin or force-reinstall `torch`.** The base image
+(`ghcr.io/jules-gp/lab-ai:2026.07`) ships `2.5.1+cu124`; pip sees the
+unpinned `torch` entry satisfied and leaves it alone, whereas a pinned or
+`--upgrade` install would shadow it with a CPU-only wheel and every GPU tool
+would silently drop to CPU. Pin versions for anything where a silent upgrade
+could change numerical results.
+
+(A dependency that cannot install from PyPI at all — e.g. `pytorch3d`, which
+needs a source build against the image's torch + CUDA — must be baked into
+the image, not added to `requirements.txt`.)
 
 ### Import heavy dependencies lazily
 
-Anything outside `requirements.txt` must be imported **inside the function
-that uses it**, not at module level:
+A heavy or optional stack must be imported **inside the function that uses
+it**, not at module level:
 
 ```python
 def _import_torch():
@@ -539,11 +549,11 @@ Two layers, matching the two layers of the tool.
 
 ### Tool logic, in isolation
 
-Add `tools/<name>/test/test_<name>_logic.py` importing directly from
-`tools.<name>.src.<name>_logic`. No HTTP, no server, synthetic data only —
+Add `tools/<name>/test/test_<name>.py` importing directly from your `src/`
+modules (`tools.<name>.src...`). No HTTP, no server, synthetic data only —
 this is where you cover the actual algorithm. `registry.py` only looks for
 `<name>/<name>.py`, so a nested `test/` folder is invisible to discovery and
-picked up by pytest alone. See `tools/surgMovPred/test/` for a worked
+picked up by pytest alone. See `tools/SurgMovPred/test/` for a worked
 example.
 
 ### HTTP layer

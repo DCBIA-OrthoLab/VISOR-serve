@@ -88,16 +88,20 @@ package at startup — e.g. import all modules in `tools/`, collect every subcla
 - Detect and reject **duplicate tool names** at startup with a clear error.
 - Expose the registry as `name -> Tool instance` (or class).
 
-## The one tool that exists now
+## The registered tools
 
-Only a single **test tool** exists for now:
-- name: `"test_tool"`
-- arguments: `text_1` (str, required), `text_2` (str, required)
-- `run(text_1, text_2) -> str`: returns some simple combination (e.g. concatenation
-  or an echo), enough to prove the round trip. Output kind: `"text"`.
+(Originally only `test_tool` existed; see the changelog for how the rest arrived.)
 
-All other ~14+ tools are future work; the architecture must accommodate them without
-change to the core. Include `# TODO` guidance showing how to add another tool.
+- `test_tool` — two required strings in, their concatenation out. Proves the
+  round trip and serves as the minimal copy-paste template.
+- `example_tool` — the feature showcase: multi-type input (`csv_file` or
+  `folder`), `choice`/`multichoice` arguments, `output_kind = "files"`.
+- `SurgMovPred` — surgical movement prediction from tabular measurements
+  (stacking models, server-side model bundles).
+- `AMASSS` — CBCT skull structure segmentation (nnUNet v2, GPU).
+
+The extension will eventually expose ~15+ tools; the architecture must
+accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 
 ## Target architecture
 
@@ -114,28 +118,42 @@ change to the core. Include `# TODO` guidance showing how to add another tool.
                                                           └──────────────────────────┘
 ```
 
-## Expected repo structure
+## Repo structure
 
 ```
 .
 ├── CLAUDE.md
+├── ADDING_A_TOOL.md         # the full contract for writing a tool
+├── docker-compose.yml       # inference service + test service (profile "test")
+├── .githooks/pre-push       # runs `docker compose run --rm test` before a push
+├── scripts/                 # populate DATA/ from the public GitHub releases
+│   ├── setup-models.sh      #   curl-pipeable entry points
+│   ├── setup-testfiles.sh
+│   ├── fetch_data.py        #   the engine (stdlib only)
+│   └── data-manifest.yml    #   what to download, and where it goes
 ├── server/
 │   ├── main.py              # FastAPI app: generic /run/{tool_name} endpoint
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError
 │   ├── registry.py          # auto-discovery of Tool subclasses in tools/
 │   ├── data_store.py        # DataStore interface + LocalDataStore (server-side models/testfiles)
+│   ├── file_utils.py        # shared helpers: zip extraction/creation, tabular loading
 │   ├── security.py          # Bearer token verification
 │   ├── config.py            # config from environment variables
-│   ├── tools/
-│   │   ├── __init__.py
-│   │   └── test_tool.py     # the only tool for now
+│   ├── tools/               # one folder per tool: tools/<name>/<name>.py (+ src/, test/)
+│   │   ├── test_tool/
+│   │   ├── example_tool/
+│   │   ├── SurgMovPred/
+│   │   └── AMASSS/
+│   ├── tests/               # HTTP-layer + integration tests
 │   ├── requirements.txt
+│   ├── requirements-dev.txt
 │   ├── .env.example
 │   └── README.md
-├── DATA/                    # DATA_DIR mount, read-only: <tool_name>/{models,testfiles}/
-└── slicer_client/
-    └── inference_client.py  # generic client used by every Slicer module
+└── DATA/                    # DATA_DIR mount, read-only, gitignored: <tool_name>/{models,testfiles}/
 ```
+
+The Slicer client (thin modules + the generic inference client) lives in its
+own repo, `SlicerAutomatedDentalToolsCloud` — not here.
 
 ---
 
@@ -414,85 +432,154 @@ after use rather than held until request cleanup.
 skip, the swap itself including cache invalidation, the report fields, and the
 preserved voxel type).
 
-### 2026-07-30 — Defaults reach the tool: one source of truth per setting
+### 2026-07-30 — AMASSS surfaces: binary, and decimated by default
 
-**Motivation:** the architecture states everywhere that a default lives in one
-place, and the comments assert it — but the mechanism meant to enforce it was
-broken in three independent ways, each silently. A default that is declared and
-not applied is worse than no default: it reads as intentional in review.
+**Motivation:** a five-structure run with surfaces returned a 41.9MB archive
+that Slicer could not open — the client froze on the main thread and the user
+read it as "the server never sent the .vtk". It had: `curl` against the same
+endpoint pulled all 41,889,544 bytes with a correct `Content-Length` and every
+mesh re-read cleanly. The transfer was never the problem. The **geometry** was.
 
-**`ArgSpec.default` was shadowed (`base.py`).** `default` is a `@property`
-deriving the value from `choices`, and the leftover `SELECTION_TYPE` block
-below it declared `default: Any = None` as a **field**. `@dataclass` turns the
-later annotation into an instance attribute, replacing the property object, so
-`spec.default` was always `None`. `validate()` hands that to `run()` for any
-omitted optional choice argument (`base.py`, "hand that over rather than making
-the tool repeat it in `run()`'s signature") — so `example_tool` answered **500**
-(`'NoneType' object has no attribute 'selected'`) when `outputs` was omitted,
-and AMASSS survived only because `_codes_from` happens to treat `None` as
-"unspecified". The leftover block is gone, with a `NOTE` at the spot so the
-field is not reintroduced. `SELECTION_TYPE`, `choice_groups` and `multiple`
-went with it: no tool ever used them, they were read only by dead code, and
-`check_schema` *rejects* the `SELECTION_TYPE` declaration that `server/README.md`
-documented as the way to write a selection argument.
+**Marching cubes runs on the original scan grid**, so a 0.33mm CBCT produces a
+triangle per voxel face: 1.6M for a cranial base, 3.5M across five structures,
+11.8M for a merged nine-structure volume. That is not detail — the mask
+underneath is only accurate to about half a voxel — it is just resolution
+nobody asked for, and it is what made the results unusable to ship and to open.
 
-**Scalar defaults never reached the widget — new `ArgSpec.initial`.** A form
-sends every widget it rendered, so an untouched field still travels: the Slicer
-panel's spin box started at Qt's own `0` and sent `0`, and `run()`'s
-`surface_smoothing: int = 5` was never reached. Every AMASSS surface generated
-through the UI came out with **zero smoothing iterations** while both the schema
-description and the signature said otherwise. `initial` is the scalar
-counterpart of `choices`: declared by the tool, published by `GET /tools`,
-applied by the client's `formgen` to int/float/bool/str widgets. It is advisory
-and *not* applied server-side — an omitted argument still falls through to
-`run()`'s Python default, which stays the single source of truth for what
-happens; `initial` only keeps the widget agreeing with it. `check_schema`
-rejects `initial` on a choice argument (its initial state is already in
-`choices`) and on a file argument.
+**`vtkPolyDataWriter` was writing ASCII** (its default), which is where the
+bulk went: 848.5MB for the merged surface alone against 6.4MB for every
+segmentation in the same run. Binary is the same geometry — and the *more*
+accurate of the two, which is the opposite of the reflex: it round-trips the
+float32 vertices exactly, while ASCII prints ~6 significant digits and moved
+points by up to 5e-05mm on read-back. It is also 133x faster to parse (a 1.6M
+triangle cranial base: 2.67s ASCII, 0.02s binary).
 
-Note the split this fixes: `default` is what `validate()` gives `run()`;
-`initial` is what a client pre-fills. Naming both `default` is what caused the
-shadowing above.
+**`surface_decimation` (new schema argument, default 90).** `vtkDecimatePro`
+with `PreserveTopologyOn`, applied after smoothing and *before* the per-cell
+colour array is built — the array is sized to the mesh that is actually
+written. Measured on the cranial base, against a 0.33mm voxel:
 
-**`DEVICE` was unreachable (`AMASSSLogic.segment`).** The signature declared
-`device: str = "cpu"` and the body did `resolve_device(device or settings.DEVICE)`
-— a truthy default short-circuits the `or`, so **`settings.DEVICE` was never
-read** and `DEVICE=cuda` in the environment did nothing. The parameter now
-defaults to `None`. Same class of bug as the two above: a default written in a
-second place, winning over the one that is supposed to be authoritative.
+| reduction | triangles | mean dev | p95 | max |
+|---|---|---|---|---|
+| 50% | 811,222 | 0.0034mm | 0.004mm | 0.277mm |
+| 80% | 324,488 | 0.0338mm | 0.125mm | 0.493mm |
+| **90%** | **162,244** | **0.0590mm** | **0.171mm** | 0.692mm |
+| 95% | 81,122 | 0.0951mm | 0.264mm | 1.223mm |
 
-**`AMASSS_MAX_GPU_JOBS` joined the config.** It was the one setting read
-straight from `os.getenv`, absent from `config.py` and `.env.example`, while
-`config.py`'s own docstring claims the configuration is "loaded entirely from
-environment variables". It is now `settings.AMASSS_MAX_GPU_JOBS`, documented
-next to `MAX_CONCURRENT_TOOLS` (which was also missing from `.env.example`),
-with what a higher value does and does not buy: AMASSS predicts its structures
-**sequentially**, so one request never exceeds one GPU job — the semaphore only
-arbitrates between concurrent *requests*, and is therefore pointless above
-`MAX_CONCURRENT_TOOLS`. Raising it also means raising `docker-compose.yml`'s
-`shm_size`: nnUNet's worker processes pass whole volumes through shared memory,
-and exhausting it surfaces as a SIGBUS in a worker, not as a clean OOM.
+90 costs a fifth of a voxel on average and buys a factor of ten. 0 keeps the
+raw mesh. The value is recorded in `AMASSS_report.json` — these surfaces are
+lossy by default now, so a run has to say by how much.
 
-**Also removed:** `main.py::_describe_argument`, a second schema serializer that
-was never called and published a different set of keys than the live
-`list_tools` — the reason `default` existed as a field but never reached any
-client. `server/README.md`'s selection-arguments section was rewritten on the
-real API (its example crashed `check_schema`, and the JSON-list wire form it
-documented is a 422).
+**End to end, the same five-structure request, real HTTP:** archive
+41,889,544 -> **5,417,443 bytes** (7.7x), triangles 3,519,420 -> **351,938**
+(10x), total client-side mesh parsing 2.7s+ -> **0.01s**. Decimation adds ~12s
+of server time for five structures.
 
-**Tests:** `test_main.py` gains coverage that `GET /tools` publishes `initial`
-and that `check_schema` rejects it on choice/file arguments; the client's
-`test_formgen.py` gains a `ScalarInitialValueTest` asserting an untouched form
-collects the tool's own defaults rather than Qt's. 110 server tests, 130 client
-tests.
+**A caveat measured and worth keeping:** binary alone did NOT shrink the
+download. DEFLATE was already squeezing ASCII at 6.2:1 and binary only
+compresses 2.7:1, so the archive went 223.4MB -> 227.8MB on a nine-structure
+run. Binary pays off in disk, RAM, write time, zip time and parse time — not
+on the wire. Only removing geometry moved the download, which is what
+decimation does.
 
-**Note for future sessions:** run the suite in a disposable container
-(`docker run --rm -v ./server:/workspace/server ...`), not in the live
-`inference` one — the tests write `tools/zz_*_probe/` into the mounted volume,
-which sends `uvicorn --reload` into a reload loop. Also export
-`API_TOKEN=test-token`: `config.settings` is instantiated at first import, so
-`test_main.py`'s module-level `os.environ` assignment loses to whatever the
-container already had, and every authenticated test 401s.
+**Still on the table, in the client repo:** `AMASSS.py`'s
+`MAX_RESULTS_TO_LOAD = 12` caps by *file count* while the cost is in triangles,
+so a 10-file run loaded 3.5M triangles on the UI thread while a 20-file run of
+small masks was correctly skipped. Decimation makes this survivable; it does
+not make the cap correct.
+
+**Tests:** 119 server tests (4 new: binary header + exact round trip, temp file
+removal, decimation reduces triangles with 0 disabling it and the colour array
+matching the final cell count, and the report field).
+
+### 2026-07-30 — AMASSS: the GPU was idle seven eighths of the run
+
+**Motivation:** AMASSS looked GPU-bound and was not. Profiling one structure on
+a 512x512x365 CBCT at 0.33mm: **14.6s** resampling the input to the model's
+0.4mm grid, **4.5s** of actual inference, **6.9s** resampling the logits back.
+Both resamplings are scipy splines pinned to a single core. The card was doing
+an eighth of the work and holding 2.7GB of 48GB.
+
+**The tempting fix was the wrong one, and was measured before being discarded.**
+At a 128^3 patch the network already saturates the SMs at batch 1: throughput
+is flat at ~43 patches/s from batch 1 through batch 12. Cutting the GPU's work
+by 5x (`tile_step_size` 0.5 -> 1.0) moved the total from 37.3s to 34.5s and
+dropped utilisation from 36% to 11% — direct evidence the GPU was never the
+constraint. **Free VRAM is not convertible into speed here; idle time is.**
+
+**GPU resampling (`nnunet_runner._enable_gpu_resampling`, new setting
+`AMASSS_GPU_RESAMPLING`, default on).** nnUNet already ships torch versions of
+both resamplers, so nothing is reimplemented — only selected. It is selected by
+NAME: nnUNet resolves `resampling_fn_data` / `resampling_fn_probabilities` out
+of the configuration dict via `recursive_find_resampling_fn_by_name`, so
+rewriting those two strings redirects both ends with no monkeypatching. Two
+things make that mutation safe, and both would have been silent bugs:
+`PlansManager` hands out a `deepcopy` of the configuration, so it touches
+neither the shared plans nor a concurrent request — and consequently the
+`torch.device` placed in the kwargs never reaches the `plans.json` nnUNet writes
+beside its output, which `json.dump` could not serialize. The two properties are
+`@property @lru_cache`, so the swap clears them.
+
+The GPU path uses `predict_from_files_sequential`: `predict_from_files` fans
+preprocessing and export out to *spawned* processes, each of which would need
+its own CUDA context to run a GPU resampler. That trades away the CPU/GPU
+overlap on multi-scan batches — recovering it with a reader thread feeding the
+GPU is the obvious next step, and the reason `num_processes_*` were left at 2.
+
+**Measured end to end, real models, default five structures, one scan:
+195.9s -> 77.0s (2.5x).** Per structure 34.2s -> 13.2s.
+
+**It is not numerically free, and the defaults say so.** torch has no 3D cubic
+interpolation, so the input resampling drops from spline order 3 to order 1.
+Dice against the scipy pipeline: MAND 0.998, UAW 0.997, MAX 0.995, CB 0.991,
+**CV 0.978**. The cervical vertebra is consistently the outlier — thinnest
+structure, closest to the edge of the field of view. `AMASSS_GPU_RESAMPLING=false`
+restores bit-identical nnUNet output, and a bundle whose plans pin a non-default
+resampler opts itself out automatically. `AMASSS_report.json` now records
+`gpu_resampling` and `tile_step_size`, because a mask is only reproducible
+next to the values that produced it.
+
+**`AMASSS_TILE_STEP_SIZE` (default 0.5, unchanged).** The one knob here that
+moves the segmentation for a *pure* speed gain, so it is exposed rather than
+tuned: 0.7 measured Dice 0.995 against 0.5 and saves ~2.5s of GPU per structure.
+
+**`_convert_to_nifti` stopped casting to float32.** The cast was never what made
+the conversion real — the read and write are — and it doubled the bytes gzipped
+per scan and gunzipped again by nnUNet, costing 2.4s + 0.4s for nothing:
+nnUNet's reader casts to float32 itself, and int16 CBCT values are exact there.
+
+**`vtk_export` cleanups.** Cell colours are built in numpy instead of a
+`SetTuple` per cell (identical bytes, 32x, but only ~80ms on a mandible — the
+honest win is small). The marching-cubes temp file had a *fixed* name, so every
+surface in a run wrote over the same path; it is now unique per call and removed
+after use rather than held until request cleanup.
+
+**Tests:** 115 server tests (5 new, covering the cpu skip, the non-default-plans
+skip, the swap itself including cache invalidation, the report fields, and the
+preserved voxel type).
+
+### 2026-07-30 — Dead-code and duplication cleanup
+
+- `base.py` had an entire block (`FOLDER_TYPE`, `SCALAR_TYPES`,
+  `CHOICE_TYPES`, `Selection`, `ResolvedPath`) declared TWICE, plus the
+  remnants of the retired `SELECTION_TYPE` API (the constant, a second
+  shadowing `choices` field, `choice_groups`, `multiple`,
+  `_TRUE_TOKENS`/`_FALSE_TOKENS`). All removed. **The current API is
+  `"choice"`/`"multichoice"`** (one `choices` dict of option → default);
+  the 2026-07-28 entry below describes the interim design it replaced.
+- `main.py._describe_argument` (unused, referenced the removed fields) and
+  `file_utils.zip_directory` (unused duplicate of `make_zip`) removed.
+- `requirements-amasss.txt` removed: torch/nnunetv2/vtk had been added to
+  `requirements.txt` ("FIX : AMASSS functional"), leaving the file a pure
+  duplicate. The heavy stack stays lazily imported, and torch stays unpinned
+  so the image's CUDA build is never shadowed.
+- The `test` service in `docker-compose.yml` (commented out earlier) is back
+  under a `profiles: ["test"]` guard: `docker compose up` ignores it, the
+  pre-push hook's `docker compose run --rm test` works again.
+- Docs realigned with the code: `claude.md` → `CLAUDE.md`, `surgMovPred` →
+  `SurgMovPred` (post-rename casing), README's selection-argument section
+  rewritten for `choice`/`multichoice`, `ADDING_A_TOOL.md` §7 now describes
+  the real requirements layout.
 
 ### 2026-07-28 — AMASSS tool + grouped selection arguments
 

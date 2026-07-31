@@ -22,6 +22,18 @@ cp .env.example .env
 # edit .env and set a real API_TOKEN
 ```
 
+## Server-side data (`DATA/`)
+
+Models and reference test files are not in the repository. Fetch them from
+the repo root with the scripts in [`scripts/`](../scripts/README.md), which
+write the exact layout `data_store.py` reads:
+
+```bash
+./scripts/setup-models.sh --tool AMASSS      # or omit --tool for everything (~29 GB)
+./scripts/setup-testfiles.sh
+python3 scripts/fetch_data.py --list         # what's available, and how big
+```
+
 ## Generating a self-signed certificate (development only)
 
 ```bash
@@ -72,17 +84,17 @@ An argument declared with `ArgSpec(server_selectable=...)` can instead be
 satisfied by a file already hosted on the server (under
 `DATA_DIR/<tool>/{models,testfiles}/`): send the file's *name* as a plain form
 value. On a scalar (non-file-typed) argument that is the only option — e.g.
-`surgMovPred`'s `model` (`ArgSpec(type=str, server_selectable="model")`) is
+`SurgMovPred`'s `model` (`ArgSpec(type=str, server_selectable="model")`) is
 always picked by name, never uploaded (an upload for it is rejected with a 400):
 
 ```bash
 # List the models/testfiles hosted server-side for a tool (Bearer-protected)
-curl -k https://localhost:8000/tools/surgMovPred/data \
+curl -k https://localhost:8000/tools/SurgMovPred/data \
   -H "Authorization: Bearer change-me-to-a-long-random-secret"
 # -> {"models": ["stacking_v2.zip"], "testfiles": ["demo_measurements.zip"]}
 
 # Run it: the model is a name, the input is a genuine upload
-curl -k -X POST https://localhost:8000/run/surgMovPred \
+curl -k -X POST https://localhost:8000/run/SurgMovPred \
   -H "Authorization: Bearer change-me-to-a-long-random-secret" \
   -F "model=stacking_v2.zip" \
   -F "input=@/path/to/measurements.zip"
@@ -125,51 +137,33 @@ to `config.ALLOWED_EXTENSIONS`.
 
 ## Choice arguments (pick one or several from a server-defined list)
 
-Two types let a tool publish a fixed set of named options, so a client renders
-the widget entirely from `GET /tools` with nothing hardcoded:
-
-* `"choice"` — exactly one option. Rendered as a combo box; `run()` gets a `str`.
-* `"multichoice"` — any number of them. Rendered as check boxes; `run()` gets a
-  `base.Selection`.
-
-A single `choices` dict declares the options **and** their initial state, so the
-defaults are written down exactly once:
+An argument typed `"choice"` (combo box, exactly one option) or
+`"multichoice"` (check boxes, any number of options) declares its options —
+and their defaults — in one `choices` dict, so a client renders the widget
+entirely from `GET /tools` with nothing hardcoded:
 
 ```python
 "structures": ArgSpec(
     type="multichoice", required=False,
-    choices={"Mandible": True, "Maxilla": True, "Cranial base": False},
+    choices={"Mandible": True, "Maxilla": True, "Skull": False},
     description="Anatomical structures to segment",
 ),
 ```
 
-The option names are what the client displays *and* what it sends back, so a
-tool speaking internal codes translates them itself (see AMASSS's `_codes_from`)
-rather than pushing a translation table to the client. Adding an option is a
-one-line server change with no client release.
-
-`GET /tools` reports `choices` verbatim — option name to initial state. Two wire
-formats are accepted for a `multichoice`:
+`GET /tools` reports `choices` for every argument. On the wire, `"choice"` is
+just the option name; `"multichoice"` accepts a JSON object or a
+comma-separated shorthand of the enabled options:
 
 ```bash
--F 'structures=Mandible,Maxilla'                        # the enabled ones
--F 'structures={"Mandible":true,"Maxilla":false}'       # explicit JSON object
+-F 'structures={"Mandible":true,"Maxilla":true,"Skull":false}'   # JSON object
+-F 'structures=Mandible,Maxilla'                                  # equivalent
 ```
 
-A `"choice"` argument takes the bare option name: `-F 'preview_format=csv'`. An
-unknown option is a `422` naming what is allowed.
-
-Whatever arrives **is** the complete selection: an option absent from the
-payload counts as unchecked, whatever its declared default. Omitting the
-argument entirely is the different request that applies the declared defaults —
-`validate()` then hands `run()` the value of `ArgSpec.default`, derived from
-`choices`. That is why `run()` should not repeat those defaults in its own
-signature.
-
-> `ArgSpec.default` is a **`@property`**, deliberately not a field. Declaring a
-> field of the same name shadows it, and every omitted optional choice argument
-> then reaches `run()` as `None`. There is a `NOTE` in `base.py` at the spot
-> where that trap was.
+Either form is the complete selection; omitting the argument entirely falls
+back to the declared defaults. An invalid option is a `422` naming what is
+allowed. Adding an option is a one-line server change with no client release.
+See [`ADDING_A_TOOL.md`](../ADDING_A_TOOL.md) for the full contract,
+including what `run()` receives (`base.Selection`).
 
 ## How to add a new tool
 
@@ -188,19 +182,19 @@ signature.
 
 If your tool needs to unzip an upload, zip its results, and/or load
 CSV/XLSX/ODS files, reuse the shared helpers in `file_utils.py`
-(`extract_zip`, `zip_directory`, `load_tabular_file`,
+(`extract_zip`, `make_zip`, `make_scratch_dir`, `load_tabular_file`,
 `load_tabular_directory`) instead of reimplementing them.
 
 ### Heavy or optional dependencies
 
-`requirements.txt` must stay installable on every deployment, because
-`registry.py` imports **every** tool at startup: a tool whose module-level
-imports fail takes the whole server down with it. A tool needing a heavy or
-optional stack should therefore import it **lazily, inside the functions that
-use it**, and ship its own requirements file. `AMASSS` does this for
-torch/nnunetv2/vtk (`requirements-amasss.txt`): until those are installed the
-server starts normally, every other tool works, and only AMASSS fails — with a
-message saying what to install.
+`registry.py` imports **every** tool at startup, so a tool whose module-level
+imports fail is skipped (see `ADDING_A_TOOL.md`). A tool needing a heavy or
+optional stack must therefore import it **lazily, inside the functions that
+use it**. `AMASSS` does this for torch/nnunetv2/vtk: those packages are listed
+in `requirements.txt` (the deployment image already ships torch built against
+its CUDA version, so pip skips it there), but on a machine where they are
+missing the server still starts normally, every other tool works, and only
+AMASSS fails — with a message saying what to install.
 
 ## AMASSS: CBCT skull structure segmentation
 
@@ -249,7 +243,7 @@ startup rather than silently overwriting each other.
 ./venv/bin/pip install -r requirements-dev.txt   # pytest, httpx
 ./venv/bin/pytest                                 # everything
 ./venv/bin/pytest tests/                          # HTTP layer only (main.py, routing, auth)
-./venv/bin/pytest tools/surgMovPred/test/        # one tool's own logic, in isolation
+./venv/bin/pytest tools/SurgMovPred/test/        # one tool's own logic, in isolation
 ```
 
 Or, without installing anything locally, run the exact same suite in Docker
@@ -265,7 +259,7 @@ that imports directly from `tools.<name>.src.<name>_logic` and exercises its
 functions without going through HTTP at all. `registry.py` only scans the
 immediate children of `tools/` for a `<name>/<name>.py` file, so a nested
 `test/` folder is invisible to tool discovery — it's picked up by pytest only.
-See `tools/surgMovPred/test/` for an example covering column-name cleaning,
+See `tools/SurgMovPred/test/` for an example covering column-name cleaning,
 patient-ID detection, zip extraction, prediction, and the full pipeline
 end-to-end with synthetic data.
 
@@ -281,8 +275,8 @@ committed — so those files only ever exist locally. Accordingly, a tool with
 no matching file under `DATA/` is **skipped**, not failed: a machine without
 the confidential dataset can still run the suite and push. To turn a skip
 into a real run, drop a file in the relevant folder, e.g.
-`DATA/surgMovPred/testfiles/my_real_input.zip` (and
-`DATA/surgMovPred/models/my_real_model.zip` if you want the real model
+`DATA/SurgMovPred/testfiles/my_real_input.zip` (and
+`DATA/SurgMovPred/models/my_real_model.zip` if you want the real model
 exercised too, instead of leaving that argument unfulfilled and the test skipped).
 
 ### Pre-push tests
