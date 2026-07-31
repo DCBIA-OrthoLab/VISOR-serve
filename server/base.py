@@ -44,6 +44,12 @@ FILE_TYPES: dict = {
         ".gipl.gz",
         ".zip",
     ),
+    # The surface counterpart: one intraoral scan mesh, or a zipped folder of
+    # them. VTK can read more formats than these two (.vtp, .obj, .off), but
+    # only what a tool's discovery actually walks is advertised -- ALI's
+    # original CLI accepted .stl in its UI and then silently ignored every one
+    # of them, which is the exact failure this list exists to prevent.
+    "surface_or_zip_file": (".vtk", ".stl", ".zip"),
 }
 
 # The type whose resolved path is a directory rather than a file.
@@ -204,6 +210,20 @@ class ArgSpec:
 
 class ToolArgumentError(Exception):
     """Raised when arguments passed to a tool don't match its declared schema."""
+
+
+class ToolUnavailableError(Exception):
+    """Raised when this SERVER cannot perform the request, though the request
+    itself is valid -- typically a dependency the deployment image does not
+    carry (see the lazy-import rule in ADDING_A_TOOL.md 7).
+
+    It exists because the alternative is a generic 500. A crash inside a tool
+    is rightly opaque to the client: it can name server-side paths and leak
+    internals. "This server has no pytorch3d, so the IOS engine cannot run" is
+    the opposite -- it is the one thing the caller needs to be told, it names
+    nothing sensitive, and no amount of retrying or fixing their arguments will
+    help. main.py maps this to 501 Not Implemented with the message.
+    """
 
 
 class ToolSchemaError(Exception):

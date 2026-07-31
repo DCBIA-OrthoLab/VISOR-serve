@@ -33,6 +33,7 @@ import logging
 import os
 import threading
 
+from base import ToolUnavailableError
 from config import settings
 
 logger = logging.getLogger("AMASSS.nnunet")
@@ -62,7 +63,7 @@ def _import_torch():
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - depends on the deployment
-        raise RuntimeError(f"{_INSTALL_HINT} (missing: torch)") from exc
+        raise ToolUnavailableError(f"{_INSTALL_HINT} (missing: torch)") from exc
     return torch
 
 
@@ -70,7 +71,7 @@ def _import_predictor():
     try:
         from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
     except ImportError as exc:  # pragma: no cover - depends on the deployment
-        raise RuntimeError(f"{_INSTALL_HINT} (missing: nnunetv2)") from exc
+        raise ToolUnavailableError(f"{_INSTALL_HINT} (missing: nnunetv2)") from exc
     return nnUNetPredictor
 
 

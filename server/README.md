@@ -93,6 +93,11 @@ curl -k https://localhost:8000/tools/SurgMovPred/data \
   -H "Authorization: Bearer change-me-to-a-long-random-secret"
 # -> {"models": ["stacking_v2.zip"], "testfiles": ["demo_measurements.zip"]}
 
+# Download one of the listed test files (a folder entry arrives zipped).
+# Test files only — models are selected by name and never leave the server.
+curl -k -O https://localhost:8000/tools/SurgMovPred/testfiles/demo_measurements.zip \
+  -H "Authorization: Bearer change-me-to-a-long-random-secret"
+
 # Run it: the model is a name, the input is a genuine upload
 curl -k -X POST https://localhost:8000/run/SurgMovPred \
   -H "Authorization: Bearer change-me-to-a-long-random-secret" \
@@ -185,6 +190,23 @@ CSV/XLSX/ODS files, reuse the shared helpers in `file_utils.py`
 (`extract_zip`, `make_zip`, `make_scratch_dir`, `load_tabular_file`,
 `load_tabular_directory`) instead of reimplementing them.
 
+### After changing `requirements.txt`, recreate the container
+
+The `inference` service installs its requirements as part of its **command**,
+so a container that has been up for days is running whatever the file said
+when it last *started*. Uvicorn's `--reload` picks up new Python code but never
+re-runs pip — which shows up as a tool failing on a `ModuleNotFoundError` for
+something you can plainly see in `requirements.txt`.
+
+```bash
+docker compose up -d --force-recreate inference
+```
+
+`--force-recreate`, not `restart`: `pip --user` writes into the container's
+writable layer, so a plain restart keeps whatever the previous resolution
+installed — including a torch it should never have replaced. Only a fresh
+layer discards it.
+
 ### Heavy or optional dependencies
 
 `registry.py` imports **every** tool at startup, so a tool whose module-level
@@ -233,6 +255,89 @@ Two knobs, both environment variables: `AMASSS_MAX_GPU_JOBS` (default 1) caps
 how many AMASSS inferences touch the GPU at once, independently of
 `MAX_CONCURRENT_TOOLS`; `DEVICE` selects cuda/cpu.
 
+## ALI: automatic landmark identification
+
+```bash
+# One CBCT scan, cranial base only
+curl -k -X POST https://localhost:8000/run/ALI \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F "model=ALI_CBCT_Models" \
+  -F "input=@/path/to/scan.nii.gz" \
+  -F 'cbct_regions={"Cranial base":true,"Upper":false,"Lower":false,"Impacted canine":false}' \
+  --output result.zip
+
+# A whole cohort (CBCT, IOS or DICOM series) as one archive
+zip -r cohort.zip cohort/
+curl -k -X POST https://localhost:8000/run/ALI \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F "model=ALI_IOS_Models" -F "input=@cohort.zip" --output result.zip
+```
+
+**There is no `mode` argument.** The server inspects the input and picks the
+CBCT or the IOS engine itself: a `.zip` can hold either kind, and a DICOM
+series has no extension at all, so nothing in the request distinguishes them —
+only the data does. An input holding both kinds is a 422 rather than a guess.
+
+The consequence a client has to live with is that the schema cannot say "this
+argument only applies in mode X". `cbct_regions` and `ios_networks` are both
+optional and both always rendered; one is inert on any given run. Emptying the
+selection for the mode that actually ran is a 422 naming the argument to fill
+in — that 422 is how a mode mismatch explains itself.
+
+The response is a zip mirroring the input's folder tree, with **one
+`<scan>_lm_<ID>.mrk.json` per scan** holding every landmark found (the two
+original CLIs wrote one file per anatomical region, and disagreed on the
+extension), plus a `run_report.json`. The report separates *"the bundle has no
+weights for this landmark"* (`landmarks_without_model` → use another bundle)
+from *"the agent did not converge on this scan"* (`landmarks_failed` → this
+scan is hard). Both look identical in the Slicer scene and need opposite
+fixes.
+
+Model bundles are selected by name and never travel. CBCT bundles hold
+`<landmark>/<scale>/*.pth` with scale folders named `1` and `0-3`; IOS bundles
+hold checkpoints named with an `O`/`C` token and an `Upper`/`Lower` one, e.g.
+`Upper_O_model.pth`.
+
+`ALI_MAX_GPU_JOBS` caps its GPU use; `ALI_SEARCH_MAX_SECONDS` bounds one CBCT
+landmark's search (unset = 15s on GPU, 60s on CPU).
+
+**The IOS half needs pytorch3d**, which has no PyPI distribution and must be
+compiled into the deployment image; the current one predates that. ALI still
+loads and still publishes its schema — only an IOS run fails, naming what is
+missing. The CBCT engine works today.
+
+**Calling ALI from another server-side tool**: import
+`tools.ALI.src.ALILogic.identify()`, which returns the run report with the
+produced files named in it.
+
+## CrownSeg: per-tooth labelling of intraoral scans
+
+```bash
+curl -k -X POST https://localhost:8000/run/CrownSeg \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F "input=@/path/to/arch.vtk" --output result.zip
+```
+
+Adds a point-data array naming the tooth each vertex belongs to — the
+precondition for ALI's IOS engine, and for the IOS modes of ASO, AREG and
+FlexReg. It is a tool of its own for exactly that reason: burying it inside
+ALI would make those three depend on ALI, whose IOS half needs pytorch3d, so
+one absent dependency would take four tools out of the registry instead of
+one.
+
+`model` is **optional**: a caller that names nothing gets the server's
+configured checkpoint (`CROWNSEG_MODEL`), which is what lets ALI ask for crown
+segmentation without knowing where CrownSeg keeps its data. Handing the
+underlying library no model at all would make it download one from GitHub
+mid-request, which a server holding confidential data does not do.
+
+A mesh already carrying tooth labels is passed through untouched unless
+`skip_segmented=false` — re-running the network on it costs minutes and
+changes nothing.
+
+**From another server-side tool**: `tools.CrownSeg.src.CrownSegLogic.segment_crowns()`.
+Needs `shapeaxi` + pytorch3d, same image caveat as ALI's IOS engine.
+
 A tool folder missing its `<name>.py` file, duplicate tool names, or a tool
 missing its `name`, all fail loudly at server
 startup rather than silently overwriting each other.
@@ -279,12 +384,36 @@ into a real run, drop a file in the relevant folder, e.g.
 `DATA/SurgMovPred/models/my_real_model.zip` if you want the real model
 exercised too, instead of leaving that argument unfulfilled and the test skipped).
 
+**This module is opt-in**, and it is the only one that wants a GPU —
+everything else stubs its models. It runs when `RUN_REAL_DATA_TESTS` is set,
+which is what `test-gpu` is for:
+
+```bash
+docker compose run --rm test-gpu               # DEVICE=cuda, GPU reserved, real data
+RUN_REAL_DATA_TESTS=1 ./venv/bin/pytest tests/test_data_integration.py
+```
+
+Plain `docker compose run --rm test` — what the pre-push hook runs — skips it
+at collection and stays around ten seconds.
+
+Two reasons it is not simply always-on. It sends only the arguments it can
+fill from `DATA/`, so each tool runs with its **schema defaults**: for ALI
+that is all four regions, 119 landmarks at ~6.5 s each, about **11 minutes**
+for one scan on a GPU and hours on a CPU. And a hook that takes hours is a
+hook people disable. `test-gpu` is a separate service rather than a flag on
+`test` because a compose device reservation is all-or-nothing — it cannot
+start without an nvidia card, which is why the hook keeps pointing at `test`.
+
 ### Pre-push tests
 
-A git hook runs the full suite above (via `docker compose run --rm test`,
-so nothing needs installing locally) before every `git push`, and blocks the
-push if any test fails. It is **not active by default** — enable it once per
-clone with:
+A git hook runs the suite above (via `docker compose run --rm test`, so
+nothing needs installing locally) before every `git push`, and blocks the push
+if any test fails. It runs `test`, never `test-gpu` — the real-data module is
+opt-in for the reasons just given, so the hook stays about ten seconds
+whatever is sitting in `DATA/`. Run `test-gpu` by hand when you touch a tool's
+inference path.
+
+The hook is **not active by default** — enable it once per clone with:
 
 ```bash
 git config core.hooksPath .githooks

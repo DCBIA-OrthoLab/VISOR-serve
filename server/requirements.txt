@@ -12,12 +12,33 @@ odfpy
 # Medical image I/O and resampling (AMASSS, and any future imaging tool).
 numpy
 SimpleITK
-# Heavy inference stack (AMASSS). Imported LAZILY inside the functions that
-# use it (see tools/AMASSS/src/nnunet_runner.py), so the server still boots
-# when it is missing -- only AMASSS fails, with an actionable message.
+# ALI's CBCT engine: itk resamples the volumes to the two spacings the agents
+# walk. Imported lazily like the stack below.
+itk
+# Heavy inference stack (AMASSS, ALI). Imported LAZILY inside the functions
+# that use it (see tools/AMASSS/src/nnunet_runner.py and
+# tools/ALI/src/ALI_CBCT/brain.py), so the server still boots when it is
+# missing -- only the tools needing it fail, with an actionable message.
 # The deployment image already ships torch built against its CUDA version;
 # pip sees it satisfied and skips it. Never pin or force-reinstall torch here:
 # that would shadow the CUDA build with a CPU-only wheel.
 vtk
 torch
 nnunetv2
+# PINNED, and the pin is load-bearing. monai 1.6.0 requires torch>=2.8.0, so an
+# unpinned entry makes pip replace the image's torch 2.5.1+cu124 with a 2.13
+# wheel on every container start -- the exact "shadow the CUDA build" failure
+# the note above warns about, plus ~3 GB downloaded each time and a broken
+# torchaudio. 1.5.1 asks for torch>=2.4.1, which the image already satisfies,
+# so pip leaves torch alone. Move to 1.6 only together with the image rebuild
+# to torch >= 2.8 (see ALI_PORT_CONTEXT.md 4).
+monai==1.5.1
+
+# NOT LISTED, and deliberately so: pytorch3d and shapeaxi, which ALI's IOS
+# engine and CrownSeg need. pytorch3d has no PyPI distribution at all and must
+# be compiled into the deployment image against its torch/CUDA build, and every
+# shapeaxi release requires a newer torch than the current image ships
+# (2.5.1+cu124). Adding either here would install nothing useful and could
+# shadow the CUDA torch build. Both are imported lazily, so ALI's CBCT engine
+# works today and the IOS half starts working the moment the image is rebuilt
+# -- no code change. See ALI_PORT_CONTEXT.md 4.

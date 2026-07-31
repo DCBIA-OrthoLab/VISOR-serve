@@ -30,6 +30,8 @@ import os
 import numpy as np
 import SimpleITK as sitk
 
+from base import ToolUnavailableError
+
 logger = logging.getLogger("AMASSS.vtk")
 
 _INSTALL_HINT = (
@@ -43,7 +45,7 @@ def _import_vtk():
     try:
         import vtk
     except ImportError as exc:  # pragma: no cover - depends on the deployment
-        raise RuntimeError(_INSTALL_HINT) from exc
+        raise ToolUnavailableError(_INSTALL_HINT) from exc
     return vtk
 
 

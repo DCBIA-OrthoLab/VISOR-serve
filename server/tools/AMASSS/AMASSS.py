@@ -28,6 +28,9 @@ class AMASSSTool(Tool):
         "input": ArgSpec(
             type=("volume_or_zip_file", "folder"),
             required=True,
+            # Lets the client run against (or download) the reference scan
+            # hosted under DATA/AMASSS/testfiles/ instead of uploading its own.
+            server_selectable="testfile",
             description=(
                 "A CBCT scan (.nii/.nii.gz/.nrrd/.nrrd.gz/.gipl/.gipl.gz), or a folder of "
                 "scans for batch segmentation (sent as a .zip archive)"

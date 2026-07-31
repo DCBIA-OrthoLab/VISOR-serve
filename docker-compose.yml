@@ -1,3 +1,18 @@
+# Shared by the two test services below, which differ only in whether they get
+# the GPU. Kept as an anchor rather than copied so the image, the mounts and
+# the pytest command cannot drift between "the suite the hook runs" and "the
+# suite a maintainer runs".
+x-test-base: &test-base
+  image: ghcr.io/jules-gp/lab-ai:2026.07
+  profiles: ["test"]
+  working_dir: /workspace/server
+  volumes:
+    - ./server:/workspace/server
+    - ./DATA:/data:ro
+  command: >
+    sh -c "pip install --no-cache-dir --user -r requirements.txt -r requirements-dev.txt &&
+           python -m pytest"
+
 services:
   inference:
     image: ghcr.io/jules-gp/lab-ai:2026.07
@@ -26,21 +41,45 @@ services:
               capabilities: [gpu]
 
   # Runs the pytest suite in the same environment as `inference`, without the
-  # GPU reservation (tests don't need one, and requiring it would make the
-  # pre-push hook fail on machines without an nvidia GPU). See .githooks/pre-push.
+  # GPU reservation. Not an oversight: compose has no notion of an OPTIONAL
+  # device reservation, so asking for a GPU here would make the pre-push hook
+  # fail outright on any clone without an nvidia card. See .githooks/pre-push.
+  # The unit tests stub every model anyway, so they gain nothing from a GPU.
+  #
   # The "test" profile keeps `docker compose up` from starting this container;
   # it only runs when invoked explicitly with: docker compose run --rm test
   test:
-    image: ghcr.io/jules-gp/lab-ai:2026.07
-    profiles: ["test"]
+    <<: *test-base
     environment:
       - API_TOKEN=test-token
       - DATA_DIR=/data
       - DEVICE=cpu
-    working_dir: /workspace/server
-    volumes:
-      - ./server:/workspace/server
-      - ./DATA:/data:ro
-    command: >
-      sh -c "pip install --no-cache-dir --user -r requirements.txt -r requirements-dev.txt &&
-             python -m pytest"
+      # RUN_REAL_DATA_TESTS is deliberately NOT set: tests/test_data_integration.py
+      # runs real inference against whatever is under DATA/, which is hours on a
+      # CPU once a full ALI bundle is present. This suite stays seconds long.
+
+  # The same suite with the card attached, for the one part that genuinely
+  # wants it: tests/test_data_integration.py runs each tool end to end against
+  # the real bundles under DATA/, which is minutes on a GPU and hours on a CPU.
+  #
+  #     docker compose run --rm test-gpu
+  #
+  # A separate service rather than a flag on `test` because the reservation is
+  # all-or-nothing: this one cannot start without a GPU, and that is exactly
+  # why the hook must keep pointing at `test`.
+  test-gpu:
+    <<: *test-base
+    environment:
+      - API_TOKEN=test-token
+      - DATA_DIR=/data
+      - DEVICE=cuda
+      # The whole reason this service exists: the real-data suite.
+      - RUN_REAL_DATA_TESTS=1
+    shm_size: 8gb
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
