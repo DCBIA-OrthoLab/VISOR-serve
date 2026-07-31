@@ -12,6 +12,10 @@ odfpy
 # Medical image I/O and resampling (AMASSS, and any future imaging tool).
 numpy
 SimpleITK
+# DICOM series ASO's CBCT mode cannot read through SimpleITK's GDCM reader.
+# Imported lazily (tools/ASO/src/cbct/dicom.py): every other ASO mode works
+# without it.
+dicom2nifti
 # Heavy inference stack (AMASSS). Imported LAZILY inside the functions that
 # use it (see tools/AMASSS/src/nnunet_runner.py), so the server still boots
 # when it is missing -- only AMASSS fails, with an actionable message.

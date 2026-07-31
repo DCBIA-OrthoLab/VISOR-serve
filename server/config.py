@@ -88,6 +88,27 @@ class Settings(BaseSettings):
     # Left at nnUNet's own default. Raise it only after looking at the masks.
     AMASSS_TILE_STEP_SIZE: float = 0.5
 
+    # How many landmark triplets ASO's coarse alignment evaluates before the
+    # ICP that follows it. Every ordered triplet is tried when there are at most
+    # this many (7 landmarks is 210, 14 is 2184), which is both faster and
+    # better than sampling; above it, candidates are drawn from a generator
+    # seeded with ASO_ICP_SEED. Raising it costs time and buys very little --
+    # the search is over a coarse alignment the ICP then refines.
+    ASO_ICP_MAX_TRIPLETS: int = 2500
+
+    # Seed for that search when it has to sample. Fixed rather than random on
+    # purpose: an orientation applied to patient data must be reproducible, and
+    # the original drew its triplets from the process-global numpy generator, so
+    # the same request gave a different transform every time and two concurrent
+    # requests consumed each other's random state.
+    ASO_ICP_SEED: int = 0
+
+    # The tool ASO asks for CBCT landmark predictions in Fully-Automated mode.
+    # Not deployed on this server yet: until it is, that mode answers 422 with
+    # a message saying so (see tools/ASO/src/ali_client.py). Semi-Automated CBCT
+    # and both IOS modes do not go near it.
+    ASO_LANDMARK_TOOL: str = "ALI"
+
     # Fallback whitelist, only used for arguments with a generic "file" type
     # (see base.FILE_TYPES). Arguments with a specific type (e.g. "zip_file")
     # are validated against that type's own extensions instead, regardless

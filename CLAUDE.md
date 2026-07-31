@@ -99,6 +99,7 @@ package at startup — e.g. import all modules in `tools/`, collect every subcla
 - `SurgMovPred` — surgical movement prediction from tabular measurements
   (stacking models, server-side model bundles).
 - `AMASSS` — CBCT skull structure segmentation (nnUNet v2, GPU).
+- `ASO` — automated standardized orientation, CBCT and intra-oral scans.
 
 The extension will eventually expose ~15+ tools; the architecture must
 accommodate them without change to the core. See `ADDING_A_TOOL.md`.
@@ -143,7 +144,8 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 │   │   ├── test_tool/
 │   │   ├── example_tool/
 │   │   ├── SurgMovPred/
-│   │   └── AMASSS/
+│   │   ├── AMASSS/
+│   │   └── ASO/
 │   ├── tests/               # HTTP-layer + integration tests
 │   ├── requirements.txt
 │   ├── requirements-dev.txt
@@ -305,6 +307,144 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-07-31 — ASO ported: four modes, one tool, and the defects it inherited
+
+**Motivation:** port ASO (Automated Standardized Orientation) from a 2587-line
+Slicer widget plus four CLI modules onto this server. ASO is the step every
+longitudinal study runs before anything else — put every scan in the same
+coordinate frame — and AREG needs it programmatically.
+
+**One tool, `server/tools/ASO/`, two engines under `src/`, four modes:**
+
+|          | Semi-Automated | Fully-Automated |
+|---|---|---|
+| **CBCT** | your landmarks, ICP onto a gold set | landmarks predicted first, then the same ICP |
+| **IOS**  | your landmarks, ICP per jaw | tooth centroids of an already segmented mesh |
+
+`modality` and `automation` are explicit `choice` arguments, never inferred:
+a `.zip` can hold either kind of data, and guessing wrong orients a patient
+against the wrong reference and calls it a success. Every mode-specific
+argument is `required=False`, with the cross-argument rules raised as
+`ToolArgumentError` **before** any file is read (`ALI_PORT_CONTEXT.md` §3.1).
+
+**Fully-Automated CBCT is wired but inert.** It needs landmark prediction,
+which is ALI's job, and ALI is not deployed here yet — so that one mode answers
+422 with a message naming the missing tool and pointing at Semi-Automated. The
+seam is `src/ali_client.py`; the day `tools/ALI/` is registered, ASO needs no
+change. **The call is in-process, not an HTTP request to our own `/run/ALI`,
+and that is load-bearing**: a tool run holds one of `MAX_CONCURRENT_TOOLS`
+slots for its whole duration, so four concurrent ASO runs each waiting on a
+fifth slot would deadlock the server — `/health` included — until they timed
+out. `Tool.invoke` is the same entry point `main.py` uses, validation included.
+
+**Fully-Automated IOS takes already-segmented meshes only.** Crown segmentation
+is `shapeaxi`/pytorch3d, absent from the image, and belongs to a future
+`tools/CrownSeg` that ALI, AREG and FlexReg want too. `segment_unlabelled()` is
+where it plugs in. **No** labelled mesh in the batch is a 422 (wrong mode);
+*some* unlabelled is a per-patient report entry and the rest of the batch is
+processed — "one of your forty meshes was bad" is not a reason to return
+nothing.
+
+**DICOM input is supported and writes nowhere near the caller's data.**
+`convertdicom2nifti` wrote `<input>/NIFTI/`, which a later run then
+re-discovered as input scans; its fallback path renamed an arbitrary earlier
+output onto the current patient; and it only looked one directory down.
+
+**The defects that cost data, all fixed by construction and each with a named
+test:**
+
+- **`SEMI_ASO_CBCT` could not work at all.** It read `data["tfm"]`
+  unconditionally, but only the fully-automated chain ever produced one, so
+  every patient of a semi-automated run died on a `KeyError` caught 90 lines
+  above. Recentring now always runs, and the landmarks are moved into the
+  centred space with it (`center_landmarks`), which is the state the ICP was
+  always written to expect.
+- **One landmark could lose a patient.** `GetDistDifference` indexed the
+  reference's pairwise table with the *input's* keys, so a landmark present in
+  one and absent from the other was a `KeyError`. The two sides are intersected
+  first and what was dropped is reported, per landmark, with the reason.
+- **Patient keys collided.** `GetPatients` keyed on the base name, so two
+  `scan.nii.gz` in different subfolders became one patient — in the working
+  dict and again in the flat output folder. Keys are paths relative to the
+  input root and the output mirrors the input tree. It also stripped
+  `_T1`/`_T2`, collapsing two timepoints of one subject into a single patient.
+- **`MergeJson` merged a patient's landmark files by writing into the caller's
+  input folder and DELETING the sources.** The merge is in memory.
+- **A second run re-ingested the first.** `patient1_Or.nii.gz` sorts before
+  `patient1_scan.nii.gz`. Previous outputs are set aside and used only when a
+  patient has nothing else.
+- **`UpperOrLower` defaulted to Lower**, so a maxillary mesh named
+  `patient1.vtk` was registered against the mandibular reference and returned
+  as a success. A file whose name does not say its jaw is now refused.
+- **`Files_vtk_json.organise` paired with `vtk_name in json_name`**, so patient
+  `1` matched patient `10` — and padded its list with a literal
+  `"Upper_nioegfjhdfjkdffdhjmndfhnmdfhj"` sentinel. Exact stem, per directory.
+- **Both jaws wrote the same `.tfm`.** `<patient>_SegOr.tfm` for Upper and
+  Lower; the second silently overwrote the first. Named per jaw.
+
+**Concurrency, which only matters because this is a shared server:**
+
+- `InitIcp` wrote `source.npy`/`target.npy` into **its own installed package
+  directory** (`ASO_IOS_utils/cache/`) and re-`np.load`ed one of them on every
+  iteration of a 2500-iteration search. That is a write into the install tree,
+  thousands of pointless round trips per patient, and — the path being fixed —
+  two concurrent requests overwriting each other's landmarks. The search is
+  pure and in memory (`src/geometry.py`, shared by both engines, which had
+  carried two drifted copies of it).
+- The triplet search drew from the **global** `numpy` generator, so the same
+  request gave a different orientation every time and concurrent requests
+  consumed each other's state. Every ordered triplet is now enumerated when
+  there are at most `ASO_ICP_MAX_TRIPLETS` of them (7 landmarks is 210), which
+  is deterministic, faster *and* better than sampling; above that a local
+  generator seeded with `ASO_ICP_SEED` is used.
+
+**Latent bugs found while reading, each now a test:** `np.arccos` of a dot
+product rounding past 1.0 gave NaN that propagated silently through the
+rotation matrix (`pre_icp.py` clamped one end only); `RotationMatrix` divided
+by a zero-length axis for two already-parallel vectors; `ASO_IOS_utils/utils.py`
+defined `PatientNumber` twice, the second shadowing the first; `WriteSurf` used
+`vtkPolyDataWriter`'s ASCII default (bigger, ~130x slower to parse, and *less*
+accurate — see the 2026-07-30 entry); the `.off` reader referenced an undefined
+`line` on its single-vertex branch; and `SEMI_ASO_IOS` wrote every transform as
+`matrix_file_0.npy`, `matrix_file_1.npy` because an `isinstance(file, dict)`
+guard was false on the path that mattered. **The IOS matrix composition order
+was also backwards** (`M_init @ M_icp`, where the ICP runs on points the
+initialisation has already moved); the CBCT engine always had it right, which
+is what makes it a transcription slip rather than a choice.
+
+**Also removed rather than ported:** `PRE_ASO_CBCT`'s `model_folder`, `SmallFOV`
+and `temp_folder` arguments (read, never used, since the learned orientation
+step was removed upstream), the `<filter-progress>` prints, `sys.exit()`,
+`tqdm`, the `time.sleep(0.2)` progress theatre (0.6s per patient), the
+`*Error.txt` files written into the output folder, the `if not os.path.exists`
+skip-if-exists guards, and the reference *scan* the CBCT ICP read and never
+used — which it nonetheless required, so a reference bundle holding only the
+landmarks it registers against died on an `IndexError`.
+
+**`scripts/data-manifest.yml`:** the ASO block dropped 600 MB nothing reads —
+`PreASOModels` (the removed deep-learning step), `identification_landmark_ios_model`
+(fully-automated IOS runs no landmark network) and `segmentation_model` (the
+blocked CrownSeg path) — and gained the seven ALI landmark bundles the default
+reference planes are built on, curated to 758 MB rather than all 112 at ~12 GB.
+
+**Core changes, both sanctioned:** one `FILE_TYPES` entry (`surface_file`), and
+three `config.Settings` fields (`ASO_ICP_MAX_TRIPLETS`, `ASO_ICP_SEED`,
+`ASO_LANDMARK_TOOL`). No GPU: everything ASO computes is SimpleITK/VTK/numpy,
+so it needs no semaphore of its own. `main.py` and `registry.py` untouched.
+
+**Tests:** 195 server tests, 65 new — 64 in `tools/ASO/test/test_ASO.py` (the
+landmark seam stubbed, everything else real, against synthetic volumes, DICOM
+series and meshes) and one in `tests/test_main.py` asserting every extension
+`surface_file` advertises is accepted on upload and a `.txt` is a 400.
+
+Two of those cover the outputs a clinician actually relies on, and both hold to
+the float: **the written landmarks land exactly where the resampling put the
+voxels** (volume and markups are moved by two different code paths — if they
+disagree the markups file opens floating beside its scan, and nothing in the
+report would say so), and **the `.tfm` maps ORIENTED -> ORIGINAL**, recentring
+included. That direction is asserted rather than assumed because getting it
+backwards is silent: the file still loads, and still transforms.
 
 ### 2026-07-30 — AMASSS surfaces: binary, and decimated by default
 

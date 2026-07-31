@@ -371,6 +371,42 @@ def test_tools_publishes_the_extensions_of_every_file_type():
                 assert extensions is None or all(e.startswith(".") for e in extensions), type_name
 
 
+def test_surface_file_type_accepts_every_mesh_format_it_advertises(monkeypatch):
+    """The "surface_file" type ASO introduced. Every extension in the table has
+    to be one the server accepts on upload: ALI's IOS mode advertised .stl and
+    then discovered only .vtk, so a caller's meshes were accepted and never
+    processed."""
+    import base
+    import registry
+
+    class SurfaceTestTool(base.Tool):
+        name = "surface_test_tool"
+        arguments = {"mesh": base.ArgSpec(type="surface_file", required=True)}
+        output_kind = "text"
+
+        def run(self, mesh: str) -> str:
+            return os.path.basename(mesh)
+
+    monkeypatch.setitem(registry.TOOLS, "surface_test_tool", SurfaceTestTool())
+
+    for extension in base.FILE_TYPES["surface_file"]:
+        response = client.post(
+            "/run/surface_test_tool",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            files={"mesh": (f"scan{extension}", io.BytesIO(b"mesh bytes"), "application/octet-stream")},
+        )
+        assert response.status_code == 200, extension
+        assert response.json() == {"result": f"mesh{extension}"}
+
+    response = client.post(
+        "/run/surface_test_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"mesh": ("scan.txt", io.BytesIO(b"not a mesh"), "text/plain")},
+    )
+    assert response.status_code == 400
+    assert ".vtk" in response.json()["detail"]
+
+
 def test_run_declaration_order_decides_zip_vs_folder(monkeypatch):
     """("zip_file", "folder") hands the archive over untouched; ("folder",
     "zip_file") extracts it first. Same upload, different kind."""

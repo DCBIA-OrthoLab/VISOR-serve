@@ -44,6 +44,11 @@ FILE_TYPES: dict = {
         ".gipl.gz",
         ".zip",
     ),
+    # A 3D surface mesh (intra-oral scan, segmentation surface, ...). Every
+    # extension listed here is one a tool declaring this type must be able to
+    # READ: advertising a format and then silently discovering only .vtk is
+    # what made ALI's IOS mode accept .stl files it never processed.
+    "surface_file": (".vtk", ".vtp", ".stl", ".obj", ".off"),
 }
 
 # The type whose resolved path is a directory rather than a file.
