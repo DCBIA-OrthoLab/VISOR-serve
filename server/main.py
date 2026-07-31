@@ -473,6 +473,14 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         for output_root in output_roots:
             background_tasks.add_task(shutil.rmtree, output_root, ignore_errors=True)
 
+        # The duration log above only records the UPLOAD size; without this
+        # line a truncated-delivery report from a client cannot be told apart
+        # from a run that genuinely produced little output. Size only -- the
+        # archive name may embed a user-provided prediction ID.
+        logger.info(
+            "endpoint=/run/%s response_bytes=%d", tool_name, os.path.getsize(result)
+        )
+
         media_type, _ = mimetypes.guess_type(str(result))
         if media_type is None:
             media_type = "application/gzip" if str(result).endswith(".gz") else "application/octet-stream"

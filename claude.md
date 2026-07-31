@@ -288,6 +288,66 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-07-30 — AMASSS surfaces: binary, and decimated by default
+
+**Motivation:** a five-structure run with surfaces returned a 41.9MB archive
+that Slicer could not open — the client froze on the main thread and the user
+read it as "the server never sent the .vtk". It had: `curl` against the same
+endpoint pulled all 41,889,544 bytes with a correct `Content-Length` and every
+mesh re-read cleanly. The transfer was never the problem. The **geometry** was.
+
+**Marching cubes runs on the original scan grid**, so a 0.33mm CBCT produces a
+triangle per voxel face: 1.6M for a cranial base, 3.5M across five structures,
+11.8M for a merged nine-structure volume. That is not detail — the mask
+underneath is only accurate to about half a voxel — it is just resolution
+nobody asked for, and it is what made the results unusable to ship and to open.
+
+**`vtkPolyDataWriter` was writing ASCII** (its default), which is where the
+bulk went: 848.5MB for the merged surface alone against 6.4MB for every
+segmentation in the same run. Binary is the same geometry — and the *more*
+accurate of the two, which is the opposite of the reflex: it round-trips the
+float32 vertices exactly, while ASCII prints ~6 significant digits and moved
+points by up to 5e-05mm on read-back. It is also 133x faster to parse (a 1.6M
+triangle cranial base: 2.67s ASCII, 0.02s binary).
+
+**`surface_decimation` (new schema argument, default 90).** `vtkDecimatePro`
+with `PreserveTopologyOn`, applied after smoothing and *before* the per-cell
+colour array is built — the array is sized to the mesh that is actually
+written. Measured on the cranial base, against a 0.33mm voxel:
+
+| reduction | triangles | mean dev | p95 | max |
+|---|---|---|---|---|
+| 50% | 811,222 | 0.0034mm | 0.004mm | 0.277mm |
+| 80% | 324,488 | 0.0338mm | 0.125mm | 0.493mm |
+| **90%** | **162,244** | **0.0590mm** | **0.171mm** | 0.692mm |
+| 95% | 81,122 | 0.0951mm | 0.264mm | 1.223mm |
+
+90 costs a fifth of a voxel on average and buys a factor of ten. 0 keeps the
+raw mesh. The value is recorded in `AMASSS_report.json` — these surfaces are
+lossy by default now, so a run has to say by how much.
+
+**End to end, the same five-structure request, real HTTP:** archive
+41,889,544 -> **5,417,443 bytes** (7.7x), triangles 3,519,420 -> **351,938**
+(10x), total client-side mesh parsing 2.7s+ -> **0.01s**. Decimation adds ~12s
+of server time for five structures.
+
+**A caveat measured and worth keeping:** binary alone did NOT shrink the
+download. DEFLATE was already squeezing ASCII at 6.2:1 and binary only
+compresses 2.7:1, so the archive went 223.4MB -> 227.8MB on a nine-structure
+run. Binary pays off in disk, RAM, write time, zip time and parse time — not
+on the wire. Only removing geometry moved the download, which is what
+decimation does.
+
+**Still on the table, in the client repo:** `AMASSS.py`'s
+`MAX_RESULTS_TO_LOAD = 12` caps by *file count* while the cost is in triangles,
+so a 10-file run loaded 3.5M triangles on the UI thread while a 20-file run of
+small masks was correctly skipped. Decimation makes this survivable; it does
+not make the cap correct.
+
+**Tests:** 119 server tests (4 new: binary header + exact round trip, temp file
+removal, decimation reduces triangles with 0 disabling it and the colour array
+matching the final cell count, and the report field).
+
 ### 2026-07-30 — AMASSS: the GPU was idle seven eighths of the run
 
 **Motivation:** AMASSS looked GPU-bound and was not. Profiling one structure on
