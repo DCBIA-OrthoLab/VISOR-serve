@@ -15,8 +15,9 @@ Two entry points, on purpose:
   directory plus a structured report. **This is what other server-side tools
   should call** (e.g. a future AREG tool needing AMASSS masks): it hands back
   the files themselves, with no zip/unzip round trip.
-* `main(...)` -> path to a zip. The thin HTTP adapter used by AMASSS.py,
-  because one HTTP response can only carry one blob.
+* `main(...)` -> path to the output directory. The thin schema adapter used
+  by AMASSS.py; with `output_kind = "files"`, main.py zips that directory and
+  streams the archive, so no zip code lives here.
 
 See the module-level comments marked "FIX:" for the specific defects of the
 original CLI that are corrected here.
@@ -54,14 +55,10 @@ if not logger.handlers:
 # ---------------------------------------------------------------------------
 # Structure catalog -- the single source of truth, published to clients
 # ---------------------------------------------------------------------------
-# The server owns the human-readable names, so the Slicer module (and any other
-# client) renders its check boxes straight from GET /tools instead of keeping its
-# own copy in sync. STRUCTURE_CHOICES below is what AMASSS.py publishes as the
-# `choices` of its "structures" argument.
-#
-# The grouping (Bones / Soft tissue / Masks) is owned here too, but survives only
-# as ORDERING -- see the note above STRUCTURE_NAMES for why the client renders
-# one flat list.
+# The server owns both the grouping and the human-readable names, so the
+# Slicer module (and any other client) renders its checkboxes straight
+# from GET /tools instead of keeping its own copy in sync. This is exported
+# through ArgSpec.choices in AMASSS.py (see STRUCTURE_CHOICES below).
 #
 # FIX: "Teeth" (TEETH), "Root canal" (RC) and "Mandibular canal" (MCAN) are
 # deliberately ABSENT. They were offered by the Slicer UI while sitting in
@@ -526,7 +523,7 @@ def segment(
     if generate_surface and not vtk_export.is_available():
         raise RuntimeError(
             "generate_surface=true but VTK is not installed on the server. "
-            "Install requirements-amasss.txt, or run with generate_surface=false."
+            "Install requirements.txt, or run with generate_surface=false."
         )
 
     device = nnunet_runner.resolve_device(device or settings.DEVICE)
