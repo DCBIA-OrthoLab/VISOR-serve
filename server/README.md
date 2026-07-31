@@ -209,9 +209,20 @@ curl -k -X POST https://localhost:8000/run/AMASSS \
   -F "model=AMASSS_Models" \
   -F "input=@/path/to/scan.nii.gz" \
   -F 'structures={"Mandible":true,"Maxilla":true}' \
-  -F "merge=MERGED" \
+  -F "merge=One merged segmentation file" \
   --output result.zip
+
+# Both output forms at once: merge is a multichoice, so it takes the
+# comma-separated shorthand (or the full JSON object) like structures does.
+  -F "merge=One merged segmentation file,Separated segmentation files"
 ```
+
+`structures` and `merge` are both **`multichoice`** arguments, so they speak the
+*declared option names* — the same labels the Slicer panel shows — not the
+internal codes (`MAND`, `MERGED`). Sending a code is a **422** naming the
+options it expected. `merge` was briefly a `"choice"`, which silently produced
+runs with no segmentation files in them at all; see the 2026-07-31 changelog
+entry in `CLAUDE.md`.
 
 Models live under `DATA/AMASSS/models/<bundle>/<CODE>/**/*__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth`
 (one subfolder per structure code) and are selected **by name** — they never
@@ -222,6 +233,13 @@ The response is a zip: one `<scan>_<ID>_SegOut/` folder per scan plus an
 `AMASSS_report.json` listing what was predicted, what was skipped for lack of
 a model, and what failed — a structure without a model used to disappear with
 nothing but a log line, which is invisible in a 200-scan batch.
+
+Segmentations are **always written compressed**, whatever the input was: a scan
+sent as a plain `.nii` comes back as `.nii.gz` masks. These are label volumes,
+so the difference is not marginal — 191 MB down to 0.4 MB per structure on a
+0.33mm CBCT, measured. The input's format is preserved (`.nrrd` stays `.nrrd`,
+compressed internally — ITK has no `.nrrd.gz` writer); only the compression is
+imposed.
 
 **Calling AMASSS from another server-side tool**: import
 `tools.AMASSS.src.AMASSSLogic.segment()` directly. It returns a
