@@ -44,11 +44,11 @@
 # ---------------------------------------------------------------------------
 # Status of each tool
 # ---------------------------------------------------------------------------
-# AMASSS and SurgMovPred are the tools that exist on the server today; their
-# entries are known-good against the current code. Everything below them is
-# staged for a port that has not happened yet (see ALI_PORT_CONTEXT.md), so
-# treat those paths as a proposal: every URL below was checked live, but which
-# files the future tool will actually want is not settled.
+# AMASSS, SurgMovPred, ALI and CrownSeg are the tools that exist on the server
+# today; their entries are known-good against the current code. Everything
+# below them is staged for a port that has not happened yet, so treat those
+# paths as a proposal: every URL below was checked live, but which files the
+# future tool will actually want is not settled.
 #
 # Two consequences of `DATA/` being organized per tool, worth knowing before
 # the ports start:
@@ -105,14 +105,21 @@ tools:
         extract: true
 
   # =========================================================================
-  # ALI -- landmark identification. NOT PORTED YET (see ALI_PORT_CONTEXT.md).
+  # ALI -- landmark identification. LIVE on the server.
   #
   # 13 GB of CBCT models. Ask for them on their own:
   #     python3 scripts/fetch_data.py --kind models --tool ALI
   #
-  # ALI_PORT_CONTEXT.md's open question 3 ("where do model bundles live and
-  # how are they named?") is what the layout below answers. Two published
-  # packagings of the same kind of weights exist:
+  # Both bundle names below are what the tool actually reads:
+  #   * ALI_CBCT_Models/ -> engine.discover_weights walks it recursively for
+  #     <landmark>/<scale>/*.pth, so the eight region archives unpack side by
+  #     side into one bundle and one dropdown entry.
+  #   * ALI_IOS_Models/  -> Upper_O_model.pth, Lower_O_model.pth,
+  #     Upper_C_model.pth, Lower_C_model.pth (verified against the published
+  #     archive). Each name carries an O/C token and an Upper/Lower one, which
+  #     is the single naming rule ALI_IOS/engine.discover_weights applies.
+  #
+  # Two published packagings of the same CBCT weights exist:
   #
   #   * DCBIA .../v0.1-v2.0_models/ -- 8 archives grouped by region, Nov 2023.
   #     USED HERE. It is what the ALI module's own "Download latest models"
@@ -180,6 +187,30 @@ tools:
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Upper_Right_Teeth_v2.zip
         size: 2054773872
         extract: true
+    testfiles:
+      - name: T1_01_U_segmented.vtk
+        url: https://github.com/baptistebaquero/ALIDDM/releases/download/v1.0.4/T1_01_U_segmented.vtk
+      # The CBCT counterpart, so both engines have a testfile to run against.
+      - name: MG_test_scan.nii.gz
+        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        size: 98611496
+
+  # =========================================================================
+  # CrownSeg -- per-tooth labelling of intraoral scans. LIVE on the server.
+  #
+  # One checkpoint, and settings.CROWNSEG_MODEL names it: a caller that picks
+  # no model gets this one. That default is what lets ALI's IOS mode segment
+  # an unlabelled mesh without naming CrownSeg's data -- and what keeps the
+  # library from downloading the file from GitHub mid-request, which is not
+  # something a server holding patient data should do.
+  #
+  # Same file FlexReg lists, duplicated because DATA/ is per tool.
+  # =========================================================================
+  CrownSeg:
+    models:
+      - name: 07-21-22_val-loss0.169.pth
+        url: https://github.com/DCBIA-OrthoLab/Fly-by-CNN/releases/download/3.0/07-21-22_val-loss0.169.pth
+        size: 6612456
     testfiles:
       - name: T1_01_U_segmented.vtk
         url: https://github.com/baptistebaquero/ALIDDM/releases/download/v1.0.4/T1_01_U_segmented.vtk

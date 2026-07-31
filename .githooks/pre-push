@@ -5,6 +5,13 @@
 #
 # To push without running the tests (e.g. a documentation-only change, or
 # Docker unavailable), use git's built-in bypass: `git push --no-verify`.
+#
+# This runs the `test` service, NOT `test-gpu`: the latter reserves an nvidia
+# card (so it cannot start on a clone without one) and sets
+# RUN_REAL_DATA_TESTS, which runs real inference against whatever bundles are
+# in DATA/ -- eleven minutes on a GPU, hours on a CPU. Run it by hand when
+# touching a tool's inference path:
+#   docker compose run --rm test-gpu
 
 set -euo pipefail
 

@@ -99,6 +99,11 @@ package at startup — e.g. import all modules in `tools/`, collect every subcla
 - `SurgMovPred` — surgical movement prediction from tabular measurements
   (stacking models, server-side model bundles).
 - `AMASSS` — CBCT skull structure segmentation (nnUNet v2, GPU).
+- `ALI` — automatic landmark identification, on CBCT volumes (deep-RL agents)
+  or intraoral surface scans (multi-view rendering + 2D UNet). The engine is
+  chosen from the data, not from an argument.
+- `CrownSeg` — per-tooth labelling of intraoral scans (shapeaxi). Its own tool
+  rather than a helper inside ALI, because ASO, AREG and FlexReg need it too.
 
 The extension will eventually expose ~15+ tools; the architecture must
 accommodate them without change to the core. See `ADDING_A_TOOL.md`.
@@ -143,7 +148,13 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 │   │   ├── test_tool/
 │   │   ├── example_tool/
 │   │   ├── SurgMovPred/
-│   │   └── AMASSS/
+│   │   ├── AMASSS/
+│   │   ├── CrownSeg/
+│   │   └── ALI/
+│   │       └── src/         # ALILogic.py dispatches; one folder per engine
+│   │           ├── ALI_CBCT/
+│   │           ├── ALI_IOS/
+│   │           └── markups/ # shared by both engines, no other tool needs it yet
 │   ├── tests/               # HTTP-layer + integration tests
 │   ├── requirements.txt
 │   ├── requirements-dev.txt
@@ -186,6 +197,10 @@ model, a reference test dataset) instead of the client uploading it every call.
 - `GET /tools/{tool_name}/data` (Bearer-protected) lists the available file names
   in both folders, so a client can present them (e.g. a dropdown) instead of a file
   picker.
+- `GET /tools/{tool_name}/testfiles/{filename}` (Bearer-protected) streams one of
+  the listed **test files** to the client (a folder entry arrives zipped) — backs
+  the Slicer client's "Test file" button. Models are deliberately not
+  downloadable: selected by name, used in place.
 - In `POST /run/{tool_name}`, a `server_selectable` argument sent as a plain form
   value (the file name) instead of an upload is resolved against `data_store`
   rather than streamed to a temp dir.
@@ -305,6 +320,260 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-07-31 — 501 for "this server cannot do that", instead of a blank 500
+
+**Found by running ALI in IOS mode.** The preflight added earlier did its job:
+it raised immediately, before any mesh was read, with a message naming
+pytorch3d and adding that the CBCT engine is unaffected. That message went to
+the server log — and the Slicer user got `500 — The tool failed on the server.`
+
+500 hides its detail deliberately, and rightly: a crash inside a tool can name
+server-side paths and internals. A missing optional dependency is the opposite
+kind of event. The request was valid, nothing the caller changes will help,
+and the reason names a package, nothing sensitive. Swallowing it sends the
+user hunting through their own arguments for a problem that is entirely ours.
+
+`base.ToolUnavailableError` plus a `501 Not Implemented` mapping in `main.py`.
+Every dependency-import failure across `ALI`, `CrownSeg` and `AMASSS` raises it
+now — twelve sites — because the same condition answering 500 in one tool and
+501 in another is worse than either. **No client release needed:**
+`error_for_status` shows the server's `detail` verbatim for any status it does
+not map specially, so 501 already reads correctly in Slicer. Verified end to
+end: an IOS request returns 501 with the pytorch3d message in the body.
+
+### 2026-07-31 — Test files are downloadable: `GET /tools/{tool}/testfiles/{filename}`
+
+**Motivation:** the Slicer client grows a per-input "Test file" button that
+fills a file input with reference data, so a user can try a tool without
+hunting for a scan of their own. The hosted-name route
+(`server_selectable="testfile"`, sent as a form value) runs a tool on a test
+file without it ever travelling — but it cannot put the file *in the user's
+hands*, and the button's whole point is a local copy the user can look at and
+re-run at will.
+
+**Design (`server/main.py`):** one new Bearer-protected endpoint streams a
+test file by name, resolved through `data_store.resolve_testfile` (so the
+backend abstraction and its traversal checks apply unchanged; unknown name →
+404). A folder entry is zipped on the fly into a staging dir under `TEMP_DIR`
+(`file_utils.make_zip`, run off the event loop) and removed by background task
+once the response has streamed; a backend temp copy
+(`ResolvedFile.is_temporary`) is likewise removed after streaming. **Test
+files only** — models are selected by name and used in place; nothing a client
+does should ever pull one off the server. The log line carries tool, status,
+duration and size, never the file name, matching `/run`. The media-type guess
+is factored into `_media_type_of()`, shared with `/run`.
+
+Also: `AMASSS`'s `input` is now `server_selectable="testfile"` like ALI's and
+SurgMovPred's, so the reference scan under `DATA/AMASSS/testfiles/` feeds its
+"Test file" button. (The Slicer GUI dropped its hosted-name dropdown for file
+arguments in the same change — the input field always holds a local file now;
+the name route stays in the API and in `test_data_integration.py`.) The
+client grays its button off this server's actual `GET /tools/{tool}/data`
+listing, so an empty `testfiles/` folder is a grayed button explaining itself
+in its tooltip, not a 404.
+
+**Tests (`tests/test_main.py`):** 401 without a token, 404 for unknown
+tool/file, a plain file streamed with the right `Content-Disposition`/type and
+the store left untouched, a folder zipped with `TEMP_DIR` clean afterward, and
+an `is_temporary` copy removed after streaming.
+
+### 2026-07-31 — `monai` pinned: an unpinned entry was replacing the image's torch
+
+**Caught by reading a `pip install` log, not by a failing test.** Adding
+`monai` (unpinned) to `requirements.txt` for ALI made every container start
+resolve `monai 1.6.0`, which requires `torch>=2.8.0` — so pip downloaded a
+`torch 2.13.0` wheel plus the whole CUDA 13 stack **over the image's
+`2.5.1+cu124`**, on every start. Three consequences, none of which fail a
+test: ~3 GB downloaded per container start (`--no-cache-dir`), `torchaudio
+2.5.1+cu124` left unsatisfiable, and the image's purpose-built CUDA torch
+shadowed by a wheel that happened to still find the card here — on a host
+whose driver predates CUDA 13 it would not have.
+
+This is exactly the failure `requirements.txt`'s own comment warns about
+("never pin or force-reinstall torch"), reached from the other direction: not
+by listing torch, but by listing something that outranks it.
+
+`monai==1.5.1` is the fix — it asks for `torch>=2.4.1`, which the image
+already satisfies, so pip leaves torch alone. Every transform and network ALI
+uses (`EnsureChannelFirst`, `BorderPad`, `ScaleIntensity`, `SpatialCrop`,
+`DenseNet`, `UNet`) exists there, confirmed by re-running the full real-data
+suite on GPU. Move to 1.6 only together with the image rebuild to torch >= 2.8.
+
+**The general rule this earns:** an unpinned dependency can upgrade torch
+transitively. When adding one to `requirements.txt`, check its torch
+requirement against the image before trusting that "pip sees torch satisfied
+and skips it".
+
+**And an operational one, learned the hard way when it bit a live container.**
+The `inference` service installs requirements as part of its *command*, so a
+container that has been up for days is running whatever `requirements.txt` said
+when it last started — uvicorn's `--reload` picks up new Python code but never
+re-runs pip. Worse, `pip --user` writes into `/home/lab/.local`, i.e. the
+container's writable layer, so `docker compose restart` keeps a bad resolution
+(the shadowing torch 2.13 survived it). After changing `requirements.txt`:
+
+    docker compose up -d --force-recreate inference
+
+`--force-recreate`, not `restart`: only a fresh layer discards what the
+previous resolution installed.
+
+**A dependency failure is a run-level failure** (`check_dependencies()` in both
+ALI engines). The missing `itk` above surfaced through the per-scan
+`try/except`, so it was reported as if one patient's data were at fault: every
+scan failed identically, each only *after* a complete histogram correction, and
+the run ended on "ALI produced no landmarks for any scan" — which buries the
+one line naming what to install. Both engines now import their whole lazy stack
+once, before the loop, so the install message is what the caller sees and a
+200-scan cohort does not discover it 200 times.
+
+### 2026-07-31 — Real-data tests are opt-in; `test-gpu` service; ALI's GPU cap off 1
+
+**Where the device is actually decided.** `inference` already runs on the GPU
+(`DEVICE=${DEVICE:-cuda}` plus the nvidia reservation), and every tool reads
+`settings.DEVICE`, falling back to CPU only when `torch.cuda.is_available()`
+says so. Nothing hardcodes a device. The one service deliberately on CPU was
+`test`.
+
+**`test-gpu` (`docker-compose.yml`).** The unit tests stub every model and
+gain nothing from a card, but `tests/test_data_integration.py` runs each tool
+end to end against the real bundles under `DATA/` — minutes on a GPU, hours on
+a CPU. A compose device reservation is all-or-nothing, so putting it on `test`
+would make the pre-push hook fail outright on any clone without an nvidia
+card. A second service instead, sharing everything else through a YAML anchor
+so the two suites cannot drift. The hook keeps pointing at `test`.
+
+**The real-data suite is now opt-in (`RUN_REAL_DATA_TESTS`), and had to
+become so.** It was written to skip when `DATA/` is empty, which made it free
+— but the moment a full ALI bundle lands, "skip" turns into eleven minutes of
+GPU inference, or hours on the CPU the hook uses, because the request carries
+no selection and ALI therefore predicts all 119 landmarks. `docker compose run
+--rm test` was left hanging for hours. It now skips the module at collection
+and stays ~10s; `test-gpu` sets the variable and runs the real thing. A
+pre-push hook that takes hours is a hook people disable, and coverage nobody
+runs is not coverage.
+
+**`ALI_MAX_GPU_JOBS` 1 → 4.** Measured on the real bundle (RTX 6000 Ada): an
+ALI CBCT run peaks at **256 MiB** of VRAM — one small DenseNet over a 64³ crop
+— on a 48 GB card. At a limit of 1, two concurrent requests fully serialized,
+the second waiting ~6.5 s per landmark for the first, for a resource neither
+was close to exhausting. The default now matches `MAX_CONCURRENT_TOOLS`, which
+makes it effectively "no extra limit" while still bounding things if that is
+ever raised a lot. The figure is a property of the models, not of the card, so
+4 × 256 MiB = 1 GB is safe on any GPU able to run this at all.
+`AMASSS_MAX_GPU_JOBS` stays at 1: nothing here measured it, and a 3d_fullres
+nnUNet is a different order of magnitude.
+
+### 2026-07-31 — ALI (both engines) + CrownSeg
+
+**Motivation:** port `ALI` — automatic landmark identification — from a pair
+of Slicer CLI modules. It is the first tool with *two* engines that share
+nothing but their output format, and the first whose IOS half depends on a
+library the deployment image does not yet carry.
+
+**One tool, two engine folders (`tools/ALI/src/{ALI_CBCT,ALI_IOS}/`).** One
+entry in `GET /tools`, one `DATA/ALI/`, one Slicer module — mirroring the
+original. `ALILogic.py` owns everything before inference (unpacking, DICOM
+conversion, mode detection, the run report) so each engine only has to know
+how to place landmarks. `src/markups/` holds the Slicer `.mrk.json` writer
+both engines use; it sits beside them rather than in a tool of its own
+because no *other* tool needs it yet.
+
+**The mode is detected, not declared.** There is deliberately no `mode`
+argument: a `.zip` can hold either kind of data and a DICOM series has no
+extension at all, so nothing in the request distinguishes them — only the
+data does. `ALILogic.detect` walks the input, and an archive holding both
+kinds is a 422 rather than a guess. (This supersedes ALI_PORT_CONTEXT.md
+§3.1, which proposed an explicit `mode` choice; the Slicer client was already
+written against the detected-mode contract, and its 24 schema tests pass
+against what shipped.)
+
+The accepted cost is that the schema cannot say "this argument only applies
+in mode X": `cbct_regions` and `ios_networks` are both optional, both always
+rendered by the client, and one is inert on any run. Emptying the selection
+for the mode that *actually ran* raises `ToolArgumentError` → 422 naming the
+argument to fill in. That 422 is how a mode mismatch explains itself.
+
+**`CrownSeg` is a tool, not a helper.** ALI's IOS engine needs a mesh
+carrying per-tooth labels. The Slicer module got them by running the
+`dentalmodelseg` executable out of Slicer's own bin — which is only the
+console-script entry point of the `shapeaxi` PyPI package
+(`dentalmodelseg = shapeaxi.dental_model_seg:cml`), so nothing needed porting:
+`tools/CrownSeg/src/` calls `shapeaxi.dental_model_seg.main()` directly with
+the namespace its `cml()` would have built. It lives in its own tool because
+ASO, AREG and FlexReg call it too, and because ALI's IOS half needs pytorch3d
+— inside ALI, one absent dependency would take four tools out of the registry
+instead of one. ALI asks for segmentation without naming CrownSeg's data:
+`model` is optional there and falls back to `settings.CROWNSEG_MODEL`. (The
+library's own fallback downloads the checkpoint from GitHub mid-request; a
+server holding patient data does not make outbound calls, so a missing file
+is an error naming `setup-models.sh`.) shapeaxi's stdout is swallowed — it
+prints "Saving results to <path>" per mesh, and that path is the patient's
+own file name.
+
+**Defects fixed by construction**, all of which lost results silently:
+
+- **One unknown landmark cost the whole patient.** `LABEL_GROUPS[landmark]`
+  was indexed with no guard inside the save loop, and its `KeyError` was
+  caught far above — so nothing at all was written for that scan, including
+  every landmark correctly found. The two spellings that triggered it (the UI
+  said `UR3OI…`, the CLI `UR3OIP…`) are now aliases of one vocabulary, and
+  `group_of()` cannot raise.
+- **Homonyms overwrote each other in batch.** The patient key was
+  `file.name`, so two `scan.nii.gz` in different subfolders collided twice
+  over — in the working dict and in the flat output folder. Scans are keyed by
+  path relative to the input root, and the output mirrors the input tree.
+- **A missing mandibular IOS model was a silently-caught `KeyError`**, so the
+  jaw vanished from the results. Reported now. The jaw must also be named
+  explicitly in the checkpoint's name: "not Lower ⇒ Upper" meant a bundle
+  missing its mandibular model quietly predicted the lower arch with the
+  maxillary one. One naming rule (an `O`/`C` token plus an `Upper`/`Lower`
+  one) replaces the two the UI and the CLI disagreed on — verified against
+  the published archive, whose files are `Upper_O_model.pth` &co.
+- **DICOM conversion wrote into the user's own folder** (`<input>/NIFTI/`),
+  which the next run then re-ingested as input scans. Everything goes to the
+  request scratch dir. Likewise the segmentation CSV, which the module wrote
+  into the extension's own source tree.
+- **`.stl` was accepted then ignored**: the UI counted them, the CLI globbed
+  for `.vtk` only. Read for real now, and `surface_or_zip_file` (new
+  `FILE_TYPES` entry — the only core edit) advertises exactly what discovery
+  walks.
+- **`R`, `RIP`, `OIP`** were selectable and predicted by nothing. Not offered.
+- **`SaveId` was read by nothing**; `prediction_ID` is a real argument.
+- **Output extensions disagreed** (`.mrk.json` vs `.json` for identical
+  content, only the first of which Slicer recognises). Uniform, and **one
+  file per scan** instead of one per anatomical region — the split forced
+  every downstream tool to recombine them by hand.
+- **`display.visibility: false`**, in both CLIs, ported faithfully at first and
+  then corrected. It switches the markups *display* node off: Slicer loads the
+  file, builds the node, lists it in the Markups module, and draws nothing —
+  independently of each control point's own `visibility`, which was already
+  true. Invisible inside the old module (which loaded the nodes itself and had
+  a panel to toggle them), fatal the moment anyone opens a result file, which
+  is exactly what a returned archive is for. Two tests pin it, because a valid
+  file that renders nothing fails no other check.
+- Two latent bugs in the search: `new_pos.all() > 0` reduced the array to one
+  boolean *before* comparing, so it tested "no component is zero" and let
+  negative coordinates through; and `Focus`'s convergence loop had no bound at
+  all, which in a worker thread is a request that never returns. Also, the IOS
+  masks were argmax'd over logits cast to `int16`, turning near ties into real
+  ones that resolved toward the background channel.
+
+**Sequencing (`ALI_PORT_CONTEXT.md` §8):** the CBCT engine runs today on
+`monai` + `itk`, both added to `requirements.txt`. The IOS engine and
+CrownSeg are written and tested but **cannot execute until the base image is
+rebuilt on torch ≥ 2.8 with pytorch3d compiled in** — pytorch3d has no PyPI
+distribution at all, and every shapeaxi release wants a newer torch than the
+image's 2.5.1. Both are imported lazily, so ALI loads, publishes its schema,
+and fails only an IOS *run*, with a message naming what is missing. Neither
+is in `requirements.txt`: adding them would install nothing useful and could
+shadow the CUDA torch build.
+
+**Tests:** 37 for ALI, 20 for CrownSeg, all without GPU, weights, or network.
+The agent's search and shapeaxi's segmentation are stubbed; everything around
+them runs for real, including a full CBCT run through real preprocessing,
+monai transforms and markups writing. Each test that pins a fixed defect says
+which one in its docstring.
 
 ### 2026-07-30 — Dead-code and duplication cleanup
 

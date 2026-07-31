@@ -20,7 +20,13 @@ from fastapi.responses import FileResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 import file_utils
-from base import FILE_TYPES, FOLDER_TYPE, ResolvedPath, ToolArgumentError
+from base import (
+    FILE_TYPES,
+    FOLDER_TYPE,
+    ResolvedPath,
+    ToolArgumentError,
+    ToolUnavailableError,
+)
 from config import settings
 from data_store import DataNotFoundError, data_store
 from registry import TOOLS, get_tool
@@ -173,6 +179,17 @@ def _discard(work_dir: Optional[str], scratch_dirs: list) -> None:
         shutil.rmtree(directory, ignore_errors=True)
 
 
+def _media_type_of(path: str) -> str:
+    """Content-Type for a file about to be streamed. Derived from the real
+    extension so an .xlsx is never mislabeled as a generic zip (see the
+    2026-07-24 changelog entry); the gzip/octet-stream fallback covers bare
+    .gz files (e.g. .nii.gz), which mimetypes cannot name."""
+    media_type, _ = mimetypes.guess_type(str(path))
+    if media_type is None:
+        media_type = "application/gzip" if str(path).endswith(".gz") else "application/octet-stream"
+    return media_type
+
+
 def _human_bytes(size: int) -> str:
     """Byte count in the largest unit that keeps it readable.
 
@@ -307,6 +324,78 @@ def list_tool_data(tool_name: str) -> dict:
         "models": data_store.list_models(tool.name),
         "testfiles": data_store.list_testfiles(tool.name),
     }
+
+
+def _remove_path(path: str) -> None:
+    """Remove a file or a whole directory tree — for backend-materialized temp
+    copies (ResolvedFile.is_temporary), which can be either."""
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
+    elif os.path.exists(path):
+        os.remove(path)
+
+
+@app.get("/tools/{tool_name}/testfiles/{filename}", dependencies=[Depends(verify_token)])
+async def download_testfile(tool_name: str, filename: str, background_tasks: BackgroundTasks):
+    """Stream one of the tool's hosted test files to the client, so a user can
+    fill an input with reference data instead of hunting for a scan of their
+    own. The valid names are what GET /tools/{tool_name}/data lists.
+
+    Only test files are downloadable. Models are deliberately NOT: they are
+    selected by name and used in place (see ArgSpec.server_selectable), and
+    nothing a client does should ever pull one off the server.
+
+    A test entry that is a FOLDER is zipped on the fly — one response carries
+    one blob — and the client unpacks it back into a directory on its side.
+    """
+    start_time = time.monotonic()
+    try:
+        tool = get_tool(tool_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    try:
+        resolved = data_store.resolve_testfile(tool.name, filename)
+    except DataNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    if resolved.is_temporary:
+        background_tasks.add_task(_remove_path, resolved.path)
+
+    path = resolved.path
+    if os.path.isdir(path):
+        # DATA_DIR is read-only: the archive is built in its own staging dir
+        # under TEMP_DIR, which must outlive the response stream — hence the
+        # background task, and the inline cleanup on the one path where no
+        # response (and so no background task) will ever run.
+        staging_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
+        archive_name = f"{os.path.basename(filename)}.zip"
+        try:
+            path = await anyio.to_thread.run_sync(
+                file_utils.make_zip, path, os.path.join(staging_dir, archive_name)
+            )
+        except Exception:
+            logger.exception("endpoint=/tools/%s/testfiles status=500 (packing)", tool_name)
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            raise HTTPException(status_code=500, detail="Could not package the test folder.")
+        background_tasks.add_task(shutil.rmtree, staging_dir, ignore_errors=True)
+
+    # Same log shape as /run: tool, status, duration, size — never the file
+    # name (see the confidentiality note at the top of this module).
+    size = os.path.getsize(path)
+    logger.info(
+        "endpoint=/tools/%s/testfiles status=200 duration=%.2fs sent=%dB (%s)",
+        tool_name,
+        time.monotonic() - start_time,
+        size,
+        _human_bytes(size),
+    )
+    return FileResponse(
+        path,
+        media_type=_media_type_of(path),
+        filename=os.path.basename(path),
+        background=background_tasks,
+    )
 
 
 @app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
@@ -451,6 +540,14 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     except ToolArgumentError as exc:
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    except ToolUnavailableError as exc:
+        # The request is fine; this deployment cannot serve it (a dependency
+        # the image does not carry). 501, not 500: nothing the caller changes
+        # will help, and unlike a crash the reason is exactly what they need to
+        # read -- it names a missing package, never a path or patient data.
+        logger.warning("endpoint=/run/%s status=501", tool_name)
+        _discard(work_dir, scratch_dirs)
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc))
     except Exception:
         logger.exception("endpoint=/run/%s status=500", tool_name)
         _discard(work_dir, scratch_dirs)
@@ -508,9 +605,7 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         for output_root in output_roots:
             background_tasks.add_task(shutil.rmtree, output_root, ignore_errors=True)
 
-        media_type, _ = mimetypes.guess_type(str(result))
-        if media_type is None:
-            media_type = "application/gzip" if str(result).endswith(".gz") else "application/octet-stream"
+        media_type = _media_type_of(str(result))
         # The size of the file about to be streamed. Measured rather than
         # accumulated: for output_kind="files" what goes out is the archive
         # built just above, not the sum of what run() produced.

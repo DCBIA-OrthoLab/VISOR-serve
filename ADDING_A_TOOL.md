@@ -393,6 +393,16 @@ matching file type otherwise. A `"folder"`-typed argument backed by a zipped
 entry in the data store is extracted for you, so the tool sees a directory
 whichever route the data took.
 
+Test files (and only test files) are also **downloadable**:
+`GET /tools/<tool_name>/testfiles/<name>` (Bearer-protected) streams the entry
+to the client — a folder entry arrives zipped. This backs the Slicer client's
+"Test file" button, which pulls a hosted test file down and fills the input
+field with the local copy; the button grays itself when this endpoint would
+404, i.e. when `DATA/<tool_name>/testfiles/` has nothing to offer. Models are
+deliberately not downloadable: they are selected by name and used in place.
+Nothing to declare per tool — drop a file under `testfiles/` and both the
+dropdown and the button light up.
+
 Two constraints worth internalizing:
 
 - `DATA_DIR` is mounted **read-only** (`./DATA:/data:ro`). Never write there.
@@ -527,7 +537,7 @@ def _import_torch():
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError(f"This tool needs torch: {_INSTALL_HINT}") from exc
+        raise ToolUnavailableError(f"This tool needs torch: {_INSTALL_HINT}") from exc
     return torch
 ```
 
@@ -537,6 +547,24 @@ the whole tool (§2). Deferring the import means the tool still loads, still
 publishes its schema through `GET /tools`, and only an actual run fails — with
 a message naming what to install. `tools/AMASSS/src/nnunet_runner.py` is the
 reference implementation.
+
+`ToolUnavailableError` (not a bare `RuntimeError`) is what carries that message
+out to the caller as a **501** instead of a blank 500 — see §9.
+
+**Call every one of these importers once, up front**, before the work starts:
+
+```python
+def check_dependencies() -> None:
+    _import_torch()
+    _import_vtk()
+```
+
+A missing dependency belongs to the server, not to one input. Discovering it
+inside a per-item loop means a 200-scan batch fails 200 times identically —
+each time only *after* that scan's preprocessing — and the run then ends on a
+summary that buries the one line saying what to install. `tools/ALI/`'s two
+engines do this; it is the difference between an actionable failure in a second
+and an opaque one in an hour.
 
 The same applies to a `src/` module other tools import: keep the heavy imports
 inside functions so importing the module never drags in the stack.
@@ -630,7 +658,17 @@ upload on a scalar argument, or an unsafe/oversized archive → **400**, file ov
 
 A rule spanning *several* arguments can't be expressed in the schema. Raise
 `ToolArgumentError` from `run()` and it gets the same **422** treatment as a
-schema violation, with your message — any other exception becomes a blank 500.
+schema violation, with your message.
+
+When it is the *server* that can't serve a perfectly valid request — almost
+always a dependency the deployment image doesn't carry — raise
+`ToolUnavailableError` instead, and the client gets a **501** with your
+message. That is what the lazy importers of §7 do. Use it only for
+"this deployment cannot do this": nothing the caller changes may fix it, and
+the message must name a package, never a path or anything about the data.
+
+**Any other exception becomes a blank 500**, on purpose — a crash can name
+server-side internals, so its detail is never shown to the client.
 
 ---
 

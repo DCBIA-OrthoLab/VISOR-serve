@@ -634,6 +634,112 @@ def test_server_selectable_folder_argument(monkeypatch, tmp_path):
     assert sorted(os.listdir(stored_folder)) == ["a.csv"]
 
 
+def test_download_testfile_requires_token():
+    response = client.get("/tools/test_tool/testfiles/anything.nii.gz")
+    assert response.status_code == 401
+
+
+def test_download_testfile_unknown_tool_is_404():
+    response = client.get(
+        "/tools/does_not_exist/testfiles/anything.nii.gz",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert response.status_code == 404
+
+
+def test_download_unknown_testfile_is_404():
+    response = client.get(
+        "/tools/test_tool/testfiles/does_not_exist.nii.gz",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+    assert response.status_code == 404
+
+
+def test_download_testfile_streams_the_file(monkeypatch, tmp_path):
+    """A plain test file is streamed as-is, named by Content-Disposition and
+    typed from its real extension — the two headers the Slicer client trusts
+    to write it to disk under the right name."""
+    import main
+    from data_store import ResolvedFile
+
+    stored = tmp_path / "reference_scan.nii.gz"
+    stored.write_bytes(b"scan-bytes")
+    monkeypatch.setattr(
+        main.data_store,
+        "resolve_testfile",
+        lambda tool_name, filename: ResolvedFile(path=str(stored)),
+    )
+
+    response = client.get(
+        "/tools/test_tool/testfiles/reference_scan.nii.gz",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"scan-bytes"
+    assert "reference_scan.nii.gz" in response.headers["content-disposition"]
+    assert response.headers["content-type"] == "application/gzip"
+    # The data store is persistent reference data: it must still be there.
+    assert stored.exists()
+
+
+def test_download_testfile_folder_arrives_zipped_and_cleans_up(monkeypatch, tmp_path):
+    """A test entry that is a folder is zipped on the fly (one response, one
+    blob) into a staging dir under TEMP_DIR that must not survive the
+    response."""
+    import main
+    from config import settings
+    from data_store import ResolvedFile
+
+    stored_folder = tmp_path / "test_cohort"
+    stored_folder.mkdir()
+    (stored_folder / "a.csv").write_text("a\n1\n")
+    (stored_folder / "b.csv").write_text("b\n2\n")
+    monkeypatch.setattr(
+        main.data_store,
+        "resolve_testfile",
+        lambda tool_name, filename: ResolvedFile(path=str(stored_folder)),
+    )
+
+    before = set(os.listdir(settings.TEMP_DIR))
+    response = client.get(
+        "/tools/test_tool/testfiles/test_cohort",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    assert "test_cohort.zip" in response.headers["content-disposition"]
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert sorted(archive.namelist()) == ["a.csv", "b.csv"]
+    assert set(os.listdir(settings.TEMP_DIR)) == before
+    assert sorted(os.listdir(stored_folder)) == ["a.csv", "b.csv"]
+
+
+def test_download_testfile_removes_a_backend_temp_copy(monkeypatch, tmp_path):
+    """A backend that materialized the test file to a local temp copy marks it
+    is_temporary=True: it must be gone once the response has streamed, while
+    the persistent-path case above must never be touched."""
+    import main
+    from data_store import ResolvedFile
+
+    temp_copy = tmp_path / "materialized.nii.gz"
+    temp_copy.write_bytes(b"blob-from-object-store")
+    monkeypatch.setattr(
+        main.data_store,
+        "resolve_testfile",
+        lambda tool_name, filename: ResolvedFile(path=str(temp_copy), is_temporary=True),
+    )
+
+    response = client.get(
+        "/tools/test_tool/testfiles/materialized.nii.gz",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+
+    assert response.status_code == 200
+    assert response.content == b"blob-from-object-store"
+    assert not temp_copy.exists()
+
+
 def test_invalid_schema_is_rejected_at_startup():
     """check_schema() runs when the registry is built, so a malformed tool
     fails on boot instead of on the first request that reaches it."""
@@ -871,6 +977,42 @@ def test_scratch_dir_is_removed_when_run_raises(monkeypatch):
     assert response.status_code == 500
     assert not os.path.exists(produced["dir"])
     assert set(os.listdir(settings.TEMP_DIR)) == before
+
+
+def test_a_missing_server_dependency_is_a_501_with_the_message(monkeypatch):
+    """A dependency the deployment does not carry is not a crash and not a bad
+    request: the caller's arguments are fine, this server simply cannot do it.
+
+    500 hides the detail on purpose -- a crash can name server-side paths. But
+    "this server has no pytorch3d" is the one thing the caller needs to read,
+    names nothing sensitive, and no retry or argument change will help. It
+    reached the Slicer user as a bare "The tool failed on the server."
+    """
+    import base
+    import registry
+
+    class UnavailableTool(base.Tool):
+        name = "unavailable_probe_tool"
+        arguments = {"text": base.ArgSpec(type=str, required=True)}
+        output_kind = "text"
+
+        def run(self, text: str) -> str:
+            raise base.ToolUnavailableError(
+                "This tool needs pytorch3d, which is not installed on this server."
+            )
+
+    monkeypatch.setitem(registry.TOOLS, "unavailable_probe_tool", UnavailableTool())
+
+    response = client.post(
+        "/run/unavailable_probe_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={"text": "hello"},
+    )
+
+    assert response.status_code == 501
+    # Verbatim: the client shows the detail of any status it does not map
+    # specially, so this needs no client-side release to be readable.
+    assert "pytorch3d" in response.json()["detail"]
 
 
 def test_concurrent_requests_do_not_share_scratch_tracking(monkeypatch):

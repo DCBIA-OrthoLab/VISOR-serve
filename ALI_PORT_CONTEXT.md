@@ -1,5 +1,12 @@
 # ALI port — working context
 
+> **Status, 2026-07-31: the port is done.** `tools/ALI/` and `tools/CrownSeg/`
+> exist, are registered, and are tested. Read this file as the *record of why*
+> — the analysis and the decisions — not as a plan. Where it and the code
+> disagree, the code is right; the two places that happened are flagged inline
+> (§3.1 on the `mode` argument, §6 on the open questions). The changelog entry
+> in `CLAUDE.md` for 2026-07-31 is the summary of what actually shipped.
+
 Handoff note for the port of **ALI** (Automatic Landmark Identification) from a
 pair of Slicer CLI modules to a tool on this inference server. Written to be
 read cold, by a session that has none of the preceding conversation.
@@ -81,14 +88,28 @@ deliberate:
   mode would block the request;
 - `run()` raises `ToolArgumentError` (→ 422) when the *active* mode's own
   selection is empty. This is the cross-argument rule §9 of the guide covers;
-- `mode` is an explicit `"choice"`, not inferred from the input extension: a
-  `.zip` can hold either kind of data.
+- ~~`mode` is an explicit `"choice"`, not inferred from the input extension: a
+  `.zip` can hold either kind of data.~~
 
-The Slicer panel will therefore always show all three checkbox groups (CBCT
-landmarks, IOS teeth, IOS landmark types), two of which are inert at any
-time. Hiding them needs a dependency key in the schema plus `formgen.py`
-support on the client — out of scope here, do not fake it with prefixed
-option labels.
+> **Superseded — there is no `mode` argument.** The observation is right and
+> the conclusion inverted: because a `.zip` says nothing, and a DICOM series
+> has no extension at all, *nothing in the request* can distinguish the two —
+> only the data can. `ALILogic.detect` walks the input and picks the engine;
+> an input holding both kinds is a 422 rather than a guess. Asking the caller
+> would move the error from the door to several minutes into a GPU run. The
+> Slicer client was already written against this contract (its `ALI_SCHEMA`
+> fixture has no `mode`), and its 24 schema tests pass against what shipped.
+>
+> The teeth selection is also gone: the networks predict every tooth they are
+> pointed at, the original's checkbox grid only filtered the *output*
+> afterwards, and every tooth present in the mesh is what a landmarking run
+> wants. Two selection groups ship, not three: `cbct_regions` and
+> `ios_networks`.
+
+The Slicer panel therefore always shows both checkbox groups, one of which is
+inert at any time. Hiding one needs a dependency key in the schema plus
+`formgen.py` support on the client — out of scope here, do not fake it with
+prefixed option labels.
 
 ### 3.2 Crown segmentation runs server-side too, but from its own tool
 
@@ -271,12 +292,27 @@ receives paths, not MRML nodes.
 
 1. **When is the base image rebuilt on torch >= 2.8 + pytorch3d?** Nothing
    IOS-related can run before that. Check nnunetv2/AMASSS against torch 2.8 in
-   the same pass. This is the critical path.
-2. **DICOM input**: in or out of the schema (see defect 7).
-3. **Where do model bundles live and how are they named?** `DATA/` currently
-   holds only `SurgMovTool/`. ALI needs `DATA/ALI/models/` with the CBCT
-   `<landmark>/<scale>/*.pth` tree and the IOS `*_O_*.pth` / `*_C_*.pth` files.
-   Both engines' bundles will appear in the same dropdown — naming matters.
+   the same pass. **Still open, and still the critical path** — it is now the
+   *only* thing between the shipped code and a working IOS mode: `tools/ALI/`'s
+   IOS engine and `tools/CrownSeg/` are written, registered and tested, and
+   fail an actual run with a message naming what is missing. No code change is
+   needed when the image lands.
+2. ~~**DICOM input**: in or out of the schema.~~ **In.** A DICOM series is
+   recognised inside the archive by asking GDCM (slices have no extension, so
+   nothing else can), converted into the request's scratch directory, and
+   processed like any other CBCT scan. Only directories holding no volume or
+   surface file of their own are probed, so a cohort of NIfTI costs nothing.
+3. ~~**Where do model bundles live and how are they named?**~~ **Answered, and
+   the manifest matches the code.** `DATA/ALI/models/ALI_CBCT_Models/` holds
+   the eight region archives unpacked side by side —
+   `discover_weights` walks recursively for `<landmark>/<scale>/*.pth`, so
+   they form one bundle and one dropdown entry.
+   `DATA/ALI/models/ALI_IOS_Models/` holds `Upper_O_model.pth`,
+   `Lower_O_model.pth`, `Upper_C_model.pth`, `Lower_C_model.pth` — verified
+   against the published archive, not guessed. The two bundle names are what
+   tells them apart in the shared dropdown. CrownSeg's checkpoint is its own
+   tool's data (`DATA/CrownSeg/models/`, named by `settings.CROWNSEG_MODEL`),
+   so ALI never reaches into another tool's folder.
 
 ---
 
@@ -300,13 +336,20 @@ From `ADDING_A_TOOL.md` and `CLAUDE.md`, the ones easiest to violate here:
 
 ## 8. Status and sequencing
 
-Nothing written yet. Analysis and decisions only.
+1. **ALI, CBCT engine** — **done and runnable.** `monai` and `itk` are in
+   `requirements.txt`.
+2. **Base image rebuild** — torch >= 2.8, pytorch3d compiled in. **Still
+   open**, ops task, and now the only blocker for 3 and 4 below. Re-check
+   AMASSS/nnunetv2 against torch 2.8 in the same pass.
+3. **`tools/CrownSeg/`** — **written and tested**, executes once the image
+   lands.
+4. **ALI, IOS engine** — **written and tested**, same. It segments an
+   unlabelled mesh through `CrownSegLogic.segment_crowns()` and goes straight
+   on to landmark identification: one button, all computation server-side, no
+   second request.
 
-1. **ALI, CBCT engine** — no blocker, needs only `pip install monai itk`.
-   Start here.
-2. **Base image rebuild** — torch >= 2.8, pytorch3d compiled in. Ops task,
-   gates everything below. Re-check AMASSS.
-3. **`tools/CrownSeg/`** — schema plus a call into
-   `shapeaxi.dental_model_seg`. Small, now that nothing has to be ported.
-4. **ALI, IOS engine** — segments through `CrownSeg` when the input is raw.
-   One button, all computation server-side.
+Neither 3 nor 4 needs a code change when the image is rebuilt — both import
+their missing stack lazily, so the day it is present they simply start
+working. `pip install -r requirements.txt` will not bring it: `pytorch3d` has
+no PyPI distribution and `shapeaxi` requires a torch the image does not ship,
+which is why neither is listed there.
