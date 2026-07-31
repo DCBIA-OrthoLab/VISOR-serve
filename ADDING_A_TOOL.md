@@ -240,8 +240,14 @@ FILE_TYPES = {
     "xlsx_file":  (".xlsx",),
     "ods_file":   (".ods",),
     "nifti_file": (".nii", ".nii.gz"),
+    "volume_or_zip_file": (...),        # one medical volume OR a zip of a folder of them
+    "surface_file": (".vtk", ".vtp", ".stl", ".obj", ".off"),   # a 3D mesh
 }
 ```
+
+Every extension a type lists is one the tool declaring it must be able to
+**read**: ALI's IOS mode advertised `.stl` and then discovered only `.vtk`, so
+a caller's meshes were accepted and silently never processed.
 
 ```python
 "scan": ArgSpec(type="nifti_file", required=True, description="Oriented CBCT (.nii/.nii.gz)"),
