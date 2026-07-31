@@ -382,6 +382,15 @@ test:**
   `"Upper_nioegfjhdfjkdffdhjmndfhnmdfhj"` sentinel. Exact stem, per directory.
 - **Both jaws wrote the same `.tfm`.** `<patient>_SegOr.tfm` for Upper and
   Lower; the second silently overwrote the first. Named per jaw.
+- **The published IOS reference was rejected outright.** Refusing a mesh whose
+  name does not say its jaw is right, but the first version also required an
+  identifier *before* the jaw token — and HUTIN1/ASO v1.0.0 `Gold_file.zip` is
+  `Upper_gold.vtk` / `Lower_gold.vtk`, jaw first. Fully-Automated IOS would have
+  failed with "no mesh whose name says which jaw it is" against the only
+  reference anyone ships. Found by reading the real archive rather than assuming
+  its shape; the rest of it checks out (`PredictedID` labels, universal ids
+  2-15 upper / 18-31 lower, 42 `<tooth><type>` landmarks per jaw covering the
+  default selection).
 
 **Concurrency, which only matters because this is a shared server:**
 
@@ -433,7 +442,18 @@ three `config.Settings` fields (`ASO_ICP_MAX_TRIPLETS`, `ASO_ICP_SEED`,
 `ASO_LANDMARK_TOOL`). No GPU: everything ASO computes is SimpleITK/VTK/numpy,
 so it needs no semaphore of its own. `main.py` and `registry.py` untouched.
 
-**Tests:** 195 server tests, 65 new — 64 in `tools/ASO/test/test_ASO.py` (the
+**The two published references carry DISJOINT landmark sets, and the schema's
+defaults only match one of them.** Frankfurt Horizontal + Midsagittal has
+`Ba, S, N, RPo, LPo, ROr, LOr` (verified by reading the bundle, 2026-07-31);
+Occlusal + Midsagittal has `ANS, IF, PNS, UL6O, UR1O, UR6O`. Picking the second
+and leaving the defaults alone would drop every landmark as "not in the
+reference" and fail all forty patients separately, for one wrong choice made in
+one place. `_check_selection_against_reference` turns that into a single 422
+naming what the reference actually offers, raised after discovery but before a
+single scan is read. The server cannot know which reference will be picked when
+it publishes `choices` — but it knows both the moment the request arrives.
+
+**Tests:** 201 server tests, 71 new — 70 in `tools/ASO/test/test_ASO.py` (the
 landmark seam stubbed, everything else real, against synthetic volumes, DICOM
 series and meshes) and one in `tests/test_main.py` asserting every extension
 `surface_file` advertises is accepted on upload and a `.txt` is a 400.

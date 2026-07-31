@@ -42,21 +42,34 @@ class JawError(Exception):
 
 
 def patient_and_jaw(filename: str) -> tuple:
-    """('P1_U_Seg.vtk') -> ('P1', 'Upper').
+    """('P1_U_Seg.vtk') -> ('P1', 'Upper'), ('Upper_gold.vtk') -> ('gold', 'Upper').
 
-    Everything from the jaw token onwards is decoration a previous step added
-    (`_Seg`, `_Or`, `_lm`, ...), so the patient is what comes before it. Raises
-    JawError when no token names a jaw, rather than guessing.
+    Everything from the jaw token onwards is normally decoration a previous
+    step added (`_Seg`, `_Or`, `_lm`, ...), so the patient is what comes before
+    it.
+
+    **The jaw token may also come first**, and that is not a corner case: the
+    published IOS reference bundle is `Upper_gold.vtk` / `Lower_gold.vtk`.
+    Requiring something before the token rejected the whole bundle with "no mesh
+    whose name says which jaw it is" — verified against
+    HUTIN1/ASO v1.0.0 Gold_file.zip. When nothing precedes the token, what
+    follows it is the identifier rather than decoration.
+
+    Raises JawError when no token names a jaw, rather than guessing: the
+    original defaulted to Lower, so a maxillary mesh named `patient1.vtk` was
+    registered against the mandibular reference and returned as a success.
     """
     stem = _strip_extension(filename)
-    tokens = _SPLIT.split(stem)
+    tokens = [token for token in _SPLIT.split(stem) if token]
     for index, token in enumerate(tokens):
         jaw = _JAW_TOKENS.get(token.lower())
-        if jaw is not None and index > 0:
-            return "_".join(tokens[:index]), jaw
+        if jaw is None:
+            continue
+        parts = tokens[:index] or tokens[index + 1:]
+        return "_".join(parts) or stem, jaw
     raise JawError(
         f"'{filename}': cannot tell which jaw this is. Name the files so a "
-        f"token says it, e.g. 'P1_U_Seg.vtk' / 'P1_Lower.vtk'."
+        f"token says it, e.g. 'P1_U_Seg.vtk' / 'P1_Lower.vtk' / 'Upper_gold.vtk'."
     )
 
 

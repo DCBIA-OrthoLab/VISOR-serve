@@ -276,6 +276,33 @@ def _check_cbct(automation: str, landmarks: list, landmark_models) -> None:
         )
 
 
+def _check_selection_against_reference(requested: list, reference_landmarks: dict) -> None:
+    """Refuse a selection the reference cannot support, before reading a scan.
+
+    A reference defines the target frame through the landmarks it carries, and
+    the two published bundles carry DISJOINT sets: Frankfurt Horizontal +
+    Midsagittal has Ba/S/N/RPo/LPo/ROr/LOr, Occlusal + Midsagittal has
+    ANS/IF/PNS/UL6O/UR1O/UR6O. The schema's defaults are the first set, so
+    picking the second one without changing the selection means every landmark
+    is dropped as "not in the reference" and every patient fails separately with
+    "0 usable landmarks" -- a batch of forty identical failures for one wrong
+    choice made in one place.
+
+    The server cannot know which reference will be picked when it publishes
+    `choices`, but it knows both the moment the request arrives. So it says so
+    once, and names what the reference actually offers.
+    """
+    usable = [name for name in requested if name in reference_landmarks]
+    if len(usable) >= cbct_pipeline.icp.MIN_LANDMARKS:
+        return
+    raise ToolArgumentError(
+        f"Only {len(usable)} of the selected landmarks exist in this reference, and "
+        f"{cbct_pipeline.icp.MIN_LANDMARKS} are needed. The reference defines: "
+        f"{', '.join(sorted(reference_landmarks))}. Select landmarks from that list in "
+        f"'cbct_landmarks', or pick a reference built on the ones you selected."
+    )
+
+
 def _check_ios(automation: str, teeth: list, types: list, jaws: list, occlusion: str) -> None:
     if not jaws:
         raise ToolArgumentError("Select at least one jaw in 'ios_jaws'.")
@@ -338,6 +365,7 @@ def _run_cbct(
 
     reference_landmarks = cbct_pipeline.load_reference(reference_root)
     report["requested_landmarks"] = list(requested)
+    report["reference_landmarks"] = sorted(reference_landmarks)
 
     patients = cbct_pipeline.discover(input_root, suffix)
     if not patients:
@@ -346,6 +374,11 @@ def _run_cbct(
             f"{', '.join(cbct_pipeline.SCAN_EXTENSIONS)}, sent as a file or a "
             f"zipped folder."
         )
+
+    # After discovery, before a single scan is read: with nothing to orient,
+    # "there are no scans here" is the useful answer, and complaining about the
+    # landmark selection first would bury it.
+    _check_selection_against_reference(requested, reference_landmarks)
 
     fully = automation == catalogs.AUTOMATION_FULLY
     centered_root = os.path.join(scratch_dir, "centered")

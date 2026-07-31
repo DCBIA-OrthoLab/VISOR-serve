@@ -823,6 +823,38 @@ def test_a_file_that_does_not_name_its_jaw_is_refused(tmp_path):
     assert ios_pipeline.patient_and_jaw("P1_Lower.vtk") == ("P1", "Lower")
 
 
+@pytest.mark.parametrize(
+    "filename,expected",
+    [
+        ("Upper_gold.vtk", ("gold", "Upper")),
+        ("Lower_gold.vtk", ("gold", "Lower")),
+        ("Upper_gold.json", ("gold", "Upper")),
+    ],
+)
+def test_the_published_reference_bundle_is_readable(filename, expected):
+    """The IOS reference published as HUTIN1/ASO v1.0.0 Gold_file.zip names the
+    jaw FIRST -- `Upper_gold.vtk`. Requiring an identifier before the jaw token
+    rejected the entire bundle with "no mesh whose name says which jaw it is",
+    which would have made Fully-Automated IOS unusable with the only reference
+    anyone ships. Verified against the real archive."""
+    assert ios_pipeline.patient_and_jaw(filename) == expected
+
+
+def test_a_gold_bundle_pairs_both_jaws_under_one_case(tmp_path):
+    """Both files of the published bundle have to land on the same patient key,
+    or load_reference would see two half-cases instead of one reference."""
+    root = tmp_path / "gold"
+    _write_mesh(root / "Upper_gold.vtk", _UPPER_CENTROIDS, array_name="PredictedID")
+    _write_mesh(root / "Lower_gold.vtk", _LOWER_CENTROIDS, array_name="PredictedID")
+    found = ios_pipeline.discover(str(root))
+    assert list(found) == ["gold"]
+    assert sorted(found["gold"]) == ["Lower", "Upper"]
+
+    reference = ios_pipeline.load_reference(str(root), need_surfaces=True)
+    assert reference["Upper"]["surface"].endswith("Upper_gold.vtk")
+    assert reference["Lower"]["surface"].endswith("Lower_gold.vtk")
+
+
 def test_patients_are_paired_by_exact_stem(tmp_path):
     """`Files_vtk_json.organise` paired with `vtk_name in json_name`, so patient
     `1` matched patient `10` -- and padded its list with a literal sentinel
@@ -1019,6 +1051,62 @@ def test_output_suffix_cannot_be_a_path(tmp_path):
             input=str(tmp_path), modality="CBCT", automation="Semi-Automated",
             reference=str(tmp_path), output_suffix="../escape",
         )
+
+
+def test_a_selection_the_reference_cannot_support_is_refused_once(tmp_path):
+    """The two published references carry DISJOINT landmark sets: Frankfurt
+    Horizontal has Ba/S/N/RPo/LPo/ROr/LOr (the schema's defaults), Occlusal has
+    ANS/IF/PNS/UL6O/UR1O/UR6O. Picking the second one and leaving the defaults
+    alone would drop every landmark and fail all forty patients separately, for
+    one wrong choice made in one place."""
+    occlusal = os.path.join(str(tmp_path), "occlusal")
+    _write_markups(
+        os.path.join(occlusal, "UP01_Or.mrk.json"),
+        {name: np.array([float(index), 1.0, 2.0]) for index, name in
+         enumerate(("ANS", "IF", "PNS", "UL6O", "UR1O", "UR6O"))},
+    )
+    _cbct_case(tmp_path / "input")
+
+    with pytest.raises(ToolArgumentError) as raised:
+        ASOLogic.orient(
+            input_path=str(tmp_path / "input"),
+            reference_path=occlusal,
+            modality=catalogs.MODALITY_CBCT,
+            automation=catalogs.AUTOMATION_SEMI,
+            cbct_landmarks=list(catalogs.DEFAULT_CBCT_LANDMARKS),
+            scratch_dir=str(tmp_path / "scratch"),
+        )
+    message = str(raised.value)
+    # It names what the reference actually offers, so the fix is one step away.
+    for name in ("ANS", "IF", "PNS", "UL6O", "UR1O", "UR6O"):
+        assert name in message
+
+
+def test_the_matching_selection_runs_against_the_same_reference(tmp_path):
+    """The other half of the rule: selecting the reference's own landmarks
+    works, so the check cannot be blocking a legitimate request."""
+    points = {
+        "ANS": np.array([0.0, 30.0, 5.0]),
+        "IF": np.array([0.0, 20.0, -5.0]),
+        "PNS": np.array([0.0, -10.0, 0.0]),
+        "UL6O": np.array([20.0, 5.0, -10.0]),
+        "UR1O": np.array([0.0, 28.0, -8.0]),
+        "UR6O": np.array([-20.0, 5.0, -10.0]),
+    }
+    occlusal = os.path.join(str(tmp_path), "occlusal")
+    _write_markups(os.path.join(occlusal, "UP01_Or.mrk.json"), points)
+    _cbct_case(tmp_path / "input", points=points)
+
+    run = ASOLogic.orient(
+        input_path=str(tmp_path / "input"),
+        reference_path=occlusal,
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(points),
+        scratch_dir=str(tmp_path / "scratch"),
+    )
+    assert run.report["patients"]["patient1"]["status"] == "ok"
+    assert run.report["reference_landmarks"] == sorted(points)
 
 
 def test_an_empty_input_says_what_was_expected(tmp_path):
