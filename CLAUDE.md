@@ -306,131 +306,70 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
-### 2026-07-30 — AMASSS surfaces: binary, and decimated by default
+### 2026-07-31 — AMASSS shipped a report and no segmentations
 
-**Motivation:** a five-structure run with surfaces returned a 41.9MB archive
-that Slicer could not open — the client froze on the main thread and the user
-read it as "the server never sent the .vtk". It had: `curl` against the same
-endpoint pulled all 41,889,544 bytes with a correct `Content-Length` and every
-mesh re-read cleanly. The transfer was never the problem. The **geometry** was.
+**Motivation:** a nine-structure run with surfaces finished in 154s and the
+client received a **556-byte** zip holding nothing but `AMASSS_report.json`.
+Read as a transfer size limit. It was not one — nothing in the response path
+caps size, and the report itself said so: `segmentations: []`.
 
-**Marching cubes runs on the original scan grid**, so a 0.33mm CBCT produces a
-triangle per voxel face: 1.6M for a cranial base, 3.5M across five structures,
-11.8M for a merged nine-structure volume. That is not detail — the mask
-underneath is only accurate to about half a voxel — it is just resolution
-nobody asked for, and it is what made the results unusable to ship and to open.
+**`merge` was declared `type="choice"`.** `base.py` hands a `"choice"` argument
+to `run()` as the bare option-name **string**, and `_codes_from` had no string
+branch — so `tuple("Separated segmentation files")` split it into its
+*characters*. Neither `"SEPARATE"` nor `"MERGED"` ever matched,
+`_assemble_scan_outputs` wrote no file at all, and the scan was still recorded
+`status: ok`. 154s of GPU work discarded into an empty result that reported
+success.
 
-**`vtkPolyDataWriter` was writing ASCII** (its default), which is where the
-bulk went: 848.5MB for the merged surface alone against 6.4MB for every
-segmentation in the same run. Binary is the same geometry — and the *more*
-accurate of the two, which is the opposite of the reflex: it round-trips the
-float32 vertices exactly, while ASCII prints ~6 significant digits and moved
-points by up to 5e-05mm on read-back. It is also 133x faster to parse (a 1.6M
-triangle cranial base: 2.67s ASCII, 0.02s binary).
+`merge` is now `multichoice` — which is what its own description always claimed
+("Both may be selected") and what `structures`, working all along, already was.
+Three defences behind it, since a silent success is the failure mode that costs
+the most: `_codes_from` accepts a lone string and translates display names
+inside iterables; `segment()` validates merge codes **before** inference, as it
+already did for structures; and a scan that produced no segmentation can no
+longer be counted as processed.
 
-**`surface_decimation` (new schema argument, default 90).** `vtkDecimatePro`
-with `PreserveTopologyOn`, applied after smoothing and *before* the per-cell
-colour array is built — the array is sized to the mesh that is actually
-written. Measured on the cranial base, against a 0.33mm voxel:
+**Then the next run exposed the second half.** With separate files finally being
+written, the masks came out **uncompressed** — the output extension mirrored the
+input's, and the scan was a plain `input.nii`. That is **191,365,472 bytes per
+structure**, 1.75GB across nine, inside a 14.1MB zip (124:1). The client pulled
+those 14MB in 12s and then had to unpack 1.75GB; the user cancelled at three
+minutes, which is why the archive was found still zipped in the output folder.
 
-| reduction | triangles | mean dev | p95 | max |
-|---|---|---|---|---|
-| 50% | 811,222 | 0.0034mm | 0.004mm | 0.277mm |
-| 80% | 324,488 | 0.0338mm | 0.125mm | 0.493mm |
-| **90%** | **162,244** | **0.0590mm** | **0.171mm** | 0.692mm |
-| 95% | 81,122 | 0.0951mm | 0.264mm | 1.223mm |
+Segmentations are now always written compressed, format preserved. Measured on
+the real MAND mask from that run: **191,365,472 -> 365,551 bytes (523x)**.
 
-90 costs a fifth of a voxel on average and buys a factor of ten. 0 keeps the
-raw mesh. The value is recorded in `AMASSS_report.json` — these surfaces are
-lossy by default now, so a run has to say by how much.
+**The extension table is what ITK accepts, verified in the container rather than
+assumed.** NIfTI and GIPL take an external `.gz`; **NRRD compresses inside the
+file and has no `.nrrd.gz` writer at all** — the first version mapped to it and
+failed every `.nrrd` run outright. `.nrrd.gz` is a legal *input* spelling and
+not a legal *output* one, so it maps back down to `.nrrd`. The test that caught
+this writes every `SCAN_EXTENSIONS` entry for real instead of asserting against
+a hardcoded list, which would only have restated the table.
 
-**End to end, the same five-structure request, real HTTP:** archive
-41,889,544 -> **5,417,443 bytes** (7.7x), triangles 3,519,420 -> **351,938**
-(10x), total client-side mesh parsing 2.7s+ -> **0.01s**. Decimation adds ~12s
-of server time for five structures.
+**Logging:** one line per served request now carries the bytes **in and out** —
+`received=12B (12 B) sent=352B (352 B)`, via `_log_served`. The old line logged
+only the upload size, which left "the server produced nothing" and "the transfer
+lost it" indistinguishable from a client-side bug report. `sent` is measured on
+the response file, so for `output_kind="files"` it is the archive actually
+streamed rather than the sum of what `run()` produced, and it is emitted at each
+return point so `duration` covers packing too. That one figure identified both
+bugs above, in a single run each: 556 bytes said the server had produced
+nothing; 14,103,823 bytes matching the client's file exactly said the transfer
+was never at fault.
 
-**A caveat measured and worth keeping:** binary alone did NOT shrink the
-download. DEFLATE was already squeezing ASCII at 6.2:1 and binary only
-compresses 2.7:1, so the archive went 223.4MB -> 227.8MB on a nine-structure
-run. Binary pays off in disk, RAM, write time, zip time and parse time — not
-on the wire. Only removing geometry moved the download, which is what
-decimation does.
+**Tests:** 131 server tests (9 new here: the schema type, every legitimate
+`merge` shape, an unknown merge mode rejected before inference, an uncompressed
+input producing compressed masks, NRRD keeping its format, and every scan
+extension being writable).
 
-**Still on the table, in the client repo:** `AMASSS.py`'s
-`MAX_RESULTS_TO_LOAD = 12` caps by *file count* while the cost is in triangles,
-so a 10-file run loaded 3.5M triangles on the UI thread while a 20-file run of
-small masks was correctly skipped. Decimation makes this survivable; it does
-not make the cap correct.
-
-**Tests:** 119 server tests (4 new: binary header + exact round trip, temp file
-removal, decimation reduces triangles with 0 disabling it and the colour array
-matching the final cell count, and the report field).
-
-### 2026-07-30 — AMASSS: the GPU was idle seven eighths of the run
-
-**Motivation:** AMASSS looked GPU-bound and was not. Profiling one structure on
-a 512x512x365 CBCT at 0.33mm: **14.6s** resampling the input to the model's
-0.4mm grid, **4.5s** of actual inference, **6.9s** resampling the logits back.
-Both resamplings are scipy splines pinned to a single core. The card was doing
-an eighth of the work and holding 2.7GB of 48GB.
-
-**The tempting fix was the wrong one, and was measured before being discarded.**
-At a 128^3 patch the network already saturates the SMs at batch 1: throughput
-is flat at ~43 patches/s from batch 1 through batch 12. Cutting the GPU's work
-by 5x (`tile_step_size` 0.5 -> 1.0) moved the total from 37.3s to 34.5s and
-dropped utilisation from 36% to 11% — direct evidence the GPU was never the
-constraint. **Free VRAM is not convertible into speed here; idle time is.**
-
-**GPU resampling (`nnunet_runner._enable_gpu_resampling`, new setting
-`AMASSS_GPU_RESAMPLING`, default on).** nnUNet already ships torch versions of
-both resamplers, so nothing is reimplemented — only selected. It is selected by
-NAME: nnUNet resolves `resampling_fn_data` / `resampling_fn_probabilities` out
-of the configuration dict via `recursive_find_resampling_fn_by_name`, so
-rewriting those two strings redirects both ends with no monkeypatching. Two
-things make that mutation safe, and both would have been silent bugs:
-`PlansManager` hands out a `deepcopy` of the configuration, so it touches
-neither the shared plans nor a concurrent request — and consequently the
-`torch.device` placed in the kwargs never reaches the `plans.json` nnUNet writes
-beside its output, which `json.dump` could not serialize. The two properties are
-`@property @lru_cache`, so the swap clears them.
-
-The GPU path uses `predict_from_files_sequential`: `predict_from_files` fans
-preprocessing and export out to *spawned* processes, each of which would need
-its own CUDA context to run a GPU resampler. That trades away the CPU/GPU
-overlap on multi-scan batches — recovering it with a reader thread feeding the
-GPU is the obvious next step, and the reason `num_processes_*` were left at 2.
-
-**Measured end to end, real models, default five structures, one scan:
-195.9s -> 77.0s (2.5x).** Per structure 34.2s -> 13.2s.
-
-**It is not numerically free, and the defaults say so.** torch has no 3D cubic
-interpolation, so the input resampling drops from spline order 3 to order 1.
-Dice against the scipy pipeline: MAND 0.998, UAW 0.997, MAX 0.995, CB 0.991,
-**CV 0.978**. The cervical vertebra is consistently the outlier — thinnest
-structure, closest to the edge of the field of view. `AMASSS_GPU_RESAMPLING=false`
-restores bit-identical nnUNet output, and a bundle whose plans pin a non-default
-resampler opts itself out automatically. `AMASSS_report.json` now records
-`gpu_resampling` and `tile_step_size`, because a mask is only reproducible
-next to the values that produced it.
-
-**`AMASSS_TILE_STEP_SIZE` (default 0.5, unchanged).** The one knob here that
-moves the segmentation for a *pure* speed gain, so it is exposed rather than
-tuned: 0.7 measured Dice 0.995 against 0.5 and saves ~2.5s of GPU per structure.
-
-**`_convert_to_nifti` stopped casting to float32.** The cast was never what made
-the conversion real — the read and write are — and it doubled the bytes gzipped
-per scan and gunzipped again by nnUNet, costing 2.4s + 0.4s for nothing:
-nnUNet's reader casts to float32 itself, and int16 CBCT values are exact there.
-
-**`vtk_export` cleanups.** Cell colours are built in numpy instead of a
-`SetTuple` per cell (identical bytes, 32x, but only ~80ms on a mandible — the
-honest win is small). The marching-cubes temp file had a *fixed* name, so every
-surface in a run wrote over the same path; it is now unique per call and removed
-after use rather than held until request cleanup.
-
-**Tests:** 115 server tests (5 new, covering the cpu skip, the non-default-plans
-skip, the swap itself including cache invalidation, the report fields, and the
-preserved voxel type).
+**Client-side, in the other repo** (see its `ARCHITECTURE.md`): the result
+download is streamed to disk in 1MB chunks instead of buffered whole in RAM,
+verified against `Content-Length` plus a zip CRC check before being accepted —
+a truncated archive still unpacks, and would have delivered a *subset* of a
+patient's segmentations — and the panel now shows elapsed time, download
+progress and an extraction message. That last one is not cosmetic: the silent
+three minutes are what caused a good run to be cancelled.
 
 ### 2026-07-30 — AMASSS surfaces: binary, and decimated by default
 
