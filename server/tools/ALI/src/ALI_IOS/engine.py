@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 
-from base import ToolUnavailableError
+from base import ToolArgumentError, ToolUnavailableError
 from config import settings
 
 from ..markups import MARKUPS_EXTENSION
@@ -110,7 +110,13 @@ def discover_weights(model_path: str):
     model quietly predicted the lower arch with the maxillary one.
     """
     if not os.path.isdir(model_path):
-        raise FileNotFoundError(f"IOS model bundle is not a directory: {model_path}")
+        # An argument error, not a server fault: the caller named a hosted
+        # entry that is not an IOS bundle. Basename only -- the message goes
+        # to the client verbatim, the server path does not.
+        raise ToolArgumentError(
+            f"IOS model bundle '{os.path.basename(model_path.rstrip(os.sep))}' "
+            f"is not a directory."
+        )
 
     weights: dict = {}
     unrecognized = []
@@ -383,7 +389,9 @@ def predict_landmarks(
         network_names = ", ".join(
             catalog.NETWORK_DISPLAY_NAMES.get(code, code) for code in networks
         )
-        raise FileNotFoundError(
+        # 422, not 500: nothing the server can do -- the caller must pick
+        # the bundle (or the networks) that match. Slicer shows this verbatim.
+        raise ToolArgumentError(
             f"'{os.path.basename(model_path)}' has no IOS weights for the selected network(s) "
             f"({network_names}). Checkpoints must be named with an 'O' or 'C' token and an "
             f"'Upper' or 'Lower' token, e.g. Upper_O_model.pth."

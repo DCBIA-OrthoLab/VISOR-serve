@@ -398,6 +398,102 @@ def test_ios_network_codes_from_a_selection():
 
 
 # ---------------------------------------------------------------------------
+# Model bundle auto-selection (the `model` argument is optional)
+# ---------------------------------------------------------------------------
+
+class FakeStore:
+    """A data_store stub mapping name -> (path, is_temporary)."""
+
+    def __init__(self, entries: dict):
+        self.entries = entries
+
+    def list_models(self, tool_name):
+        assert tool_name == "ALI"
+        return sorted(self.entries)
+
+    def resolve_model(self, tool_name, name):
+        path, is_temporary = self.entries[name]
+        return ALILogic.ResolvedFile(path=str(path), is_temporary=is_temporary)
+
+
+def test_the_bundle_is_picked_from_the_detected_mode(tmp_path, monkeypatch):
+    """No `model` in the request: the bundle whose LAYOUT matches the mode runs."""
+    cbct = write_cbct_bundle(tmp_path / "ALI_CBCT_Models", {"Cranial_Base": ["Ba"]})
+    ios = write_ios_bundle(
+        tmp_path / "ALI_IOS_Models", ["Upper_O_model.pth", "Lower_O_model.pth"]
+    )
+    monkeypatch.setattr(
+        ALILogic,
+        "data_store",
+        FakeStore({"ALI_CBCT_Models": (cbct, False), "ALI_IOS_Models": (ios, False)}),
+    )
+
+    assert ALILogic.select_bundle(ALILogic.CBCT).path == cbct
+    assert ALILogic.select_bundle(ALILogic.IOS).path == ios
+
+
+def test_no_hosted_bundle_is_a_422_naming_the_setup_script(monkeypatch):
+    monkeypatch.setattr(ALILogic, "data_store", FakeStore({}))
+    with pytest.raises(ToolArgumentError, match="setup-models.sh"):
+        ALILogic.select_bundle(ALILogic.IOS)
+
+
+def test_a_mode_with_no_matching_bundle_is_a_422_naming_the_mode(tmp_path, monkeypatch):
+    cbct = write_cbct_bundle(tmp_path / "ALI_CBCT_Models", {"Cranial_Base": ["Ba"]})
+    monkeypatch.setattr(
+        ALILogic, "data_store", FakeStore({"ALI_CBCT_Models": (cbct, False)})
+    )
+    with pytest.raises(ToolArgumentError, match="IOS"):
+        ALILogic.select_bundle(ALILogic.IOS)
+
+
+def test_two_matching_bundles_are_a_422_not_a_silent_pick(tmp_path, monkeypatch):
+    """Which model vintage ran must never be a surprise."""
+    first = write_ios_bundle(tmp_path / "ALIDDM_2023", ["Upper_O_model.pth"])
+    second = write_ios_bundle(tmp_path / "ALIDDM_2026", ["Upper_O_model.pth"])
+    monkeypatch.setattr(
+        ALILogic,
+        "data_store",
+        FakeStore({"ALIDDM_2023": (first, False), "ALIDDM_2026": (second, False)}),
+    )
+    with pytest.raises(ToolArgumentError) as excinfo:
+        ALILogic.select_bundle(ALILogic.IOS)
+    assert "ALIDDM_2023" in str(excinfo.value) and "ALIDDM_2026" in str(excinfo.value)
+
+
+def test_a_temporary_probe_copy_is_removed(tmp_path, monkeypatch):
+    """A backend temp copy probed and not selected must not leak on disk."""
+    cbct = write_cbct_bundle(tmp_path / "cbct", {"Cranial_Base": ["Ba"]})
+    ios = write_ios_bundle(tmp_path / "ios", ["Upper_O_model.pth"])
+    monkeypatch.setattr(
+        ALILogic, "data_store", FakeStore({"cbct": (cbct, True), "ios": (ios, False)})
+    )
+
+    selected = ALILogic.select_bundle(ALILogic.IOS)
+
+    assert selected.path == ios
+    assert not os.path.exists(cbct)
+
+
+def test_a_bundle_of_the_wrong_kind_is_an_argument_error(tmp_path, cbct_environment):
+    """The mismatch that used to be a 500: naming the IOS bundle for a CBCT
+    run (or vice versa) must answer 422, whose message Slicer shows verbatim
+    -- a 500 buries it in the server log."""
+    from tools.ALI.src.ALI_CBCT import engine as cbct_engine
+
+    ios_bundle = write_ios_bundle(tmp_path / "ios", ["Upper_O_model.pth"])
+    with pytest.raises(ToolArgumentError, match="No CBCT landmark weights"):
+        cbct_engine.predict_landmarks(
+            scans=[],
+            model_path=ios_bundle,
+            regions=None,
+            prediction_ID="Pred",
+            output_dir=str(tmp_path / "out"),
+            scratch_dir=str(tmp_path / "scratch"),
+        )
+
+
+# ---------------------------------------------------------------------------
 # The markups writer
 # ---------------------------------------------------------------------------
 
@@ -500,6 +596,32 @@ def test_a_cbct_run_writes_one_file_per_scan(tmp_path, stub_agent, cbct_environm
     assert sorted(point["label"] for point in content["markups"][0]["controlPoints"]) == [
         "Ba", "N", "S"
     ]
+
+
+def test_a_cbct_run_with_no_model_uses_the_matching_bundle(
+    tmp_path, monkeypatch, stub_agent, cbct_environment
+):
+    """End to end without `model`: the data picks the engine, the engine's
+    layout picks the bundle, and the report says which one ran."""
+    write_volume(tmp_path / "cohort" / "patient01.nii.gz")
+    cbct = write_cbct_bundle(tmp_path / "ALI_CBCT_Models", {"Cranial_Base": ["Ba"]})
+    ios = write_ios_bundle(tmp_path / "ALI_IOS_Models", ["Upper_O_model.pth"])
+    monkeypatch.setattr(
+        ALILogic,
+        "data_store",
+        FakeStore({"ALI_CBCT_Models": (cbct, False), "ALI_IOS_Models": (ios, False)}),
+    )
+
+    report = ALILogic.identify(
+        input_path=str(tmp_path / "cohort"),
+        cbct_regions=Selection(
+            {"Cranial base": True, "Upper": False, "Lower": False, "Impacted canine": False}
+        ),
+        scratch_dir=str(tmp_path / "scratch"),
+    )
+
+    assert report["summary"]["processed"] == 1
+    assert report["model_bundle"] == "ALI_CBCT_Models"
 
 
 def test_a_batch_keeps_its_tree_so_homonyms_cannot_collide(

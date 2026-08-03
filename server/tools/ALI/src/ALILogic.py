@@ -32,6 +32,7 @@ import zipfile
 import file_utils
 from base import ToolArgumentError
 from config import settings
+from data_store import ResolvedFile, data_store
 
 from .ALI_CBCT import landmarks as cbct_catalog
 from .ALI_IOS import landmarks as ios_catalog
@@ -261,12 +262,94 @@ def ensure_segmented(scans: list, scratch_dir: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Model bundle selection
+# ---------------------------------------------------------------------------
+
+def _bundle_matches(mode: str, path: str) -> bool:
+    """Does this hosted entry hold weights the detected mode's engine can read?
+
+    Cheap by construction: both engines' `discover_weights` only parse file
+    names, so probing a bundle costs a directory walk, never a model load.
+    The two layouts are mutually exclusive -- CBCT wants `<landmark>/<scale>/
+    *.pth` folders, IOS wants flat checkpoints named with network and jaw
+    tokens -- so a bundle never matches both.
+    """
+    if not os.path.isdir(path):
+        return False
+    if mode == CBCT:
+        from .ALI_CBCT import engine as cbct_engine
+
+        return bool(cbct_engine.discover_weights(path))
+    from .ALI_IOS import engine as ios_engine
+
+    weights, _unrecognized = ios_engine.discover_weights(path)
+    return bool(weights)
+
+
+def _discard(resolved: ResolvedFile) -> None:
+    """Remove a backend temp copy; persistent DATA_DIR paths are never touched."""
+    if not resolved.is_temporary:
+        return
+    if os.path.isdir(resolved.path):
+        shutil.rmtree(resolved.path, ignore_errors=True)
+    elif os.path.exists(resolved.path):
+        try:
+            os.remove(resolved.path)
+        except OSError:
+            logger.warning("Could not remove a temporary model copy")
+
+
+def select_bundle(mode: str) -> ResolvedFile:
+    """Pick the hosted bundle whose content matches the detected mode.
+
+    The `model` argument is optional for the same reason there is no `mode`
+    argument: the server already knows, from the data, which engine will run,
+    and each engine recognises its own bundle layout. An ambiguity (two
+    hosted CBCT bundles, say) is a 422 naming the candidates rather than a
+    silent pick -- which model vintage ran must never be a surprise.
+    """
+    names = data_store.list_models("ALI")
+    if not names:
+        raise ToolArgumentError(
+            "No model bundle is hosted for ALI on this server. Fetch the published "
+            "bundles with `./scripts/setup-models.sh --tool ALI`."
+        )
+
+    matches: list = []
+    for name in names:
+        resolved = data_store.resolve_model("ALI", name)
+        if _bundle_matches(mode, resolved.path):
+            matches.append((name, resolved))
+        else:
+            # A backend may have materialized a copy just for this probe;
+            # it is not the bundle that runs, so it goes now.
+            _discard(resolved)
+
+    if not matches:
+        raise ToolArgumentError(
+            f"This input is {mode}, but none of the hosted model bundles "
+            f"({', '.join(names)}) holds {mode} weights. Fetch them with "
+            f"`./scripts/setup-models.sh --tool ALI`, or pass 'model' if a "
+            f"bundle is named in a way discovery does not recognise."
+        )
+    if len(matches) > 1:
+        for _name, resolved in matches:
+            _discard(resolved)
+        raise ToolArgumentError(
+            f"Several hosted bundles hold {mode} weights "
+            f"({', '.join(name for name, _resolved in matches)}): "
+            f"pass 'model' to say which one to run."
+        )
+    return matches[0][1]
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def identify(
     input_path: str,
-    model_path: str,
+    model_path: str = None,
     cbct_regions=None,
     ios_networks=None,
     prediction_ID: str = "Pred",
@@ -302,51 +385,67 @@ def identify(
     output_dir = os.path.join(scratch_dir, f"ALI_{prediction_ID}")
     os.makedirs(output_dir, exist_ok=True)
 
-    if detected.mode == CBCT:
-        regions = cbct_catalog.region_codes(cbct_regions)
-        if not regions:
-            # The cross-argument rule the schema cannot express. Naming the
-            # detected mode is the point: it is what tells a caller who ticked
-            # the other group's boxes what actually happened.
-            raise ToolArgumentError(
-                f"This input is a CBCT batch: select at least one region under 'cbct_regions' "
-                f"({', '.join(cbct_catalog.REGION_NAMES)})."
+    # The bundle is picked here, AFTER detection, because the pick depends on
+    # the mode: when the request names no model, the hosted bundle whose
+    # layout the detected engine recognises is the one that runs.
+    selected = None
+    if model_path is None:
+        selected = select_bundle(detected.mode)
+        model_path = selected.path
+        logger.info("ALI: auto-selected the hosted %s model bundle", detected.mode)
+
+    try:
+        if detected.mode == CBCT:
+            regions = cbct_catalog.region_codes(cbct_regions)
+            if not regions:
+                # The cross-argument rule the schema cannot express. Naming the
+                # detected mode is the point: it is what tells a caller who ticked
+                # the other group's boxes what actually happened.
+                raise ToolArgumentError(
+                    f"This input is a CBCT batch: select at least one region under 'cbct_regions' "
+                    f"({', '.join(cbct_catalog.REGION_NAMES)})."
+                )
+            from .ALI_CBCT import engine as cbct_engine
+
+            report = cbct_engine.predict_landmarks(
+                scans=detected.scans,
+                model_path=model_path,
+                regions=regions,
+                prediction_ID=prediction_ID,
+                output_dir=output_dir,
+                scratch_dir=scratch_dir,
+                device=device,
             )
-        from .ALI_CBCT import engine as cbct_engine
+            report["dicom_series_converted"] = detected.converted_dicom
+        else:
+            networks = ios_catalog.network_codes(ios_networks)
+            if not networks:
+                raise ToolArgumentError(
+                    f"This input is a batch of intraoral surfaces: select at least one landmark "
+                    f"family under 'ios_networks' ({', '.join(ios_catalog.NETWORK_NAMES)})."
+                )
+            scans, segmented = ensure_segmented(detected.scans, scratch_dir)
 
-        report = cbct_engine.predict_landmarks(
-            scans=detected.scans,
-            model_path=model_path,
-            regions=regions,
-            prediction_ID=prediction_ID,
-            output_dir=output_dir,
-            scratch_dir=scratch_dir,
-            device=device,
-        )
-        report["dicom_series_converted"] = detected.converted_dicom
-    else:
-        networks = ios_catalog.network_codes(ios_networks)
-        if not networks:
-            raise ToolArgumentError(
-                f"This input is a batch of intraoral surfaces: select at least one landmark "
-                f"family under 'ios_networks' ({', '.join(ios_catalog.NETWORK_NAMES)})."
+            from .ALI_IOS import engine as ios_engine
+
+            report = ios_engine.predict_landmarks(
+                meshes=scans,
+                model_path=model_path,
+                networks=networks,
+                prediction_ID=prediction_ID,
+                output_dir=output_dir,
+                scratch_dir=scratch_dir,
+                device=device,
             )
-        scans, segmented = ensure_segmented(detected.scans, scratch_dir)
-
-        from .ALI_IOS import engine as ios_engine
-
-        report = ios_engine.predict_landmarks(
-            meshes=scans,
-            model_path=model_path,
-            networks=networks,
-            prediction_ID=prediction_ID,
-            output_dir=output_dir,
-            scratch_dir=scratch_dir,
-            device=device,
-        )
-        report["meshes_segmented"] = segmented
+            report["meshes_segmented"] = segmented
+    finally:
+        # Only ever a backend temp copy; a persistent DATA_DIR path survives.
+        if selected is not None:
+            _discard(selected)
 
     report["tool"] = "ALI"
+    # So the report says which weights ran even when nobody named them.
+    report["model_bundle"] = os.path.basename(model_path.rstrip(os.sep))
     report["output_dir"] = output_dir
     report["duration_seconds"] = round(time.monotonic() - started_at, 2)
 
@@ -369,7 +468,7 @@ def identify(
 
 def main(
     input: str,
-    model: str,
+    model: str = None,
     cbct_regions=None,
     ios_networks=None,
     prediction_ID: str = "Pred",

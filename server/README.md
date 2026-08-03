@@ -258,15 +258,17 @@ how many AMASSS inferences touch the GPU at once, independently of
 ## ALI: automatic landmark identification
 
 ```bash
-# One CBCT scan, cranial base only
+# One CBCT scan, cranial base only. No `model`: the server picks the hosted
+# bundle whose layout matches the detected mode.
 curl -k -X POST https://localhost:8000/run/ALI \
   -H "Authorization: Bearer $API_TOKEN" \
-  -F "model=ALI_CBCT_Models" \
   -F "input=@/path/to/scan.nii.gz" \
   -F 'cbct_regions={"Cranial base":true,"Upper":false,"Lower":false,"Impacted canine":false}' \
   --output result.zip
 
-# A whole cohort (CBCT, IOS or DICOM series) as one archive
+# A whole cohort (CBCT, IOS or DICOM series) as one archive. `model` names a
+# bundle explicitly — only needed when several bundles of the same kind are
+# hosted (a 422 lists them if the pick is ambiguous).
 zip -r cohort.zip cohort/
 curl -k -X POST https://localhost:8000/run/ALI \
   -H "Authorization: Bearer $API_TOKEN" \
@@ -277,6 +279,9 @@ curl -k -X POST https://localhost:8000/run/ALI \
 CBCT or the IOS engine itself: a `.zip` can hold either kind, and a DICOM
 series has no extension at all, so nothing in the request distinguishes them —
 only the data does. An input holding both kinds is a 422 rather than a guess.
+The optional `model` argument follows the same rule: left out, the hosted
+bundle whose content the chosen engine recognises is the one that runs, and
+the run report's `model_bundle` field says which it was.
 
 The consequence a client has to live with is that the schema cannot say "this
 argument only applies in mode X". `cbct_regions` and `ios_networks` are both
