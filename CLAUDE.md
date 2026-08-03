@@ -321,6 +321,56 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-07-31 — ALI's model bundle is matched to the detected mode; a wrong bundle is a 422
+
+**Found by running ALI IOS from Slicer**, on the first request after the
+torch-2.8/pytorch3d image rebuild. The client's model dropdown was left on
+`ALI_CBCT_Models` for an intraoral scan: the IOS engine looked for
+jaw/network-token checkpoints in the CBCT folder, listed all 119 CBCT files
+as unrecognized -- and Slicer showed `500 -- The tool failed on the server`,
+with the one message actually written for the user buried in the server log.
+
+**`model` is now optional, and the mode picks it (`ALILogic.select_bundle`).**
+The tool's own rule -- the mode is detected, not declared -- applied one
+argument further: the server already knows which engine will run, and each
+engine recognises its own bundle layout through its `discover_weights`
+(`<landmark>/<scale>/*.pth` folders vs flat jaw/network-token checkpoints;
+mutually exclusive by construction, and file-name parsing only, so probing a
+bundle costs a directory walk, never a model load). Among the hosted bundles,
+the one the chosen engine recognises runs. No match is a 422 naming
+`setup-models.sh`; several matches are a 422 naming the candidates rather
+than a silent pick -- which model vintage ran must never be a surprise. For
+the same reason the report gains `model_bundle`, so "which weights placed
+these landmarks?" has an answer even when nobody named them. A backend temp
+copy materialized for a probe (`ResolvedFile.is_temporary`) is deleted
+whether or not it was picked.
+
+**A named-but-wrong bundle answers 422, not 500.** The five
+`FileNotFoundError`s the two engines raised on a mismatched or empty bundle
+are `ToolArgumentError` now -- same category as an empty
+`cbct_regions`/`ios_networks` selection, and the message (which names the
+bundle, the selection and the expected checkpoint naming) reaches Slicer
+verbatim instead of dying in the log. The two "not a directory" messages
+carried the full server path; a 422 body travels, so they name the basename
+only.
+
+**Client (`SlicerAutomatedDentalToolsCloud`):** the dropdown of an OPTIONAL
+scalar `server_selectable` argument now leads with an "(automatic)" entry
+whose item data is `""` -- `collectArgs` already drops empty optionals, so
+the default selection sends no `model` at all and the server decides.
+Generic in `base_widget`/`formgen`, so any future tool with an optional
+hosted-file argument gets the entry for free. `test_data_integration.py`
+needs no change: it still sends every `server_selectable` argument
+explicitly, names included.
+
+**Tests:** 7 new server-side (auto-pick per mode, no hosted bundle,
+no matching bundle, ambiguity, temp-probe cleanup, engine-level 422, and an
+end-to-end CBCT run with no `model` whose report names the bundle), plus the
+client's schema mirror, its combo stub gaining item data, and its "input
+alone is a complete request" contract tests. Verified live end to end: an
+IOS request with no `model` returned 200 in 17s with
+`model_bundle: ALI_IOS_Models` in the report.
+
 ### 2026-07-31 — 501 for "this server cannot do that", instead of a blank 500
 
 **Found by running ALI in IOS mode.** The preflight added earlier did its job:

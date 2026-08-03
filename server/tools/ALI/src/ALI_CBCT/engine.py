@@ -30,6 +30,7 @@ import time
 
 import numpy as np
 
+from base import ToolArgumentError
 from config import settings
 
 from ..markups import MARKUPS_EXTENSION
@@ -128,7 +129,13 @@ def discover_weights(model_path: str) -> dict:
     same landmark as one naming them the way the CLI did.
     """
     if not os.path.isdir(model_path):
-        raise FileNotFoundError(f"CBCT model bundle is not a directory: {model_path}")
+        # An argument error, not a server fault: the caller named a hosted
+        # entry that is not a CBCT bundle. Basename only -- the message goes
+        # to the client verbatim, the server path does not.
+        raise ToolArgumentError(
+            f"CBCT model bundle '{os.path.basename(model_path.rstrip(os.sep))}' "
+            f"is not a directory."
+        )
 
     weights: dict = {}
     for root, _dirs, files in os.walk(model_path):
@@ -236,7 +243,10 @@ def predict_landmarks(
 
     weights = discover_weights(model_path)
     if not weights:
-        raise FileNotFoundError(
+        # 422, not 500, here and below: nothing the server can do -- the
+        # caller must pick the bundle (or the regions) that match. Slicer
+        # shows these messages verbatim.
+        raise ToolArgumentError(
             f"No CBCT landmark weights found in '{os.path.basename(model_path)}'. Expected "
             f"<bundle>/**/<landmark>/<scale>/*.pth, with scale folders named "
             f"{' and '.join(catalog.SCALE_KEYS)}."
@@ -245,7 +255,7 @@ def predict_landmarks(
     runnable, without_model, ungrouped = requested_landmarks(weights, regions)
     if not runnable:
         region_names = ", ".join(catalog.REGION_DISPLAY_NAMES.get(code, code) for code in regions)
-        raise FileNotFoundError(
+        raise ToolArgumentError(
             f"'{os.path.basename(model_path)}' has no weights for any landmark of the selected "
             f"region(s) ({region_names}). It provides: {', '.join(sorted(weights)) or 'nothing'}."
         )

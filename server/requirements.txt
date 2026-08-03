@@ -25,20 +25,23 @@ itk
 vtk
 torch
 nnunetv2
-# PINNED, and the pin is load-bearing. monai 1.6.0 requires torch>=2.8.0, so an
-# unpinned entry makes pip replace the image's torch 2.5.1+cu124 with a 2.13
-# wheel on every container start -- the exact "shadow the CUDA build" failure
-# the note above warns about, plus ~3 GB downloaded each time and a broken
-# torchaudio. 1.5.1 asks for torch>=2.4.1, which the image already satisfies,
-# so pip leaves torch alone. Move to 1.6 only together with the image rebuild
-# to torch >= 2.8 (see ALI_PORT_CONTEXT.md 4).
-monai==1.5.1
+# PINNED, and the pin is load-bearing: monai must ask for a torch the image
+# already satisfies, or an unpinned entry lets pip replace the CUDA build on
+# every container start -- the exact "shadow the CUDA build" failure the note
+# above warns about. 1.6.0 requires torch>=2.8.0, which the lab-ai:2026.08
+# image (torch 2.8.0+cu128) ships, so pip leaves torch alone. It is also the
+# monai the image already carries (dragged in by shapeaxi): pinning anything
+# older would shadow it with a downgrade in the pip --user layer at every
+# start. Bump only together with an image rebuild (see ALI_PORT_CONTEXT.md 4).
+monai==1.6.0
 
 # NOT LISTED, and deliberately so: pytorch3d and shapeaxi, which ALI's IOS
-# engine and CrownSeg need. pytorch3d has no PyPI distribution at all and must
-# be compiled into the deployment image against its torch/CUDA build, and every
-# shapeaxi release requires a newer torch than the current image ships
-# (2.5.1+cu124). Adding either here would install nothing useful and could
-# shadow the CUDA torch build. Both are imported lazily, so ALI's CBCT engine
-# works today and the IOS half starts working the moment the image is rebuilt
-# -- no code change. See ALI_PORT_CONTEXT.md 4.
+# engine and CrownSeg need. pytorch3d has no PyPI distribution at all, so it
+# is compiled from source INTO the deployment image (see the LabEnv repo's
+# Dockerfile) against its torch/CUDA build; shapeaxi is baked in right after
+# it, both because it declares pytorch3d as a hard dependency (pip would try
+# to resolve it from PyPI here and fail) and because its own deps (lightning,
+# mlflow, diffusers) are minutes of install per container start. Listing
+# either here would at best reinstall what the image already ships and at
+# worst shadow the CUDA torch build. Both are imported lazily; since
+# lab-ai:2026.08 the IOS engine actually runs. See ALI_PORT_CONTEXT.md 4.

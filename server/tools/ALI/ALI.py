@@ -57,14 +57,20 @@ class ALITool(Tool):
             ),
         ),
         # Server-side only: the client sends the NAME of a bundle hosted on
-        # the server, never the weights. Both engines' bundles appear in the
-        # same dropdown, so the name is what says which is which.
+        # the server, never the weights. Optional, like the mode it depends
+        # on: the server already detects CBCT vs IOS from the data, so when
+        # no name is sent it also picks the hosted bundle whose CONTENT
+        # matches the detected mode (each engine recognises its own layout).
+        # Naming one is only needed to disambiguate when several bundles of
+        # the same kind are hosted -- and a name that does not match the
+        # detected mode is a 422, not a guess.
         "model": ArgSpec(
             type=str,
-            required=True,
+            required=False,
             server_selectable="model",
             description=(
                 "Name of a model bundle hosted on the server (see GET /tools/ALI/data). "
+                "Leave empty to let the server pick the bundle matching the detected mode. "
                 "CBCT bundles hold <landmark>/<scale>/*.pth; IOS bundles hold checkpoints "
                 "named with an 'O' or 'C' token and an 'Upper' or 'Lower' one, "
                 "e.g. Upper_O_model.pth"
@@ -103,7 +109,7 @@ class ALITool(Tool):
     def run(
         self,
         input: str,
-        model: str,
+        model: str = None,
         cbct_regions: dict = None,
         ios_networks: dict = None,
         prediction_ID: str = "Pred",

@@ -3,7 +3,7 @@
 # the pytest command cannot drift between "the suite the hook runs" and "the
 # suite a maintainer runs".
 x-test-base: &test-base
-  image: ghcr.io/jules-gp/lab-ai:2026.07
+  image: ghcr.io/jules-gp/lab-ai:2026.08
   profiles: ["test"]
   working_dir: /workspace/server
   volumes:
@@ -15,7 +15,7 @@ x-test-base: &test-base
 
 services:
   inference:
-    image: ghcr.io/jules-gp/lab-ai:2026.07
+    image: ghcr.io/jules-gp/lab-ai:2026.08
     environment:
       - API_TOKEN=${API_TOKEN:-dev-token}
       - DATA_DIR=/data
