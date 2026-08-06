@@ -276,6 +276,39 @@ def _check_cbct(automation: str, landmarks: list, landmark_models) -> None:
         )
 
 
+def _no_landmarks_reason(key: str, markups_paths: list, orphans: list) -> str:
+    """Why a Semi-Automated patient has no landmarks -- three situations the
+    one message used to cover with the only wording that could be wrong.
+
+    "No landmark file alongside this scan" was emitted whenever the merged
+    dict came out empty, which happens when the file is absent, when it was
+    matched but unreadable (`load_landmarks` only logs that), and when a file
+    IS in the folder but under a name that put it in another bucket. Telling
+    a user their file is missing while it sits next to the scan is the worst
+    of the three, and it was the likeliest.
+    """
+    if markups_paths:
+        names = ", ".join(sorted(os.path.basename(path) for path in markups_paths))
+        return (
+            f"the landmark file(s) found for this scan ({names}) hold no usable "
+            f"control point -- check the server log for the file that was skipped"
+        )
+    if orphans:
+        return (
+            f"no landmark file matched this scan. {len(orphans)} landmark file(s) in "
+            f"the input matched no scan at all ({', '.join(orphans)}): a scan and its "
+            f"landmarks are paired by name, up to a trailing "
+            f"{', '.join(cbct_pipeline.PATIENT_SUFFIXES)}. Rename them so both sides "
+            f"share the same stem -- e.g. '{key}_scan.nii.gz' with '{key}_lm.mrk.json'"
+        )
+    return (
+        "no landmark file (.mrk.json) alongside this scan. Semi-Automated mode "
+        "registers on landmarks you provide, so they must travel with the scans -- "
+        "send the whole FOLDER rather than the single scan file, or use "
+        "Fully-Automated mode to have them predicted"
+    )
+
+
 def _check_selection_against_reference(requested: list, reference_landmarks: dict) -> None:
     """Refuse a selection the reference cannot support, before reading a scan.
 
@@ -381,6 +414,21 @@ def _run_cbct(
     _check_selection_against_reference(requested, reference_landmarks)
 
     fully = automation == catalogs.AUTOMATION_FULLY
+
+    # Landmark files that matched no scan. Collected even on a run that
+    # succeeds: "39 of your 40 patients were oriented" and "the 40th one's
+    # landmarks are in the folder under a name nothing matched" are the same
+    # sentence, and only this makes the second half sayable.
+    orphans = (
+        [] if fully
+        else sorted(
+            os.path.basename(path)
+            for paths in cbct_pipeline.orphan_markups(input_root, suffix).values()
+            for path in paths
+        )
+    )
+    report["unmatched_markups"] = orphans
+
     centered_root = os.path.join(scratch_dir, "centered")
 
     # Phase 1 -- recentre. The landmark tool runs on centred scans (that is what
@@ -437,7 +485,7 @@ def _run_cbct(
                 "reason": (
                     "no predicted landmarks for this scan"
                     if fully
-                    else "no landmark file (.mrk.json) alongside this scan"
+                    else _no_landmarks_reason(key, patients[key]["markups"], orphans)
                 ),
             }
             continue

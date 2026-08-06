@@ -330,6 +330,61 @@ def test_timepoints_are_two_patients(tmp_path):
     assert sorted(cbct_pipeline.discover(str(tmp_path / "input"))) == ["P1_T1", "P1_T2"]
 
 
+def test_a_landmark_file_matching_no_scan_is_reported_not_silently_dropped(tmp_path):
+    """The failure a real run hit: 1 patient found, 0 oriented, and a report
+    saying "no landmark file (.mrk.json) alongside this scan" while the file
+    was sitting right next to the scan.
+
+    `discover` keys every file by `patient_stem` and then drops any group with
+    no scan in it. A landmark file whose stem does not collapse onto the
+    scan's -- `P1_CBCT.nii.gz` beside `P1.mrk.json` -- becomes its own
+    scan-less group and disappears without a word: not in the report, not in
+    the logs. The caller is then told the file is missing, which is the one
+    thing it is not.
+    """
+    root = tmp_path / "input"
+    _write_scan(root / "P1_CBCT.nii.gz")
+    _write_markups(str(root / "P1.mrk.json"), _REFERENCE_POINTS)
+
+    found = cbct_pipeline.discover(str(root))
+    assert list(found) == ["P1_CBCT"]
+    assert found["P1_CBCT"]["markups"] == []
+
+    orphans = cbct_pipeline.orphan_markups(str(root))
+    assert [os.path.basename(path) for paths in orphans.values() for path in paths] == [
+        "P1.mrk.json"
+    ]
+
+
+def test_landmark_files_that_do_match_are_not_reported_as_orphans(tmp_path):
+    _cbct_case(tmp_path / "input")
+    assert cbct_pipeline.orphan_markups(str(tmp_path / "input")) == {}
+
+
+def test_the_run_report_names_the_unmatched_landmark_files(tmp_path):
+    """What the user actually needs on screen: the file is there, and this is
+    the name it would have to have."""
+    root = tmp_path / "input"
+    _write_scan(root / "P1_CBCT.nii.gz")
+    _write_markups(str(root / "P1.mrk.json"), _REFERENCE_POINTS)
+
+    report = ASOLogic.orient(
+        input_path=str(root),
+        reference_path=_cbct_reference(tmp_path),
+        modality=catalogs.MODALITY_CBCT,
+        automation=catalogs.AUTOMATION_SEMI,
+        cbct_landmarks=list(_REFERENCE_POINTS),
+        scratch_dir=str(tmp_path / "scratch"),
+    ).report
+
+    assert report["summary"]["oriented"] == 0
+    assert report["unmatched_markups"] == ["P1.mrk.json"]
+    reason = report["patients"]["P1_CBCT"]["reason"]
+    # The file is NAMED, and so is the rule that would have paired it.
+    assert "P1.mrk.json" in reason
+    assert "_scan" in reason and "_lm" in reason
+
+
 def test_a_previous_run_is_not_re_ingested(tmp_path):
     """`patient1_Or.nii.gz` sorts BEFORE `patient1_scan.nii.gz`, so running
     twice on the same folder would orient the first run's output; and the first
