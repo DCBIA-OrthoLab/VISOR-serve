@@ -156,17 +156,41 @@ def discover_weights(model_path: str) -> dict:
     }
 
 
-def requested_landmarks(weights: dict, regions):
-    """(runnable, without_model, ungrouped) for a bundle and a region selection.
+def requested_landmarks(weights: dict, regions, landmarks=()):
+    """(runnable, without_model, ungrouped) for a bundle and a selection.
 
     "Requested" is every catalog landmark of the selected regions, plus any
     landmark the bundle itself provides whose region is selected -- so weights
     published for a landmark this catalog has not heard of are not silently
     ignored: they surface as `ungrouped`.
+
+    **An explicit `landmarks` list replaces the regions entirely**, rather than
+    narrowing them. That is what lets a caller ask for exactly the points it
+    needs: ASO's fully-automated CBCT mode registers on seven
+    (Ba, S, N, RPo, LPo, ROr, LOr) which straddle two regions, so going through
+    `regions` would run 58 agents to use 7 -- and one agent is a full two-scale
+    walk of the volume. Narrowing instead of replacing would give the same
+    answer here only because ASO leaves the regions at their all-on default;
+    it would silently drop landmarks for any caller that set both.
+
+    Empty (the default) means "not specified" and leaves the regions in charge,
+    which is every request that predates this argument.
     """
     regions = set(regions)
-    wanted = set(catalog.landmarks_in(regions))
     ungrouped = []
+
+    if landmarks:
+        wanted = set(landmarks)
+        # An explicitly named landmark the catalog does not know is still run
+        # if the bundle has weights for it: the caller named it on purpose.
+        ungrouped = sorted(
+            label for label in wanted if catalog.group_of(label) == catalog.UNGROUPED
+        )
+        runnable = tuple(sorted(label for label in wanted if label in weights))
+        without_model = sorted(label for label in wanted if label not in weights)
+        return runnable, without_model, ungrouped
+
+    wanted = set(catalog.landmarks_in(regions))
 
     for label in weights:
         group = catalog.group_of(label)
@@ -213,6 +237,7 @@ def predict_landmarks(
     scans: list,
     model_path: str,
     regions=None,
+    landmarks=(),
     prediction_ID: str = "Pred",
     output_dir: str = None,
     scratch_dir: str = None,
@@ -238,6 +263,7 @@ def predict_landmarks(
     check_dependencies()
     device = resolve_device(device)
     regions = tuple(regions) if regions is not None else catalog.REGION_CODES
+    landmarks = tuple(landmarks or ())
     prediction_ID = (prediction_ID or "Pred").strip() or "Pred"
     budget = search_budget(device)
 
@@ -252,12 +278,20 @@ def predict_landmarks(
             f"{' and '.join(catalog.SCALE_KEYS)}."
         )
 
-    runnable, without_model, ungrouped = requested_landmarks(weights, regions)
+    runnable, without_model, ungrouped = requested_landmarks(weights, regions, landmarks)
     if not runnable:
-        region_names = ", ".join(catalog.REGION_DISPLAY_NAMES.get(code, code) for code in regions)
+        # Name what was actually asked for. Reporting the regions when the
+        # caller named landmarks would point at a selection they never made.
+        if landmarks:
+            asked = f"landmark(s) ({', '.join(landmarks)})"
+        else:
+            asked = (
+                f"region(s) ("
+                f"{', '.join(catalog.REGION_DISPLAY_NAMES.get(code, code) for code in regions)})"
+            )
         raise ToolArgumentError(
-            f"'{os.path.basename(model_path)}' has no weights for any landmark of the selected "
-            f"region(s) ({region_names}). It provides: {', '.join(sorted(weights)) or 'nothing'}."
+            f"'{os.path.basename(model_path)}' has no weights for any of the selected "
+            f"{asked}. It provides: {', '.join(sorted(weights)) or 'nothing'}."
         )
 
     preprocessed_dir = os.path.join(scratch_dir, "preprocessed")
@@ -337,7 +371,14 @@ def predict_landmarks(
         "mode": "CBCT",
         "device": device,
         "prediction_ID": prediction_ID,
-        "regions": [catalog.REGION_DISPLAY_NAMES.get(code, code) for code in regions],
+        # What drove the selection, and only that: reporting the regions on a
+        # run that named landmarks would show a selection the caller never
+        # made (they are left at their all-on default in that case).
+        "regions": (
+            [] if landmarks
+            else [catalog.REGION_DISPLAY_NAMES.get(code, code) for code in regions]
+        ),
+        "landmarks_selected": list(landmarks),
         "landmarks_requested": list(runnable),
         # Named after AMASSS's `structures_without_model` and read by the
         # Slicer module: a landmark listed here means "use another bundle",

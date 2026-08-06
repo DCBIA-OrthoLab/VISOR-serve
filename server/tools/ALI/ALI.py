@@ -33,6 +33,16 @@ from .src import ALILogic
 from .src.ALI_CBCT import landmarks as cbct_catalog
 from .src.ALI_IOS import landmarks as ios_catalog
 
+# The collapsible boxes a client lays this panel out in. Both engines'
+# selections are always shown -- there is no `mode` argument to hide one behind
+# (see the module docstring) -- so the least a panel can do is not interleave
+# them: a CBCT user reads one box and ignores the other, instead of scanning a
+# flat list for the four rows that apply to them.
+_INPUTS = "Inputs"
+_CBCT = "CBCT landmarks"
+_IOS = "IOS landmarks"
+_OUTPUTS = "Outputs"
+
 
 class ALITool(Tool):
     name = "ALI"
@@ -47,6 +57,8 @@ class ALITool(Tool):
         # offers a folder picker for this argument and zips the selection
         # before uploading.
         "input": ArgSpec(
+            label="Scan or Folder",
+            section=_INPUTS,
             type=("volume_or_zip_file", "surface_or_zip_file"),
             required=True,
             server_selectable="testfile",
@@ -65,6 +77,8 @@ class ALITool(Tool):
         # the same kind are hosted -- and a name that does not match the
         # detected mode is a 422, not a guess.
         "model": ArgSpec(
+            label="Model Bundle",
+            section=_INPUTS,
             type=str,
             required=False,
             server_selectable="model",
@@ -81,15 +95,49 @@ class ALITool(Tool):
         # bundle lacks costs a line in the run report, whereas a region left
         # off by default is one the user never finds.
         "cbct_regions": ArgSpec(
+            label="Regions",
+            section=_CBCT,
             type="multichoice",
             required=False,
             choices=cbct_catalog.REGION_CHOICES,
+            ui="inline",
             description="CBCT only: anatomical regions to predict",
         ),
+        # The precise counterpart of `cbct_regions`, and the argument another
+        # server-side tool drives this engine through.
+        #
+        # A region is the right granularity for a human placing a full set of
+        # points, and the wrong one for a caller that needs a named few: ASO's
+        # fully-automated CBCT mode registers on seven landmarks
+        # (Ba, S, N, RPo, LPo, ROr, LOr) that straddle the Cranial base and
+        # Upper regions, so asking by region would run 58 agents to use 7 --
+        # and one agent is a full two-scale walk of the volume.
+        #
+        # All options off by default, unlike the regions: "off" is what an
+        # omitted multichoice arrives as, so the default state is exactly
+        # "nothing said here, the regions decide" -- which is what every
+        # request written before this argument existed keeps meaning.
+        "landmarks": ArgSpec(
+            label="Individual landmarks",
+            section=_CBCT,
+            type="multichoice",
+            required=False,
+            choices=cbct_catalog.LANDMARK_CHOICES,
+            ui="tabs",
+            groups=cbct_catalog.LANDMARK_GROUPS,
+            description=(
+                "CBCT only: predict exactly these landmarks. Leave every box unchecked "
+                "to select by region instead -- naming any landmark here REPLACES the "
+                "region selection rather than narrowing it"
+            ),
+        ),
         "ios_networks": ArgSpec(
+            label="Landmark families",
+            section=_IOS,
             type="multichoice",
             required=False,
             choices=ios_catalog.NETWORK_CHOICES,
+            ui="inline",
             description="IOS only: landmark families to predict",
         ),
         # No `initial`: an optional field left empty is dropped from the
@@ -97,6 +145,8 @@ class ALITool(Tool):
         # module shows "Pred" as a placeholder rather than pre-filling it, for
         # the same reason.
         "prediction_ID": ArgSpec(
+            label="Prediction ID",
+            section=_OUTPUTS,
             type=str,
             required=False,
             description="Suffix used in output file names, e.g. scan_lm_Pred.mrk.json",
@@ -111,16 +161,18 @@ class ALITool(Tool):
         input: str,
         model: str = None,
         cbct_regions: dict = None,
+        landmarks: dict = None,
         ios_networks: dict = None,
         prediction_ID: str = "Pred",
     ) -> str:
-        # `cbct_regions` and `ios_networks` are base.Selection mappings keyed
-        # by the display names the schema published; ALILogic translates them
-        # into the codes each engine speaks.
+        # `cbct_regions`, `landmarks` and `ios_networks` are base.Selection
+        # mappings keyed by the display names the schema published; ALILogic
+        # translates them into the codes each engine speaks.
         return ALILogic.main(
             input=input,
             model=model,
             cbct_regions=cbct_regions,
+            landmarks=landmarks,
             ios_networks=ios_networks,
             prediction_ID=prediction_ID,
         )

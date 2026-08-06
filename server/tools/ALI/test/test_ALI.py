@@ -28,7 +28,7 @@ import numpy as np
 import pytest
 import SimpleITK as sitk
 
-from base import Selection, ToolArgumentError, ToolUnavailableError
+from base import ResolvedPath, Selection, ToolArgumentError, ToolUnavailableError
 from tools.ALI.ALI import ALITool
 from tools.ALI.src import ALILogic
 from tools.ALI.src import markups
@@ -864,7 +864,7 @@ def test_the_schema_is_valid_and_has_no_mode_argument():
     tool = ALITool()
     tool.check_schema()
     assert sorted(tool.arguments) == [
-        "cbct_regions", "input", "ios_networks", "model", "prediction_ID"
+        "cbct_regions", "input", "ios_networks", "landmarks", "model", "prediction_ID"
     ]
     assert "mode" not in tool.arguments
 
@@ -894,3 +894,168 @@ def test_both_selections_are_optional_so_neither_blocks_the_other_mode():
 
 def test_the_output_is_a_bundle_of_files():
     assert ALITool().output_kind == "files"
+
+
+# ---------------------------------------------------------------------------
+# `landmarks` -- asking for named points instead of whole regions
+# ---------------------------------------------------------------------------
+
+# What ASO's fully-automated CBCT mode registers on. Straddles two regions,
+# which is the whole reason this argument exists.
+ASO_LANDMARKS = ("Ba", "S", "N", "RPo", "LPo", "ROr", "LOr")
+
+
+def _cbct_engine():
+    """Imported inside each test, like everywhere else in this file: the CBCT
+    engine pulls in torch and SimpleITK at import time."""
+    from tools.ALI.src.ALI_CBCT import engine
+
+    return engine
+
+
+def _weights_for(labels):
+    """A discover_weights() result: every label with both scales present."""
+    return {label: {scale: f"/w/{label}/{scale}.pth" for scale in cbct_catalog.SCALE_KEYS}
+            for label in labels}
+
+
+def test_naming_landmarks_replaces_the_region_selection():
+    """The point of the argument: 7 agents, not 58.
+
+    ASO's seven points span Cranial base and Upper. Asking by region would run
+    every landmark of both (58) to use seven, and one agent is a full two-scale
+    walk of the volume.
+    """
+    engine = _cbct_engine()
+    weights = _weights_for(cbct_catalog.LABELS)
+
+    by_region, _missing, _ungrouped = engine.requested_landmarks(
+        weights, regions=("CB", "U")
+    )
+    by_name, missing, _ungrouped = engine.requested_landmarks(
+        weights, regions=cbct_catalog.REGION_CODES, landmarks=ASO_LANDMARKS
+    )
+
+    assert set(by_name) == set(ASO_LANDMARKS)
+    assert not missing
+    # The regions were left at their all-on default and still did not widen it.
+    assert len(by_region) > 8 * len(by_name)
+
+
+def test_an_empty_landmark_selection_leaves_the_regions_in_charge():
+    """Every request written before this argument existed keeps its meaning:
+    an omitted multichoice arrives as its declared defaults, and those are all
+    off."""
+    engine = _cbct_engine()
+    weights = _weights_for(cbct_catalog.LABELS)
+
+    without = engine.requested_landmarks(weights, regions=("CB",))
+    with_empty = engine.requested_landmarks(weights, regions=("CB",), landmarks=())
+
+    assert without == with_empty
+    assert set(without[0]) == set(cbct_catalog.GROUP_LABELS["CB"])
+
+
+def test_a_named_landmark_the_bundle_lacks_is_reported_not_dropped():
+    """Same contract as the region path: "use another bundle" has to be
+    distinguishable from "this scan is hard"."""
+    engine = _cbct_engine()
+    weights = _weights_for(("Ba", "S", "N"))
+
+    runnable, without_model, _ungrouped = engine.requested_landmarks(
+        weights, regions=cbct_catalog.REGION_CODES, landmarks=ASO_LANDMARKS
+    )
+
+    assert set(runnable) == {"Ba", "S", "N"}
+    assert set(without_model) == {"RPo", "LPo", "ROr", "LOr"}
+
+
+def test_landmark_names_accepts_every_shape_a_caller_uses():
+    # The HTTP path (a Selection), a plain list from another server-side tool,
+    # and the omitted argument.
+    assert cbct_catalog.landmark_names({"Ba": True, "S": False, "N": True}) == ("Ba", "N")
+    assert cbct_catalog.landmark_names(["N", "Ba"]) == ("Ba", "N")  # declaration order
+    assert cbct_catalog.landmark_names(None) == ()
+    assert cbct_catalog.landmark_names({}) == ()
+    # Aliases resolve to the spelling the weights are packaged under.
+    assert cbct_catalog.landmark_names(["UR3OI"]) == ("UR3OIP",)
+
+
+def test_the_landmark_tabs_are_the_engines_own_grouping():
+    """Published, not restated: the client renders the same table the engine
+    names its output files by, so a landmark added to GROUP_LABELS appears in
+    its tab with no client release."""
+    tool = ALITool()
+    spec = tool.arguments["landmarks"]
+
+    assert spec.ui == "tabs"
+    assert set(spec.groups) == set(cbct_catalog.REGION_NAMES)
+    for display, code in cbct_catalog.REGION_NAMES.items():
+        assert tuple(spec.groups[display]) == tuple(cbct_catalog.GROUP_LABELS[code])
+    # Every grouped option is one the argument actually offers.
+    for options in spec.groups.values():
+        assert set(options) <= set(spec.choices)
+
+
+def test_landmarks_start_all_off_so_the_regions_keep_deciding():
+    spec = ALITool().arguments["landmarks"]
+    assert set(spec.choices.values()) == {False}
+    assert not spec.required
+
+
+# ---------------------------------------------------------------------------
+# The contract another server-side tool drives this one through
+# ---------------------------------------------------------------------------
+
+def test_the_schema_exposes_what_aso_drives_it_with():
+    """ASO's fully-automated CBCT mode calls `tool.invoke` in-process (never
+    over HTTP -- that would deadlock its own concurrency limiter) and checks
+    these three argument names up front, so a drift here is one clear message
+    instead of a 422 from inside another tool.
+
+    Guarded here rather than in ASO's suite because it is THIS schema that has
+    to keep the promise, and the two tools live on separate branches until
+    both land.
+    """
+    tool = ALITool()
+    for name in ("input", "model", "landmarks"):
+        assert name in tool.arguments, name
+    # ASO also sets it when present, and ALI must keep accepting that.
+    assert "prediction_ID" in tool.arguments
+
+
+def test_the_aso_selection_validates_and_survives_coercion():
+    """The exact args ASO builds, through the same entry point main.py uses.
+
+    `input` arrives as an already-resolved DIRECTORY (ASO hands over the folder
+    it extracted, not an upload), the model as a local path, and the landmark
+    selection as a partial mapping -- every option ASO did not name must come
+    back False, since what is sent IS the selection.
+    """
+    tool = ALITool()
+    cleaned = tool.validate({
+        "input": ResolvedPath("/tmp/cohort", "folder"),
+        "model": "/data/ALI/models/ALI_CBCT_Models",
+        "landmarks": {name: True for name in ASO_LANDMARKS},
+        "prediction_ID": "Pred",
+    })
+
+    assert cleaned["input"].kind == "folder"
+    assert {name for name, on in cleaned["landmarks"].items() if on} == set(ASO_LANDMARKS)
+    assert set(cleaned["landmarks"]) == set(cbct_catalog.LABELS)
+    # The regions were never sent, so they arrive as their declared defaults --
+    # all on -- and the landmark selection is what must win. See
+    # engine.requested_landmarks.
+    assert set(cleaned["cbct_regions"].selected) == set(cbct_catalog.REGION_NAMES)
+
+
+def test_a_landmark_aso_asks_for_that_this_catalog_lacks_is_a_clear_422():
+    """Not a silent drop: ASO would then orient against fewer points than it
+    asked for and report success."""
+    tool = ALITool()
+    with pytest.raises(ToolArgumentError) as excinfo:
+        tool.validate({
+            "input": ResolvedPath("/tmp/cohort", "folder"),
+            "landmarks": {"NoSuchPoint": True},
+        })
+    assert "NoSuchPoint" in str(excinfo.value)

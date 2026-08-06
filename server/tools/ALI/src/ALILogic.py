@@ -351,6 +351,7 @@ def identify(
     input_path: str,
     model_path: str = None,
     cbct_regions=None,
+    landmarks=None,
     ios_networks=None,
     prediction_ID: str = "Pred",
     scratch_dir: str = None,
@@ -396,14 +397,19 @@ def identify(
 
     try:
         if detected.mode == CBCT:
+            # An explicit landmark list replaces the regions rather than
+            # narrowing them -- see engine.requested_landmarks for why, and for
+            # the eight-fold cost that motivates it.
+            chosen_landmarks = cbct_catalog.landmark_names(landmarks)
             regions = cbct_catalog.region_codes(cbct_regions)
-            if not regions:
+            if not chosen_landmarks and not regions:
                 # The cross-argument rule the schema cannot express. Naming the
                 # detected mode is the point: it is what tells a caller who ticked
                 # the other group's boxes what actually happened.
                 raise ToolArgumentError(
-                    f"This input is a CBCT batch: select at least one region under 'cbct_regions' "
-                    f"({', '.join(cbct_catalog.REGION_NAMES)})."
+                    f"This input is a CBCT batch: select at least one region under "
+                    f"'cbct_regions' ({', '.join(cbct_catalog.REGION_NAMES)}), or name the "
+                    f"points you want under 'landmarks'."
                 )
             from .ALI_CBCT import engine as cbct_engine
 
@@ -411,6 +417,7 @@ def identify(
                 scans=detected.scans,
                 model_path=model_path,
                 regions=regions,
+                landmarks=chosen_landmarks,
                 prediction_ID=prediction_ID,
                 output_dir=output_dir,
                 scratch_dir=scratch_dir,
@@ -470,6 +477,7 @@ def main(
     input: str,
     model: str = None,
     cbct_regions=None,
+    landmarks=None,
     ios_networks=None,
     prediction_ID: str = "Pred",
 ) -> str:
@@ -484,6 +492,7 @@ def main(
         input_path=input,
         model_path=model,
         cbct_regions=cbct_regions,
+        landmarks=landmarks,
         ios_networks=ios_networks,
         prediction_ID=prediction_ID,
         scratch_dir=scratch_dir,
