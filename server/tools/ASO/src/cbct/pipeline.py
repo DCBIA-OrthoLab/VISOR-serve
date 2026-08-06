@@ -37,7 +37,7 @@ _COMPRESSED_EXTENSIONS = {".nii": ".nii.gz", ".gipl": ".gipl.gz", ".nrrd.gz": ".
 # they mark two timepoints of the same subject, which are two scans to orient,
 # not one. Collapsing them dropped the second scan and merged both landmark
 # sets into the survivor.
-_PATIENT_SUFFIXES = (
+PATIENT_SUFFIXES = (
     "_lm_Pred", "_Scanreg", "_MERGED", "_scan", "_Scan", "_Or", "_OR", "_lm",
 )
 
@@ -75,7 +75,7 @@ def patient_stem(filename: str) -> str:
         else:
             stem = os.path.splitext(stem)[0]
 
-    for suffix in _PATIENT_SUFFIXES:
+    for suffix in PATIENT_SUFFIXES:
         index = stem.find(suffix)
         if index > 0:
             stem = stem[:index]
@@ -99,6 +99,56 @@ def is_previous_output(filename: str, suffix: str) -> bool:
     return stem.endswith(f"_{suffix}") or stem.endswith(f"_{suffix}_transform")
 
 
+def _group_by_patient(input_root: str, output_suffix: str) -> dict:
+    """Every file under `input_root`, bucketed by the patient its NAME implies.
+
+    Shared by `discover` and `orphan_markups` so the two can never disagree
+    about what belongs to whom -- which is the whole point of reporting the
+    leftovers: a second implementation would eventually call a different file
+    an orphan than the one discovery dropped.
+    """
+    patients: dict = {}
+    for directory, _, file_names in os.walk(input_root):
+        relative = os.path.relpath(directory, input_root)
+        prefix = "" if relative == "." else relative
+        for file_name in sorted(file_names):
+            if file_name.startswith("."):
+                continue
+            key = os.path.join(prefix, patient_stem(file_name))
+            entry = patients.setdefault(
+                key, {"scans": [], "old_scans": [], "markups": [], "old_markups": []}
+            )
+            path = os.path.join(directory, file_name)
+            previous = is_previous_output(file_name, output_suffix)
+            if file_name.lower().endswith(SCAN_EXTENSIONS):
+                entry["old_scans" if previous else "scans"].append(path)
+            elif markups.is_markups_file(file_name):
+                entry["old_markups" if previous else "markups"].append(path)
+    return patients
+
+
+def orphan_markups(input_root: str, output_suffix: str = "Or") -> dict:
+    """{patient key it was filed under: [markups paths]} for every landmark
+    file that matched no scan.
+
+    `discover` drops these groups, and used to drop them in complete silence.
+    The caller was then told "no landmark file (.mrk.json) alongside this
+    scan" about a scan whose landmark file was sitting next to it -- named
+    just differently enough that `patient_stem` put the two in separate
+    buckets (`P1_CBCT.nii.gz` beside `P1.mrk.json`). Nothing said so: not the
+    report, not the logs.
+
+    A run that produces nothing has to be able to say why, so the leftovers
+    are collected and named. Files a previous run wrote are not leftovers --
+    they are deliberately set aside -- so only the fresh ones count.
+    """
+    return {
+        key: entry["markups"]
+        for key, entry in _group_by_patient(input_root, output_suffix).items()
+        if entry["markups"] and not (entry["scans"] or entry["old_scans"])
+    }
+
+
 def discover(input_root: str, output_suffix: str = "Or") -> dict:
     """{patient key: {"scan": path, "markups": [paths]}} for one input tree.
 
@@ -118,23 +168,7 @@ def discover(input_root: str, output_suffix: str = "Or") -> dict:
     while a folder holding both an original and its orientation uses the
     original.
     """
-    patients: dict = {}
-    for directory, _, file_names in os.walk(input_root):
-        relative = os.path.relpath(directory, input_root)
-        prefix = "" if relative == "." else relative
-        for file_name in sorted(file_names):
-            if file_name.startswith("."):
-                continue
-            key = os.path.join(prefix, patient_stem(file_name))
-            entry = patients.setdefault(
-                key, {"scans": [], "old_scans": [], "markups": [], "old_markups": []}
-            )
-            path = os.path.join(directory, file_name)
-            previous = is_previous_output(file_name, output_suffix)
-            if file_name.lower().endswith(SCAN_EXTENSIONS):
-                entry["old_scans" if previous else "scans"].append(path)
-            elif markups.is_markups_file(file_name):
-                entry["old_markups" if previous else "markups"].append(path)
+    patients = _group_by_patient(input_root, output_suffix)
 
     found = {}
     for key, entry in patients.items():
