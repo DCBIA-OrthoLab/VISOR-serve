@@ -308,6 +308,65 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-08-06 — Presentation hints: the schema says how to lay a panel out
+
+**Motivation:** ASO's panel was unusable. Four modes share one schema, so the
+generic client rendered 130 CBCT landmarks, 32 teeth, 8 landmark types and 2
+jaws as a single column of ~180 check boxes with the CBCT and IOS options
+interleaved — while any given run uses one half or the other. The old Slicer
+module solved this with a hand-written four-page `QStackedWidget`, ~700 lines
+of checkbox plumbing and the tooth numbering written out twice inside the
+widget. That is exactly the anatomy-in-the-client the port removed, so it could
+not come back; the schema had to say enough for a generic client to do it.
+
+**Four optional `ArgSpec` fields, published by `GET /tools`, ignored by
+`validate()` and `run()`:** `section` (which collapsible box), `visible_when`
+(`{other_arg: value}`, show only while every entry matches), `ui`
+(`"tabs"`/`"grid"`/`"inline"` — how a multichoice's boxes are laid out) and
+`groups` (`{group name: (option, ...)}` for the two grouped layouts). Every one
+is `null` on every existing tool, so every existing panel renders unchanged.
+
+**None of them names an anatomical concept**, which is the whole point:
+`groups` says what to group, `ui` how to lay it out, `visible_when` when it
+applies. `catalogs.CBCT_LANDMARK_GROUPS` had carried a comment since the port
+saying the grouping was kept "as a comment-level structure only: the schema has
+no way to express groups" — it does now, and `TOOTH_GROUPS` is derived from
+`TOOTH_IDS` rather than written out again, so a tooth added to the label table
+appears in its own arch on screen.
+
+**`check_schema` rejects them at startup, and that matters more here than for
+a real type.** A wrong `visible_when` hides a field for good, and a client
+cannot tell that from a field the tool never declared — the failure is silent
+everywhere else, so it has to be loud at boot: unknown layout, `groups` without
+a layout that uses them, a group naming an option that does not exist, a
+`visible_when` on an undeclared argument, on a non-`choice` argument, or
+expecting a value outside its `choices`. An option no group mentions is *not*
+an error: the client renders the leftovers rather than dropping a selection the
+tool genuinely offers.
+
+**`visible_when` is presentation, not validation.** A hidden argument is not
+sent, so its declared default applies — and `_check_cbct`/`_check_ios` still
+run for a direct API call that sends whatever it likes. What it does fix is a
+real wire problem: a multichoice is read back as the *complete*
+`{option: checked}` dict and the server reads what it receives **as** the
+selection, so a CBCT run was sending `ios_teeth` — a selection the user was
+never shown, frozen at whatever the invisible widget was built with even after
+the default changed here.
+
+**ASO declares them in ~15 lines** and the client module is untouched: four
+boxes (Inputs / Landmark Reference / Teeth & Landmarks / Outputs), the two
+selection boxes mutually exclusive on `modality`, `landmark_models` visible
+only for Fully-Automated CBCT, `ios_landmark_types` only for Semi-Automated
+IOS, the 130 landmarks in tabs, the 32 teeth as a two-row chart. Adding a
+landmark server-side still needs no client release.
+
+**Tests:** 204 server tests (2 new — every rejection above, and `/tools`
+echoing the hints as `null` for `example_tool` and as real values for ASO with
+every grouped option checked against `choices`). Client-side, 86 formgen tests
+and 33 ASO tests, the load-bearing one being that all four layouts read back
+identically: a layout the client renders badly is ugly, never wrong on the
+wire.
+
 ### 2026-07-31 — ASO ported: four modes, one tool, and the defects it inherited
 
 **Motivation:** port ASO (Automated Standardized Orientation) from a 2587-line

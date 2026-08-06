@@ -15,11 +15,11 @@ discovery time.
 # ---------------------------------------------------------------------------
 # CBCT landmarks
 # ---------------------------------------------------------------------------
-# Grouped exactly as the Slicer UI grouped them (one tab per group). The
-# grouping is kept as a comment-level structure only: the schema has no way to
-# express groups, and faking them with prefixed option labels would change the
-# names the server matches against a reference file. See ALI_PORT_CONTEXT.md
-# section 3.1.
+# Grouped exactly as the Slicer UI grouped them, one tab per group. This is
+# published through `ArgSpec.groups`, so a client renders the tabs from the
+# schema: the alternative once considered here -- prefixing the option labels
+# with their group -- was rejected because those labels ARE the names the
+# server matches against a reference file. See ALI_PORT_CONTEXT.md section 3.1.
 CBCT_LANDMARK_GROUPS = {
     "Cranial base": (
         "Ba", "C2", "C3", "C4", "LFZyg", "LPo", "N", "RFZyg", "RPo", "S",
@@ -80,6 +80,13 @@ TOOTH_NAMES = {number: name for name, number in TOOTH_IDS.items()}
 
 UPPER_TEETH = tuple(name for name, number in TOOTH_IDS.items() if number <= 16)
 LOWER_TEETH = tuple(name for name, number in TOOTH_IDS.items() if number > 16)
+
+# One row per arch, teeth left to right in universal-numbering order -- the
+# dental chart a clinician reads, published so a client lays the check boxes
+# out that way instead of stacking 32 of them in a column. Deriving it from
+# TOOTH_IDS rather than writing it out again is what keeps the chart and the
+# label array in step: a tooth added to TOOTH_IDS appears in its own arch.
+TOOTH_GROUPS = {"Upper": UPPER_TEETH, "Lower": LOWER_TEETH}
 
 # Auto_IOS.Suggest(): three teeth per jaw, spread left/middle/right, which is
 # what the coarse pre-alignment needs (see ios/pre_icp.py).

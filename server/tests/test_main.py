@@ -849,6 +849,93 @@ def test_choice_schema_is_validated_at_startup():
     valid.check_schema()
 
 
+def test_presentation_hints_are_validated_at_startup():
+    """The hints are cosmetic, which is exactly why they are checked at boot.
+
+    A wrong `visible_when` hides a field for good, and a client cannot tell
+    that from a field the tool never declared -- the failure is silent
+    everywhere else, so it has to be loud here.
+    """
+    import base
+
+    def tool_with(arguments):
+        return type(
+            "T", (base.Tool,), {"name": "t", "arguments": arguments, "run": lambda self: None}
+        )()
+
+    mode = base.ArgSpec(type="choice", choices={"CBCT": True, "IOS": False})
+    picks = dict(type="multichoice", choices={"a": True, "b": False})
+
+    invalid = {
+        "ui on a non-multichoice": {"opt": base.ArgSpec(type=str, ui="tabs")},
+        "unknown layout": {"opt": base.ArgSpec(ui="carousel", **picks)},
+        "grouped layout without groups": {"opt": base.ArgSpec(ui="tabs", **picks)},
+        "groups without a grouped layout": {
+            "opt": base.ArgSpec(ui="inline", groups={"G": ("a",)}, **picks)
+        },
+        "a group naming an option that does not exist": {
+            "opt": base.ArgSpec(ui="tabs", groups={"G": ("a", "zzz")}, **picks)
+        },
+        "visible_when on an argument the tool does not declare": {
+            "opt": base.ArgSpec(type=str, visible_when={"absent": "CBCT"})
+        },
+        "visible_when on a non-choice argument": {
+            "mode": base.ArgSpec(type=str),
+            "opt": base.ArgSpec(type=str, visible_when={"mode": "CBCT"}),
+        },
+        "visible_when expecting a value outside the choices": {
+            "mode": mode,
+            "opt": base.ArgSpec(type=str, visible_when={"mode": "MRI"}),
+        },
+    }
+    for reason, arguments in invalid.items():
+        try:
+            tool_with(arguments).check_schema()
+        except base.ToolSchemaError:
+            continue
+        raise AssertionError(f"should have been rejected: {reason}")
+
+    # An option no group mentions is NOT an error: the client renders the
+    # leftovers rather than dropping a selection the tool genuinely offers.
+    tool_with(
+        {
+            "mode": mode,
+            "opt": base.ArgSpec(
+                ui="tabs", groups={"G": ("a",)}, section="Advanced",
+                visible_when={"mode": ("CBCT", "IOS")}, **picks
+            ),
+        }
+    ).check_schema()
+
+
+def test_tools_exposes_presentation_hints():
+    """A client builds its panel from GET /tools alone, so the hints have to
+    travel -- and stay null for every tool declaring none, which is what keeps
+    an existing panel rendering exactly as it did."""
+    tools = {tool["name"]: tool for tool in client.get("/tools").json()}
+
+    example = tools["example_tool"]["arguments"]["outputs"]
+    assert example["section"] is None
+    assert example["visible_when"] is None
+    assert example["ui"] is None
+    assert example["groups"] is None
+
+    aso = tools.get("ASO")
+    if aso is None:  # ASO's heavy stack may be absent from a minimal image
+        return
+    landmarks = aso["arguments"]["cbct_landmarks"]
+    assert landmarks["ui"] == "tabs"
+    assert landmarks["visible_when"] == {"modality": "CBCT"}
+    assert landmarks["section"] == "Landmark Reference"
+    # Serialized as lists, not tuples, so the wire shape does not depend on how
+    # the tool spelled its catalog.
+    assert isinstance(landmarks["groups"]["Cranial base"], list)
+    assert set(landmarks["groups"]) == {"Cranial base", "Upper", "Lower"}
+    # Every grouped option is one the argument actually offers.
+    for options in landmarks["groups"].values():
+        assert set(options) <= set(landmarks["choices"])
+
+
 def test_selection_helper():
     """run() gets every declared option, so no .get(name, False) is ever needed."""
     import base

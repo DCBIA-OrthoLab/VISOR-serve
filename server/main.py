@@ -284,6 +284,22 @@ def list_tools() -> list:
                     # "file", which falls back to ALLOWED_EXTENSIONS), and
                     # None for an argument that takes no file at all.
                     "extensions": _extensions_of(spec),
+                    # Presentation hints (see ArgSpec). Purely about how a
+                    # client should lay this argument out and when to show it;
+                    # every one of them is null on a tool that declares none,
+                    # which is what keeps a client's default rendering the
+                    # rendering every existing tool already gets.
+                    "section": spec.section,
+                    "visible_when": spec.visible_when,
+                    "ui": spec.ui,
+                    # Tuples would serialize as JSON arrays anyway; listed
+                    # explicitly so the wire shape does not depend on how a
+                    # tool happened to spell its catalog.
+                    "groups": (
+                        {name: list(options) for name, options in spec.groups.items()}
+                        if spec.groups
+                        else None
+                    ),
                 }
                 for arg_name, spec in tool.arguments.items()
             },

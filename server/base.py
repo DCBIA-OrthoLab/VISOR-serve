@@ -66,6 +66,22 @@ CHOICE_TYPE = "choice"
 MULTICHOICE_TYPE = "multichoice"
 CHOICE_TYPES = (CHOICE_TYPE, MULTICHOICE_TYPE)
 
+# How a client should lay a "multichoice" argument's options out (ArgSpec.ui).
+# Presentation only -- none of these changes what the argument means, what is
+# sent, or what run() receives. Absent (None) is the single-column stack every
+# tool gets today.
+#   "tabs"   -> one tab per entry of `groups`, options in a scrollable grid.
+#               For a catalog too long to scroll through (ASO's 130 landmarks).
+#   "grid"   -> one ROW per entry of `groups`, options as columns. For options
+#               whose position carries meaning (ASO's 32 teeth, upper arch
+#               above lower arch -- the dental chart clinicians read).
+#   "inline" -> a single horizontal row. For a handful of short options that
+#               waste a line each stacked vertically.
+UI_LAYOUTS = ("tabs", "grid", "inline")
+
+# The layouts that are meaningless without ArgSpec.groups.
+_GROUPED_LAYOUTS = ("tabs", "grid")
+
 
 class Selection(dict):
     """What run() receives for a "multichoice" argument: every option the tool
@@ -147,6 +163,48 @@ class ArgSpec:
     # already in `choices`, and `default` derives from it (check_schema rejects
     # the combination).
     initial: Any = None
+
+    # ------------------------------------------------------------------
+    # Presentation hints
+    # ------------------------------------------------------------------
+    # Published through GET /tools and read by the client's form generator;
+    # `validate()` and `run()` ignore every one of them. They exist because a
+    # schema that only says WHAT an argument is produces an unusable panel past
+    # a certain size: ASO declares 130 CBCT landmarks, 32 teeth, 8 landmark
+    # types and 2 jaws, which a generic client renders as one column of ~180
+    # check boxes with CBCT and IOS options interleaved -- while any given run
+    # uses one half or the other. The alternative was a hand-written Qt panel
+    # per tool, which puts the anatomy back inside the widget and makes "add a
+    # landmark server-side" a client release again.
+    #
+    # Nothing here names an anatomical concept: `groups` says what to group,
+    # `ui` says how to lay it out, `visible_when` says when it applies.
+
+    # The collapsible box this argument is rendered in. None -> the client's
+    # default section ("Inputs"), i.e. exactly what every tool does today.
+    section: Optional[str] = None
+
+    # Show this argument only while other arguments hold given values:
+    # {"modality": "CBCT"} or {"modality": "CBCT", "automation": "Fully-Automated"}
+    # (every entry must match; a tuple/list of values means "any of these").
+    # The named arguments must be "choice" arguments of the same tool and the
+    # values must exist in their `choices` -- check_schema enforces both, so a
+    # typo fails at boot instead of hiding a field forever.
+    #
+    # This is presentation only: a hidden argument is simply not sent, so the
+    # server applies its declared default. It does NOT replace the tool's own
+    # cross-argument validation, which still has to hold for a direct API call.
+    visible_when: Optional[dict] = None
+
+    # How a "multichoice" argument's check boxes are laid out. None keeps the
+    # single-column stack. See UI_LAYOUTS for what each value means.
+    ui: Optional[str] = None
+
+    # {group name: (option, ...)} for the layouts that need it. Every option
+    # must exist in `choices`; options left out of every group are rendered
+    # after the groups rather than dropped (check_schema only rejects the
+    # reverse -- a group naming an option that does not exist).
+    groups: Optional[dict] = None
 
     @property
     def types(self) -> tuple:
@@ -249,6 +307,72 @@ class Tool(ABC):
                     f"must stand alone (got {spec.types})."
                 )
             self._check_choices(where, spec)
+            self._check_presentation(where, spec)
+
+    def _check_presentation(self, where: str, spec: ArgSpec) -> None:
+        """Reject a presentation hint that cannot be honored.
+
+        These are checked at startup precisely BECAUSE they are cosmetic: a
+        wrong `visible_when` hides a field for good and a client has no way to
+        tell that from a field the tool never declared, so the failure is
+        silent everywhere else. Here it is a boot error naming the typo.
+        """
+        if spec.ui is not None:
+            if spec.types[0] != MULTICHOICE_TYPE:
+                raise ToolSchemaError(
+                    f"{where}: 'ui' lays a multichoice argument's check boxes out, and this "
+                    f"argument is a {spec.types[0]!r}."
+                )
+            if spec.ui not in UI_LAYOUTS:
+                raise ToolSchemaError(
+                    f"{where}: unknown ui layout {spec.ui!r}. Expected one of "
+                    f"{sorted(UI_LAYOUTS)}."
+                )
+
+        if spec.groups is not None:
+            if spec.ui not in _GROUPED_LAYOUTS:
+                raise ToolSchemaError(
+                    f"{where}: 'groups' only applies to the {sorted(_GROUPED_LAYOUTS)} "
+                    f"layouts (ui={spec.ui!r})."
+                )
+            if not isinstance(spec.groups, dict) or not spec.groups:
+                raise ToolSchemaError(f"{where}: 'groups' must be a non-empty dict.")
+            for group_name, options in spec.groups.items():
+                unknown = [option for option in options if option not in spec.choices]
+                if unknown:
+                    raise ToolSchemaError(
+                        f"{where}: group '{group_name}' names {unknown}, which are not in "
+                        f"this argument's choices."
+                    )
+        elif spec.ui in _GROUPED_LAYOUTS:
+            raise ToolSchemaError(
+                f"{where}: the {spec.ui!r} layout needs 'groups' to say what to group."
+            )
+
+        if spec.visible_when is None:
+            return
+        if not isinstance(spec.visible_when, dict) or not spec.visible_when:
+            raise ToolSchemaError(f"{where}: 'visible_when' must be a non-empty dict.")
+        for other_name, expected in spec.visible_when.items():
+            other = self.arguments.get(other_name)
+            if other is None:
+                raise ToolSchemaError(
+                    f"{where}: 'visible_when' refers to '{other_name}', which this tool "
+                    f"does not declare."
+                )
+            if other.types[0] != CHOICE_TYPE:
+                raise ToolSchemaError(
+                    f"{where}: 'visible_when' can only test a 'choice' argument, and "
+                    f"'{other_name}' is a {other.types[0]!r}. Only a choice argument has a "
+                    f"fixed set of values to compare against."
+                )
+            wanted = expected if isinstance(expected, (tuple, list)) else (expected,)
+            unknown = [value for value in wanted if value not in other.choices]
+            if unknown:
+                raise ToolSchemaError(
+                    f"{where}: 'visible_when' expects '{other_name}' to be {unknown}, which "
+                    f"is not among its choices ({sorted(other.choices)})."
+                )
 
     @staticmethod
     def _check_choices(where: str, spec: ArgSpec) -> None:
