@@ -867,6 +867,8 @@ def test_presentation_hints_are_validated_at_startup():
     picks = dict(type="multichoice", choices={"a": True, "b": False})
 
     invalid = {
+        "an empty label": {"opt": base.ArgSpec(type=str, label="   ")},
+        "a non-string label": {"opt": base.ArgSpec(type=str, label=3)},
         "ui on a non-multichoice": {"opt": base.ArgSpec(type=str, ui="tabs")},
         "unknown layout": {"opt": base.ArgSpec(ui="carousel", **picks)},
         "grouped layout without groups": {"opt": base.ArgSpec(ui="tabs", **picks)},
@@ -915,6 +917,7 @@ def test_tools_exposes_presentation_hints():
     tools = {tool["name"]: tool for tool in client.get("/tools").json()}
 
     example = tools["example_tool"]["arguments"]["outputs"]
+    assert example["label"] is None
     assert example["section"] is None
     assert example["visible_when"] is None
     assert example["ui"] is None
@@ -923,6 +926,12 @@ def test_tools_exposes_presentation_hints():
     aso = tools.get("ASO")
     if aso is None:  # ASO's heavy stack may be absent from a minimal image
         return
+    # Every ASO argument names itself: the client's fallback would render
+    # "cbct_landmarks" as "Cbct landmarks" and cannot invent
+    # "Scan / Landmark Folder" for `input`.
+    assert all(spec["label"] for spec in aso["arguments"].values())
+    assert aso["arguments"]["input"]["label"] == "Scan / Landmark Folder"
+
     landmarks = aso["arguments"]["cbct_landmarks"]
     assert landmarks["ui"] == "tabs"
     assert landmarks["visible_when"] == {"modality": "CBCT"}

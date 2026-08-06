@@ -289,6 +289,10 @@ def list_tools() -> list:
                     # every one of them is null on a tool that declares none,
                     # which is what keeps a client's default rendering the
                     # rendering every existing tool already gets.
+                    # The field label. null means "prettify the argument name",
+                    # which is what every client already did on its own -- so a
+                    # tool declaring none renders exactly as before.
+                    "label": spec.label,
                     "section": spec.section,
                     "visible_when": spec.visible_when,
                     "ui": spec.ui,

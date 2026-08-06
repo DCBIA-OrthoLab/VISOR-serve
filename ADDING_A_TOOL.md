@@ -337,6 +337,7 @@ through), not by default.
 
 ```python
 "cbct_landmarks": ArgSpec(
+    label="Landmarks",                            # what the user reads
     type="multichoice",
     required=False,
     choices=catalogs.CBCT_LANDMARK_CHOICES,      # 130 options
@@ -350,6 +351,7 @@ through), not by default.
 
 | Field | Applies to | Meaning |
 |---|---|---|
+| `label` | any argument | The field label. Absent → the client prettifies the argument *name* (`output_suffix` → "Output suffix"), which is a guess: it renders an acronym as "Cbct landmarks" and cannot produce "Scan / Landmark Folder" from `input` |
 | `section` | any argument | The collapsible box it belongs in. Absent → the client's default box ("Inputs"). Boxes appear in the order your schema first mentions them, so declaration order is the reading order |
 | `visible_when` | any argument | `{other_argument: value}` — show only while every entry matches. A list/tuple of values means "any of these". The named arguments must be `"choice"` arguments of the same tool |
 | `ui` | `"multichoice"` only | `"tabs"` (one scrollable tab per group), `"grid"` (one row per group, options as columns — for options whose position carries meaning, like a dental chart), `"inline"` (one horizontal row) |
@@ -371,6 +373,11 @@ Two things to keep in mind:
 - **Derive `groups` from the same table the logic uses**, never write it out a
   second time. `catalogs.TOOTH_GROUPS` is built from `TOOTH_IDS`, so a tooth
   added to the label table appears in its own arch on screen.
+- **`label` is worth declaring even on a tool that needs none of the rest.**
+  Every user-visible word describing your tool — the field label, the section
+  title, the group names, the option names — belongs here, next to
+  `description` and `choices`. A client that has to invent one can only guess
+  from an identifier you chose for Python, not for a reader.
 
 ---
 
