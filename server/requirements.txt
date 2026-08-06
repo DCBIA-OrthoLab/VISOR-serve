@@ -15,6 +15,10 @@ SimpleITK
 # ALI's CBCT engine: itk resamples the volumes to the two spacings the agents
 # walk. Imported lazily like the stack below.
 itk
+# DICOM series ASO's CBCT mode cannot read through SimpleITK's GDCM reader.
+# Imported lazily (tools/ASO/src/cbct/dicom.py): every other ASO mode works
+# without it.
+dicom2nifti
 # Heavy inference stack (AMASSS, ALI). Imported LAZILY inside the functions
 # that use it (see tools/AMASSS/src/nnunet_runner.py and
 # tools/ALI/src/ALI_CBCT/brain.py), so the server still boots when it is

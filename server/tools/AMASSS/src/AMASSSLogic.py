@@ -180,22 +180,30 @@ MERGE_CHOICES = {
 def _codes_from(selection, name_to_code: dict, fallback: tuple) -> tuple:
     """Turn what `run()` received for a multichoice argument into tool codes.
 
-    Accepts the three shapes that legitimately reach here:
+    Accepts the four shapes that legitimately reach here:
 
     * a `base.Selection` / dict `{option name: bool}` -- the normal HTTP path;
     * `None` -- an omitted optional argument, which must fall back to the
       declared defaults (see the note in AMASSS.py about ArgSpec.default);
-    * an iterable of codes already -- so `segment()` stays directly callable
-      by another server-side tool without going through the schema.
+    * a single option name or code as a plain string -- what a "choice"-typed
+      schema hands run(). Without its own branch a string fell through to the
+      iterable one below and was split into a tuple of its CHARACTERS, so no
+      code ever matched: `merge` shipped that way once, and every run came
+      back as a report-only zip with zero segmentation files in it;
+    * an iterable of codes (or display names) -- so `segment()` stays directly
+      callable by another server-side tool without going through the schema.
     """
     if selection is None:
         return fallback
+    if isinstance(selection, str):
+        selection = (selection,)
     if isinstance(selection, dict):
-        codes = tuple(
+        return tuple(
             name_to_code[name] for name, enabled in selection.items() if enabled and name in name_to_code
         )
-        return codes
-    return tuple(selection)
+    # Display names are translated, codes pass through; anything unknown is
+    # kept as-is for segment() to reject loudly rather than silently drop.
+    return tuple(name_to_code.get(item, item) for item in selection)
 
 
 def structure_codes(selection) -> tuple:
@@ -246,6 +254,37 @@ def split_scan_extension(filename: str):
         if lower.endswith(extension):
             return filename[: -len(extension)], filename[-len(extension):]
     return os.path.splitext(filename)
+
+
+# A segmentation output keeps its input's FORMAT but is always written
+# compressed, whatever the input was.
+#
+# The masks are label volumes -- long runs of a single value -- so gzip takes
+# them roughly 100x down. Uncompressed, a 0.33mm CBCT gives a 191 MB file PER
+# structure: a nine-structure run wrote 1.75 GB, which the client then had to
+# receive and unpack. The same run compressed is 14 MB. The scan the masks came
+# from is untouched; only what AMASSS writes is affected.
+#
+# The two families compress differently, and the table is what ITK actually
+# accepts (measured, not assumed): NIfTI and GIPL take an external .gz wrapper,
+# while NRRD compresses INSIDE the file and keeps its own extension -- ITK has
+# no writer for ".nrrd.gz" at all, so mapping to it fails the write outright.
+# ".nrrd.gz" is therefore mapped back DOWN to ".nrrd": it is a legal input
+# spelling but not a legal output one.
+_COMPRESSED_EXTENSIONS = {
+    ".nii": ".nii.gz",
+    ".gipl": ".gipl.gz",
+    ".nrrd.gz": ".nrrd",
+}
+
+
+def compressed_extension(extension: str) -> str:
+    """The compressed spelling ITK can WRITE for a scan extension.
+
+    '.nii' -> '.nii.gz'; '.nrrd' stays '.nrrd' (compressed internally by
+    _write_segmentation's useCompression).
+    """
+    return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)
 
 
 def is_previous_output(filename: str, prediction_id: str) -> bool:
@@ -378,9 +417,15 @@ def _convert_to_nifti(scan_path: str, destination: str) -> None:
     an NRRD renamed to .nii.gz, handed to a reader that picks its format from
     the extension. NRRD is Slicer's own default format, so "supported" input
     was in practice only reliable for NIfTI. A read + write actually converts.
+
+    The voxel type is left alone. Casting to float32 first, as this did, was
+    not what made the conversion real -- the read and write are -- and on a CBCT
+    it doubled the bytes to gzip on the way out and to gunzip on the way back
+    in, for 2.4s + 0.4s per scan buying nothing: nnUNet's reader casts to
+    float32 itself, and int16 CBCT values are exact in float32 either way.
     """
     image = sitk.ReadImage(scan_path)
-    sitk.WriteImage(sitk.Cast(image, sitk.sitkFloat32), destination)
+    sitk.WriteImage(image, destination)
 
 
 def _match_reference_geometry(mask_image: sitk.Image, reference: sitk.Image) -> sitk.Image:
@@ -402,7 +447,12 @@ def _match_reference_geometry(mask_image: sitk.Image, reference: sitk.Image) -> 
 def _write_segmentation(array: np.ndarray, reference: sitk.Image, output_path: str) -> str:
     image = sitk.GetImageFromArray(array.astype(np.int16))
     image.CopyInformation(reference)
-    sitk.WriteImage(_match_reference_geometry(image, reference), output_path)
+    # useCompression covers the formats whose extension does not already imply
+    # it (.nrrd); for a .nii.gz the gz is applied from the name either way.
+    # Harmless where compression is already on, so it is not conditional.
+    sitk.WriteImage(
+        _match_reference_geometry(image, reference), output_path, useCompression=True
+    )
     return output_path
 
 
@@ -418,6 +468,7 @@ def segment(
     prediction_ID: str = "Pred",
     generate_surface: bool = False,
     surface_smoothing: int = 5,
+    surface_decimation: int = 90,
     device: str = None,
     scratch_dir: str = None,
 ) -> SegmentationRun:
@@ -453,6 +504,16 @@ def segment(
     if not merge:
         raise ToolArgumentError(
             "Select at least one output form (merged and/or separated segmentations)."
+        )
+    # Same treatment as unknown structure codes above: an unrecognised merge
+    # mode must fail HERE, before minutes of inference. Left unvalidated, it
+    # matches neither branch of _assemble_scan_outputs and the run ends "ok"
+    # with a report and no segmentation files at all.
+    unknown_merge = [code for code in merge if code not in MERGE_MODES]
+    if unknown_merge:
+        raise ValueError(
+            f"Unknown merge mode(s): {', '.join(unknown_merge)}. "
+            f"Known: {', '.join(MERGE_MODES)}"
         )
 
     if scratch_dir is None:
@@ -543,6 +604,7 @@ def segment(
                 merge=merge,
                 generate_surface=generate_surface,
                 surface_smoothing=surface_smoothing,
+                surface_decimation=surface_decimation,
             )
             record["status"] = "ok"
         except Exception as exc:
@@ -565,9 +627,16 @@ def segment(
     report = {
         "tool": "AMASSS",
         "device": device,
+        # Both of these move the segmentation, so a mask is only reproducible
+        # alongside them (see settings.AMASSS_GPU_RESAMPLING for how much).
+        # This records what was ASKED for: a model bundle whose plans pin a
+        # non-default resampler opts itself out, and says so in the log.
+        "gpu_resampling": bool(settings.AMASSS_GPU_RESAMPLING) and device.startswith("cuda"),
+        "tile_step_size": float(settings.AMASSS_TILE_STEP_SIZE),
         "prediction_ID": prediction_ID,
         "merge_modes": list(merge),
         "generate_surface": bool(generate_surface),
+        "surface_decimation": int(surface_decimation) if generate_surface else None,
         "requested_structures": list(structures),
         "predicted_structures": sorted(predictions, key=lambda c: STRUCTURE_CODES.index(c)),
         # FIX: a structure whose model was missing used to vanish with nothing
@@ -595,11 +664,15 @@ def segment(
 
 
 def _assemble_scan_outputs(record, predictions, output_dir, scratch_dir, prediction_ID,
-                           merge, generate_surface, surface_smoothing) -> None:
+                           merge, generate_surface, surface_smoothing,
+                           surface_decimation) -> None:
     """Turn one scan's per-structure nnUNet masks into its final files."""
     scan_path = record["input_path"]
     case_id = record["case_id"]
-    base, extension = split_scan_extension(os.path.basename(scan_path))
+    base, input_extension = split_scan_extension(os.path.basename(scan_path))
+    # Never the input's own spelling: a scan sent as an uncompressed .nii must
+    # not produce nine uncompressed masks (see compressed_extension).
+    extension = compressed_extension(input_extension)
 
     reference = sitk.ReadImage(scan_path)
 
@@ -642,6 +715,7 @@ def _assemble_scan_outputs(record, predictions, output_dir, scratch_dir, predict
                         labels=LABELS,
                         temp_dir=surface_temp,
                         smoothing=surface_smoothing,
+                        decimation=surface_decimation,
                         output_path=os.path.join(
                             scan_dir, f"{base}_{prediction_ID}_{code}.vtk"
                         ),
@@ -665,10 +739,21 @@ def _assemble_scan_outputs(record, predictions, output_dir, scratch_dir, predict
                 label_colors=LABEL_COLORS,
                 temp_dir=surface_temp,
                 smoothing=surface_smoothing,
+                decimation=surface_decimation,
                 output_path=os.path.join(scan_dir, f"{base}_{prediction_ID}_MERGED.vtk"),
             )
             if surface:
                 record["surfaces"].append(surface)
+
+    # Unreachable while the merge codes are validated in segment(): SEPARATE
+    # writes per structure, MERGED writes above, and a lone mask falls back to
+    # the separate branch. Kept anyway -- the one time this happened, the run
+    # was reported "ok" and the client received a zip holding nothing but the
+    # report. A scan with no output must never count as processed.
+    if not record["segmentations"]:
+        raise RuntimeError(
+            f"No segmentation was written for {record['input']} (merge modes: {', '.join(merge)})."
+        )
 
 
 def main(
@@ -679,6 +764,7 @@ def main(
     prediction_ID: str = "Pred",
     generate_surface: bool = False,
     surface_smoothing: int = 5,
+    surface_decimation: int = 90,
 ) -> str:
     """Schema adapter: translate the declared option names into tool codes, run
     `segment()`, and return the folder holding the results.
@@ -706,6 +792,7 @@ def main(
         prediction_ID=prediction_ID,
         generate_surface=generate_surface,
         surface_smoothing=surface_smoothing,
+        surface_decimation=surface_decimation,
         scratch_dir=scratch_dir,
     )
 

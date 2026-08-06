@@ -44,11 +44,16 @@ FILE_TYPES: dict = {
         ".gipl.gz",
         ".zip",
     ),
-    # The surface counterpart: one intraoral scan mesh, or a zipped folder of
-    # them. VTK can read more formats than these two (.vtp, .obj, .off), but
-    # only what a tool's discovery actually walks is advertised -- ALI's
-    # original CLI accepted .stl in its UI and then silently ignored every one
-    # of them, which is the exact failure this list exists to prevent.
+    # A 3D surface mesh (intra-oral scan, segmentation surface, ...). Every
+    # extension listed here is one a tool declaring this type must be able to
+    # READ: advertising a format and then silently discovering only .vtk is
+    # what made ALI's IOS mode accept .stl files it never processed.
+    "surface_file": (".vtk", ".vtp", ".stl", ".obj", ".off"),
+    # The surface counterpart of volume_or_zip_file: one mesh, or a zipped
+    # folder of them. A SEPARATE type from surface_file rather than an
+    # extension of it, and deliberately shorter: these are the formats ALI's
+    # discovery actually walks, and the same rule as above applies -- what is
+    # advertised has to be what is read.
     "surface_or_zip_file": (".vtk", ".stl", ".zip"),
 }
 

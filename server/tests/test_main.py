@@ -371,6 +371,42 @@ def test_tools_publishes_the_extensions_of_every_file_type():
                 assert extensions is None or all(e.startswith(".") for e in extensions), type_name
 
 
+def test_surface_file_type_accepts_every_mesh_format_it_advertises(monkeypatch):
+    """The "surface_file" type ASO introduced. Every extension in the table has
+    to be one the server accepts on upload: ALI's IOS mode advertised .stl and
+    then discovered only .vtk, so a caller's meshes were accepted and never
+    processed."""
+    import base
+    import registry
+
+    class SurfaceTestTool(base.Tool):
+        name = "surface_test_tool"
+        arguments = {"mesh": base.ArgSpec(type="surface_file", required=True)}
+        output_kind = "text"
+
+        def run(self, mesh: str) -> str:
+            return os.path.basename(mesh)
+
+    monkeypatch.setitem(registry.TOOLS, "surface_test_tool", SurfaceTestTool())
+
+    for extension in base.FILE_TYPES["surface_file"]:
+        response = client.post(
+            "/run/surface_test_tool",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            files={"mesh": (f"scan{extension}", io.BytesIO(b"mesh bytes"), "application/octet-stream")},
+        )
+        assert response.status_code == 200, extension
+        assert response.json() == {"result": f"mesh{extension}"}
+
+    response = client.post(
+        "/run/surface_test_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"mesh": ("scan.txt", io.BytesIO(b"not a mesh"), "text/plain")},
+    )
+    assert response.status_code == 400
+    assert ".vtk" in response.json()["detail"]
+
+
 def test_run_declaration_order_decides_zip_vs_folder(monkeypatch):
     """("zip_file", "folder") hands the archive over untouched; ("folder",
     "zip_file") extracts it first. Same upload, different kind."""
@@ -993,33 +1029,51 @@ def test_tools_exposes_presentation_hints():
     assert example["ui"] is None
     assert example["groups"] is None
 
+    # Both tools declare hints, and each is checked: an early `return` here
+    # would silently skip whichever block came second.
     ali = tools.get("ALI")
-    if ali is None:  # ALI's heavy stack may be absent from a minimal image
-        return
-    # Every ALI argument names itself: the client's fallback would render
-    # "cbct_regions" as "Cbct regions" and "prediction_ID" as "Prediction id".
-    assert all(spec["label"] for spec in ali["arguments"].values())
-    assert ali["arguments"]["input"]["label"] == "Scan or Folder"
-    # Each engine's selection in its own box, so the one that does not apply to
-    # a given run is not interleaved with the one that does.
-    assert ali["arguments"]["cbct_regions"]["section"] == "CBCT landmarks"
-    assert ali["arguments"]["ios_networks"]["section"] == "IOS landmarks"
+    if ali is not None:  # the heavy stack may be absent from a minimal image
+        # Every ALI argument names itself: the client's fallback would render
+        # "cbct_regions" as "Cbct regions" and "prediction_ID" as "Prediction id".
+        assert all(spec["label"] for spec in ali["arguments"].values())
+        assert ali["arguments"]["input"]["label"] == "Scan or Folder"
+        # Each engine's selection in its own box, so the one that does not apply
+        # to a given run is not interleaved with the one that does. ALI has no
+        # `mode` argument to hide either behind -- it detects from the data.
+        assert ali["arguments"]["cbct_regions"]["section"] == "CBCT landmarks"
+        assert ali["arguments"]["ios_networks"]["section"] == "IOS landmarks"
 
-    landmarks = ali["arguments"]["landmarks"]
-    assert landmarks["ui"] == "tabs"
-    assert landmarks["section"] == "CBCT landmarks"
-    # Serialized as lists, not tuples, so the wire shape does not depend on how
-    # the tool spelled its catalog.
-    assert isinstance(landmarks["groups"]["Cranial base"], list)
-    assert set(landmarks["groups"]) == set(ali["arguments"]["cbct_regions"]["choices"])
-    # Every grouped option is one the argument actually offers.
-    for options in landmarks["groups"].values():
-        assert set(options) <= set(landmarks["choices"])
-    # And every offered option is in exactly one tab: a landmark reachable
-    # through no tab is one the panel cannot select.
-    grouped = [name for options in landmarks["groups"].values() for name in options]
-    assert sorted(grouped) == sorted(landmarks["choices"])
-    assert len(grouped) == len(set(grouped))
+        landmarks = ali["arguments"]["landmarks"]
+        assert landmarks["ui"] == "tabs"
+        assert landmarks["section"] == "CBCT landmarks"
+        # Serialized as lists, not tuples, so the wire shape does not depend on
+        # how the tool spelled its catalog.
+        assert isinstance(landmarks["groups"]["Cranial base"], list)
+        assert set(landmarks["groups"]) == set(ali["arguments"]["cbct_regions"]["choices"])
+        for options in landmarks["groups"].values():
+            assert set(options) <= set(landmarks["choices"])
+        # And every offered option is in exactly one tab: a landmark reachable
+        # through no tab is one the panel cannot select.
+        grouped = [name for options in landmarks["groups"].values() for name in options]
+        assert sorted(grouped) == sorted(landmarks["choices"])
+        assert len(grouped) == len(set(grouped))
+
+    aso = tools.get("ASO")
+    if aso is not None:
+        # ASO is the one tool that can hide a field: `modality` is a `choice`,
+        # so its two selections are mutually exclusive rather than merely
+        # separated.
+        assert all(spec["label"] for spec in aso["arguments"].values())
+        assert aso["arguments"]["input"]["label"] == "Scan / Landmark Folder"
+
+        aso_landmarks = aso["arguments"]["cbct_landmarks"]
+        assert aso_landmarks["ui"] == "tabs"
+        assert aso_landmarks["visible_when"] == {"modality": "CBCT"}
+        assert aso_landmarks["section"] == "Landmark Reference"
+        assert isinstance(aso_landmarks["groups"]["Cranial base"], list)
+        assert set(aso_landmarks["groups"]) == {"Cranial base", "Upper", "Lower"}
+        for options in aso_landmarks["groups"].values():
+            assert set(options) <= set(aso_landmarks["choices"])
 
 
 def test_selection_helper():

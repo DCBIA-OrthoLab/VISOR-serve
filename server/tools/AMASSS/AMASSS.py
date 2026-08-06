@@ -57,6 +57,12 @@ class AMASSSTool(Tool):
             choices=AMASSSLogic.STRUCTURE_CHOICES,
             description="Anatomical structures to segment",
         ),
+        # "multichoice", NOT "choice": both forms may be selected at once, and
+        # the two types hand run() different values -- a Selection dict here,
+        # a bare option-name string for "choice". This shipped as "choice"
+        # once: the string fell through _codes_from's iterable branch as a
+        # tuple of CHARACTERS, no merge mode ever matched, and every run
+        # "succeeded" with a report and zero segmentation files.
         "merge": ArgSpec(
             type="multichoice",
             required=False,
@@ -88,6 +94,31 @@ class AMASSSTool(Tool):
             initial=5,
             description="Smoothing iterations for the surfaces (0-95), ignored without generate_surface",
         ),
+        # Marching cubes runs on the original scan grid, so a 0.33mm CBCT gives
+        # a triangle per voxel face: 1.6M for a cranial base, 3.5M across a
+        # five-structure run, 11.8M for a merged nine-structure volume. Nothing
+        # downstream can use that -- it is minutes of parsing in a viewer and
+        # hundreds of MB on the wire -- and it is not real detail either, since
+        # the mask underneath is only accurate to about half a voxel.
+        #
+        # 90 drops nine triangles in ten and moves the cranial-base surface by
+        # 0.059mm on average (p95 0.171mm, max 0.692mm), against a 0.33mm voxel.
+        # Set it to 0 for the raw marching-cubes mesh.
+        #
+        # `initial` must match the Python default below: a form always sends
+        # every widget, so the default in run() is never what reaches the tool
+        # (this is exactly how surface_smoothing shipped unsmoothed, see the
+        # note above it).
+        "surface_decimation": ArgSpec(
+            type=int,
+            required=False,
+            initial=90,
+            description=(
+                "Percentage of surface triangles to drop (0-99). 90 keeps the shape to "
+                "well under a voxel while making the .vtk usable; 0 keeps every triangle. "
+                "Ignored without generate_surface"
+            ),
+        ),
     }
     # One folder per scan plus a run report: main.py zips what run() returns and
     # streams the archive back, so no zip code lives in this tool.
@@ -102,6 +133,7 @@ class AMASSSTool(Tool):
         prediction_ID: str = "Pred",
         generate_surface: bool = False,
         surface_smoothing: int = 5,
+        surface_decimation: int = 90,
     ) -> str:
         # `structures` and `merge` are base.Selection mappings keyed by the
         # display names the schema published; AMASSSLogic.main translates them
@@ -114,4 +146,5 @@ class AMASSSTool(Tool):
             prediction_ID=prediction_ID,
             generate_surface=generate_surface,
             surface_smoothing=surface_smoothing,
+            surface_decimation=surface_decimation,
         )
