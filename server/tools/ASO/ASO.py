@@ -10,6 +10,22 @@ from .src import catalogs
 from .src import ASOLogic
 
 
+# The collapsible boxes a client lays this tool's panel out in, and the reason
+# they are declared at all: ASO's four modes share ONE schema, so a panel that
+# shows every argument shows 130 CBCT landmarks next to 32 teeth when a run
+# uses one or the other. The two selection sections below are mutually
+# exclusive by construction (`visible_when` on every argument they hold), which
+# is the old Slicer module's four-page QStackedWidget expressed as data instead
+# of as widget code -- see SADT_tools_analysis/ASO.md.
+_INPUTS = "Inputs"
+_CBCT_SELECTION = "Landmark Reference"
+_IOS_SELECTION = "Teeth & Landmarks"
+_OUTPUTS = "Outputs"
+
+_CBCT_ONLY = {"modality": catalogs.MODALITY_CBCT}
+_IOS_ONLY = {"modality": catalogs.MODALITY_IOS}
+
+
 class ASOTool(Tool):
     name = "ASO"
     arguments = {
@@ -23,6 +39,7 @@ class ASOTool(Tool):
             description=(
                 "CBCT: cone-beam CT volumes. IOS: intra-oral surface scans"
             ),
+            section=_INPUTS,
         ),
         "automation": ArgSpec(
             type="choice",
@@ -33,6 +50,7 @@ class ASOTool(Tool):
                 "each scan. Fully-Automated: CBCT landmarks are predicted "
                 "server-side, IOS meshes are oriented from their tooth labels"
             ),
+            section=_INPUTS,
         ),
         "input": ArgSpec(
             type=("volume_or_zip_file", "surface_file", "folder"),
@@ -44,6 +62,7 @@ class ASOTool(Tool):
                 "mode the landmark files go in the same folder as the scans they "
                 "belong to"
             ),
+            section=_INPUTS,
         ),
         "reference": ArgSpec(
             type=("zip_file", "folder"),
@@ -55,6 +74,7 @@ class ASOTool(Tool):
                 "your own. CBCT: one landmark file. IOS: one file per jaw, named "
                 "so a token says which jaw it is (e.g. 'Gold_Upper.vtk')"
             ),
+            section=_INPUTS,
         ),
         "landmark_models": ArgSpec(
             type=str,
@@ -65,6 +85,15 @@ class ASOTool(Tool):
                 "predict with (see GET /tools/ASO/data), laid out as one folder "
                 "per landmark holding its per-scale weights"
             ),
+            section=_INPUTS,
+            # The one argument that is neither CBCT-wide nor IOS-wide: it is
+            # read by exactly one of the four modes, and offering it to the
+            # other three is how a user comes to believe Semi-Automated needs
+            # a model bundle.
+            visible_when={
+                "modality": catalogs.MODALITY_CBCT,
+                "automation": catalogs.AUTOMATION_FULLY,
+            },
         ),
         "cbct_landmarks": ArgSpec(
             type="multichoice",
@@ -76,6 +105,10 @@ class ASOTool(Tool):
                 "built on. A landmark missing from your file or from the "
                 "reference is reported in ASO_report.json, not silently dropped"
             ),
+            section=_CBCT_SELECTION,
+            visible_when=_CBCT_ONLY,
+            ui="tabs",
+            groups=catalogs.CBCT_LANDMARK_GROUPS,
         ),
         "ios_teeth": ArgSpec(
             type="multichoice",
@@ -85,6 +118,13 @@ class ASOTool(Tool):
                 "IOS only: the teeth to register on. Fully-Automated needs "
                 "exactly 3 or 4 per jaw, spread across the arch"
             ),
+            section=_IOS_SELECTION,
+            visible_when=_IOS_ONLY,
+            # "spread across the arch" is a spatial instruction, and a column
+            # of 32 check boxes is the one layout that cannot show whether a
+            # selection is spread or clustered.
+            ui="grid",
+            groups=catalogs.TOOTH_GROUPS,
         ),
         "ios_landmark_types": ArgSpec(
             type="multichoice",
@@ -95,12 +135,21 @@ class ASOTool(Tool):
                 "on. Combined with the selected teeth into the labels looked up "
                 "in your landmark file, e.g. UR6 + O -> 'UR6O'"
             ),
+            section=_IOS_SELECTION,
+            visible_when={
+                "modality": catalogs.MODALITY_IOS,
+                "automation": catalogs.AUTOMATION_SEMI,
+            },
+            ui="inline",
         ),
         "ios_jaws": ArgSpec(
             type="multichoice",
             required=False,
             choices=catalogs.JAW_CHOICES,
             description="IOS only: which jaws to orient",
+            section=_IOS_SELECTION,
+            visible_when=_IOS_ONLY,
+            ui="inline",
         ),
         "ios_occlusion": ArgSpec(
             type="choice",
@@ -112,6 +161,8 @@ class ASOTool(Tool):
                 "preserves the occlusion but only makes sense if the two meshes "
                 "were in occlusion to begin with"
             ),
+            section=_IOS_SELECTION,
+            visible_when=_IOS_ONLY,
         ),
         "dicom_input": ArgSpec(
             type=bool,
@@ -121,12 +172,15 @@ class ASOTool(Tool):
                 "CBCT only: the input is a zip of DICOM folders, one per patient, "
                 "to convert server-side before orienting"
             ),
+            section=_INPUTS,
+            visible_when=_CBCT_ONLY,
         ),
         "output_suffix": ArgSpec(
             type=str,
             required=False,
             initial="Or",
             description="Added to every output file name, e.g. patient1_Or.nii.gz",
+            section=_OUTPUTS,
         ),
     }
     output_kind = "files"
