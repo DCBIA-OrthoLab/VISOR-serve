@@ -78,9 +78,9 @@ LABELS = tuple(label for labels in GROUP_LABELS.values() for label in labels)
 # is the state that hands the decision back to `cbct_regions`.
 #
 # Off rather than on, unlike REGION_CHOICES, and the asymmetry is deliberate:
-# a region left off is one the user never discovers, whereas 118 landmarks all
+# a region left off is one the user never discovers, whereas 119 landmarks all
 # on would mean every panel that never touches this field silently overrides
-# the region selection with "all 118".
+# the region selection with "all 119".
 LANDMARK_CHOICES = {label: False for label in LABELS}
 
 # The two spacings the agent walks, coarse first. The scale key is the spacing
@@ -91,7 +91,7 @@ SCALE_SPACINGS = (1.0, 0.3)
 # Region code -> a name a human reads. Used for the run report only.
 REGION_DISPLAY_NAMES = {code: display for display, code in REGION_NAMES.items()}
 
-# The tabs a client lays the 118 `landmarks` check boxes out in -- the SAME
+# The tabs a client lays the 119 `landmarks` check boxes out in -- the SAME
 # grouping the engine names its output files by, published rather than
 # restated, so a landmark added to GROUP_LABELS appears in its own tab with no
 # client release. Regions in REGION_NAMES order, not GROUP_LABELS order, so the
