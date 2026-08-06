@@ -192,6 +192,19 @@ What `run()` receives:
 so `structures["skull"]` can't raise `KeyError` and `.get(name, False)` is
 never needed. `.selected` is the tuple of enabled names.
 
+> **Pick the right one of the two, and check what `run()` actually receives.**
+> The types differ in the *shape* of that value, not just in how many options
+> may be on — `"choice"` gives a bare `str`, `"multichoice"` a `Selection`. Code
+> written for one and fed the other does not raise: a `str` is iterable, so
+> `tuple(value)` yields its **characters**, every membership test fails, and the
+> tool takes the "nothing was selected" path while reporting success. AMASSS
+> shipped exactly that — its `merge` argument was declared `"choice"` while its
+> description said "Both may be selected" — and a nine-structure run spent 154s
+> on the GPU to return a report saying it had produced no files. If an argument
+> can ever have two options on at once, it is `"multichoice"`; and validate the
+> translated codes before doing minutes of work on them, so a mismatch fails
+> loudly at the front instead of quietly at the end.
+
 **The declared booleans are also the defaults.** If the caller omits an
 optional choice argument, `validate()` hands `run()` exactly what `choices`
 declared — so don't repeat those defaults in `run()`'s signature, where the two
@@ -227,8 +240,14 @@ FILE_TYPES = {
     "xlsx_file":  (".xlsx",),
     "ods_file":   (".ods",),
     "nifti_file": (".nii", ".nii.gz"),
+    "volume_or_zip_file": (...),        # one medical volume OR a zip of a folder of them
+    "surface_file": (".vtk", ".vtp", ".stl", ".obj", ".off"),   # a 3D mesh
 }
 ```
+
+Every extension a type lists is one the tool declaring it must be able to
+**read**: ALI's IOS mode advertised `.stl` and then discovered only `.vtk`, so
+a caller's meshes were accepted and silently never processed.
 
 ```python
 "scan": ArgSpec(type="nifti_file", required=True, description="Oriented CBCT (.nii/.nii.gz)"),

@@ -11,6 +11,7 @@ Run just this module:
 """
 
 import glob
+from functools import lru_cache
 import json
 import os
 import zipfile
@@ -24,6 +25,7 @@ import pytest
 import SimpleITK as sitk
 
 from base import Selection, ToolArgumentError
+from config import settings
 from tools.AMASSS.AMASSS import AMASSSTool
 from tools.AMASSS.src import AMASSSLogic, nnunet_runner
 
@@ -240,6 +242,68 @@ def test_segment_batch_merged_and_separate(tmp_path, stub_predictor):
     assert os.path.isfile(os.path.join(run.output_dir, "AMASSS_report.json"))
 
 
+def test_an_uncompressed_input_still_produces_compressed_masks(tmp_path, stub_predictor):
+    """Regression: the output extension used to mirror the input's, so a scan
+    sent as a plain .nii produced one UNCOMPRESSED mask per structure -- 191 MB
+    each on a real CBCT, 1.75 GB for a nine-structure run, all of which the
+    client then had to download and unpack. Label volumes gzip ~100x."""
+    _write_scan(tmp_path / "input" / "patient01.nii")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "MAX"])
+
+    run = AMASSSLogic.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        structures=("MAND", "MAX"),
+        merge=("MERGED", "SEPARATE"),
+        scratch_dir=str(tmp_path / "scratch"),
+    )
+
+    produced = sorted(os.path.basename(path) for path in run.segmentation_files)
+    assert produced == [
+        "patient01_Pred_MAND.nii.gz",
+        "patient01_Pred_MAX.nii.gz",
+        "patient01_Pred_MERGED.nii.gz",
+    ]
+    # Written compressed, not merely named .gz.
+    for path in run.segmentation_files:
+        with open(path, "rb") as handle:
+            assert handle.read(2) == b"\x1f\x8b", f"{path} is not gzip data"
+
+
+def test_a_nrrd_input_keeps_its_format_and_is_compressed(tmp_path, stub_predictor):
+    """Compression must not cost the user their chosen format -- and NRRD
+    compresses inside the file, so it keeps its own extension (ITK has no
+    ".nrrd.gz" writer; asking for one used to fail the whole run)."""
+    _write_scan(tmp_path / "input" / "patient01.nrrd")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+
+    run = AMASSSLogic.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        structures=("MAND",),
+        merge=("SEPARATE",),
+        scratch_dir=str(tmp_path / "scratch"),
+    )
+
+    produced = run.segmentation_files[0]
+    assert os.path.basename(produced) == "patient01_Pred_MAND.nrrd"
+    # Still a readable NRRD carrying the right labels, not just a renamed file.
+    assert set(np.unique(sitk.GetArrayFromImage(sitk.ReadImage(produced))).tolist()) <= {0, 1}
+    with open(produced, "rb") as handle:
+        assert b"encoding: gzip" in handle.read(512), "NRRD written uncompressed"
+
+
+def test_every_scan_extension_maps_to_a_writable_output_extension(tmp_path):
+    """compressed_extension must only ever name a spelling ITK can write --
+    the ".nrrd.gz" mapping that shipped first could not be written at all."""
+    image = sitk.GetImageFromArray(np.zeros((4, 4, 4), dtype=np.int16))
+    for extension in AMASSSLogic.SCAN_EXTENSIONS:
+        mapped = AMASSSLogic.compressed_extension(extension)
+        # Writing is the real check: ITK accepts or refuses an extension, and
+        # asserting against a hardcoded list would just restate the table.
+        sitk.WriteImage(image, str(tmp_path / f"x{mapped}"), useCompression=True)
+
+
 def test_merged_volume_uses_the_documented_labels(tmp_path, stub_predictor):
     _write_scan(tmp_path / "input" / "patient01.nii.gz")
     bundle = _make_model_bundle(tmp_path / "bundle", ["MAND", "CB"])
@@ -393,6 +457,47 @@ def test_omitted_optional_merge_falls_back_to_the_default():
     assert AMASSSLogic.merge_modes(Selection(AMASSSLogic.MERGE_CHOICES)) == ("MERGED",)
 
 
+def test_merge_is_a_multichoice_so_both_forms_can_be_requested_together():
+    """Regression: `merge` shipped as "choice" once. base.py hands a "choice"
+    argument to run() as the bare option-name STRING, which _codes_from's
+    iterable branch split into characters -- no merge mode ever matched, and a
+    full run came back as a 556-byte zip holding nothing but the report."""
+    spec = AMASSSTool.arguments["merge"]
+    assert spec.types[0] == "multichoice"
+
+
+@pytest.mark.parametrize(
+    "sent, expected",
+    [
+        # What a "choice"-typed schema (or a naive direct caller) passes: one
+        # bare string, display name or code -- never to be iterated as chars.
+        ("Separated segmentation files", ("SEPARATE",)),
+        ("SEPARATE", ("SEPARATE",)),
+        # Display names inside an iterable are translated like codes are.
+        (("One merged segmentation file", "SEPARATE"), ("MERGED", "SEPARATE")),
+        # The real HTTP shape now that merge is a multichoice.
+        (Selection({"One merged segmentation file": True, "Separated segmentation files": True}),
+         ("MERGED", "SEPARATE")),
+    ],
+)
+def test_merge_modes_accepts_every_legitimate_shape(sent, expected):
+    assert AMASSSLogic.merge_modes(sent) == expected
+
+
+def test_segment_rejects_an_unknown_merge_mode(tmp_path):
+    """An unrecognised merge mode must fail before inference, not surface as a
+    run that "succeeds" while writing zero segmentation files."""
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    with pytest.raises(ValueError, match="Unknown merge mode"):
+        AMASSSLogic.segment(
+            input_path=str(tmp_path / "input"),
+            model_path=str(tmp_path),
+            structures=("MAND",),
+            merge=("SEPARATED",),  # plausible typo for SEPARATE
+            scratch_dir=str(tmp_path / "scratch"),
+        )
+
+
 def test_segment_rejects_an_empty_selection(tmp_path):
     """Every box unchecked is a valid Selection, so the schema cannot catch it."""
     _write_scan(tmp_path / "input" / "patient01.nii.gz")
@@ -403,3 +508,210 @@ def test_segment_rejects_an_empty_selection(tmp_path):
             structures=(),
             scratch_dir=str(tmp_path / "scratch"),
         )
+
+
+# ---------------------------------------------------------------------------
+# GPU resampling (see settings.AMASSS_GPU_RESAMPLING)
+# ---------------------------------------------------------------------------
+
+class _FakeConfigurationManager:
+    """Stands in for nnUNet's, reproducing the one detail that can bite.
+
+    The real `resampling_fn_data` / `resampling_fn_probabilities` are
+    `@property @lru_cache`, so a value read before the swap outlives it unless
+    the cache is cleared. Declaring them the same way here means a version of
+    `_enable_gpu_resampling` that forgot `cache_clear()` fails the test below
+    instead of passing it.
+    """
+
+    def __init__(self, configuration):
+        self.configuration = configuration
+
+    @property
+    @lru_cache(maxsize=1)  # noqa: B019 - deliberately mirrors nnUNet's own shape
+    def resampling_fn_data(self):
+        return self.configuration["resampling_fn_data"]
+
+    @property
+    @lru_cache(maxsize=1)  # noqa: B019
+    def resampling_fn_probabilities(self):
+        return self.configuration["resampling_fn_probabilities"]
+
+
+def _fake_predictor(**overrides):
+    configuration = {
+        "resampling_fn_data": "resample_data_or_seg_to_shape",
+        "resampling_fn_data_kwargs": {"is_seg": False, "order": 3},
+        "resampling_fn_probabilities": "resample_data_or_seg_to_shape",
+        "resampling_fn_probabilities_kwargs": {"is_seg": False, "order": 1},
+    }
+    configuration.update(overrides)
+
+    class _Predictor:
+        pass
+
+    predictor = _Predictor()
+    predictor.configuration_manager = _FakeConfigurationManager(configuration)
+    return predictor
+
+
+def test_gpu_resampling_is_skipped_on_cpu():
+    """No CUDA, nothing to move: the scipy resamplers must stay untouched."""
+    predictor = _fake_predictor()
+    assert nnunet_runner._enable_gpu_resampling(predictor, "cpu") is False
+    assert (
+        predictor.configuration_manager.configuration["resampling_fn_data"]
+        == "resample_data_or_seg_to_shape"
+    )
+
+
+def test_gpu_resampling_leaves_a_non_default_resampler_alone():
+    """A bundle pinning its own resampler configured its geometry on purpose."""
+    predictor = _fake_predictor(resampling_fn_data="no_resampling")
+    assert nnunet_runner._enable_gpu_resampling(predictor, "cuda") is False
+    assert predictor.configuration_manager.configuration["resampling_fn_data"] == "no_resampling"
+
+
+def test_gpu_resampling_redirects_both_ends_and_drops_the_memoized_value():
+    """Both resamplers move to the GPU, and the cached property does not survive."""
+    pytest.importorskip("torch")
+    predictor = _fake_predictor()
+    manager = predictor.configuration_manager
+
+    # Read one through the cache first: this is what the swap has to invalidate.
+    assert manager.resampling_fn_data == "resample_data_or_seg_to_shape"
+
+    assert nnunet_runner._enable_gpu_resampling(predictor, "cuda") is True
+
+    for key in ("resampling_fn_data", "resampling_fn_probabilities"):
+        assert manager.configuration[key] == "resample_torch_fornnunet"
+        kwargs = manager.configuration[f"{key}_kwargs"]
+        assert kwargs["mode"] == "linear"
+        assert str(kwargs["device"]).startswith("cuda")
+        # The scipy-only spline order must be gone, not merely overridden.
+        assert "order" not in kwargs
+
+    assert manager.resampling_fn_data == "resample_torch_fornnunet"
+
+
+def test_report_records_the_settings_that_move_the_masks(tmp_path, stub_predictor):
+    """GPU resampling and the step size both change the output, so a mask is
+    only reproducible next to the values that produced it."""
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+
+    run = AMASSSLogic.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        structures=("MAND",),
+        scratch_dir=str(tmp_path / "scratch"),
+    )
+
+    # resolve_device is stubbed to "cpu", where the GPU path cannot apply.
+    assert run.report["gpu_resampling"] is False
+    assert run.report["tile_step_size"] == float(settings.AMASSS_TILE_STEP_SIZE)
+
+
+def test_converted_input_keeps_its_voxel_type(tmp_path):
+    """Casting to float32 doubled the bytes gzipped per scan and bought nothing."""
+    source = _write_scan(tmp_path / "scan.nrrd")
+    destination = str(tmp_path / "p_000_0000.nii.gz")
+
+    AMASSSLogic._convert_to_nifti(source, destination)
+
+    assert sitk.ReadImage(destination).GetPixelID() == sitk.ReadImage(source).GetPixelID()
+
+
+def test_surfaces_are_written_as_binary_vtk(tmp_path):
+    """ASCII was the default, and it was both the bulkiest and the lossiest.
+
+    A nine-structure run shipped 1386MB of surfaces against 6.4MB of actual
+    segmentation, purely because every coordinate was a decimal string -- and
+    printing them to ~6 significant digits moved vertices by up to 5e-05mm.
+    """
+    vtk = pytest.importorskip("vtk")
+    from vtk.util.numpy_support import vtk_to_numpy
+
+    from tools.AMASSS.src import vtk_export
+
+    volume = np.zeros((30, 30, 30), dtype=np.uint8)
+    volume[10:20, 10:20, 10:20] = 1
+    reference = sitk.GetImageFromArray(volume)
+    reference.SetSpacing((0.4, 0.4, 0.4))
+
+    output = str(tmp_path / "surface.vtk")
+    mesh = vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 5, (216, 101, 79))
+    vtk_export._write(mesh, output)
+
+    with open(output, "rb") as handle:
+        assert b"BINARY" in handle.read(200), "legacy VTK header must not say ASCII"
+
+    reader = vtk.vtkPolyDataReader()
+    reader.SetFileName(output)
+    reader.Update()
+    written = reader.GetOutput()
+
+    # Exact round trip, which is what ASCII could not give.
+    assert np.array_equal(
+        vtk_to_numpy(mesh.GetPoints().GetData()),
+        vtk_to_numpy(written.GetPoints().GetData()),
+    )
+    assert np.array_equal(
+        vtk_to_numpy(mesh.GetCellData().GetScalars()),
+        vtk_to_numpy(written.GetCellData().GetScalars()),
+    )
+
+
+def test_mesh_temp_file_does_not_outlive_the_call(tmp_path):
+    """The scratch .nrrd used to have a fixed name and was never removed."""
+    pytest.importorskip("vtk")
+    from tools.AMASSS.src import vtk_export
+
+    volume = np.zeros((20, 20, 20), dtype=np.uint8)
+    volume[5:15, 5:15, 5:15] = 1
+    reference = sitk.GetImageFromArray(volume)
+
+    vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 3, (1, 2, 3))
+
+    assert list(tmp_path.glob("*.nrrd")) == []
+
+
+def test_decimation_reduces_triangles_and_zero_disables_it(tmp_path):
+    """Raw marching cubes on a CBCT grid yields meshes nothing downstream can
+    open (1.6M triangles for a cranial base); decimation is what makes the
+    .vtk usable, and 0 must still give the untouched mesh back."""
+    pytest.importorskip("vtk")
+    from tools.AMASSS.src import vtk_export
+
+    volume = np.zeros((40, 40, 40), dtype=np.uint8)
+    zz, yy, xx = np.ogrid[:40, :40, :40]
+    volume[((zz - 20) ** 2 + (yy - 20) ** 2 + (xx - 20) ** 2) < 225] = 1
+    reference = sitk.GetImageFromArray(volume)
+    reference.SetSpacing((0.4, 0.4, 0.4))
+
+    raw = vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 5, (1, 2, 3), 0)
+    reduced = vtk_export._mesh_from_mask(volume, reference, str(tmp_path), 5, (1, 2, 3), 90)
+
+    assert raw.GetNumberOfCells() > 0
+    assert reduced.GetNumberOfCells() < raw.GetNumberOfCells() / 2
+
+    # The colour array is per-cell, so it has to be built AFTER decimating --
+    # sized to the mesh that is actually written, not the one before it.
+    assert reduced.GetCellData().GetScalars().GetNumberOfTuples() == reduced.GetNumberOfCells()
+    assert raw.GetCellData().GetScalars().GetNumberOfTuples() == raw.GetNumberOfCells()
+
+
+def test_report_records_the_decimation_applied(tmp_path, stub_predictor):
+    """The surfaces are lossy by default now, so the run has to say by how much."""
+    _write_scan(tmp_path / "input" / "patient01.nii.gz")
+    bundle = _make_model_bundle(tmp_path / "bundle", ["MAND"])
+
+    run = AMASSSLogic.segment(
+        input_path=str(tmp_path / "input"),
+        model_path=bundle,
+        structures=("MAND",),
+        scratch_dir=str(tmp_path / "scratch"),
+    )
+
+    # No surfaces requested -> nothing to report.
+    assert run.report["surface_decimation"] is None

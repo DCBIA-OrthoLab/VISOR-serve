@@ -263,35 +263,86 @@ tools:
         extract: true
 
   # =========================================================================
-  # ASO -- automated slicer orientation. NOT PORTED YET.
+  # ASO -- automated standardized orientation. Ported: server/tools/ASO/.
+  #
+  # Three bundles this block used to fetch have been REMOVED rather than left
+  # in place, because nothing on either side of the port reads them:
+  #
+  #   * CBCT_PreASOModels (410 MB) -- PRE_ASO_CBCT.py imports PreASOResample
+  #     and never calls it, and ASO_CBCT_utils/__init__.py has
+  #     `# from .Net import DenseNet` commented out. The learned orientation
+  #     step was removed upstream ("ENH: Remove Pred Pre ASO CBCT step"); all
+  #     that survives is a recentring translation, which needs no model.
+  #   * IOS_landmark_models (189 MB) -- Auto_IOS.Process runs crown
+  #     segmentation then a tooth-centroid ICP. No landmark network is
+  #     involved; getALIModelList() is declared and never used.
+  #   * IOS_segmentation_model -- the dentalmodelseg/shapeaxi path. It belongs
+  #     to a future tools/CrownSeg (ALI, ASO, AREG and FlexReg all want it) and
+  #     is blocked on the base image gaining pytorch3d. ASO's fully-automated
+  #     IOS mode takes already-segmented meshes.
   # =========================================================================
   ASO:
     models:
-      - name: segmentation_model.zip
-        dest: IOS_segmentation_model
-        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.0/segmentation_model.zip
-        size: 6118943
+      # Landmark weights for Fully-Automated CBCT. ASO does not predict
+      # landmarks itself -- it hands this bundle to the ALI tool (see
+      # tools/ASO/src/ali_client.py), which is not deployed yet, so nothing
+      # reads these until it is.
+      #
+      # They live under DATA/ASO/ because `landmark_models` is
+      # server_selectable on ASO's schema, and GET /tools/{tool}/data is
+      # per tool: the client's dropdown lists DATA/ASO/models/ and main.py
+      # resolves the name there before ASO ever runs.
+      #
+      # These are the SAME weights DATA/ALI/models/ will hold. A deployment
+      # tight on disk can symlink CBCT_landmark_models/<LM> at ALI's copy
+      # instead of fetching both -- data_store resolves symlinks as long as
+      # they stay inside DATA_DIR.
+      #
+      # Curated to the seven landmarks the published reference planes are
+      # built on (ASO's own defaults), not all 112: that is 758 MB instead of
+      # roughly 12 GB. Add a landmark here the day someone selects it.
+      # Verified 2026-07-31: each archive holds its scales at the root
+      # (0-3/<LM>_Net_0-3.pth, 1/<LM>_Net_1.pth), which is why `dest` nests
+      # them one level -- GetBrain keys on <LM>/<scale>/*.pth.
+      - name: Ba.zip
+        dest: CBCT_landmark_models/Ba
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/Ba.zip
+        size: 108211992
+        extract: true
+      - name: S.zip
+        dest: CBCT_landmark_models/S
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/S.zip
+        size: 108238247
+        extract: true
+      - name: N.zip
+        dest: CBCT_landmark_models/N
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/N.zip
+        size: 108237024
+        extract: true
+      - name: RPo.zip
+        dest: CBCT_landmark_models/RPo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RPo.zip
+        size: 108190441
+        extract: true
+      - name: LPo.zip
+        dest: CBCT_landmark_models/LPo
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LPo.zip
+        size: 108189434
+        extract: true
+      - name: ROr.zip
+        dest: CBCT_landmark_models/ROr
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/ROr.zip
+        size: 108230408
+        extract: true
+      - name: LOr.zip
+        dest: CBCT_landmark_models/LOr
+        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LOr.zip
+        size: 108211595
         extract: true
       - name: Gold_file.zip
         dest: IOS_Gold_file
         url: https://github.com/HUTIN1/ASO/releases/download/v1.0.0/Gold_file.zip
         size: 5169472
-        extract: true
-      # ASO's own copy of the IOS landmark models -- byte-identical to ALI's
-      # ALIDDM Models.zip (same four Upper/Lower x O/C weights). Duplicated on
-      # purpose: DATA/ is per tool, so ASO cannot reach into DATA/ALI/.
-      # Worth knowing when porting: the client never fetches this correctly --
-      # ASO.py appends "<landmark>.zip" to whatever getALIModelList() returns,
-      # which mangles a URL that is already a complete archive.
-      - name: identification_landmark_ios_model.zip
-        dest: IOS_landmark_models
-        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.0/identification_landmark_ios_model.zip
-        size: 189452566
-        extract: true
-      - name: PreASOModels.zip
-        dest: CBCT_PreASOModels
-        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_preASOmodels/PreASOModels.zip
-        size: 409801686
         extract: true
       - name: Occlusal_Midsagittal_Plane.zip
         dest: CBCT_Gold_Occlusal_Midsagittal_Plane

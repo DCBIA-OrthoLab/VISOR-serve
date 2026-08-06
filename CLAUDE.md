@@ -99,6 +99,8 @@ package at startup — e.g. import all modules in `tools/`, collect every subcla
 - `SurgMovPred` — surgical movement prediction from tabular measurements
   (stacking models, server-side model bundles).
 - `AMASSS` — CBCT skull structure segmentation (nnUNet v2, GPU).
+- `ASO` — automated standardized orientation, CBCT and intra-oral scans. Its
+  fully-automated CBCT mode calls `ALI` in-process for the landmarks.
 - `ALI` — automatic landmark identification, on CBCT volumes (deep-RL agents)
   or intraoral surface scans (multi-view rendering + 2D UNet). The engine is
   chosen from the data, not from an argument.
@@ -149,6 +151,7 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 │   │   ├── example_tool/
 │   │   ├── SurgMovPred/
 │   │   ├── AMASSS/
+│   │   ├── ASO/
 │   │   ├── CrownSeg/
 │   │   └── ALI/
 │   │       └── src/         # ALILogic.py dispatches; one folder per engine
@@ -370,35 +373,50 @@ Client-side, 34 ALI tests (+10).
 
 ### 2026-08-06 — Presentation hints: the schema says how to lay a panel out
 
-**Ported here from the `aso` branch, where it was written for ASO's four-mode
-panel; this branch needs it for a different reason.** ALI's `landmarks`
-argument (see the entry below) publishes 118 options, and the generic client
-renders a `multichoice` as one check box per line — a column of 118 on top of
-the two selections ALI already always shows. The alternative was a hand-written
-Qt panel, which puts the anatomy back in the client and makes "add a landmark
-server-side" a client release again.
+**Motivation, from both tools at once.** ASO's panel was unusable: four modes
+share one schema, so the generic client rendered 130 CBCT landmarks, 32 teeth,
+8 landmark types and 2 jaws as a single column of ~180 check boxes with the
+CBCT and IOS options interleaved -- while any given run uses one half or the
+other. ALI has the same shape for a different reason: its `landmarks` argument
+publishes 118 options, and it has no `mode` field to hide the inert engine's
+selection behind. The old Slicer modules solved this with hand-written
+QStackedWidgets and ~700 lines of checkbox plumbing, with the anatomy written
+out inside the widget -- exactly what the ports removed, so it could not come
+back. The schema had to say enough for a generic client to do it.
 
 **Five optional `ArgSpec` fields, published by `GET /tools`, ignored by
 `validate()` and `run()`:** `label` (the field label), `section` (which
 collapsible box), `visible_when` (`{other_arg: value}`, show only while every
-entry matches), `ui` (`"tabs"`/`"grid"`/`"inline"` — how a multichoice's boxes
+entry matches), `ui` (`"tabs"`/`"grid"`/`"inline"` -- how a multichoice's boxes
 are laid out) and `groups` (`{group name: (option, ...)}` for the two grouped
-layouts). Every one is `null` on every existing tool, so every existing panel
-renders unchanged.
+layouts). Every one is `null` on every tool that declares none, so every
+existing panel renders unchanged.
 
 **`label` closes the last thing the client was still inventing.** Field labels
 were built client-side from the argument name, by two different rules in the
 same panel: `formgen.build` used the raw schema name while the file-input rows
-prettified it, so a panel showed "Input" directly above "cbct_regions". No
-naming rule can do better than "Cbct regions" for an acronym. Every
-user-visible word describing a tool is now the tool's: label, section title,
-tab names, option names, tooltip. The client keeps only its own chrome (Apply,
-Cancel, "Output folder", All / None / Default).
+prettified it, so ASO showed "Reference" directly above "cbct_landmarks". No
+naming rule can do better -- it renders an acronym as "Cbct landmarks" and
+cannot produce "Scan / Landmark Folder" from `input`. Every user-visible word
+describing a tool is now the tool's: label, section title, tab names, option
+names, tooltip. The client keeps only its own chrome (Apply, Cancel, "Output
+folder", All / None / Default), which exists on every panel regardless of tool.
 
 **None of the layout fields names an anatomical concept**, which is the whole
 point: `groups` says what to group, `ui` how to lay it out, `visible_when` when
-it applies. ALI's tabs are `ALI_CBCT/landmarks.GROUP_LABELS` — the same table
-the engine groups its output files by, published rather than restated.
+it applies. ASO's `catalogs.CBCT_LANDMARK_GROUPS` had carried a comment since
+the port saying the grouping was kept "as a comment-level structure only: the
+schema has no way to express groups" -- it does now, `TOOTH_GROUPS` is derived
+from `TOOTH_IDS` rather than written out again, and ALI's tabs are
+`ALI_CBCT/landmarks.GROUP_LABELS`, the same table its engine already names its
+output files by.
+
+**The two tools use different amounts of it, and that is the point.** ASO has a
+`modality` `choice`, so `visible_when` makes its two selections mutually
+exclusive. ALI has no such field on purpose -- a `.zip` can hold either kind of
+data, so the mode is detected, not asked -- so it gets `section` only, and both
+selections stay on screen with one of them inert. The schema expresses what is
+true of each tool rather than forcing them into one shape.
 
 **`check_schema` rejects them at startup, and that matters more here than for
 a real type.** A wrong `visible_when` hides a field for good, and a client
@@ -722,6 +740,299 @@ The agent's search and shapeaxi's segmentation are stubbed; everything around
 them runs for real, including a full CBCT run through real preprocessing,
 monai transforms and markups writing. Each test that pins a fixed defect says
 which one in its docstring.
+### 2026-07-31 — ASO ported: four modes, one tool, and the defects it inherited
+
+**Motivation:** port ASO (Automated Standardized Orientation) from a 2587-line
+Slicer widget plus four CLI modules onto this server. ASO is the step every
+longitudinal study runs before anything else — put every scan in the same
+coordinate frame — and AREG needs it programmatically.
+
+**One tool, `server/tools/ASO/`, two engines under `src/`, four modes:**
+
+|          | Semi-Automated | Fully-Automated |
+|---|---|---|
+| **CBCT** | your landmarks, ICP onto a gold set | landmarks predicted first, then the same ICP |
+| **IOS**  | your landmarks, ICP per jaw | tooth centroids of an already segmented mesh |
+
+`modality` and `automation` are explicit `choice` arguments, never inferred:
+a `.zip` can hold either kind of data, and guessing wrong orients a patient
+against the wrong reference and calls it a success. Every mode-specific
+argument is `required=False`, with the cross-argument rules raised as
+`ToolArgumentError` **before** any file is read (`ALI_PORT_CONTEXT.md` §3.1).
+
+**Fully-Automated CBCT is wired but inert.** It needs landmark prediction,
+which is ALI's job, and ALI is not deployed here yet — so that one mode answers
+422 with a message naming the missing tool and pointing at Semi-Automated. The
+seam is `src/ali_client.py`; the day `tools/ALI/` is registered, ASO needs no
+change.
+
+> **Superseded — `tools/ALI/` and `tools/CrownSeg/` are both registered now, so
+> Fully-Automated CBCT and Fully-Automated IOS are live.** ASO needed no change
+> for either, which is what the seams were for; ALI gained the `landmarks`
+> argument this file's 2026-08-06 entry describes, because asking by region
+> would have run 58 agents to use 7. The availability checks stay: a deployment
+> may legitimately not carry them, and must then say so rather than fail from
+> somewhere inside another tool.
+
+**The call is in-process, not an HTTP request to our own `/run/ALI`,
+and that is load-bearing**: a tool run holds one of `MAX_CONCURRENT_TOOLS`
+slots for its whole duration, so four concurrent ASO runs each waiting on a
+fifth slot would deadlock the server — `/health` included — until they timed
+out. `Tool.invoke` is the same entry point `main.py` uses, validation included.
+
+**Fully-Automated IOS takes already-segmented meshes only.** Crown segmentation
+is `shapeaxi`/pytorch3d, absent from the image, and belongs to a future
+`tools/CrownSeg` that ALI, AREG and FlexReg want too. `segment_unlabelled()` is
+where it plugs in. **No** labelled mesh in the batch is a 422 (wrong mode);
+*some* unlabelled is a per-patient report entry and the rest of the batch is
+processed — "one of your forty meshes was bad" is not a reason to return
+nothing.
+
+**DICOM input is supported and writes nowhere near the caller's data.**
+`convertdicom2nifti` wrote `<input>/NIFTI/`, which a later run then
+re-discovered as input scans; its fallback path renamed an arbitrary earlier
+output onto the current patient; and it only looked one directory down.
+
+**The defects that cost data, all fixed by construction and each with a named
+test:**
+
+- **`SEMI_ASO_CBCT` could not work at all.** It read `data["tfm"]`
+  unconditionally, but only the fully-automated chain ever produced one, so
+  every patient of a semi-automated run died on a `KeyError` caught 90 lines
+  above. Recentring now always runs, and the landmarks are moved into the
+  centred space with it (`center_landmarks`), which is the state the ICP was
+  always written to expect.
+- **One landmark could lose a patient.** `GetDistDifference` indexed the
+  reference's pairwise table with the *input's* keys, so a landmark present in
+  one and absent from the other was a `KeyError`. The two sides are intersected
+  first and what was dropped is reported, per landmark, with the reason.
+- **Patient keys collided.** `GetPatients` keyed on the base name, so two
+  `scan.nii.gz` in different subfolders became one patient — in the working
+  dict and again in the flat output folder. Keys are paths relative to the
+  input root and the output mirrors the input tree. It also stripped
+  `_T1`/`_T2`, collapsing two timepoints of one subject into a single patient.
+- **`MergeJson` merged a patient's landmark files by writing into the caller's
+  input folder and DELETING the sources.** The merge is in memory.
+- **A second run re-ingested the first.** `patient1_Or.nii.gz` sorts before
+  `patient1_scan.nii.gz`. Previous outputs are set aside and used only when a
+  patient has nothing else.
+- **`UpperOrLower` defaulted to Lower**, so a maxillary mesh named
+  `patient1.vtk` was registered against the mandibular reference and returned
+  as a success. A file whose name does not say its jaw is now refused.
+- **`Files_vtk_json.organise` paired with `vtk_name in json_name`**, so patient
+  `1` matched patient `10` — and padded its list with a literal
+  `"Upper_nioegfjhdfjkdffdhjmndfhnmdfhj"` sentinel. Exact stem, per directory.
+- **Both jaws wrote the same `.tfm`.** `<patient>_SegOr.tfm` for Upper and
+  Lower; the second silently overwrote the first. Named per jaw.
+- **The published IOS reference was rejected outright.** Refusing a mesh whose
+  name does not say its jaw is right, but the first version also required an
+  identifier *before* the jaw token — and HUTIN1/ASO v1.0.0 `Gold_file.zip` is
+  `Upper_gold.vtk` / `Lower_gold.vtk`, jaw first. Fully-Automated IOS would have
+  failed with "no mesh whose name says which jaw it is" against the only
+  reference anyone ships. Found by reading the real archive rather than assuming
+  its shape; the rest of it checks out (`PredictedID` labels, universal ids
+  2-15 upper / 18-31 lower, 42 `<tooth><type>` landmarks per jaw covering the
+  default selection).
+
+**Concurrency, which only matters because this is a shared server:**
+
+- `InitIcp` wrote `source.npy`/`target.npy` into **its own installed package
+  directory** (`ASO_IOS_utils/cache/`) and re-`np.load`ed one of them on every
+  iteration of a 2500-iteration search. That is a write into the install tree,
+  thousands of pointless round trips per patient, and — the path being fixed —
+  two concurrent requests overwriting each other's landmarks. The search is
+  pure and in memory (`src/geometry.py`, shared by both engines, which had
+  carried two drifted copies of it).
+- The triplet search drew from the **global** `numpy` generator, so the same
+  request gave a different orientation every time and concurrent requests
+  consumed each other's state. Every ordered triplet is now enumerated when
+  there are at most `ASO_ICP_MAX_TRIPLETS` of them (7 landmarks is 210), which
+  is deterministic, faster *and* better than sampling; above that a local
+  generator seeded with `ASO_ICP_SEED` is used.
+
+**Latent bugs found while reading, each now a test:** `np.arccos` of a dot
+product rounding past 1.0 gave NaN that propagated silently through the
+rotation matrix (`pre_icp.py` clamped one end only); `RotationMatrix` divided
+by a zero-length axis for two already-parallel vectors; `ASO_IOS_utils/utils.py`
+defined `PatientNumber` twice, the second shadowing the first; `WriteSurf` used
+`vtkPolyDataWriter`'s ASCII default (bigger, ~130x slower to parse, and *less*
+accurate — see the 2026-07-30 entry); the `.off` reader referenced an undefined
+`line` on its single-vertex branch; and `SEMI_ASO_IOS` wrote every transform as
+`matrix_file_0.npy`, `matrix_file_1.npy` because an `isinstance(file, dict)`
+guard was false on the path that mattered. **The IOS matrix composition order
+was also backwards** (`M_init @ M_icp`, where the ICP runs on points the
+initialisation has already moved); the CBCT engine always had it right, which
+is what makes it a transcription slip rather than a choice.
+
+**Also removed rather than ported:** `PRE_ASO_CBCT`'s `model_folder`, `SmallFOV`
+and `temp_folder` arguments (read, never used, since the learned orientation
+step was removed upstream), the `<filter-progress>` prints, `sys.exit()`,
+`tqdm`, the `time.sleep(0.2)` progress theatre (0.6s per patient), the
+`*Error.txt` files written into the output folder, the `if not os.path.exists`
+skip-if-exists guards, and the reference *scan* the CBCT ICP read and never
+used — which it nonetheless required, so a reference bundle holding only the
+landmarks it registers against died on an `IndexError`.
+
+**`scripts/data-manifest.yml`:** the ASO block dropped 600 MB nothing reads —
+`PreASOModels` (the removed deep-learning step), `identification_landmark_ios_model`
+(fully-automated IOS runs no landmark network) and `segmentation_model` (the
+blocked CrownSeg path) — and gained the seven ALI landmark bundles the default
+reference planes are built on, curated to 758 MB rather than all 112 at ~12 GB.
+
+**Core changes, both sanctioned:** one `FILE_TYPES` entry (`surface_file`), and
+three `config.Settings` fields (`ASO_ICP_MAX_TRIPLETS`, `ASO_ICP_SEED`,
+`ASO_LANDMARK_TOOL`). No GPU: everything ASO computes is SimpleITK/VTK/numpy,
+so it needs no semaphore of its own. `main.py` and `registry.py` untouched.
+
+**The two published references carry DISJOINT landmark sets, and the schema's
+defaults only match one of them.** Frankfurt Horizontal + Midsagittal has
+`Ba, S, N, RPo, LPo, ROr, LOr` (verified by reading the bundle, 2026-07-31);
+Occlusal + Midsagittal has `ANS, IF, PNS, UL6O, UR1O, UR6O`. Picking the second
+and leaving the defaults alone would drop every landmark as "not in the
+reference" and fail all forty patients separately, for one wrong choice made in
+one place. `_check_selection_against_reference` turns that into a single 422
+naming what the reference actually offers, raised after discovery but before a
+single scan is read. The server cannot know which reference will be picked when
+it publishes `choices` — but it knows both the moment the request arrives.
+
+**Tests:** 201 server tests, 71 new — 70 in `tools/ASO/test/test_ASO.py` (the
+landmark seam stubbed, everything else real, against synthetic volumes, DICOM
+series and meshes) and one in `tests/test_main.py` asserting every extension
+`surface_file` advertises is accepted on upload and a `.txt` is a 400.
+
+Two of those cover the outputs a clinician actually relies on, and both hold to
+the float: **the written landmarks land exactly where the resampling put the
+voxels** (volume and markups are moved by two different code paths — if they
+disagree the markups file opens floating beside its scan, and nothing in the
+report would say so), and **the `.tfm` maps ORIENTED -> ORIGINAL**, recentring
+included. That direction is asserted rather than assumed because getting it
+backwards is silent: the file still loads, and still transforms.
+
+### 2026-07-30 — AMASSS surfaces: binary, and decimated by default
+
+**Motivation:** a five-structure run with surfaces returned a 41.9MB archive
+that Slicer could not open — the client froze on the main thread and the user
+read it as "the server never sent the .vtk". It had: `curl` against the same
+endpoint pulled all 41,889,544 bytes with a correct `Content-Length` and every
+mesh re-read cleanly. The transfer was never the problem. The **geometry** was.
+
+**Marching cubes runs on the original scan grid**, so a 0.33mm CBCT produces a
+triangle per voxel face: 1.6M for a cranial base, 3.5M across five structures,
+11.8M for a merged nine-structure volume. That is not detail — the mask
+underneath is only accurate to about half a voxel — it is just resolution
+nobody asked for, and it is what made the results unusable to ship and to open.
+
+**`vtkPolyDataWriter` was writing ASCII** (its default), which is where the
+bulk went: 848.5MB for the merged surface alone against 6.4MB for every
+segmentation in the same run. Binary is the same geometry — and the *more*
+accurate of the two, which is the opposite of the reflex: it round-trips the
+float32 vertices exactly, while ASCII prints ~6 significant digits and moved
+points by up to 5e-05mm on read-back. It is also 133x faster to parse (a 1.6M
+triangle cranial base: 2.67s ASCII, 0.02s binary).
+
+**`surface_decimation` (new schema argument, default 90).** `vtkDecimatePro`
+with `PreserveTopologyOn`, applied after smoothing and *before* the per-cell
+colour array is built — the array is sized to the mesh that is actually
+written. Measured on the cranial base, against a 0.33mm voxel:
+
+| reduction | triangles | mean dev | p95 | max |
+|---|---|---|---|---|
+| 50% | 811,222 | 0.0034mm | 0.004mm | 0.277mm |
+| 80% | 324,488 | 0.0338mm | 0.125mm | 0.493mm |
+| **90%** | **162,244** | **0.0590mm** | **0.171mm** | 0.692mm |
+| 95% | 81,122 | 0.0951mm | 0.264mm | 1.223mm |
+
+90 costs a fifth of a voxel on average and buys a factor of ten. 0 keeps the
+raw mesh. The value is recorded in `AMASSS_report.json` — these surfaces are
+lossy by default now, so a run has to say by how much.
+
+**End to end, the same five-structure request, real HTTP:** archive
+41,889,544 -> **5,417,443 bytes** (7.7x), triangles 3,519,420 -> **351,938**
+(10x), total client-side mesh parsing 2.7s+ -> **0.01s**. Decimation adds ~12s
+of server time for five structures.
+
+**A caveat measured and worth keeping:** binary alone did NOT shrink the
+download. DEFLATE was already squeezing ASCII at 6.2:1 and binary only
+compresses 2.7:1, so the archive went 223.4MB -> 227.8MB on a nine-structure
+run. Binary pays off in disk, RAM, write time, zip time and parse time — not
+on the wire. Only removing geometry moved the download, which is what
+decimation does.
+
+**Still on the table, in the client repo:** `AMASSS.py`'s
+`MAX_RESULTS_TO_LOAD = 12` caps by *file count* while the cost is in triangles,
+so a 10-file run loaded 3.5M triangles on the UI thread while a 20-file run of
+small masks was correctly skipped. Decimation makes this survivable; it does
+not make the cap correct.
+
+**Tests:** 119 server tests (4 new: binary header + exact round trip, temp file
+removal, decimation reduces triangles with 0 disabling it and the colour array
+matching the final cell count, and the report field).
+
+### 2026-07-30 — AMASSS: the GPU was idle seven eighths of the run
+
+**Motivation:** AMASSS looked GPU-bound and was not. Profiling one structure on
+a 512x512x365 CBCT at 0.33mm: **14.6s** resampling the input to the model's
+0.4mm grid, **4.5s** of actual inference, **6.9s** resampling the logits back.
+Both resamplings are scipy splines pinned to a single core. The card was doing
+an eighth of the work and holding 2.7GB of 48GB.
+
+**The tempting fix was the wrong one, and was measured before being discarded.**
+At a 128^3 patch the network already saturates the SMs at batch 1: throughput
+is flat at ~43 patches/s from batch 1 through batch 12. Cutting the GPU's work
+by 5x (`tile_step_size` 0.5 -> 1.0) moved the total from 37.3s to 34.5s and
+dropped utilisation from 36% to 11% — direct evidence the GPU was never the
+constraint. **Free VRAM is not convertible into speed here; idle time is.**
+
+**GPU resampling (`nnunet_runner._enable_gpu_resampling`, new setting
+`AMASSS_GPU_RESAMPLING`, default on).** nnUNet already ships torch versions of
+both resamplers, so nothing is reimplemented — only selected. It is selected by
+NAME: nnUNet resolves `resampling_fn_data` / `resampling_fn_probabilities` out
+of the configuration dict via `recursive_find_resampling_fn_by_name`, so
+rewriting those two strings redirects both ends with no monkeypatching. Two
+things make that mutation safe, and both would have been silent bugs:
+`PlansManager` hands out a `deepcopy` of the configuration, so it touches
+neither the shared plans nor a concurrent request — and consequently the
+`torch.device` placed in the kwargs never reaches the `plans.json` nnUNet writes
+beside its output, which `json.dump` could not serialize. The two properties are
+`@property @lru_cache`, so the swap clears them.
+
+The GPU path uses `predict_from_files_sequential`: `predict_from_files` fans
+preprocessing and export out to *spawned* processes, each of which would need
+its own CUDA context to run a GPU resampler. That trades away the CPU/GPU
+overlap on multi-scan batches — recovering it with a reader thread feeding the
+GPU is the obvious next step, and the reason `num_processes_*` were left at 2.
+
+**Measured end to end, real models, default five structures, one scan:
+195.9s -> 77.0s (2.5x).** Per structure 34.2s -> 13.2s.
+
+**It is not numerically free, and the defaults say so.** torch has no 3D cubic
+interpolation, so the input resampling drops from spline order 3 to order 1.
+Dice against the scipy pipeline: MAND 0.998, UAW 0.997, MAX 0.995, CB 0.991,
+**CV 0.978**. The cervical vertebra is consistently the outlier — thinnest
+structure, closest to the edge of the field of view. `AMASSS_GPU_RESAMPLING=false`
+restores bit-identical nnUNet output, and a bundle whose plans pin a non-default
+resampler opts itself out automatically. `AMASSS_report.json` now records
+`gpu_resampling` and `tile_step_size`, because a mask is only reproducible
+next to the values that produced it.
+
+**`AMASSS_TILE_STEP_SIZE` (default 0.5, unchanged).** The one knob here that
+moves the segmentation for a *pure* speed gain, so it is exposed rather than
+tuned: 0.7 measured Dice 0.995 against 0.5 and saves ~2.5s of GPU per structure.
+
+**`_convert_to_nifti` stopped casting to float32.** The cast was never what made
+the conversion real — the read and write are — and it doubled the bytes gzipped
+per scan and gunzipped again by nnUNet, costing 2.4s + 0.4s for nothing:
+nnUNet's reader casts to float32 itself, and int16 CBCT values are exact there.
+
+**`vtk_export` cleanups.** Cell colours are built in numpy instead of a
+`SetTuple` per cell (identical bytes, 32x, but only ~80ms on a mandible — the
+honest win is small). The marching-cubes temp file had a *fixed* name, so every
+surface in a run wrote over the same path; it is now unique per call and removed
+after use rather than held until request cleanup.
+
+**Tests:** 115 server tests (5 new, covering the cpu skip, the non-default-plans
+skip, the swap itself including cache invalidation, the report fields, and the
+preserved voxel type).
 
 ### 2026-07-30 — Dead-code and duplication cleanup
 
