@@ -321,6 +321,57 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-08-06 — Presentation hints: the schema says how to lay a panel out
+
+**Ported here from the `aso` branch, where it was written for ASO's four-mode
+panel; this branch needs it for a different reason.** ALI's `landmarks`
+argument (see the entry below) publishes 118 options, and the generic client
+renders a `multichoice` as one check box per line — a column of 118 on top of
+the two selections ALI already always shows. The alternative was a hand-written
+Qt panel, which puts the anatomy back in the client and makes "add a landmark
+server-side" a client release again.
+
+**Five optional `ArgSpec` fields, published by `GET /tools`, ignored by
+`validate()` and `run()`:** `label` (the field label), `section` (which
+collapsible box), `visible_when` (`{other_arg: value}`, show only while every
+entry matches), `ui` (`"tabs"`/`"grid"`/`"inline"` — how a multichoice's boxes
+are laid out) and `groups` (`{group name: (option, ...)}` for the two grouped
+layouts). Every one is `null` on every existing tool, so every existing panel
+renders unchanged.
+
+**`label` closes the last thing the client was still inventing.** Field labels
+were built client-side from the argument name, by two different rules in the
+same panel: `formgen.build` used the raw schema name while the file-input rows
+prettified it, so a panel showed "Input" directly above "cbct_regions". No
+naming rule can do better than "Cbct regions" for an acronym. Every
+user-visible word describing a tool is now the tool's: label, section title,
+tab names, option names, tooltip. The client keeps only its own chrome (Apply,
+Cancel, "Output folder", All / None / Default).
+
+**None of the layout fields names an anatomical concept**, which is the whole
+point: `groups` says what to group, `ui` how to lay it out, `visible_when` when
+it applies. ALI's tabs are `ALI_CBCT/landmarks.GROUP_LABELS` — the same table
+the engine groups its output files by, published rather than restated.
+
+**`check_schema` rejects them at startup, and that matters more here than for
+a real type.** A wrong `visible_when` hides a field for good, and a client
+cannot tell that from a field the tool never declared — the failure is silent
+everywhere else, so it has to be loud at boot: unknown layout, `groups` without
+a layout that uses them, a group naming an option that does not exist, a
+`visible_when` on an undeclared argument, on a non-`choice` argument, or
+expecting a value outside its `choices`. An option no group mentions is *not*
+an error: the client renders the leftovers rather than dropping a selection the
+tool genuinely offers.
+
+**`visible_when` is presentation, not validation.** A hidden argument is not
+sent, so its declared default applies, and a tool's own cross-argument checks
+still run for a direct API call that sends whatever it likes. What it does fix
+is a real wire problem: a multichoice is read back as the *complete*
+`{option: checked}` dict and the server reads what it receives **as** the
+selection, so a panel was sending the inert mode's selection too — a choice the
+user was never shown, frozen at whatever the invisible widget was built with
+even after the default changed here.
+
 ### 2026-07-31 — ALI's model bundle is matched to the detected mode; a wrong bundle is a 422
 
 **Found by running ALI IOS from Slicer**, on the first request after the

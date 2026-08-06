@@ -301,6 +301,65 @@ def run(self, input: str) -> list:
 
 `tools/example_tool/` is a working example of this.
 
+### Presentation hints — laying the client's panel out
+
+Four optional `ArgSpec` fields say *how* an argument should be presented. The
+server never reads them: `validate()` and `run()` ignore every one, they only
+travel through `GET /tools`. A tool declaring none renders exactly as it always
+did, which is the right default for almost every tool.
+
+They exist because past a certain size, "what is this argument" stops producing
+a usable panel. `ASO` declares 130 CBCT landmarks, 32 teeth, 8 landmark types
+and 2 jaws in one schema, and a generic client renders that as one column of
+~180 check boxes with the CBCT and IOS options interleaved — while any given
+run uses one half or the other. **Reach for these when your tool has that
+shape** (several modes sharing a schema, or a catalog too long to scroll
+through), not by default.
+
+```python
+"cbct_landmarks": ArgSpec(
+    label="Landmarks",                            # what the user reads
+    type="multichoice",
+    required=False,
+    choices=catalogs.CBCT_LANDMARK_CHOICES,      # 130 options
+    description="CBCT only: the landmarks to register on...",
+    section="Landmark Reference",                 # its own collapsible box
+    visible_when={"modality": "CBCT"},            # hidden for an IOS run
+    ui="tabs",                                    # one tab per group
+    groups=catalogs.CBCT_LANDMARK_GROUPS,         # {"Cranial base": (...), ...}
+),
+```
+
+| Field | Applies to | Meaning |
+|---|---|---|
+| `label` | any argument | The field label. Absent → the client prettifies the argument *name* (`output_suffix` → "Output suffix"), which is a guess: it renders an acronym as "Cbct landmarks" and cannot produce "Scan / Landmark Folder" from `input` |
+| `section` | any argument | The collapsible box it belongs in. Absent → the client's default box ("Inputs"). Boxes appear in the order your schema first mentions them, so declaration order is the reading order |
+| `visible_when` | any argument | `{other_argument: value}` — show only while every entry matches. A list/tuple of values means "any of these". The named arguments must be `"choice"` arguments of the same tool |
+| `ui` | `"multichoice"` only | `"tabs"` (one scrollable tab per group), `"grid"` (one row per group, options as columns — for options whose position carries meaning, like a dental chart), `"inline"` (one horizontal row) |
+| `groups` | `ui="tabs"`/`"grid"` | `{group name: (option, ...)}`. Every option must exist in `choices`; options no group mentions are rendered after the groups, not dropped |
+
+`check_schema()` rejects all of these at **startup** — an unknown layout,
+`groups` without a layout that uses them, a group naming an option that does
+not exist, a `visible_when` on an argument you do not declare or expecting a
+value outside its `choices`. That is deliberate for something purely cosmetic:
+a wrong `visible_when` hides a field for good, and a client cannot tell that
+from a field the tool never declared, so the failure is silent everywhere else.
+
+Two things to keep in mind:
+
+- **`visible_when` is presentation, not validation.** A hidden argument is
+  simply not sent, so its declared default applies. Your tool's own
+  cross-argument checks still have to hold — a direct API call sends whatever
+  it likes.
+- **Derive `groups` from the same table the logic uses**, never write it out a
+  second time. `catalogs.TOOTH_GROUPS` is built from `TOOTH_IDS`, so a tooth
+  added to the label table appears in its own arch on screen.
+- **`label` is worth declaring even on a tool that needs none of the rest.**
+  Every user-visible word describing your tool — the field label, the section
+  title, the group names, the option names — belongs here, next to
+  `description` and `choices`. A client that has to invent one can only guess
+  from an identifier you chose for Python, not for a reader.
+
 ---
 
 ## 4. Writing `run()`
@@ -675,11 +734,14 @@ server-side internals, so its detail is never shown to the client.
 ## 10. What the client gets for free
 
 `GET /tools` returns, per argument, `type` / `types` / `required` /
-`description` / `server_selectable` / `choices`. The Slicer client builds its
-panel from that: a file picker filtered on the declared extensions, a dropdown
-of server-side names for `server_selectable` arguments, a numeric field for
-`int`/`float`, a combo box or a group of check boxes pre-ticked from `choices`,
-and your `description` as the label or tooltip.
+`description` / `server_selectable` / `choices` / `initial` / `extensions`,
+plus the four presentation hints (`section` / `visible_when` / `ui` /
+`groups`). The Slicer client builds its panel from that: a file picker filtered
+on the declared extensions, a dropdown of server-side names for
+`server_selectable` arguments, a numeric field for `int`/`float`, a combo box
+or a group of check boxes pre-ticked from `choices`, your `description` as the
+label or tooltip — and, where you asked for them, collapsible sections, tabs, a
+chart grid, and fields that appear only in the modes they apply to.
 
 `types` is the full list of accepted types; `type` repeats the first one so
 clients written before multi-type arguments keep working. An argument whose
