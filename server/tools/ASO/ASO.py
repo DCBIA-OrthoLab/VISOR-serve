@@ -33,6 +33,7 @@ class ASOTool(Tool):
         # of data, and guessing wrong means orienting a patient against the
         # wrong reference and calling it a success.
         "modality": ArgSpec(
+            label="Input Type",
             type="choice",
             required=True,
             choices=catalogs.MODALITY_CHOICES,
@@ -42,6 +43,7 @@ class ASOTool(Tool):
             section=_INPUTS,
         ),
         "automation": ArgSpec(
+            label="Mode",
             type="choice",
             required=True,
             choices=catalogs.AUTOMATION_CHOICES,
@@ -53,6 +55,7 @@ class ASOTool(Tool):
             section=_INPUTS,
         ),
         "input": ArgSpec(
+            label="Scan / Landmark Folder",
             type=("volume_or_zip_file", "surface_file", "folder"),
             required=True,
             description=(
@@ -65,6 +68,7 @@ class ASOTool(Tool):
             section=_INPUTS,
         ),
         "reference": ArgSpec(
+            label="Reference",
             type=("zip_file", "folder"),
             required=True,
             server_selectable="model",
@@ -77,6 +81,7 @@ class ASOTool(Tool):
             section=_INPUTS,
         ),
         "landmark_models": ArgSpec(
+            label="Landmark Models",
             type=str,
             required=False,
             server_selectable="model",
@@ -96,6 +101,7 @@ class ASOTool(Tool):
             },
         ),
         "cbct_landmarks": ArgSpec(
+            label="Landmarks",
             type="multichoice",
             required=False,
             choices=catalogs.CBCT_LANDMARK_CHOICES,
@@ -111,6 +117,7 @@ class ASOTool(Tool):
             groups=catalogs.CBCT_LANDMARK_GROUPS,
         ),
         "ios_teeth": ArgSpec(
+            label="Teeth",
             type="multichoice",
             required=False,
             choices=catalogs.TOOTH_CHOICES,
@@ -127,6 +134,7 @@ class ASOTool(Tool):
             groups=catalogs.TOOTH_GROUPS,
         ),
         "ios_landmark_types": ArgSpec(
+            label="Landmark Types",
             type="multichoice",
             required=False,
             choices=catalogs.IOS_LANDMARK_TYPE_CHOICES,
@@ -143,6 +151,7 @@ class ASOTool(Tool):
             ui="inline",
         ),
         "ios_jaws": ArgSpec(
+            label="Jaws",
             type="multichoice",
             required=False,
             choices=catalogs.JAW_CHOICES,
@@ -152,6 +161,7 @@ class ASOTool(Tool):
             ui="inline",
         ),
         "ios_occlusion": ArgSpec(
+            label="Occlusion",
             type="choice",
             required=False,
             choices=catalogs.OCCLUSION_CHOICES,
@@ -165,6 +175,7 @@ class ASOTool(Tool):
             visible_when=_IOS_ONLY,
         ),
         "dicom_input": ArgSpec(
+            label="DICOM Input",
             type=bool,
             required=False,
             initial=False,
@@ -176,6 +187,7 @@ class ASOTool(Tool):
             visible_when=_CBCT_ONLY,
         ),
         "output_suffix": ArgSpec(
+            label="Suffix",
             type=str,
             required=False,
             initial="Or",

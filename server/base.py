@@ -180,6 +180,14 @@ class ArgSpec:
     # Nothing here names an anatomical concept: `groups` says what to group,
     # `ui` says how to lay it out, `visible_when` says when it applies.
 
+    # What a client shows as this argument's field label. None -> the client
+    # falls back to prettifying the argument NAME ("output_suffix" ->
+    # "Output suffix"), which is a guess, not a name anyone chose: it cannot
+    # produce "Scan / Landmark Folder" from `input`, and it renders an acronym
+    # as "Cbct landmarks". The vocabulary a user reads belongs with the tool
+    # that defines it, next to `description` and `choices`, not in a Qt widget.
+    label: Optional[str] = None
+
     # The collapsible box this argument is rendered in. None -> the client's
     # default section ("Inputs"), i.e. exactly what every tool does today.
     section: Optional[str] = None
@@ -317,6 +325,12 @@ class Tool(ABC):
         tell that from a field the tool never declared, so the failure is
         silent everywhere else. Here it is a boot error naming the typo.
         """
+        if spec.label is not None and (not isinstance(spec.label, str) or not spec.label.strip()):
+            raise ToolSchemaError(
+                f"{where}: 'label' must be a non-empty string, or None to let the client "
+                f"fall back to the argument name."
+            )
+
         if spec.ui is not None:
             if spec.types[0] != MULTICHOICE_TYPE:
                 raise ToolSchemaError(

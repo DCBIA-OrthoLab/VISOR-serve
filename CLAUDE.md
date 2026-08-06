@@ -319,16 +319,27 @@ of checkbox plumbing and the tooth numbering written out twice inside the
 widget. That is exactly the anatomy-in-the-client the port removed, so it could
 not come back; the schema had to say enough for a generic client to do it.
 
-**Four optional `ArgSpec` fields, published by `GET /tools`, ignored by
-`validate()` and `run()`:** `section` (which collapsible box), `visible_when`
+**Five optional `ArgSpec` fields, published by `GET /tools`, ignored by
+`validate()` and `run()`:** `label` (the field label), `section` (which
+collapsible box), `visible_when`
 (`{other_arg: value}`, show only while every entry matches), `ui`
 (`"tabs"`/`"grid"`/`"inline"` — how a multichoice's boxes are laid out) and
 `groups` (`{group name: (option, ...)}` for the two grouped layouts). Every one
 is `null` on every existing tool, so every existing panel renders unchanged.
 
-**None of them names an anatomical concept**, which is the whole point:
-`groups` says what to group, `ui` how to lay it out, `visible_when` when it
-applies. `catalogs.CBCT_LANDMARK_GROUPS` had carried a comment since the port
+**`label` closes the last thing the client was still inventing.** Field labels
+were built client-side from the argument name, by two different rules in the
+same panel: `formgen.build` used the raw schema name while the file-input rows
+prettified it, so ASO showed "Reference" directly above "cbct_landmarks". No
+naming rule can do better — it renders an acronym as "Cbct landmarks" and
+cannot produce "Scan / Landmark Folder" from `input`. Every user-visible word
+describing a tool is now the tool's: label, section title, tab names, option
+names, tooltip. The client keeps only its own chrome (Apply, Cancel, "Output
+folder", All / None / Default), which exists on every panel regardless of tool.
+
+**None of the layout fields names an anatomical concept**, which is the whole
+point: `groups` says what to group, `ui` how to lay it out, `visible_when` when
+it applies. `catalogs.CBCT_LANDMARK_GROUPS` had carried a comment since the port
 saying the grouping was kept "as a comment-level structure only: the schema has
 no way to express groups" — it does now, and `TOOTH_GROUPS` is derived from
 `TOOTH_IDS` rather than written out again, so a tooth added to the label table
