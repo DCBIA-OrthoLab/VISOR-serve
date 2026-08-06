@@ -993,26 +993,33 @@ def test_tools_exposes_presentation_hints():
     assert example["ui"] is None
     assert example["groups"] is None
 
-    aso = tools.get("ASO")
-    if aso is None:  # ASO's heavy stack may be absent from a minimal image
+    ali = tools.get("ALI")
+    if ali is None:  # ALI's heavy stack may be absent from a minimal image
         return
-    # Every ASO argument names itself: the client's fallback would render
-    # "cbct_landmarks" as "Cbct landmarks" and cannot invent
-    # "Scan / Landmark Folder" for `input`.
-    assert all(spec["label"] for spec in aso["arguments"].values())
-    assert aso["arguments"]["input"]["label"] == "Scan / Landmark Folder"
+    # Every ALI argument names itself: the client's fallback would render
+    # "cbct_regions" as "Cbct regions" and "prediction_ID" as "Prediction id".
+    assert all(spec["label"] for spec in ali["arguments"].values())
+    assert ali["arguments"]["input"]["label"] == "Scan or Folder"
+    # Each engine's selection in its own box, so the one that does not apply to
+    # a given run is not interleaved with the one that does.
+    assert ali["arguments"]["cbct_regions"]["section"] == "CBCT landmarks"
+    assert ali["arguments"]["ios_networks"]["section"] == "IOS landmarks"
 
-    landmarks = aso["arguments"]["cbct_landmarks"]
+    landmarks = ali["arguments"]["landmarks"]
     assert landmarks["ui"] == "tabs"
-    assert landmarks["visible_when"] == {"modality": "CBCT"}
-    assert landmarks["section"] == "Landmark Reference"
+    assert landmarks["section"] == "CBCT landmarks"
     # Serialized as lists, not tuples, so the wire shape does not depend on how
     # the tool spelled its catalog.
     assert isinstance(landmarks["groups"]["Cranial base"], list)
-    assert set(landmarks["groups"]) == {"Cranial base", "Upper", "Lower"}
+    assert set(landmarks["groups"]) == set(ali["arguments"]["cbct_regions"]["choices"])
     # Every grouped option is one the argument actually offers.
     for options in landmarks["groups"].values():
         assert set(options) <= set(landmarks["choices"])
+    # And every offered option is in exactly one tab: a landmark reachable
+    # through no tab is one the panel cannot select.
+    grouped = [name for options in landmarks["groups"].values() for name in options]
+    assert sorted(grouped) == sorted(landmarks["choices"])
+    assert len(grouped) == len(set(grouped))
 
 
 def test_selection_helper():

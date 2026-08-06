@@ -321,6 +321,53 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-08-06 — ALI can be asked for named landmarks, which is what ASO needs
+
+**Motivation:** ASO's fully-automated CBCT mode predicts landmarks by calling
+ALI in-process, and the two could not talk. `ASO/src/ali_client.py` checks that
+ALI's schema exposes `("input", "model", "landmarks")` and sends a per-landmark
+selection; ALI declared `cbct_regions` and `ios_networks` and no `landmarks`,
+so the call failed on the contract check with *"The 'ALI' tool on this server
+does not take landmarks"*.
+
+**The name was the smaller half.** ASO registers on seven points — Ba, S, N,
+RPo, LPo, ROr, LOr — which straddle the Cranial base and Upper regions. Asking
+by region means running every landmark of both: **58 agents to use 7**, and one
+agent is a full two-scale walk of the volume. The engine has always worked at
+landmark granularity internally (`requested_landmarks` intersects the bundle's
+weights with `catalog.landmarks_in(regions)`); only the schema was coarser.
+
+**`landmarks`: a multichoice over all 118 catalog labels, every option off by
+default.** Off, unlike `cbct_regions` whose options are all on, and the
+asymmetry is the whole design: "all off" is what an omitted multichoice arrives
+as, so the default state means *"nothing said here, the regions decide"* — which
+is what every request written before this argument keeps meaning, and what the
+`test_an_empty_landmark_selection_leaves_the_regions_in_charge` test pins.
+
+**Naming a landmark REPLACES the region selection rather than narrowing it.**
+Narrowing would give the same answer for ASO only because it leaves the regions
+at their all-on default, and would silently drop landmarks for any caller that
+set both. The run report says which one drove the run: `regions` is empty when
+`landmarks_selected` is not, so it can never show a selection the caller never
+made.
+
+**The 118 options are readable because the schema says how to group them:**
+`ui="tabs"` with `groups=LANDMARK_GROUPS`, which is `GROUP_LABELS` — the same
+table the engine already names its output files by, published rather than
+restated, so a landmark added to it appears in its own tab with no client
+release. That needed the presentation hints, ported from the `aso` branch in
+the entry below. ALI also gained sections (Inputs / CBCT landmarks / IOS
+landmarks / Outputs) and a `label` on every argument: it has no `mode` argument
+to hide the inert engine's selection behind — a `.zip` can hold either kind of
+data, so the mode is detected, not asked — but the two no longer interleave.
+
+**Tests:** 197 server tests (+3), covering the 8× agent saving, the empty
+selection falling through to the regions, a named landmark the bundle lacks
+being reported rather than dropped, the alias spellings, the tabs matching the
+engine's own grouping, and — the one that motivated all of it — ASO's exact
+argument dict surviving `tool.validate` with `input` as a resolved directory.
+Client-side, 34 ALI tests (+10).
+
 ### 2026-08-06 — Presentation hints: the schema says how to lay a panel out
 
 **Ported here from the `aso` branch, where it was written for ASO's four-mode

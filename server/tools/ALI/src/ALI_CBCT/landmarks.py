@@ -72,6 +72,17 @@ LABEL_GROUPS.update({alias: LABEL_GROUPS[canonical] for alias, canonical in _ALI
 
 LABELS = tuple(label for labels in GROUP_LABELS.values() for label in labels)
 
+# What the schema publishes for the `landmarks` argument: every catalog
+# landmark, all off. "All off" is what "not specified" looks like for a
+# multichoice -- an omitted argument arrives as its declared defaults -- and it
+# is the state that hands the decision back to `cbct_regions`.
+#
+# Off rather than on, unlike REGION_CHOICES, and the asymmetry is deliberate:
+# a region left off is one the user never discovers, whereas 118 landmarks all
+# on would mean every panel that never touches this field silently overrides
+# the region selection with "all 118".
+LANDMARK_CHOICES = {label: False for label in LABELS}
+
 # The two spacings the agent walks, coarse first. The scale key is the spacing
 # with its decimal point replaced, because that is what the shipped weight
 # folders are named (`<landmark>/1/` and `<landmark>/0-3/`).
@@ -79,6 +90,15 @@ SCALE_SPACINGS = (1.0, 0.3)
 
 # Region code -> a name a human reads. Used for the run report only.
 REGION_DISPLAY_NAMES = {code: display for display, code in REGION_NAMES.items()}
+
+# The tabs a client lays the 118 `landmarks` check boxes out in -- the SAME
+# grouping the engine names its output files by, published rather than
+# restated, so a landmark added to GROUP_LABELS appears in its own tab with no
+# client release. Regions in REGION_NAMES order, not GROUP_LABELS order, so the
+# tabs read in the order the region check boxes above them do.
+LANDMARK_GROUPS = {
+    display: tuple(GROUP_LABELS[code]) for display, code in REGION_NAMES.items()
+}
 
 UNGROUPED = "Other"
 
@@ -124,6 +144,29 @@ def region_codes(selection) -> tuple:
             if enabled and name in REGION_NAMES
         )
     return tuple(selection)
+
+
+def landmark_names(selection) -> tuple:
+    """Turn what `run()` received for `landmarks` into canonical label names.
+
+    Empty is the normal case and means "not specified": the caller said nothing
+    about individual landmarks, so `cbct_regions` decides. Same three accepted
+    shapes as `region_codes`, for the same reason -- another server-side tool
+    drives this engine with a plain list.
+
+    Aliases are resolved here (`UR3OI` -> `UR3OIP`) so a caller may use either
+    spelling; the weights are only ever packaged under the canonical one.
+    """
+    if selection is None:
+        return ()
+    if isinstance(selection, dict):
+        chosen = [name for name, enabled in selection.items() if enabled]
+    else:
+        chosen = list(selection)
+    # Declaration order, not the caller's: it is the order the report and the
+    # per-group output files already use.
+    wanted = {canonical(name) for name in chosen}
+    return tuple(label for label in LABELS if label in wanted)
 
 
 def landmarks_in(codes) -> tuple:
