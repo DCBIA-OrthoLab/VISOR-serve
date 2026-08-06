@@ -340,7 +340,7 @@ agent is a full two-scale walk of the volume. The engine has always worked at
 landmark granularity internally (`requested_landmarks` intersects the bundle's
 weights with `catalog.landmarks_in(regions)`); only the schema was coarser.
 
-**`landmarks`: a multichoice over all 118 catalog labels, every option off by
+**`landmarks`: a multichoice over all 119 catalog labels, every option off by
 default.** Off, unlike `cbct_regions` whose options are all on, and the
 asymmetry is the whole design: "all off" is what an omitted multichoice arrives
 as, so the default state means *"nothing said here, the regions decide"* — which
@@ -354,7 +354,7 @@ set both. The run report says which one drove the run: `regions` is empty when
 `landmarks_selected` is not, so it can never show a selection the caller never
 made.
 
-**The 118 options are readable because the schema says how to group them:**
+**The 119 options are readable because the schema says how to group them:**
 `ui="tabs"` with `groups=LANDMARK_GROUPS`, which is `GROUP_LABELS` — the same
 table the engine already names its output files by, published rather than
 restated, so a landmark added to it appears in its own tab with no client
@@ -378,7 +378,7 @@ share one schema, so the generic client rendered 130 CBCT landmarks, 32 teeth,
 8 landmark types and 2 jaws as a single column of ~180 check boxes with the
 CBCT and IOS options interleaved -- while any given run uses one half or the
 other. ALI has the same shape for a different reason: its `landmarks` argument
-publishes 118 options, and it has no `mode` field to hide the inert engine's
+publishes 119 options, and it has no `mode` field to hide the inert engine's
 selection behind. The old Slicer modules solved this with hand-written
 QStackedWidgets and ~700 lines of checkbox plumbing, with the anatomy written
 out inside the widget -- exactly what the ports removed, so it could not come
