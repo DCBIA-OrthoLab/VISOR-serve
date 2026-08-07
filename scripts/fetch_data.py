@@ -23,6 +23,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -206,10 +207,20 @@ def _target_path(data_dir: str, entry: dict) -> str:
     return os.path.join(directory, name)
 
 
-def _download(url: str, destination: str, show_progress: bool) -> str:
+# How progress is reported while a file downloads.
+#   "tty"  one line rewritten in place with \r -- what a terminal wants
+#   "line" one new line every _LINE_PROGRESS_SECONDS -- what a PIPE wants,
+#          because \r is invisible to a reader collecting whole lines and a
+#          12 GB bundle would otherwise print nothing at all for an hour
+#   None   silent
+_LINE_PROGRESS_SECONDS = 3
+
+
+def _download(url: str, destination: str, progress) -> str:
     """Stream `url` to `destination`, returning the content's sha256."""
     digest = hashlib.sha256()
     request = urllib.request.Request(url, headers=_HEADERS)
+    last_report = 0.0
     with urllib.request.urlopen(request) as response:  # noqa: S310 - https URLs from the manifest
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
@@ -221,10 +232,14 @@ def _download(url: str, destination: str, show_progress: bool) -> str:
                 out.write(chunk)
                 digest.update(chunk)
                 done += len(chunk)
-                if show_progress:
+                if progress == "tty":
                     percent = f" {done * 100 // total:3d}%" if total else ""
                     print(f"\r      {_human(done)}{percent}", end="", flush=True)
-    if show_progress:
+                elif progress == "line" and time.monotonic() - last_report >= _LINE_PROGRESS_SECONDS:
+                    last_report = time.monotonic()
+                    of_total = f" / {_human(total)} ({done * 100 // total:3d}%)" if total else ""
+                    print(f"      {_human(done)}{of_total}", flush=True)
+    if progress == "tty":
         print("\r" + " " * 32 + "\r", end="", flush=True)
     return digest.hexdigest()
 
@@ -259,7 +274,7 @@ def _safe_extract(archive: str, destination: str) -> None:
         os.rename(staging, root)
 
 
-def _fetch(entry: dict, data_dir: str, force: bool, show_progress: bool) -> str:
+def _fetch(entry: dict, data_dir: str, force: bool, progress) -> str:
     """Fetch one entry. Returns "skipped", "fetched", or raises."""
     target = _target_path(data_dir, entry)
     label = os.path.relpath(target, data_dir)
@@ -278,7 +293,7 @@ def _fetch(entry: dict, data_dir: str, force: bool, show_progress: bool) -> str:
     staging = tempfile.mkdtemp(dir=os.path.dirname(target), prefix=".fetch_")
     try:
         archive = os.path.join(staging, entry["name"])
-        actual = _download(entry["url"], archive, show_progress)
+        actual = _download(entry["url"], archive, progress)
 
         expected = entry.get("sha256")
         if expected and actual != expected:
@@ -344,6 +359,12 @@ def main(argv=None) -> int:
         help="Destination root, laid out as <tool>/<kind>/. Default: ./DATA",
     )
     parser.add_argument("--manifest", default=_DEFAULT_MANIFEST, help="Manifest to read.")
+    parser.add_argument(
+        "--progress", choices=("auto", "always", "never"), default="auto",
+        help="Per-file download progress. 'auto' redraws one line on a terminal and stays "
+             "silent in a pipe; 'always' prints a new line every few seconds, which is what "
+             "a GUI streaming this output needs. Default: auto.",
+    )
     parser.add_argument("--list", action="store_true", help="Show the manifest and exit.")
     parser.add_argument("--force", action="store_true", help="Re-download even if present.")
     args = parser.parse_args(argv)
@@ -390,12 +411,18 @@ def main(argv=None) -> int:
           f"({_human(sum(e.get('size') or 0 for e in missing))} to download)")
     print(f"Kinds: {', '.join(kinds)}\n")
 
-    show_progress = sys.stdout.isatty()
+    if args.progress == "never":
+        progress = None
+    elif args.progress == "always":
+        progress = "line"
+    else:
+        progress = "tty" if sys.stdout.isatty() else None
+
     counts = {"fetched": 0, "skipped": 0}
     failures = []
     for entry in work:
         try:
-            counts[_fetch(entry, data_dir, args.force, show_progress)] += 1
+            counts[_fetch(entry, data_dir, args.force, progress)] += 1
         except (ManifestError, urllib.error.URLError, OSError, zipfile.BadZipFile) as exc:
             # One unreachable asset must not abandon the other 40: report it at
             # the end and keep going, so a single dead release URL still leaves

@@ -131,12 +131,16 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 .
 ├── CLAUDE.md
 ├── ADDING_A_TOOL.md         # the full contract for writing a tool
-├── docker-compose.yml       # inference service + test service (profile "test")
+├── docker-compose.yml       # inference (GPU) + inference-cpu (profile "cpu") + test services
+├── .env.example             # the three variables compose interpolates
 ├── .githooks/pre-push       # runs `docker compose run --rm test` before a push
-├── scripts/                 # populate DATA/ from the public GitHub releases
+├── scripts/                 # stand the server up, and populate DATA/
+│   ├── setup-server.sh      #   curl-pipeable: clone, check docker, start
+│   ├── install-docker.sh    #   Docker Engine + compose plugin (Linux, root)
+│   ├── server_ctl.py        #   the deployment engine: status/up/update/down/catalog/models
 │   ├── setup-models.sh      #   curl-pipeable entry points
 │   ├── setup-testfiles.sh
-│   ├── fetch_data.py        #   the engine (stdlib only)
+│   ├── fetch_data.py        #   the download engine (stdlib only)
 │   └── data-manifest.yml    #   what to download, and where it goes
 ├── server/
 │   ├── main.py              # FastAPI app: generic /run/{tool_name} endpoint
@@ -167,7 +171,12 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 ```
 
 The Slicer client (thin modules + the generic inference client) lives in its
-own repo, `SlicerAutomatedDentalToolsCloud` — not here.
+own repo, `SlicerAutomatedDentalToolsCloud` — not here. Its **Slicer Cloud**
+module is a panel over `scripts/server_ctl.py`: it clones this repository,
+checks Docker, starts the container, reports when the clone has fallen behind
+and relaunches it, and picks which tools' bundles land in `DATA/`. The logic
+stays here on purpose — a deployment fix ships with the server rather than
+needing an extension release.
 
 ---
 
@@ -323,6 +332,162 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-07 — `scripts/` stands the server up, not just fills `DATA/`
+
+**Motivation:** the answer to "how do I get one of these servers?" was a page
+of terminal instructions, and every tool in the extension is useless without
+one. The Slicer client now carries a **Slicer Cloud** module whose buttons are
+this repository's subcommands, so a clinician's first action is opening a panel
+and their last is typing nothing.
+
+**`scripts/server_ctl.py` — one engine, driven from a terminal or from Qt.**
+`status` / `up` / `update` / `down` / `logs` / `catalog` / `models`, standard
+library only (same rule as `fetch_data.py`, for one more reason: it also runs
+inside Slicer's interpreter, where nothing may be pip-installed on a user's
+behalf). Two conventions carry the whole GUI integration: **progress goes to
+stderr, machine-readable output to stdout**, so `--json` prints exactly one
+object whatever is being narrated at the same time; and **nothing prints the
+API token** except `server_ctl.py token`, because a status dump lands in log
+panes, screenshots and bug reports.
+
+**The compose file grew a second server service, and it had to.** A compose
+device reservation is all-or-nothing: `inference` cannot start *at all* on a
+machine with no nvidia device. An override file cannot rescue it either —
+compose **merges** the `devices` list rather than replacing it, so
+`devices: []` in a second `-f` file leaves the reservation in place (measured,
+not assumed). Hence `inference-cpu` under a `cpu` profile, sharing everything
+else through a YAML anchor — the same shape, and the same reasoning, as the
+`test`/`test-gpu` split one level up. `inference` is untouched, so every
+existing `docker compose up` behaves exactly as before.
+
+Which one runs is decided by **whether docker has an `nvidia` runtime**, not by
+whether `nvidia-smi` exists: the container toolkit is a separate install, and a
+host whose card works perfectly outside docker still cannot start the GPU
+service without it. Guessing from `nvidia-smi` would fail with a compose error
+about a device, on a machine whose GPU is fine.
+
+**`BIND_ADDR`, unset by default — i.e. today's behaviour — and written as
+`127.0.0.1` by `server_ctl.py up`.** A local plug-and-play deployment speaks
+plain HTTP, and plain HTTP carrying medical images must not be reachable from
+the rest of the network. The lab server behind a TLS terminator keeps binding
+every interface, unchanged.
+
+**Unset, though, and not `0.0.0.0` — the first version got this wrong.**
+Writing `${BIND_ADDR:-0.0.0.0}` looks like it preserves the default and does
+not: with no host address docker publishes on **both** stacks (`0.0.0.0` and
+`[::]`), while an explicit `0.0.0.0` is IPv4 only, so the "harmless default"
+silently dropped every IPv6 client. The `${BIND_ADDR:+${BIND_ADDR:-}:}` form
+keeps unset meaning *no address at all*; the inner `:-` is not redundant, it
+is what stops compose warning about an unset variable on every command.
+Verified by diffing `docker compose config` against `main` (the `inference`
+service is byte-identical) and by reading `docker compose ps` on a real
+container for both cases.
+
+**`HOST_PORT`, and the two conflicts that were found by running it.** The first
+attempt started a container while another clone of this repository was already
+serving 8000 — and compose's "port is already allocated", buried under twenty
+lines of layer output, reads as a broken machine. The preflight now refuses to
+start when *anything* is listening where it would publish, checked by
+connecting rather than by `compose ps`: a second clone is its **own compose
+project**, so `ps` here reports nothing at all while its container holds the
+port. `--port` is the way out, remembered in `.env` so it is passed once.
+
+**`--branch` on `status` and `update`, because a clone is created once.**
+`clone()` runs only when there is nothing there, and `update` fast-forwarded
+against whatever upstream the checked-out branch tracked — so a deployment
+repointed at another branch after its first install kept following the old one
+**in complete silence**. `status --branch X` now reports the mismatch and
+`update --branch X` checks the clone out onto it first, refusing a dirty tree
+exactly as the pull does. The Slicer panel passes its Branch field on every
+call, which is what makes that field mean anything after day one.
+
+This forced the git half of `cmd_update` **above** the docker preflight:
+fetching new code needs neither a working docker nor a free port, and those
+are precisely what someone may be updating in order to fix.
+
+**The dependency install no longer gates the server, and that is a fix.**
+Found while building the Slicer panel's "stop the server when Slicer closes"
+setting, which makes restarts routine: `pip install -r requirements.txt`
+**cannot succeed offline even when every dependency is already installed.**
+The chain is `nnunetv2` → `batchgenerators` → `unittest2` → `argparse`, and
+pip never treats `argparse` as satisfied — the stdlib module shadows the
+distribution, so the version check finds nothing and it re-downloads that one
+23 kB wheel on every single start (measured: 252 packages "already satisfied",
+1 downloaded, twice in a row). With `&&`, pip's exit 1 meant uvicorn never
+ran: a laptop off the network had a server that started once and never again.
+
+The command now warns and continues, then hard-gates on `python -c 'import
+fastapi, uvicorn'` instead. That probe is what separates "pip could not run
+but everything is here" (warn, start) from "pip could not run and nothing is
+installed" (one `DEPENDENCY-INSTALL-FATAL` line, exit 1) — without it the
+second case was an ImportError traceback restarted for ever by
+`restart: unless-stopped`. `server_ctl.py` greps for both markers and repeats
+them in its own output, so a start that skipped its install says so rather
+than looking perfectly healthy while a `requirements.txt` change silently did
+not apply.
+
+Verified on a container run with `--network none` and a fully populated
+`--user` layer: pip fails on `argparse`, the marker is emitted, and
+`Application startup complete` follows.
+
+**Every operator in that command sits at the END of its line.** A YAML `>`
+folded scalar keeps the newlines of its more-indented continuation lines, so a
+line *starting* with `||` reaches `sh` as a command of its own — `sh: 2:
+Syntax error: "||" unexpected`, in a restart loop. The original trailing `&&`
+was load-bearing for the same reason.
+
+**`wait_for_health` treats `restarting` as a failure**, alongside `exited` and
+`dead`. `restart: unless-stopped` turns any boot failure into a loop, and a
+loop never becomes healthy — before this the caller sat out the full
+30-minute timeout on a failure that was visible in three seconds.
+
+**`DATA/` is created before docker can create it.** `./DATA:/data:ro` is a
+bind mount, so a missing host path is created by the *daemon* — owned by root.
+Every subsequent `models` download then died on `Permission denied` against
+the very directory the server reads, on a brand-new install, with nothing on
+screen explaining why. `ensure_data_dir()` creates it as the invoking user
+before compose runs, and reports the one-line `chown` when docker already won
+that race. Found by running the thing, not by reading it.
+
+**`update` is `up -d --force-recreate`, never `restart`.** This is the
+2026-07-31 lesson turned into a button: the container installs
+`requirements.txt` as part of its *command*, into a writable layer `restart`
+keeps, so a pulled dependency change that is never re-resolved would be a
+silent no-op update — worse than a failed one. It also **fast-forwards only**
+and refuses to pull over uncommitted changes: an "Update" click must never
+invent a merge commit in someone's clone, or discard their edits.
+
+**`--progress always` on `fetch_data.py`.** Its per-file progress was drawn
+with `\r`, which is invisible to a reader collecting whole lines out of a pipe
+— so a 12 GB bundle printed *nothing at all* for an hour into the client's log
+pane. `always` emits a new line every few seconds instead. Terminal behaviour
+is unchanged.
+
+**`catalog` is what makes a partial install legible**: per tool, the manifest
+size *and* what a download would actually transfer, cross-referenced against
+what is already on disk. The distinction is the point — "ALI: 12.3 GB" printed
+next to an already-complete ALI is the number that makes someone skip a tool
+they could have for free. Everything already present is skipped by the engine,
+so there is no separate "resume" and no separate "add one more tool": re-running
+is both.
+
+**`install-docker.sh`** (Linux, needs root) runs Docker's own
+`https://get.docker.com`, adds the invoking user to the `docker` group, and
+says loudly that group membership only applies to a **new login session** —
+otherwise a successful install is followed by "permission denied" and reads as
+a failed one. `--nvidia` adds the container toolkit; it deliberately does not
+install a GPU *driver*, which can need a reboot and a specific kernel package.
+
+**`setup-server.sh`** is the curl-pipeable one-liner tying it together: clone
+(or fast-forward), check docker, optionally fetch named tools, start, print the
+URL and token. Re-running **keeps the existing token**, because regenerating it
+would silently lock out every client already configured against that server.
+
+**Also:** a root `.env.example` documenting the three variables compose
+interpolates (distinct from `server/.env.example`, which documents what the
+application reads), and `scripts/README.md` rewritten around the two jobs the
+folder now has.
 
 ### 2026-08-06 — ALI can be asked for named landmarks, which is what ASO needs
 
