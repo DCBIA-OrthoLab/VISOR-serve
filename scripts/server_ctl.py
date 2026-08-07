@@ -462,7 +462,10 @@ def health(url=None, timeout: float = 5.0) -> bool:
             if response.status != 200:
                 return False
             return json.loads(response.read().decode("utf-8")).get("status") == "ok"
-    except (urllib.error.URLError, OSError, ValueError):
+    except Exception:  # noqa: BLE001 - a probe answers False, it never raises
+        # Deliberately broad: urlopen raises http.client.HTTPException (not an
+        # OSError) when something that is not our server holds the port, and a
+        # yes/no probe must never be able to abort the command around it.
         return False
 
 
@@ -1042,6 +1045,20 @@ def main(argv=None) -> int:
         log(f"error: {exc}")
         if args.json:
             print(json.dumps({"error": str(exc)}, indent=2))
+        return 1
+    except Exception as exc:  # noqa: BLE001 - deliberate, see below
+        # An UNEXPECTED failure must still travel. Letting it escape printed a
+        # traceback on stderr and exited 1 with an empty stdout, and the GUI
+        # -- which reads stdout for the result -- could then say nothing better
+        # than "exit code 1". The traceback still goes to stderr for the log;
+        # this is what reaches the user's dialog.
+        import traceback
+        log(traceback.format_exc())
+        if args.json:
+            print(json.dumps({
+                "error": f"{type(exc).__name__}: {exc}",
+                "unexpected": True,
+            }, indent=2))
         return 1
 
     if args.json:
