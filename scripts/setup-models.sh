@@ -16,6 +16,10 @@
 # Files already present are skipped, so re-running only fetches what is
 # missing. The result is the layout server/data_store.py reads:
 # DATA/<tool>/models/<name>.
+#
+# To see what is already on disk before choosing, and to stand the server
+# itself up, see scripts/server_ctl.py (catalog / up / update) and
+# scripts/setup-server.sh.
 
 set -eu
 
