@@ -324,6 +324,47 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-08-07 — Result archives stop re-deflating already-compressed members
+
+**Motivation: "the zip and the unzip are super long, and a 90 MB transfer is
+slow on a 1 Gb link".** Measured before touching anything, on the live
+container: the HTTP stack is innocent — the 94 MB testfile downloads at
+~600 MB/s and uploads at ~450 MB/s over loopback (httptools+uvloop confirmed
+in the image; the double disk write on upload, Starlette's spool plus
+`_stream_to_disk`, is invisible on NVMe). A 1 Gb wire moves 90 MB in ~1 s. So
+if a *transfer* feels slow, the wire or the client's path to it is the place
+to look — everything slower than that here was CPU, and it was the zip.
+
+**`zipfile` DEFLATE level 6 runs at 30–46 MB/s on one core, and most of what
+this server ships is already compressed.** The 94 MB input everyone tests
+with is a `.nii.gz`; deflating it again cost 3.3 s to shrink the archive by
+0%. The client then pays the same tax twice more on arrival: its
+`_verify_download` CRCs every member (a full decompression) and its
+extraction inflates them again — both ~5x faster on a STORED member.
+
+**`make_zip` now picks the compression per member** (`_STORED_EXTENSIONS`):
+`.gz`/`.zip`/OOXML/image members are stored as-is, everything else deflates
+at the new `settings.ZIP_COMPRESSLEVEL`, default 1 — measured twice as fast
+as level 6 for ~3% of size on the one member class still worth compressing
+(binary `.vtk`, ~2.7:1 at either level). Storing *everything* would have
+traded real wire bytes for nothing: the split keeps both wins. A mixed
+archive is an ordinary zip, so the Slicer client needs no change and still
+benefits on its CRC + extract passes. Measured on the real testfiles
+(94 MB `.nii.gz` + 16 MB `.vtk`): **3.32 s → 0.31 s** for a 105 MB archive
+where level 6 produced 104 MB.
+
+**Not touched, deliberately:** the client's `slicer_io.zip_folder` deflates
+uploads at level 6 with the same waste — that is where the biggest *perceived*
+win sits (it runs on the user's own machine), but it lives in the client repo
+and this change was server-only by instruction. Noted for a future client
+release; the extraction side (`extract_zip`, `extractall`) was measured fast
+enough to leave alone (~1 s per 200 MB).
+
+**Tests:** 297 server tests (+3, `tests/test_file_utils.py`): the `.nii.gz`
+and `.XLSX` members stored whatever their case, the `.vtk` still genuinely
+deflated, and a mixed archive round-tripping byte-identically through
+`extract_zip`.
+
 ### 2026-08-06 — ALI can be asked for named landmarks, which is what ASO needs
 
 **Motivation:** ASO's fully-automated CBCT mode predicts landmarks by calling

@@ -157,6 +157,16 @@ class Settings(BaseSettings):
     # Semi-Automated CBCT and both IOS modes never go near it either way.
     ASO_LANDMARK_TOOL: str = "ALI"
 
+    # DEFLATE level for the archives file_utils.make_zip builds (tool outputs,
+    # zipped test folders). 1 by default: measured on the real testfiles
+    # (2026-08-07, one core), level 6 compresses at ~30 MB/s against level 1's
+    # ~61 MB/s, and buys about 3% of size on the one kind of member still worth
+    # compressing (binary .vtk, ~2.7:1 at either level). Members that are
+    # already compressed (.nii.gz, .zip, .xlsx, ...) never see this knob: they
+    # are STORED as-is, because DEFLATE was measured gaining ~0% on them while
+    # costing seconds of CPU per request on both ends of the transfer.
+    ZIP_COMPRESSLEVEL: int = 1
+
     # Fallback whitelist, only used for arguments with a generic "file" type
     # (see base.FILE_TYPES). Arguments with a specific type (e.g. "zip_file")
     # are validated against that type's own extensions instead, regardless
