@@ -205,7 +205,7 @@ def main(
 
     if modality == catalogs.MODALITY_CBCT:
         landmarks = _selected(cbct_landmarks, catalogs.CBCT_LANDMARK_CHOICES)
-        _check_cbct(automation, landmarks, landmark_models)
+        _check_cbct(automation, landmarks)
         selection = {"cbct_landmarks": landmarks}
     else:
         teeth = _selected(ios_teeth, catalogs.TOOTH_CHOICES)
@@ -252,7 +252,7 @@ def _selected(value, choices: dict) -> list:
     return [name for name in choices if name in wanted]
 
 
-def _check_cbct(automation: str, landmarks: list, landmark_models) -> None:
+def _check_cbct(automation: str, landmarks: list) -> None:
     if len(landmarks) < 3:
         raise ToolArgumentError(
             f"CBCT orientation registers on at least 3 landmarks; "
@@ -260,19 +260,23 @@ def _check_cbct(automation: str, landmarks: list, landmark_models) -> None:
         )
     if automation != catalogs.AUTOMATION_FULLY:
         return
-    # The landmark tool is checked FIRST, and before the input is even
-    # extracted. Neither order changes what fails, but this one changes what the
-    # caller is told: with the tool absent, "deploy ALI or use Semi-Automated"
-    # is the answer whatever they put in 'landmark_models', and "name a model"
-    # would only send them looking for a bundle that cannot help them.
+    # The landmark tool is checked before the input is even extracted. Neither
+    # order changes what fails, but this one changes what the caller is told:
+    # with the tool absent, "deploy ALI or use Semi-Automated" is the answer
+    # whatever they put in 'landmark_models'.
+    #
+    # 'landmark_models' itself is NOT checked here any more. It is optional:
+    # omitted, the landmark tool picks the bundle matching the input from its
+    # OWN hosted models (ALILogic.select_bundle), which is both the right
+    # default and the only one a client can express -- a combo box selects its
+    # first entry the moment it is filled, so "name a bundle or else" made the
+    # first entry of a list ASO does not control into the de-facto answer. That
+    # list is DATA/ASO/models/, which holds the reference bundles too, so the
+    # de-facto answer was routinely a reference: 'No CBCT landmark weights
+    # found in CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane'.
     if not ali_client.is_available(settings.ASO_LANDMARK_TOOL):
         raise ToolArgumentError(
             ali_client._NOT_AVAILABLE.format(tool=settings.ASO_LANDMARK_TOOL)
-        )
-    if not landmark_models:
-        raise ToolArgumentError(
-            "Fully-Automated CBCT needs 'landmark_models': the name of a landmark "
-            "model bundle hosted on this server (see GET /tools/ASO/data)."
         )
 
 

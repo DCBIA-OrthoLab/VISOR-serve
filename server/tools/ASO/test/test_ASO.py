@@ -744,16 +744,126 @@ def test_the_missing_tool_is_reported_before_the_missing_model(tmp_path, monkeyp
     assert settings.ASO_LANDMARK_TOOL in str(raised.value)
 
 
-def test_fully_automated_cbct_needs_a_model_name(tmp_path, monkeypatch):
-    """Once the tool IS there, the model is the next thing checked -- still
-    before the input is extracted, since minutes of work would not supply it."""
+class _FakeLandmarkTool:
+    """Stands in for the registered landmark tool, recording what it was asked
+    for. `arguments` mirrors the three names ali_client checks the contract
+    against, plus the optional prediction_ID."""
+
+    arguments = {"input": None, "model": None, "landmarks": None, "prediction_ID": None}
+
+    def __init__(self, output_dir=None, error=None):
+        self.output_dir = output_dir
+        self.error = error
+        self.received = None
+
+    def invoke(self, args):
+        self.received = args
+        if self.error is not None:
+            raise self.error
+        return self.output_dir
+
+
+def _register_fake_tool(monkeypatch, tool):
+    """ali_client does `from registry import TOOLS` INSIDE its functions (the
+    module-level import would be a cycle), so patching the attribute is enough
+    -- the import runs again on every call."""
+    import registry
+
+    monkeypatch.setattr(registry, "TOOLS", {settings.ASO_LANDMARK_TOOL: tool})
+    return tool
+
+
+def test_fully_automated_cbct_does_not_require_a_model_name(tmp_path, monkeypatch):
+    """Omitting 'landmark_models' must reach the landmark tool, not a 422.
+
+    It used to be rejected up front, which no client could satisfy honestly: a
+    combo box selects its first entry as soon as it is filled, and the list it
+    is filled from (DATA/ASO/models/) holds the REFERENCE bundles too. So
+    "name a bundle or else" turned into "submit whichever name happens to sort
+    first", and a reference bundle arrived where landmark weights were
+    expected.
+    """
     monkeypatch.setattr(ali_client, "is_available", lambda tool_name: True)
+    predicted = _rotate(_REFERENCE_POINTS, (0.2, 1.0, 0.3), 14.0)
+    monkeypatch.setattr(
+        ali_client,
+        "predict_landmarks",
+        lambda input_dir, tool_name, model_name, landmarks, work_dir: {
+            "patient1": predicted
+        },
+    )
+    root = tmp_path / "input"
+    _write_scan(root / "patient1_scan.nii.gz")
+
+    output_dir = ASOLogic.main(
+        input=str(root), modality="CBCT", automation="Fully-Automated",
+        reference=_cbct_reference(tmp_path),
+        cbct_landmarks=Selection({name: True for name in _REFERENCE_POINTS}),
+    )
+    assert _report(output_dir)["patients"]["patient1"]["status"] == "ok"
+
+
+def test_no_model_name_means_the_argument_is_omitted_not_sent_empty(tmp_path, monkeypatch):
+    """The landmark tool picks its own bundle only when `model` is ABSENT.
+    Sending "" would be a named bundle that does not exist."""
+    tool = _register_fake_tool(monkeypatch, _FakeLandmarkTool(output_dir=str(tmp_path)))
+
+    ali_client._invoke_ali(str(tmp_path), settings.ASO_LANDMARK_TOOL, None, ["Ba"], str(tmp_path))
+
+    assert "model" not in tool.received
+    assert tool.received["landmarks"] == {"Ba": True}
+
+
+def test_a_named_model_is_forwarded_unchanged(tmp_path, monkeypatch):
+    """Naming one still forces that bundle -- the auto-pick is a default, not a
+    policy."""
+    tool = _register_fake_tool(monkeypatch, _FakeLandmarkTool(output_dir=str(tmp_path)))
+
+    ali_client._invoke_ali(
+        str(tmp_path), settings.ASO_LANDMARK_TOOL, "/data/ASO/models/Bundle", ["Ba"], str(tmp_path)
+    )
+
+    assert tool.received["model"] == "/data/ASO/models/Bundle"
+
+
+def test_a_reference_bundle_named_as_the_model_says_which_field_to_clear(tmp_path, monkeypatch):
+    """The landmark tool judges the bundle and says so in its own vocabulary;
+    it cannot know ASO offered that name in a list that also holds the
+    references. Naming the field is the whole difference between "wrong
+    weights" and "wrong field"."""
+    _register_fake_tool(
+        monkeypatch,
+        _FakeLandmarkTool(error=ToolArgumentError("No CBCT landmark weights found in 'Gold'.")),
+    )
+
     with pytest.raises(ToolArgumentError) as raised:
-        ASOLogic.main(
-            input=str(tmp_path), modality="CBCT", automation="Fully-Automated",
-            reference=str(tmp_path),
+        ali_client._invoke_ali(
+            str(tmp_path), settings.ASO_LANDMARK_TOOL,
+            "/data/ASO/models/CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane",
+            ["Ba"], str(tmp_path),
         )
-    assert "landmark_models" in str(raised.value)
+
+    message = str(raised.value)
+    # The tool's own diagnosis survives, and ASO's guidance is added to it.
+    assert "No CBCT landmark weights found" in message
+    assert "CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane" in message
+    assert "Leave 'landmark_models' empty" in message
+
+
+def test_an_unnamed_model_does_not_get_the_wrong_field_advice(tmp_path, monkeypatch):
+    """Nothing was named, so 'clear the field' would be nonsense: the tool's
+    own message has to come through untouched."""
+    _register_fake_tool(
+        monkeypatch,
+        _FakeLandmarkTool(error=ToolArgumentError("No model bundle is hosted for ALI.")),
+    )
+
+    with pytest.raises(ToolArgumentError) as raised:
+        ali_client._invoke_ali(
+            str(tmp_path), settings.ASO_LANDMARK_TOOL, None, ["Ba"], str(tmp_path)
+        )
+
+    assert "landmark_models" not in str(raised.value)
 
 
 def test_fully_automated_cbct_runs_once_the_tool_is_there(tmp_path, monkeypatch):
