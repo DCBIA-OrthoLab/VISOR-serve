@@ -74,11 +74,18 @@ def predict_landmarks(
 ) -> dict:
     """Predict landmarks for every scan under `input_dir`.
 
-    `model_path` is already a local path: `landmark_models` is declared
-    `server_selectable` on ASO's schema, so main.py resolved the name the client
-    picked against `DATA/ASO/models/` before `run()` was called. It is forwarded
-    as-is, which is exactly the shape the landmark tool would have received had
-    it been called over HTTP.
+    `model_path` is optional, and None is the ordinary case. When given it is
+    already a local path: `landmark_models` is declared `server_selectable` on
+    ASO's schema, so main.py resolved the name the client picked against
+    `DATA/ASO/models/` before `run()` was called. It is forwarded as-is, which
+    is exactly the shape the landmark tool would have received had it been
+    called over HTTP.
+
+    When it is None the argument is left out of the call entirely, and the
+    landmark tool picks the bundle matching the input from the models hosted
+    for IT (`DATA/ALI/models/`) -- which is the better default anyway: ASO's
+    own folder holds the reference bundles as well, and nothing in a flat list
+    of names says which entries are landmark weights.
 
     Returns `{patient key: {landmark: np.ndarray}}` keyed exactly like
     `cbct.pipeline.discover`, so the caller can look a patient up without
@@ -90,11 +97,6 @@ def predict_landmarks(
     """
     if not is_available(tool_name):
         raise ToolArgumentError(_NOT_AVAILABLE.format(tool=tool_name))
-    if not model_path:
-        raise ToolArgumentError(
-            "Fully-Automated CBCT needs 'landmark_models': the name of a landmark "
-            "model bundle hosted on this server (see GET /tools/ASO/data)."
-        )
 
     output_dir = _invoke_ali(input_dir, tool_name, model_path, landmarks, work_dir)
     return _collect(output_dir)
@@ -122,16 +124,45 @@ def _invoke_ali(
 
     args = {
         "input": ResolvedPath(input_dir, "folder"),
-        "model": model_path,
         # Sent as the complete selection: an option left out counts as off,
         # whatever its declared default (see base.Tool._coerce_multichoice).
         "landmarks": {name: True for name in landmarks},
     }
+    # OMITTED, not sent empty, when the caller named no bundle: `model` is
+    # optional on the landmark tool, and leaving it out is what makes it pick
+    # the hosted bundle whose layout matches the input. Sending "" instead
+    # would be a named bundle that does not exist.
+    if model_path:
+        args["model"] = model_path
     if "prediction_ID" in tool.arguments:
         args["prediction_ID"] = "Pred"
 
-    logger.info("Requesting %d landmark(s) from '%s'", len(landmarks), tool_name)
-    result = tool.invoke(args)
+    logger.info(
+        "Requesting %d landmark(s) from '%s' (%s)",
+        len(landmarks),
+        tool_name,
+        f"bundle '{os.path.basename(str(model_path).rstrip(os.sep))}'"
+        if model_path
+        else "bundle chosen by the tool",
+    )
+    try:
+        result = tool.invoke(args)
+    except ToolArgumentError as exc:
+        # The landmark tool judges the bundle, and its message says so in its
+        # own vocabulary ("No CBCT landmark weights found in '<name>'"). What
+        # it cannot know is that ASO offered that name: the caller picked it
+        # from ASO's model list, which also holds the reference bundles, so the
+        # likeliest way to get here is having chosen a reference by mistake.
+        # Say which field to clear rather than leaving them to guess.
+        if model_path:
+            raise ToolArgumentError(
+                f"{exc} -- 'landmark_models' named "
+                f"'{os.path.basename(str(model_path).rstrip(os.sep))}', which is one "
+                f"of the entries hosted for ASO but not a landmark model bundle "
+                f"(the reference bundles are in that same list). Leave "
+                f"'landmark_models' empty to let the server pick the right one."
+            ) from exc
+        raise
 
     if isinstance(result, (list, tuple)):
         result = result[0] if result else None

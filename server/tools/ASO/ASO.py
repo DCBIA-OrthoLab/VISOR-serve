@@ -86,9 +86,12 @@ class ASOTool(Tool):
             required=False,
             server_selectable="model",
             description=(
-                "Fully-Automated CBCT only: name of the landmark model bundle to "
-                "predict with (see GET /tools/ASO/data), laid out as one folder "
-                "per landmark holding its per-scale weights"
+                "Fully-Automated CBCT only. Leave empty -- the server then picks "
+                "the bundle matching the scans from the ones hosted for the "
+                "landmark tool, which is almost always what you want. Name one "
+                "(see GET /tools/ASO/data) only to force a particular vintage; "
+                "note that list also holds the reference bundles, which are not "
+                "landmark weights"
             ),
             section=_INPUTS,
             # The one argument that is neither CBCT-wide nor IOS-wide: it is
