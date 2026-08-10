@@ -139,11 +139,12 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 │   ├── fetch_data.py        #   the engine (stdlib only)
 │   └── data-manifest.yml    #   what to download, and where it goes
 ├── server/
-│   ├── main.py              # FastAPI app: generic /run/{tool_name} endpoint
+│   ├── main.py              # FastAPI app: /run/{tool_name}, /uploads, /results
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError
 │   ├── registry.py          # auto-discovery of Tool subclasses in tools/
 │   ├── data_store.py        # DataStore interface + LocalDataStore (server-side models/testfiles)
 │   ├── file_utils.py        # shared helpers: zip extraction/creation, tabular loading
+│   ├── transfer.py          # chunked resumable uploads, range-served results
 │   ├── security.py          # Bearer token verification
 │   ├── config.py            # config from environment variables
 │   ├── tools/               # one folder per tool: tools/<name>/<name>.py (+ src/, test/)
@@ -236,11 +237,90 @@ model, a reference test dataset) instead of the client uploading it every call.
    - **Guaranteed cleanup** of any temp files (input and output), including on error
      (`BackgroundTask` for the streamed output, `try/finally` for the input).
 
+### Chunked transfer (`transfer.py`)
+
+A file arriving in one request rides one TCP connection, and one connection to a
+remote client is bound by its congestion window long before it is bound by
+bandwidth, which is why a 100 MB CBCT took minutes and a connection dropped at
+95% started again from zero. These endpoints let a client use several at once.
+All Bearer-protected, all optional: a client that ignores them still works, and
+a client that uses them against an older server falls back on the `404`.
+
+4. `POST /uploads` `{filename, size, chunk_size?}` → `{upload_id, chunk_size,
+   part_count}`. The server clamps `chunk_size` to [1, 64] MB and **answers with
+   what it used**: part `n` is always `[n * chunk_size, (n+1) * chunk_size)`, and
+   both sides compute offsets from that one number. A file over `MAX_UPLOAD_MB`
+   is refused here, before a byte of it travels, which the multipart path
+   cannot do.
+5. `PUT /uploads/{id}/parts/{n}`, raw body, no multipart framing. `os.pwrite`
+   at the part's offset into a pre-`truncate`d (sparse) blob, so concurrent
+   parts write disjoint ranges of one file and there is **no reassembly pass**:
+   each uploaded byte is written to disk exactly once. Idempotent, re-sending a
+   part is how a client resumes. `X-Part-SHA256` is verified before anything is
+   written, so a bad part is one retried part; since the parts tile the file,
+   that verifies the whole upload without either side making a second pass.
+   `Content-Encoding: gzip` is honoured (worth ~3x on an uncompressed `.nii` or
+   a `.vtk`), and the checksum covers the *decompressed* bytes, what lands on
+   disk, not what travelled.
+6. `GET /uploads/{id}` → `missing_parts`. What makes a transfer resumable.
+7. `DELETE /uploads/{id}`.
+8. `GET /results/{id}`, honouring `Range` → `206`. `POST /run` hands back a
+   *reference* instead of the bytes when the client sends
+   `X-Result-Delivery: reference` **and the result is at least
+   `RESULT_REFERENCE_MIN_MB`**; `DELETE /results/{id}` releases it.
+
+   That threshold is about cleanup, not speed. A streamed `FileResponse`
+   deletes its file through a `BackgroundTask` when the response ends, and that
+   fires even when the client disconnects mid-body (measured), so it depends on
+   nothing the client does. A reference does depend on the client: the file
+   waits for a `DELETE`, or for the reaper. Parallel ranges buy nothing under
+   16 MB, so there is no reason to trade the stronger guarantee away for one,
+   and the overwhelming majority of runs keep exactly the cleanup behaviour they
+   have always had.
+9. In `POST /run/{tool_name}`, an input that came up this way is named in the
+   reserved `__uploads__` form field (`{argument name: upload id}`) instead of
+   being sent as bytes. Its blob is **renamed** into the request's work dir, not
+   copied, same filesystem, so a 2 GB upload becomes a tool's input in
+   microseconds. Extensions are validated identically on both routes.
+
+State lives on disk (a `meta.json` written once and never mutated, plus a
+zero-byte marker file per received part), not in a module global: part `n` and
+part `n+1` of one upload may legitimately be served by different `uvicorn
+--workers`, and a session has to survive the `--reload` a code edit triggers
+mid-transfer. It also means no lock anywhere, parts never overlap, and a marker
+is created with `O_EXCL`. Ids are `secrets.token_urlsafe(24)`, matched against
+`[A-Za-z0-9_-]{16,64}` *before* any path is built from them.
+
+**Cleanup, and why it is a timer.** A reference is the one thing here that
+survives its request, so it needs a bound that does not depend on the client
+behaving. Three layers, in the order they normally fire:
+
+1. The client `DELETE`s the result as soon as it has it, from a `finally`, so a
+   download that failed halfway or an archive that failed its integrity check
+   releases it too. Retried once.
+2. `transfer.reap_expired` runs **on a timer** (`_reaper_loop`, every
+   `TRANSFER_SWEEP_SECONDS`), not only opportunistically when a session is
+   created. That opportunistic sweep alone was a hole: the case where an
+   abandoned transfer sits longest is exactly the case where no new request
+   arrives to trigger one, so an idle server would have held it indefinitely.
+3. `TRANSFER_TTL_SECONDS` is an **idle** timeout, not an age limit. Every part
+   written and every range read stamps its directory (`transfer.touch`), so a
+   transfer still in flight is never at risk however long it takes, while one
+   whose client vanished expires 15 minutes later. That is what lets the number
+   be minutes instead of the hours an age limit would need in order to survive
+   the slowest imaginable transfer.
+
+Worst case, therefore, for patient data left on disk by a client that died
+mid-download: `TRANSFER_TTL_SECONDS + TRANSFER_SWEEP_SECONDS`, about 16
+minutes, with no upper bound depending on when the next request happens to
+arrive.
+
 ### `security.py`, `config.py`
 - Bearer token from env (`API_TOKEN`), constant-time compare, `401` on failure.
 - Config from env: `API_TOKEN`, `DEVICE`, `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
   `TEMP_DIR`, `MAX_CONCURRENT_TOOLS`, `AMASSS_MAX_GPU_JOBS`, `ALLOWED_EXTENSIONS`,
-  `DATA_DIR`, `DATA_BACKEND`. Sensible dev defaults.
+  `DATA_DIR`, `DATA_BACKEND`, `UPLOAD_CHUNK_MB`, `TRANSFER_TTL_SECONDS`,
+  `TRANSFER_SWEEP_SECONDS`, `RESULT_REFERENCE_MIN_MB`. Sensible dev defaults.
 - **Every setting goes through `config.Settings`** — no tool reads `os.getenv`
   directly, even for a knob only it uses, so the whole configuration stays
   discoverable in one file and documented in `.env.example`.
@@ -323,6 +403,128 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-10, Transfers use several connections instead of one
+
+**Motivation: "a 100 MB file takes an eternity to upload".** The 2026-08-07
+entry below measured the HTTP stack as innocent *over loopback* and pointed at
+"the wire or the client's path to it". That was right, and this is that part: a
+remote deployment is the target, and one HTTP request rides one TCP connection,
+which is bound by its congestion window long before it is bound by bandwidth.
+No amount of tuning a single stream fixes that, only more streams do.
+
+**`transfer.py`: uploads arrive as independent parts, results leave as byte
+ranges.** `POST /uploads` opens a session and answers with the part size it
+actually chose; `PUT /uploads/{id}/parts/{n}` `os.pwrite`s each part at its
+offset into a pre-`truncate`d sparse blob. Parts never overlap, so there is no
+lock anywhere and **no reassembly pass**, the blob *is* the file once the last
+part lands, and `claim_upload` then *renames* it into the run's work dir. That
+also removes the double disk write the old path had (Starlette spools the
+multipart body to a temp file, `_stream_to_disk` copied it out again). On the
+way back, `X-Result-Delivery: reference` makes `/run` return a pointer instead
+of the bytes, and `GET /results/{id}` honours `Range`.
+
+Measured client-to-server for 100 MB, through a relay capping each connection
+at 12 MB/s (what a congestion-window-limited stream looks like to the
+application):
+
+| | upload | download |
+|---|---|---|
+| one request, one connection | 9.1 s | 8.7 s |
+| 4 connections (the client default) | 2.5 s, **3.7x** | 2.5 s, **3.6x** |
+| 8 connections | 1.5 s, **6.2x** | 1.4 s, **6.2x** |
+
+Over loopback, where there is no window to be limited by, the upload is still
+1.5x faster from losing the double write, and the client's peak RSS for a
+100 MB upload drops from 200 MB to 32 MB (`requests` reads a `files=` argument
+entirely into memory, then builds the whole encoded body next to it).
+
+**Integrity is per part, not per file.** Each `PUT` carries `X-Part-SHA256` and
+is refused before anything is written if it does not match, so corruption costs
+one retried part. The parts tile the file exactly, so the assembled blob is
+verified in full without either side making a second pass over it, which
+matters more than the speed does: a silently truncated CBCT reaching a tool is a
+wrong result, not an error. `Content-Encoding: gzip` on a part is honoured (the
+checksum covers the decompressed bytes), worth ~3x on an uncompressed `.nii` or
+a `.vtk`.
+
+**Resumability falls out of the same design.** A part that fails is a part that
+is retried; `GET /uploads/{id}` reports `missing_parts`, so a client coming back
+from a dropped connection sends only the gap instead of restarting 100 MB. State
+is on disk (immutable `meta.json` + one `O_EXCL` marker per part), not in a
+module global, so it survives `--reload` and works under `uvicorn --workers N`.
+
+**Nothing is mandatory.** A client that ignores all of this gets byte-identical
+behaviour to before; a client that uses it against an older server sees a `404`
+on `POST /uploads` and falls back. Abandoned sessions and unclaimed results are
+reaped after `TRANSFER_TTL_SECONDS` of **inactivity** (15 min) by a sweep that
+runs on a timer, so an idle server cleans up too. Every part written and every
+range read stamps its directory, so a transfer still moving is never reaped
+however long it takes. This is a confidentiality bound, not a disk-space one.
+
+**And the cleanup guarantee is deliberately not weakened for the common case.**
+A result under `RESULT_REFERENCE_MIN_MB` (16 MB) is streamed in the /run
+response and deleted server-side when that response ends, exactly as before,
+with no dependency on the client at all. Only results big enough to genuinely
+need several connections take the reference route, where the client `DELETE`s
+from a `finally` and the timed reaper is the backstop. Worst case for a client
+that dies mid-download: about 16 minutes.
+
+**The client-side note from 2026-08-07 is now closed too:** `slicer_io.zip_folder`
+deflated already-compressed uploads at level 6, on the user's own machine, on the
+main thread. 105 MB of gzipped CBCT took 2.3 s to pack into an archive of exactly
+the same size; it now stores those members and takes 0.16 s.
+
+**Tests:** `server/tests/test_transfer.py` (+31), including the cleanup
+guarantees specifically: a transfer still making progress is never reaped, a
+result being range-read is never reaped, an abandoned one does expire, the
+timed sweep fires with no request at all, a small result is streamed and leaves
+nothing in `results/`, and a guard asserting the idle timeout stays in minutes.
+Plus parts in any order, resume
+from a reported gap, a refused checksum, a wrong-length part, gzip round-trip,
+an over-size file refused before transfer, traversal ids, the reaper, `/run`
+through a session, and range / suffix-range / 416 on results.
+
+### 2026-08-07 — Result archives stop re-deflating already-compressed members
+
+**Motivation: "the zip and the unzip are super long, and a 90 MB transfer is
+slow on a 1 Gb link".** Measured before touching anything, on the live
+container: the HTTP stack is innocent — the 94 MB testfile downloads at
+~600 MB/s and uploads at ~450 MB/s over loopback (httptools+uvloop confirmed
+in the image; the double disk write on upload, Starlette's spool plus
+`_stream_to_disk`, is invisible on NVMe). A 1 Gb wire moves 90 MB in ~1 s. So
+if a *transfer* feels slow, the wire or the client's path to it is the place
+to look — everything slower than that here was CPU, and it was the zip.
+
+**`zipfile` DEFLATE level 6 runs at 30–46 MB/s on one core, and most of what
+this server ships is already compressed.** The 94 MB input everyone tests
+with is a `.nii.gz`; deflating it again cost 3.3 s to shrink the archive by
+0%. The client then pays the same tax twice more on arrival: its
+`_verify_download` CRCs every member (a full decompression) and its
+extraction inflates them again — both ~5x faster on a STORED member.
+
+**`make_zip` now picks the compression per member** (`_STORED_EXTENSIONS`):
+`.gz`/`.zip`/OOXML/image members are stored as-is, everything else deflates
+at the new `settings.ZIP_COMPRESSLEVEL`, default 1 — measured twice as fast
+as level 6 for ~3% of size on the one member class still worth compressing
+(binary `.vtk`, ~2.7:1 at either level). Storing *everything* would have
+traded real wire bytes for nothing: the split keeps both wins. A mixed
+archive is an ordinary zip, so the Slicer client needs no change and still
+benefits on its CRC + extract passes. Measured on the real testfiles
+(94 MB `.nii.gz` + 16 MB `.vtk`): **3.32 s → 0.31 s** for a 105 MB archive
+where level 6 produced 104 MB.
+
+**Not touched, deliberately:** the client's `slicer_io.zip_folder` deflates
+uploads at level 6 with the same waste — that is where the biggest *perceived*
+win sits (it runs on the user's own machine), but it lives in the client repo
+and this change was server-only by instruction. Noted for a future client
+release; the extraction side (`extract_zip`, `extractall`) was measured fast
+enough to leave alone (~1 s per 200 MB).
+
+**Tests:** 297 server tests (+3, `tests/test_file_utils.py`): the `.nii.gz`
+and `.XLSX` members stored whatever their case, the `.vtk` still genuinely
+deflated, and a mixed archive round-tripping byte-identically through
+`extract_zip`.
 
 ### 2026-08-06 — ALI can be asked for named landmarks, which is what ASO needs
 

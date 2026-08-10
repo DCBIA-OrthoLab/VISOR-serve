@@ -4,22 +4,28 @@
 # De-identification of patient data happens on the client side before upload;
 # this server never logs file contents, argument values, or patient metadata.
 
+import contextlib
 import functools
+import gzip
+import json
 import logging
 import mimetypes
 import os
 import shutil
 import tempfile
 import time
+import zlib
 from typing import Optional
 
 import anyio.to_thread
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 import file_utils
+import transfer
 from base import (
     FILE_TYPES,
     FOLDER_TYPE,
@@ -37,11 +43,43 @@ logger = logging.getLogger("inference_server")
 
 os.makedirs(settings.TEMP_DIR, exist_ok=True)
 
-app = FastAPI()
+
+async def _reaper_loop() -> None:
+    """Sweep expired transfer directories for as long as the server runs.
+
+    A timer, not only the opportunistic sweep transfer.py already does when a
+    session is created: the case where an abandoned upload or an undownloaded
+    result sits longest is exactly the case where no new request comes in to
+    trigger that sweep. On a server holding confidential imaging, "cleaned up
+    the next time somebody happens to use it" is not a bound.
+    """
+    while True:
+        await anyio.sleep(settings.TRANSFER_SWEEP_SECONDS)
+        try:
+            await anyio.to_thread.run_sync(transfer.reap_expired)
+        except Exception:  # noqa: BLE001 - one bad sweep must not end the loop
+            logger.exception("transfer reaper sweep failed")
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    async with anyio.create_task_group() as task_group:
+        task_group.start_soon(_reaper_loop)
+        try:
+            yield
+        finally:
+            # The loop never returns on its own; cancelling the scope is how it
+            # ends, and without this the task group waits for it forever on
+            # shutdown.
+            task_group.cancel_scope.cancel()
+
+
+app = FastAPI(lifespan=_lifespan)
 
 _CHUNK_SIZE_BYTES = 1024 * 1024  # read/write in 1 MB chunks, never load the full file into RAM
 _MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_MB * 1024 * 1024
 _MAX_EXTRACTED_BYTES = settings.MAX_EXTRACTED_MB * 1024 * 1024
+_RESULT_REFERENCE_MIN_BYTES = settings.RESULT_REFERENCE_MIN_MB * 1024 * 1024
 
 
 class _UploadTooLargeError(Exception):
@@ -49,6 +87,19 @@ class _UploadTooLargeError(Exception):
 
 
 _ACCEPT_ALL_EXTENSIONS = "*"
+
+# Form field carrying {argument name: upload id} for inputs that travelled
+# through the chunked-upload endpoints instead of this request's body (see
+# transfer.py). Double-underscored so it can never collide with a tool's own
+# argument name, and popped before anything looks at `args`.
+_UPLOADS_FIELD = "__uploads__"
+
+# Sent by a client that would rather be handed a reference to the result and
+# fetch the bytes itself, over as many parallel range requests as it wants,
+# than have them streamed down the same connection that carried the run. A
+# client that does not send it gets exactly the response it always got.
+_RESULT_DELIVERY_HEADER = "X-Result-Delivery"
+_DELIVER_BY_REFERENCE = "reference"
 
 # Caps how many tool executions run at once (see settings.MAX_CONCURRENT_TOOLS).
 # Dedicated to tool runs only, so waiting inference jobs can never starve the
@@ -418,6 +469,227 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
     )
 
 
+# ----------------------------------------------------------------------
+# Chunked upload / range-served results (see transfer.py for the why)
+# ----------------------------------------------------------------------
+
+class _NewUpload(BaseModel):
+    filename: str
+    size: int
+    chunk_size: Optional[int] = None
+
+
+def _transfer_error(exc: transfer.TransferError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@app.post("/uploads", dependencies=[Depends(verify_token)])
+async def create_upload(spec: _NewUpload) -> dict:
+    """Open a session the client then fills with parallel PUTs.
+
+    Answering with `chunk_size` rather than accepting the client's is what
+    keeps the layout single-sourced: part n is always
+    `[n * chunk_size, (n+1) * chunk_size)`, and both sides compute it from the
+    one number returned here.
+    """
+    try:
+        session = await anyio.to_thread.run_sync(
+            functools.partial(
+                transfer.create_upload, spec.filename, spec.size, spec.chunk_size
+            )
+        )
+    except transfer.TransferError as exc:
+        raise _transfer_error(exc)
+    return {
+        "upload_id": session.upload_id,
+        "chunk_size": session.chunk_size,
+        "part_count": session.part_count,
+    }
+
+
+@app.get("/uploads/{upload_id}", dependencies=[Depends(verify_token)])
+async def upload_status(upload_id: str) -> dict:
+    """What is still missing, this is what makes a transfer resumable: a
+    client coming back after a dropped connection sends only these parts."""
+    try:
+        session = await anyio.to_thread.run_sync(transfer.get_upload, upload_id)
+        missing = await anyio.to_thread.run_sync(session.missing_parts)
+    except transfer.TransferError as exc:
+        raise _transfer_error(exc)
+    return {
+        "upload_id": session.upload_id,
+        "size": session.size,
+        "chunk_size": session.chunk_size,
+        "part_count": session.part_count,
+        "missing_parts": missing,
+    }
+
+
+@app.put("/uploads/{upload_id}/parts/{index}", dependencies=[Depends(verify_token)])
+async def upload_part(upload_id: str, index: int, request: Request) -> dict:
+    """Receive one part, verify it, write it at its offset.
+
+    The body is the raw bytes, no multipart framing, because there is exactly
+    one thing in it and parsing a boundary out of a 8 MB body buys nothing.
+    `Content-Encoding: gzip` is honoured for inputs that are not already
+    compressed (an uncompressed .nii or a .vtk mesh is 3-4x smaller deflated,
+    which on a remote link is 3-4x less time), and `X-Part-SHA256` is checked
+    against what lands on disk either way.
+    """
+    body = await request.body()
+    if request.headers.get("Content-Encoding", "").lower() == "gzip":
+        try:
+            body = await anyio.to_thread.run_sync(gzip.decompress, body)
+        except (OSError, EOFError, zlib.error) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Part {index} is not readable gzip: {exc}",
+            )
+    try:
+        session = await anyio.to_thread.run_sync(transfer.get_upload, upload_id)
+        remaining = await anyio.to_thread.run_sync(
+            functools.partial(
+                transfer.write_part,
+                session,
+                index,
+                body,
+                request.headers.get("X-Part-SHA256"),
+            )
+        )
+    except transfer.TransferError as exc:
+        raise _transfer_error(exc)
+    # An upload that is still moving must never be reaped, however long it
+    # takes. This is what makes TRANSFER_TTL_SECONDS an idle timeout.
+    await anyio.to_thread.run_sync(transfer.touch, session.directory)
+    return {"received": index, "missing_count": remaining}
+
+
+@app.delete("/uploads/{upload_id}", dependencies=[Depends(verify_token)])
+async def delete_upload(upload_id: str) -> dict:
+    await anyio.to_thread.run_sync(transfer.discard_upload, upload_id)
+    return {"status": "ok"}
+
+
+@app.get("/results/{result_id}", dependencies=[Depends(verify_token)])
+async def download_result(result_id: str, request: Request):
+    """Serve a stored result, honouring `Range`.
+
+    That header is the whole point: it lets the client pull one file down over
+    several connections at once, which on a long-haul link is the difference
+    between one congestion window's worth of throughput and several. A client
+    that sends no Range still gets the entire file in one response.
+    """
+    try:
+        stored = await anyio.to_thread.run_sync(transfer.get_result, result_id)
+    except transfer.TransferError as exc:
+        raise _transfer_error(exc)
+
+    try:
+        span = transfer.parse_range(request.headers.get("Range"), stored.size)
+    except transfer.TransferError as exc:
+        # The size is what the client got wrong, so the real one has to travel
+        # with the refusal, otherwise it can only guess again.
+        return JSONResponse(
+            {"detail": str(exc)},
+            status_code=exc.status_code,
+            headers={"Content-Range": f"bytes */{stored.size}"},
+        )
+
+    # Stamped before the body streams, not after: a download in progress is a
+    # download that must survive the reaper, and the next range may be minutes
+    # away on a slow link.
+    await anyio.to_thread.run_sync(transfer.touch, stored.directory)
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'attachment; filename="{stored.filename}"',
+    }
+    if span is None:
+        start, end, code = 0, stored.size - 1, status.HTTP_200_OK
+    else:
+        start, end = span
+        code = status.HTTP_206_PARTIAL_CONTENT
+        headers["Content-Range"] = f"bytes {start}-{end}/{stored.size}"
+    headers["Content-Length"] = str(max(0, end - start + 1))
+
+    return StreamingResponse(
+        transfer.read_range(stored.blob_path, start, end),
+        status_code=code,
+        media_type=stored.media_type,
+        headers=headers,
+    )
+
+
+@app.delete("/results/{result_id}", dependencies=[Depends(verify_token)])
+async def delete_result(result_id: str) -> dict:
+    """Sent by a client that has the whole file. Not required for correctness
+   , the reaper collects what is never claimed, but it is what keeps TEMP_DIR
+    flat under load instead of holding every result for the full TTL."""
+    await anyio.to_thread.run_sync(transfer.discard_result, result_id)
+    return {"status": "ok"}
+
+
+def _upload_references(raw) -> dict:
+    """{argument name: upload id} from the request's `__uploads__` field."""
+    if not raw:
+        return {}
+    try:
+        references = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Malformed '{_UPLOADS_FIELD}' field: {exc}",
+        )
+    if not isinstance(references, dict) or not all(
+        isinstance(key, str) and isinstance(value, str) for key, value in references.items()
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{_UPLOADS_FIELD}' must be an object of argument name -> upload id.",
+        )
+    return references
+
+
+def _checked_extension(tool, field_name: str, filename: str) -> str:
+    """The extension an input will be saved under, or a 400 naming what was
+    allowed. Shared by the multipart path and the chunked one so an upload is
+    validated identically however its bytes arrived."""
+    expected = _expected_extensions(tool, field_name)
+    extension = _matched_extension(filename or "", expected)
+    if extension is None:
+        allowed = expected if expected is not None else settings.ALLOWED_EXTENSIONS
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unsupported file extension for '{field_name}'. Allowed: {allowed}",
+        )
+    return extension
+
+
+def _reject_upload_for_scalar(spec, field_name: str) -> None:
+    """A scalar-typed argument must never arrive as a file -- e.g. a
+    server-side-only model (ArgSpec(type=str, server_selectable="model")) is
+    selected by name, never sent by the client. Without this check the
+    uploaded file's temp path would be silently passed through as the
+    argument's string value."""
+    if spec is not None and not spec.is_file:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Argument '{field_name}' expects a plain value, not an uploaded file.",
+        )
+
+
+async def _as_resolved_path(spec, input_path: str, extension: str, work_dir: str, field_name: str):
+    """Tag an input with the declared type it actually is, unpacking a
+    "folder" argument's archive so run() only ever sees a directory."""
+    kind = spec.match_type(extension) if spec is not None and spec.is_file else "file"
+    if kind != FOLDER_TYPE:
+        return ResolvedPath(input_path, kind)
+    extracted = await anyio.to_thread.run_sync(
+        functools.partial(_extract_folder_argument, spec, input_path, work_dir, field_name)
+    )
+    return ResolvedPath(extracted, FOLDER_TYPE)
+
+
 @app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
 async def run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks):
     start_time = time.monotonic()
@@ -442,6 +714,11 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         else:
             args[key] = value
 
+    # Inputs that came up through the chunked-upload endpoints reference their
+    # session here instead of carrying their bytes in this request. Popped
+    # before `args` is looked at, so it can never reach a tool as an argument.
+    upload_references = _upload_references(args.pop(_UPLOADS_FIELD, None))
+
     # An argument declared with ArgSpec(server_selectable=...) can be sent as
     # a plain form value (the file name) instead of an upload -- resolved
     # below into a path already present on the server (see data_store.py).
@@ -458,59 +735,59 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     resolved_files = []
     size = 0
 
-    if uploaded_files:
+    if uploaded_files or upload_references:
         work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
+
+    try:
         for field_name, upload in uploaded_files.items():
-            # A scalar-typed argument must never arrive as an upload -- e.g. a
-            # server-side-only model (ArgSpec(type=str, server_selectable="model"))
-            # is selected by name, never sent by the client. Without this check
-            # the uploaded file's temp path would be silently passed through as
-            # the argument's string value.
             spec = tool.arguments.get(field_name)
-            if spec is not None and not spec.is_file:
-                shutil.rmtree(work_dir, ignore_errors=True)
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Argument '{field_name}' expects a plain value, not an uploaded file.",
-                )
-            expected = _expected_extensions(tool, field_name)
-            extension = _matched_extension(upload.filename or "", expected)
-            if extension is None:
-                shutil.rmtree(work_dir, ignore_errors=True)
-                allowed = expected if expected is not None else settings.ALLOWED_EXTENSIONS
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Unsupported file extension for '{field_name}'. Allowed: {allowed}",
-                )
+            _reject_upload_for_scalar(spec, field_name)
+            extension = _checked_extension(tool, field_name, upload.filename or "")
             input_path = os.path.join(work_dir, f"{field_name}{extension}")
             try:
                 size += await _stream_to_disk(upload, input_path)
             except _UploadTooLargeError:
-                shutil.rmtree(work_dir, ignore_errors=True)
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail=f"File exceeds the {settings.MAX_UPLOAD_MB} MB limit.",
                 )
             input_paths.append(input_path)
-
             # An argument can accept several types (e.g. ("csv_file", "folder")):
             # decide here which one this upload actually is, and hand run() a
             # path tagged with it. A "folder" arrives zipped and is unpacked
             # now, so the tool only ever sees a directory.
-            kind = spec.match_type(extension) if spec is not None and spec.is_file else "file"
-            if kind == FOLDER_TYPE:
-                try:
-                    extracted = await anyio.to_thread.run_sync(
-                        functools.partial(
-                            _extract_folder_argument, spec, input_path, work_dir, field_name
-                        )
-                    )
-                except HTTPException:
-                    shutil.rmtree(work_dir, ignore_errors=True)
-                    raise
-                args[field_name] = ResolvedPath(extracted, FOLDER_TYPE)
-            else:
-                args[field_name] = ResolvedPath(input_path, kind)
+            args[field_name] = await _as_resolved_path(
+                spec, input_path, extension, work_dir, field_name
+            )
+
+        # Same treatment, for the inputs whose bytes are already on disk: the
+        # session's blob is RENAMED into the work dir rather than copied, so a
+        # chunked upload costs no extra pass over the file at all.
+        for field_name, upload_id in upload_references.items():
+            spec = tool.arguments.get(field_name)
+            _reject_upload_for_scalar(spec, field_name)
+            try:
+                session = await anyio.to_thread.run_sync(transfer.get_upload, upload_id)
+                extension = _checked_extension(tool, field_name, session.filename)
+                input_path = os.path.join(work_dir, f"{field_name}{extension}")
+                await anyio.to_thread.run_sync(transfer.claim_upload, upload_id, input_path)
+            except transfer.TransferError as exc:
+                raise _transfer_error(exc)
+            size += session.size
+            input_paths.append(input_path)
+            args[field_name] = await _as_resolved_path(
+                spec, input_path, extension, work_dir, field_name
+            )
+    except HTTPException:
+        # Nothing has been queued for cleanup yet, and no response will stream,
+        # so the work dir has to go now. The sessions that were never claimed
+        # go too: the reaper would get them eventually, but "eventually" is a
+        # TTL's worth of confidential imaging sitting on disk.
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
+        for upload_id in upload_references.values():
+            await anyio.to_thread.run_sync(transfer.discard_upload, upload_id)
+        raise
 
     for field_name, filename in server_file_args.items():
         spec = tool.arguments[field_name]
@@ -621,11 +898,44 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             _discard(work_dir, _output_roots(_output_paths(result), work_dir) | set(scratch_dirs))
             raise HTTPException(status_code=500, detail="Tool execution failed.")
 
+        media_type = _media_type_of(str(result))
+
+        # A client asking for reference delivery gets the result MOVED out of
+        # the work dir (a rename, not a copy) and a JSON pointer to it, so it
+        # can pull the bytes down over several range requests at once instead
+        # of through this one connection. Done before the cleanup tasks are
+        # queued, since those are what would otherwise take the file with them.
+        #
+        # Only above RESULT_REFERENCE_MIN_MB, and the reason is cleanup rather
+        # than speed. A streamed response deletes its file server-side the
+        # moment the response ends, with no dependency at all on the client
+        # coming back for it; a reference depends on a DELETE or on the reaper.
+        # Parallel ranges buy nothing on a small result, so there is no reason
+        # to trade the stronger guarantee away for one.
+        deliver_by_reference = (
+            request.headers.get(_RESULT_DELIVERY_HEADER, "").lower() == _DELIVER_BY_REFERENCE
+            and os.path.getsize(result) >= _RESULT_REFERENCE_MIN_BYTES
+        )
+        stored = None
+        if deliver_by_reference:
+            try:
+                stored = await anyio.to_thread.run_sync(
+                    transfer.store_result, str(result), media_type
+                )
+            except OSError:
+                # Reference delivery is an optimisation; failing it must not
+                # fail a run that has already done the expensive part. Falls
+                # through to streaming the file the way it always did.
+                logger.exception("endpoint=/run/%s (storing result by reference)", tool_name)
+
         background_tasks.add_task(shutil.rmtree, work_dir, ignore_errors=True)
         for output_root in output_roots:
             background_tasks.add_task(shutil.rmtree, output_root, ignore_errors=True)
 
-        media_type = _media_type_of(str(result))
+        if stored is not None:
+            _log_served(tool_name, start_time, size, stored.size)
+            return JSONResponse({"result_ref": stored.as_reference()}, background=background_tasks)
+
         # The size of the file about to be streamed. Measured rather than
         # accumulated: for output_kind="files" what goes out is the archive
         # built just above, not the sum of what run() produced.
