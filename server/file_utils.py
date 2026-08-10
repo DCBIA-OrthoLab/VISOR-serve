@@ -123,6 +123,20 @@ def extract_zip(
     return root
 
 
+# Extensions whose bytes are already compressed. DEFLATE gains ~0% on them
+# while running at 30-46 MB/s on one core (measured 2026-08-07 on the real
+# 94 MB .nii.gz testfile: 3.3s of CPU to shave 0% off the archive), and the
+# client pays the same tax twice more on arrival -- its integrity pass CRCs
+# every member and its extraction inflates them again, both ~5x faster on a
+# STORED member. `.gz` covers the compound medical extensions (.nii.gz,
+# .nrrd.gz, .gipl.gz); the OOXML formats are zip containers by design.
+_STORED_EXTENSIONS = (
+    ".gz", ".bz2", ".xz", ".zip", ".7z",
+    ".xlsx", ".ods", ".docx", ".pptx",
+    ".png", ".jpg", ".jpeg",
+)
+
+
 def make_zip(sources, destination: str) -> str:
     """Bundle `sources` into the zip archive at `destination`; return its path.
 
@@ -130,6 +144,11 @@ def make_zip(sources, destination: str) -> str:
     root of the archive) or a list of file/directory paths (each kept under
     its own base name). This is what backs `output_kind = "files"`: a tool
     returns the paths it produced and never writes zip code of its own.
+
+    Compression is chosen per member: already-compressed files (see
+    _STORED_EXTENSIONS) are stored as-is, everything else is deflated at
+    settings.ZIP_COMPRESSLEVEL. The result is an ordinary zip either way --
+    every reader handles mixed compression, so clients need no change.
     """
     if isinstance(sources, (str, os.PathLike)):
         sources = [sources]
@@ -143,7 +162,9 @@ def make_zip(sources, destination: str) -> str:
 
     os.makedirs(os.path.dirname(destination) or ".", exist_ok=True)
     written: set = set()
-    with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(
+        destination, "w", zipfile.ZIP_DEFLATED, compresslevel=settings.ZIP_COMPRESSLEVEL
+    ) as zf:
         for source in sources:
             if not os.path.exists(source):
                 raise FileNotFoundError(f"Output path does not exist: {source}")
@@ -165,7 +186,10 @@ def _add_to_zip(zf: zipfile.ZipFile, file_path: str, arcname: str, written: set)
     if arcname in written:
         raise ValueError(f"Duplicate name in output archive: '{arcname}'")
     written.add(arcname)
-    zf.write(file_path, arcname)
+    # compress_type=None defers to the archive's default (DEFLATED at
+    # settings.ZIP_COMPRESSLEVEL); already-compressed members opt out of it.
+    stored = arcname.lower().endswith(_STORED_EXTENSIONS)
+    zf.write(file_path, arcname, compress_type=zipfile.ZIP_STORED if stored else None)
 
 
 def load_tabular_file(file_path: str) -> pd.DataFrame:
