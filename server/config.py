@@ -33,6 +33,49 @@ class Settings(BaseSettings):
     # here is deleted once a request has been served.
     TEMP_DIR: str = "/tmp/inference_server"
 
+    # Default size of one part in a chunked upload (see transfer.py), in
+    # megabytes. A client may ask for another value and gets it clamped to
+    # [1, 64] MB. 8 is a compromise the two ends pull on from opposite sides:
+    # smaller parts recover faster from a dropped connection and keep more
+    # streams busy on a small file, larger ones amortise the per-request
+    # headers, auth check and disk write over more bytes. At 8 MB a 100 MB scan
+    # is 13 parts, which four connections keep saturated with no part big
+    # enough that losing one hurts.
+    UPLOAD_CHUNK_MB: int = 8
+
+    # How long an upload session or a stored result may sit under TEMP_DIR
+    # WITHOUT BEING TOUCHED before the reaper deletes it.
+    #
+    # An idle timeout, not an age limit, and the distinction is what lets it be
+    # this short. Every part written and every range read stamps its directory
+    # (transfer.touch), so a transfer that is still moving is never at risk
+    # however long it takes, while one whose client vanished expires 15 minutes
+    # later. The longest legitimate gap is one part's transfer plus the retry
+    # backoff, which is seconds even on a bad link.
+    #
+    # This is a confidentiality bound, not a disk-space one: a result the
+    # client never came back for is patient data sitting on the server, and
+    # this is the number that says for how long at most.
+    TRANSFER_TTL_SECONDS: int = 900
+
+    # How often the reaper sweeps. It also runs whenever a session or result is
+    # created, but that alone would mean an idle server never cleans up at all
+    # -- the one case where an abandoned transfer sits longest is exactly the
+    # case where no new request comes in to trigger an opportunistic sweep.
+    TRANSFER_SWEEP_SECONDS: int = 60
+
+    # Results at least this large are offered to the client as a reference it
+    # fetches over parallel ranges (see transfer.py); smaller ones are streamed
+    # in the response to /run, exactly as they always were.
+    #
+    # The threshold is not about speed. Parallel ranges buy nothing on a result
+    # this small, and the streamed path deletes the file server-side the moment
+    # the response ends, with no dependency whatsoever on the client coming
+    # back -- so the strongest cleanup guarantee is kept for the overwhelming
+    # majority of runs, and only outputs big enough to genuinely need several
+    # connections take the reference route.
+    RESULT_REFERENCE_MIN_MB: int = 16
+
     # Maximum number of tool executions allowed to run at the same time.
     # Tool runs happen in worker threads (see main.py) so the server stays
     # responsive while inference is in progress; this caps how many run
