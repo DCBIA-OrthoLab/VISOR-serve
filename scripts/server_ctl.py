@@ -29,6 +29,7 @@ Two conventions the GUI depends on:
 """
 
 import argparse
+import getpass
 import json
 import os
 import secrets
@@ -136,13 +137,21 @@ def docker_info() -> dict:
     rc, _out, err = _capture(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=30)
     if rc != 0:
         message = err or "the docker daemon did not answer"
-        if "permission denied" in message.lower():
+        # Reported as a FLAG, not only as prose. This is the one failure here
+        # with a fixed, one-command remedy, and a GUI has to be able to tell it
+        # apart from "the daemon is down" without matching on English text --
+        # the panel answers the two with completely different screens.
+        needs_group = "permission denied" in message.lower()
+        if needs_group:
             message = (
-                "the docker daemon refused this user. Add yourself to the 'docker' group "
-                "(sudo usermod -aG docker $USER) and log out and back in."
+                f"the docker daemon refused this user. Add yourself to the 'docker' group:\n"
+                f"    sudo usermod -aG docker {getpass.getuser()}\n"
+                "then log out and back in -- a group only applies to a NEW session."
             )
-        return {"available": True, "version": version, "daemon": False, "error": message}
-    return {"available": True, "version": version, "daemon": True, "error": None}
+        return {"available": True, "version": version, "daemon": False,
+                "error": message, "needs_group": needs_group}
+    return {"available": True, "version": version, "daemon": True,
+            "error": None, "needs_group": False}
 
 
 def compose_command():
