@@ -11,15 +11,12 @@ This is a preprocessing step, not a result: the transform is used to render, and
 the registration the tool returns is computed and reported in the mesh's own
 original coordinates.
 
-Two latent bugs of the original are fixed, both of which produced a NaN or a
-wrong rotation in silence:
+Two latent bugs are fixed, both silent:
 
-* `np.arccos` was clamped at +1 only, so a dot product rounding just past -1 --
-  two nearly anti-parallel vectors -- gave NaN, which then propagated through
-  the rotation matrix and out into every vertex;
+* `np.arccos` was clamped at +1 only, so a dot product rounding just past -1
+  gave NaN, which propagated through the rotation matrix into every vertex;
 * `RotationMatrix` normalised its axis without checking it, so two already
-  parallel vectors (cross product of length zero) divided by zero. The rotation
-  in that case is the identity, and saying so is both correct and cheap.
+  parallel vectors divided by zero. The rotation there is the identity.
 """
 
 import numpy as np

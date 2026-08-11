@@ -15,11 +15,10 @@ port removed, since the two CLIs carried the same function:
   current patient's name. The fallback writes into its own empty directory, so
   there is nothing else to pick up.
 
-This is AREG's own copy rather than an import of `tools/ASO/src/cbct/dicom.py`:
+AREG's own copy rather than an import of `tools/ASO/src/cbct/dicom.py`:
 importing another tool's module at load time makes one tool's missing
-dependency take both out of the registry. Two copies of sixty lines is the
-smaller cost; a shared `file_utils` home for it is the right answer once a
-third tool needs it.
+dependency take both out of the registry. A shared `file_utils` home for it is
+the right answer once a third tool needs it.
 """
 
 import logging

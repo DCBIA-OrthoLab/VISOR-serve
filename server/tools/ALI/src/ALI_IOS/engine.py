@@ -96,16 +96,15 @@ def check_dependencies() -> None:
 def discover_weights(model_path: str):
     """({network: {jaw: path}}, unrecognized file names) for an IOS bundle.
 
-    **One naming rule, stated once.** A checkpoint's base name is split on
-    `_`; it must contain a token naming the network (`O` or `C`) and a token
-    naming the jaw (`Upper` or `Lower`). The published weights are called
-    `Upper_O_model.pth`, `Lower_C_model.pth` and so on, so both rules the
-    original used agreed on them -- but they were different rules (the UI
-    required the substring `_O_`, the CLI took `basename.split("_")[1]`), and
-    a bundle named slightly differently was accepted by one and rejected by
-    the other.
+    One naming rule, stated once: a checkpoint's base name is split on `_` and
+    must contain a token naming the network (`O` or `C`) and one naming the jaw
+    (`Upper` or `Lower`). The published weights are `Upper_O_model.pth` and so
+    on, so both rules the original used agreed on them -- but they were
+    different rules (the UI required the substring `_O_`, the CLI took
+    `basename.split("_")[1]`), so a bundle named slightly differently was
+    accepted by one and rejected by the other.
 
-    The jaw must be named explicitly. The original treated every file not
+    The jaw must be named explicitly: the original treated every file not
     containing "Lower" as upper-jaw weights, so a bundle missing its mandibular
     model quietly predicted the lower arch with the maxillary one.
     """
@@ -144,14 +143,13 @@ def _build_network(checkpoint: str, device: str, network_code: str = "O"):
     """The 2D UNet the IOS weights were trained as.
 
     Every argument here is part of the checkpoint's shape; changing one makes
-    `load_state_dict` fail rather than degrade -- which is why the two shapes
-    are declared rather than inferred.
+    `load_state_dict` fail rather than degrade, which is why the two shapes are
+    declared rather than inferred.
 
-    **The mucogingival network is a different shape.** O and C take one image
-    per camera as a batch: 4 channels in (normals as RGB + depth), 4 classes out
-    (background plus their three or two landmark types). MG stacks its three
-    buccal views into ONE input of 12 channels and predicts 3 classes -- it has
-    a single landmark to find and needs the three views together to place it.
+    The mucogingival network is a different shape. O and C take one image per
+    camera as a batch: 4 channels in (normals as RGB + depth), 4 classes out.
+    MG stacks its three buccal views into ONE input of 12 channels and predicts
+    3 classes -- one landmark to find, needing the three views together.
     """
     torch = import_torch()
     UNet = _import_unet()
@@ -414,18 +412,17 @@ def _predict_mucogingival(unet, renderer, mesh, tooth_number, label_name, vertic
                           estimated=None, notes=None) -> dict:
     """One mucogingival landmark, from the three adaptive buccal views.
 
-    Three things differ from the crown networks, and each one is why the naive
+    Three things differ from the crown networks, and each is why the naive
     version of this returned nothing:
 
-    * **the cameras are aimed per tooth**, at where the landmark is expected,
-      along the buccal normal of the arch at that tooth (see `render.mg_frame`);
-    * **the predicted faces are NOT filtered to the tooth.** The mucogingival
-      point is on the gingiva, and `faces_on_tooth` would drop every one of
-      them -- it keeps only faces whose vertices carry this tooth's label;
-    * **the whole point is placed, or nothing is.** There is one landmark per
-      tooth, and a mandible with gaps in its mucogingival line is what AREG then
-      has to fit a spline through, so a tooth that predicts no pixel at all
-      falls back to its most likely ones rather than being dropped.
+    * the cameras are aimed PER TOOTH, along the buccal normal of the arch at
+      that tooth (see `render.mg_frame`);
+    * the predicted faces are NOT filtered to the tooth. The mucogingival point
+      is on the gingiva, and `faces_on_tooth` keeps only faces whose vertices
+      carry this tooth's label -- it would drop every one of them;
+    * a tooth that predicts no pixel at all falls back to its most likely ones
+      rather than being dropped, a gap in the mucogingival line being what AREG
+      then has to fit a spline through.
     """
     torch = import_torch()
 

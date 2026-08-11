@@ -7,17 +7,16 @@ is four channels (the normals as RGB, plus the depth map); a 2D monai UNet
 segments all seven; the per-pixel predictions are scattered back onto the faces
 they came from through pytorch3d's pixel-to-face map.
 
-Everything the training loop needed is gone -- the loss, the metrics, the
-optimizer, `training_step`/`validation_step`/`test_step` and the
-`pytorch_lightning` base class with them. This module only has to be able to
-LOAD a checkpoint and run a forward pass, and the checkpoint stores a plain
-`state_dict`, so a `torch.nn.Module` is enough. That removes `pytorch_lightning`
-and `torchmetrics` from the import path of a tool that never trains anything.
+Everything the training loop needed is gone -- loss, metrics, optimizer, the
+`*_step` methods and the `pytorch_lightning` base class. This module only loads
+a checkpoint and runs a forward pass, and the checkpoint stores a plain
+`state_dict`, so a `torch.nn.Module` is enough. That keeps `pytorch_lightning`
+and `torchmetrics` off the import path of a tool that never trains.
 
-**Every heavy import is inside a function.** `registry.py` imports every tool at
+Every heavy import is inside a function: `registry.py` imports every tool at
 startup, so a module-level `import pytorch3d` would take AREG out of the
-registry entirely on a deployment that lacks it -- CBCT registration included,
-which needs none of this.
+registry on a deployment that lacks it -- CBCT registration included, which
+needs none of this.
 """
 
 import logging

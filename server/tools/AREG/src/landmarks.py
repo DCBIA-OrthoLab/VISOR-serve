@@ -6,17 +6,15 @@ module ASO and ALI each carry. Same reason those two are separate: importing
 another tool's module at load time makes one tool's missing dependency take
 both out of the registry.
 
-The matching is the part worth reading. Upstream's `FindLandmarkFile` tried
-`<scan stem>_Lower_MG_Pred.json` and then fell back to *any* json whose name
-merely CONTAINS the scan's stem, taking `sorted(...)[0]` of the result with a
-warning when several matched. That substring test is the one this codebase has
-already had to fix twice (`vtk_name in json_name` paired patient `1` with
-patient `10`; `"cb" in basename` made every CBCT a cranial base): here it would
-hand patient `P1`'s landmarks to patient `P10` whenever `P1`'s own file is
-missing, and register a mandible against another patient's mucogingival line
-while reporting success. Files are matched through `pairing.patient_stem`, the
-same rule that paired the scans, and an ambiguity is an error naming the
-candidates rather than a warning and a guess.
+The matching is the part worth reading. Upstream's `FindLandmarkFile` fell back
+to ANY json whose name merely contains the scan's stem, taking `sorted(...)[0]`
+with a warning when several matched -- the same substring defect this codebase
+has already fixed twice (`vtk_name in json_name` pairing patient 1 with patient
+10; `"cb" in basename` making every CBCT a cranial base). Here it would hand
+`P1`'s landmarks to `P10` whenever `P1`'s own file is missing, registering a
+mandible against another patient's mucogingival line while reporting success.
+Files are matched through `pairing.patient_stem`, the rule that paired the
+scans, and an ambiguity is an error naming the candidates.
 """
 
 import json

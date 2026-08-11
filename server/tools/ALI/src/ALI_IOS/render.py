@@ -5,18 +5,15 @@ fixed set of camera directions, runs a 2D UNet on each image, and projects the
 predicted mask back onto the faces that produced those pixels. This module
 builds the renderer and holds the camera directions.
 
-Ported from ALI_IOS_utils/{render,mask_renderer,agent}.py. **The camera
-directions are reproduced byte for byte, including their inconsistencies** --
-several are divided by the norm of a *different* vector than the one being
-normalized, so the resulting directions are not unit length. That is not a
-typo to fix: the shipped weights were trained on the views these exact
-vectors produce, and "correcting" them silently changes every prediction.
+Ported from ALI_IOS_utils/{render,mask_renderer,agent}.py. The camera
+directions are reproduced byte for byte INCLUDING their inconsistencies:
+several are divided by the norm of a different vector than the one being
+normalized, so they are not unit length. That is not a typo to fix -- the
+shipped weights were trained on the views these exact vectors produce.
 
 pytorch3d is imported inside the functions that need it. It has no PyPI
-distribution at all and must be compiled into the deployment image, so on a
-server without it ALI still loads, still publishes its schema, and only an
-IOS run fails -- with a message naming what is missing. The CBCT engine is
-unaffected.
+distribution and must be compiled into the deployment image, so on a server
+without it ALI still loads and publishes its schema, and only an IOS run fails.
 """
 
 import math
@@ -283,10 +280,10 @@ def render_mg_views(renderer, mesh, aim, directions, radius: float, device):
     engine's projection back onto the mesh is the same code.
 
     The renderer and the rasterizer are called with the SAME R and T, so
-    `pix_to_face` lines up with the pixels of the image it accompanies. The
-    sphere-scheme path below rasterizes the mesh with no R/T at all, which
-    happens to work there because the camera is baked into the meshes it is
-    handed; here the cameras differ per view and the pairing has to be explicit.
+    `pix_to_face` lines up with the image it accompanies. The sphere-scheme
+    path below rasterizes with no R/T at all, which works there because the
+    camera is baked into the meshes it is handed; here the cameras differ per
+    view, so the pairing has to be explicit.
     """
     from ..ALI_CBCT.brain import import_torch
 

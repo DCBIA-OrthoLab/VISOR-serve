@@ -5,32 +5,29 @@ Ported from `AREG_IOS/AREG_IOS_utils/mgl_patch.py` in the upstream
 SlicerAutomatedDentalTools ("ADD: MGL registration mode for the lower arch in
 AREG_IOS", 2026-08), which the Cloud fork the rest of AREG came from predates.
 
-**Why it exists.** The upper arch is registered on the palate, a plateau
-orthodontic treatment does not move, painted by a network (see `butterfly.py`).
-The mandible has no such plateau -- but it has the mucogingival line, where
-attached gingiva meets alveolar mucosa. ALI's MG model places 13 landmarks along
-it; joined into a curve and grown into a band, they play exactly the same role,
-and the patch is written as a 0/1 point array of the same shape so the ICP reads
-it identically.
+The upper arch is registered on the palate, a plateau orthodontic treatment
+does not move, painted by a network (see `butterfly.py`). The mandible has no
+such plateau, but it has the mucogingival line where attached gingiva meets
+alveolar mucosa: ALI's MG model places 13 landmarks along it, and joined into a
+curve and grown into a band they play the same role. The patch is written as a
+0/1 point array of the same shape, so the ICP reads it identically.
 
-**It needs no network of its own**, which is the operational point on this
-server: the palatal patch needs pytorch3d, and this one is a spline, a
-shortest-path walk and a label lookup. A deployment without pytorch3d answers
-501 for the upper arch and registers lower arches perfectly well.
+It needs no network of its own, which is the operational point here: the
+palatal patch needs pytorch3d, and this is a spline, a shortest-path walk and a
+label lookup. A deployment without pytorch3d answers 501 for the upper arch and
+registers lower arches at full speed.
 
-Two properties the original singles out, and both are load-bearing:
+Two properties of the band are load-bearing, and both are the original's:
 
-* every sample of the curve is **snapped onto the mesh**, because a curve
+* every sample of the curve is SNAPPED onto the mesh, because a curve
   interpolated between landmarks floats off the surface in the concavities
   between teeth;
-* the band grows **along the surface** (geodesic), never through space, so a
-  buccal patch cannot leak onto the lingual side wherever the ridge is thinner
-  than the radius.
+* the band grows GEODESICALLY, never through space, so a buccal patch cannot
+  leak onto the lingual side wherever the ridge is thinner than the radius.
 
-What is different here is the implementation of the second one, not its
-meaning: `_adjacency` built a Python `set` per vertex by walking every cell of
-the mesh through `vtkIdList`, which on a 200k-vertex intraoral scan is millions
-of interpreter-level operations for something `postprocess.Adjacency` already
+Only the implementation of the second differs: `_adjacency` built a Python
+`set` per vertex by walking every cell through a `vtkIdList`, millions of
+interpreter-level operations for something `postprocess.Adjacency` already
 computes in numpy. The Dijkstra walk itself is unchanged.
 """
 

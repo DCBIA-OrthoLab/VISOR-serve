@@ -8,26 +8,20 @@ Ported from the Slicer extension's `AREG/` module and its CLI modules
 | **CBCT** | your T1 masks, masked Elastix | AMASSS segments the T1 masks | ASO orients the T1 first   |
 | **IOS**  | your segmented meshes         | CrownSeg labels + ASO orients| --                         |
 
-The Slicer envelope is gone entirely: no `slicer.modules.*` chaining, no
-`<filter-progress>` prints, no `time.sleep(0.2)` progress theatre, no
-`sys.exit`, no log file the client polls, and nothing written into the caller's
-input tree.
+The Slicer envelope is gone entirely: no `<filter-progress>` prints, no
+`time.sleep(0.2)` progress theatre, no `sys.exit`, no log file the client
+polls, and nothing written into the caller's input tree.
 
 Two entry points, for the same reason AMASSS and ASO have two:
 
-* `register(...)` -> `RegistrationRun`. The real API, returning the output
-  directory plus a structured report. This is what another server-side tool
-  should call.
-* `main(...)` -> the output directory's path. The thin schema adapter used by
-  `AREG.py`; with `output_kind = "files"`, main.py zips that directory and
-  streams it, so no zip code lives here.
+* `register(...)` -> `RegistrationRun`, the real API: the output directory plus
+  a structured report. This is what another server-side tool calls.
+* `main(...)` -> the output directory's path, the schema adapter `AREG.py` uses.
 
-### What the modes actually chain
-
-The Slicer widget built a list of CLI invocations per mode and ran them one
-after another, passing folders between them. That structure survives, but the
-steps are the server's own tools rather than `slicer.modules.*` -- see
-`tools_client.py` for why they are called in-process and through the registry.
+The Slicer widget built a list of CLI invocations per mode and ran them in
+order, passing folders between them. That structure survives, but the steps are
+the server's own tools -- see `tools_client.py` for why they are called
+in-process and through the registry.
 """
 
 import json

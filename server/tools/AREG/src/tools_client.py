@@ -1,36 +1,22 @@
 """The seams between AREG and the three tools its automated modes need.
 
-AREG is the first tool that is mostly *other tools*. Its Fully-Automated CBCT
-mode is "segment the T1 to get a mask, then register"; its Oriented mode adds
-"orient the T1 first"; its Fully-Automated IOS mode is "label the crowns, orient
-both timepoints, then register". Segmenting, orienting and labelling are AMASSS,
-ASO and CrownSeg -- all three already on this server, none of them AREG's job to
-contain.
+AREG is the first tool that is mostly *other tools*: its automated modes
+segment the T1 (AMASSS), orient it (ASO) and label the crowns (CrownSeg), all
+three already on this server and none of them AREG's job to contain.
 
-### Why the calls are in-process and not HTTP requests to our own /run
+**The calls are in-process, not HTTP to our own /run.** Same reason as
+`ASO/src/ali_client.py`, and it bites harder here because AREG chains up to
+three of them: a tool run holds one of `MAX_CONCURRENT_TOOLS` slots for its
+whole duration, so four concurrent AREG runs each waiting on a fifth slot would
+deadlock the server, `/health` included. `Tool.invoke` is the same entry point
+main.py uses, validation included, and for `output_kind = "files"` it returns
+the output DIRECTORY, so there is no archive round trip either.
 
-Exactly the reason `ASO/src/ali_client.py` gives, and it bites harder here
-because AREG chains up to three of them. `main.py` runs every tool inside an
-`anyio.CapacityLimiter` capped at `MAX_CONCURRENT_TOOLS` (4 by default), and an
-AREG request holds one of those slots for its whole run. If it then blocked on
-an HTTP request to this same server asking for a slot of its own, four
-concurrent AREG runs would hold all four slots and each wait for a fifth that
-can never be freed -- the server would stop answering anything, `/health`
-included, until they timed out.
-
-`Tool.invoke` is the same entry point `main.py` uses, validation included, and
-for a tool whose `output_kind` is `"files"` it returns the output DIRECTORY
-(main.py is what zips it), so there is no archive round trip either.
-
-### Why `registry.TOOLS[...]` rather than importing the logic module
-
-Both patterns exist in this repo: `ali_client` goes through the registry,
-AMASSS's docstring invites a direct `from ...AMASSSLogic import segment`. The
-registry is the right one here because AREG needs the *availability* answer as
-much as the result. A deployment may legitimately not carry AMASSS, and AREG
-must then say "this mode needs AMASSS, use Semi-Automated and send your own
-masks" -- a 422 the caller can act on -- rather than fail at import time and
-take AREG out of the registry along with it.
+**Through `registry.TOOLS[...]` rather than importing the logic module**,
+because AREG needs the *availability* answer as much as the result: a
+deployment may legitimately not carry AMASSS, and AREG must then answer 422
+with "use Semi-Automated and send your own masks" rather than fail at import
+and take itself out of the registry too.
 """
 
 import logging

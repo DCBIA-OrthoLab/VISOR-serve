@@ -10,18 +10,17 @@ what the teeth did rather than what the whole model did.
 
 Corrections, all of which were silent:
 
-* **the device was hardcoded.** `PredPatch.__init__` did
-  `torch.device("cuda")` and every tensor went through `.cuda()`, so the tool
-  could not run on a CPU deployment at all -- it raised inside the first
-  forward pass. The device is `settings.DEVICE`, like every other tool here;
-* **background pixels voted for the last face.** `P_faces[:, pf] += pred`
-  indexes with pytorch3d's pixel-to-face map, whose value is **-1** where a
-  pixel hit no geometry -- and -1 indexes the last element. Those pixels were
-  zeroed before the softmax, which then turned the zeros back into an even
-  0.5/0.5 vote. Only pixels that actually hit a face contribute here;
-* **the mesh's face array was assumed to be triangles** by a `reshape(-1, 4)`
-  that does not fail on anything else, it just reads the wrong indices. The
-  mesh is triangulated first (see `postprocess.triangulate`).
+* the device was hardcoded. `PredPatch.__init__` did `torch.device("cuda")` and
+  every tensor went through `.cuda()`, so a CPU deployment raised inside the
+  first forward pass. The device is `settings.DEVICE` now;
+* background pixels voted for the last face. `P_faces[:, pf] += pred` indexes
+  with pytorch3d's pixel-to-face map, whose value is **-1** where a pixel hit
+  no geometry -- and -1 indexes the last element. Those pixels were zeroed
+  before a softmax that turned the zeros back into an even 0.5/0.5 vote. Only
+  pixels that hit a face contribute here;
+* the face array was assumed to be triangles by a `reshape(-1, 4)` that does
+  not fail on anything else, it just reads the wrong indices. The mesh is
+  triangulated first (see `postprocess.triangulate`).
 """
 
 import logging

@@ -1,25 +1,23 @@
 """Pairing a T1 folder with a T2 folder, and finding the masks that go with T1.
 
-AREG's whole input is two timepoints of the same subjects, sent as two folders.
-Everything downstream keys off the pairing this module produces, so it is one
-implementation shared by both engines -- `AREG_CBCT_utils.GetPatients` and the
-near-identical copy inside `AREG_Method/CBCT.py` had already drifted into two
-different signatures with two different mask rules.
+AREG's whole input is two timepoints of the same subjects, sent as two folders,
+and everything downstream keys off the pairing this module produces. One
+implementation shared by both engines: `AREG_CBCT_utils.GetPatients` and the
+near-identical copy in `AREG_Method/CBCT.py` had drifted into two signatures
+with two different mask rules.
 
-Three defects of those copies are fixed here by construction:
+Three defects of those copies are fixed by construction:
 
-* **the patient key was a base name**, so `scanT1.nii.gz` in two different
-  subfolders became one patient -- in the working dict and again in the flat
-  output folder. The key is the path RELATIVE to the input root, so two
-  subjects with the same file name stay apart and the output mirrors the input
-  tree;
-* **`.split(".")[0]`** truncated a name at its first dot, so `P1.2_scan.nii.gz`
+* the patient key was a BASE NAME, so `scanT1.nii.gz` in two subfolders became
+  one patient, in the working dict and again in the flat output folder. The key
+  is the path relative to the input root, and the output mirrors that tree;
+* `.split(".")[0]` truncated a name at its first dot, so `P1.2_scan.nii.gz`
   became patient `P1`. Extensions are split off properly, compound ones
-  (`.nii.gz`) included;
-* **mask regions were matched as substrings**: `"cb" in basename.lower()` makes
-  every file whose name contains **CBCT** a cranial-base mask, `"max"` matches
-  a patient named MAX_01 and `"md"` matches almost anything. Matching is on
-  whole tokens of the stem.
+  included;
+* mask regions were matched as SUBSTRINGS: `"cb" in basename.lower()` makes
+  every file whose name contains CBCT a cranial-base mask, `"max"` matches a
+  patient named MAX_01 and `"md"` matches almost anything. Matching is on whole
+  tokens of the stem.
 """
 
 import os

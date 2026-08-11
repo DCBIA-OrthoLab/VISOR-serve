@@ -6,23 +6,21 @@ VTKMatrixToNumpy), `transformation.py` (TransformSurf) and the jaw half of
 `dataset.py` (isLowerUpper/removeLowerUpper).
 
 Deliberately AREG's own copy rather than an import of `tools/ASO/src/ios/
-surfaces.py`, for the reason ASO and ALI each carry their own markups writer:
-importing another tool's module at load time makes one tool's missing
-dependency take both out of the registry. The two files are close but not
+surfaces.py`: importing another tool's module at load time makes one tool's
+missing dependency take both out of the registry. The two are close but not
 identical -- this one has the jaw vocabulary AREG needs and no .off reader,
-because AREG's IOS engine never sees a .off.
+AREG's IOS engine never seeing a .off.
 
 Two behaviours differ from the original:
 
-* **meshes are written BINARY.** `vtkPolyDataWriter` defaults to ASCII, and the
-  difference is not cosmetic: binary is smaller, roughly a hundred times faster
-  to parse, and the MORE accurate of the two -- it round-trips float32
-  coordinates exactly while ASCII prints about six significant digits and moves
-  points on read-back (see this repository's 2026-07-30 changelog entry);
-* **a mesh whose name does not say its jaw is refused**, instead of being
-  treated as a lower arch. `isLowerUpper(file, "Upper")` returning False was
-  taken to mean "lower" by `Sort`, so a maxillary mesh named `patient1.vtk` was
-  registered against the mandibular timepoint and returned as a success.
+* meshes are written BINARY. `vtkPolyDataWriter` defaults to ASCII, and the
+  difference is not cosmetic: binary is smaller, ~100x faster to parse, and the
+  MORE accurate of the two, round-tripping float32 exactly where ASCII prints
+  six significant digits and moves points on read-back;
+* a mesh whose name does not say its jaw is REFUSED rather than treated as a
+  lower arch. `isLowerUpper(file, "Upper")` returning False was taken to mean
+  "lower", so a maxillary mesh named `patient1.vtk` was registered against the
+  mandibular timepoint and returned as a success.
 """
 
 import os

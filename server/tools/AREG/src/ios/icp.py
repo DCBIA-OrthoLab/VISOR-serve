@@ -5,21 +5,19 @@ Ported from `AREG_IOS/AREG_IOS_utils/ICP.py` (ICP / vtkICP) and the
 
 Two things the originals got wrong, both invisible:
 
-* **`vtkICP.__call__` returned its source unmoved.** It built a
-  `vtkTransformPolyDataFilter`, ran it, and then returned the *input* polydata
-  plus the matrix, throwing the filter's output away. `ICP.run` fed that return
-  value into the next entry of `list_icp` and multiplied the matrices together
-  -- so with more than one method in the list, every one after the first ran on
-  unaligned points while its matrix was composed as if it had not. Only one
-  method was ever configured, which is why it never showed. There is one
-  alignment here and no list to compose;
-* **`read_matrix` read `GetTranslation()`**, which is only the whole
-  translation when the transform's centre of rotation is the origin. A
-  transform about any other centre maps `y = R(x - c) + c + t`, i.e. an offset
-  of `t + c - Rc` -- SimpleITK spells that `GetOffset()`. It happens to be
-  equal here (ASO writes its transforms centred on the origin), so this is the
-  same correction the CBCT engine needed for elastix's output, applied before
-  it can bite rather than after.
+* `vtkICP.__call__` returned its source UNMOVED: it built a
+  `vtkTransformPolyDataFilter`, ran it, and returned the input polydata,
+  throwing the filter's output away. `ICP.run` fed that into the next entry of
+  `list_icp` and multiplied the matrices together, so every method after the
+  first ran on unaligned points while its matrix was composed as if it had not.
+  Only one method was ever configured, which is why it never showed. There is
+  one alignment here and no list to compose.
+* `read_matrix` read `GetTranslation()`, which is the whole translation only
+  when the centre of rotation is the origin. A transform about any other centre
+  maps `y = R(x - c) + c + t`, an offset of `t + c - Rc` -- `GetOffset()` in
+  SimpleITK. The two happen to be equal here, ASO writing its transforms
+  centred on the origin, so this is the same correction the CBCT engine needed
+  for elastix, applied before it can bite rather than after.
 """
 
 import numpy as np

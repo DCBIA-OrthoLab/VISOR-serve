@@ -5,15 +5,13 @@ DilateLabel / ErodeLabel / GetNeighbors / ConnectedRegion / NeighborLabel).
 
 The semantics are unchanged; the implementation is not. The original asked VTK
 for a point's neighbours one `vtkIdList` at a time, inside loops over every
-point of the mesh, once per morphological iteration -- on a 200k-vertex
-intra-oral scan that is a few million Python-level VTK calls for what is one
-sparse adjacency traversal. The adjacency is built once here, in numpy, and
-every operation reads it.
+point, once per morphological iteration -- a few million Python-level VTK calls
+on a 200k-vertex scan for what is one sparse adjacency traversal. The adjacency
+is built once here, in numpy.
 
-One call is also **removed rather than ported**: `RemoveIslands(surf, labels,
-33, 500)`. The label array is binary (0 or 1), so nothing was ever equal to 33
-and that line did nothing at all -- it is the first of the four post-processing
-steps and it has never run.
+One call is removed rather than ported: `RemoveIslands(surf, labels, 33, 500)`.
+The label array is binary, so nothing was ever equal to 33 -- it is the first
+of the four post-processing steps and it has never run.
 """
 
 import numpy as np

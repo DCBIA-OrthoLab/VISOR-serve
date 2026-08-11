@@ -4,25 +4,24 @@ stable region on each, align them, move the whole model with it.
 Ported from `AREG_IOS/AREG_IOS.py` (the driver, both of its modes) and the
 `Sort`/`SortLower` half of `AREG_IOS_utils/dataset.py`.
 
-**Which region is stable depends on the arch, and that is the whole design.**
-The maxilla has the palate -- a plateau orthodontic treatment does not move,
-painted by a network (`butterfly.py`). The mandible has none, but it has the
-mucogingival line, and the band around it does the same job (`mgl.py`). Picking
-the patch therefore also picks which arch is registered:
+Which region is stable depends on the arch, and that is the whole design. The
+maxilla has the palate, a plateau orthodontic treatment does not move, painted
+by a network (`butterfly.py`); the mandible has none, but the band around its
+mucogingival line does the same job (`mgl.py`). Picking the patch therefore
+also picks which arch is registered:
 
 * **palate** -- the upper arches are registered and the lower ones are carried
-  along by the upper's transform, so the occlusion the pair was captured in
-  survives;
-* **mucogingival line** -- the lower arches are registered on their own. The
-  upper arches are left untouched, as upstream leaves them: the MG model covers
-  the mandible only, and a maxilla is not rigidly attached to it.
+  along by the upper's transform, so the captured occlusion survives;
+* **mucogingival line** -- the lower arches are registered on their own and the
+  upper ones are left untouched, as upstream leaves them: the MG model covers
+  the mandible only.
 
 The pairing is rewritten rather than transcribed. `Sort` matched two files by
-`os.path.basename(name).replace("T1", "")` -- so it paired on base names alone
-(two subjects called `Upper.vtk` in different folders became one), a patient
-identifier containing the literal `T1` was mangled, and its jaw split defaulted
-every file that did not say "Upper" to the LOWER arch. Here both timepoints go
-through `pairing.patient_stem`, and a mesh whose name does not say its jaw is
+`os.path.basename(name).replace("T1", "")`, so it paired on base names alone
+(two subjects called `Upper.vtk` in different folders became one), mangled a
+patient identifier containing the literal `T1`, and defaulted every file that
+did not say "Upper" to the LOWER arch. Both timepoints go through
+`pairing.patient_stem` here, and a mesh whose name does not say its jaw is
 reported rather than guessed.
 """
 

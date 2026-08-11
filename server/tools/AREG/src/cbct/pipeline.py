@@ -6,25 +6,22 @@ Ported from `AREG_CBCT/AREG_CBCT.py` (the driver) and the registration half of
 prints, no `time.sleep(0.2)` progress theatre (0.6 s per patient), no
 `sys.exit`, and nothing written into the caller's input tree.
 
-Three behaviours are deliberately different from the original, all of them
-visible in what the caller receives:
+Three behaviours are deliberately different from the original:
 
-**The written `.tfm` is usable.** The original registered the T1 against a
-*recentred copy* of the T2 and wrote the transform between those two spaces --
-while the recentred T2 lived in a `<t2_folder>_Center` directory next to the
-user's own data and was never returned. So the one file that says *how* the
-scans were aligned referred to a volume the caller did not have. There is no
-recentring here (see `elastix._RIGID_PARAMETERS`), so the transform maps the T1
-frame to the T2 frame the caller sent, and `AREG_report.json` says so.
-
-**The T2 is interpolated once instead of twice.** Recentring resampled every
-moving volume with linear interpolation before the registration resampled it
-again. elastix's `AutomaticTransformInitialization` aligns the two volumes'
-centres by itself, so the first pass bought nothing and cost a blur.
-
-**A registration that cannot be done is reported, not raised.** The original
-caught every per-patient exception into a log line and finished by printing how
-many had failed; the archive gave no clue. Each patient gets a report entry.
+* **The written `.tfm` is usable.** The original registered the T1 against a
+  RECENTRED COPY of the T2 and wrote the transform between those two spaces,
+  while that copy lived in a `<t2_folder>_Center` directory next to the user's
+  own data and was never returned -- so the one file saying how the scans were
+  aligned referred to a volume the caller did not have. There is no recentring
+  here (see `elastix._RIGID_PARAMETERS`), so the transform maps the T1 frame to
+  the T2 frame the caller sent.
+* **The T2 is interpolated once instead of twice.** Recentring resampled every
+  moving volume before the registration resampled it again; elastix's
+  `AutomaticTransformInitialization` aligns the centres itself, so the first
+  pass bought nothing and cost a blur.
+* **A registration that cannot be done is reported, not raised.** The original
+  caught every per-patient exception into a log line and printed how many had
+  failed; the archive gave no clue. Each patient gets a report entry.
 """
 
 import logging
