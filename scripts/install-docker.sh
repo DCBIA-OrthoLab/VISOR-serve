@@ -50,9 +50,24 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# Whoever called sudo is who should end up able to run docker -- not root,
-# who already can.
+# Whoever asked for the elevation is who should end up able to run docker --
+# not root, who already can.
+#
+# `sudo` says so in SUDO_USER. `pkexec` -- which is how the Slicer panel runs
+# this script -- does NOT: it leaves SUDO_USER unset and sets USER to root, so
+# TARGET_USER resolved to "root" and the group block below, guarded by
+# `!= root`, was skipped in complete silence. The panel therefore installed
+# Docker perfectly and left the user unable to use it, which is precisely the
+# case they cannot fix themselves without the terminal this button exists to
+# avoid. pkexec passes the caller's uid in PKEXEC_UID instead; that is the only
+# thing here that identifies them.
 TARGET_USER="${SUDO_USER:-${USER:-root}}"
+if [ -n "${PKEXEC_UID:-}" ]; then
+    _pkexec_user="$(getent passwd "$PKEXEC_UID" 2>/dev/null | cut -d: -f1 || true)"
+    if [ -n "$_pkexec_user" ]; then
+        TARGET_USER="$_pkexec_user"
+    fi
+fi
 
 if command -v docker >/dev/null 2>&1; then
     echo "Docker is already installed: $(docker --version)"
