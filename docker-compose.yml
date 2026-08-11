@@ -61,6 +61,10 @@ x-test-base: &test-base
   volumes:
     - ./server:/workspace/server
     - ./DATA:/data:ro
+    # Read-only, and only for the tests: a few of them check that the code and
+    # scripts/data-manifest.yml still agree on where a bundle is downloaded.
+    # The server itself never reads this file.
+    - ./scripts:/workspace/scripts:ro
   command: >
     sh -c "pip install --no-cache-dir --user -r requirements.txt -r requirements-dev.txt &&
            python -m pytest"

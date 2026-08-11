@@ -106,6 +106,10 @@ package at startup — e.g. import all modules in `tools/`, collect every subcla
   chosen from the data, not from an argument.
 - `CrownSeg` — per-tooth labelling of intraoral scans (shapeaxi). Its own tool
   rather than a helper inside ALI, because ASO, AREG and FlexReg need it too.
+- `BatchDentalSeg` — teeth and jaw structures on dental CT/CBCT, one scan or a
+  whole cohort (nnUNet v2, GPU). Four trained models that label different
+  things; the hosted bundle name selects the weights and their label table
+  together.
 
 The extension will eventually expose ~15+ tools; the architecture must
 accommodate them without change to the core. See `ADDING_A_TOOL.md`.
@@ -158,6 +162,7 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 │   │   ├── AMASSS/
 │   │   ├── ASO/
 │   │   ├── CrownSeg/
+│   │   ├── BatchDentalSeg/
 │   │   └── ALI/
 │   │       └── src/         # ALILogic.py dispatches; one folder per engine
 │   │           ├── ALI_CBCT/
@@ -407,6 +412,75 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-11 — BatchDentalSeg ported: four models, and a manifest that could not load
+
+Port `BATCHDENTALSEG` (teeth and jaw structures on dental CT/CBCT, nnUNet v2).
+Upstream is a 2940-line Qt widget, and most of it is not this pipeline: a queue
+table, a RAM watchdog, killing nnUNet processes a crashed scan left behind, a
+"free memory" button, a cool-down between scans, restoring the queue from disk.
+All of it exists because the widget runs inside Slicer on a clinician's laptop
+and has to survive being out of memory. Here the queue is a folder argument,
+concurrency is `MAX_CONCURRENT_TOOLS` plus a GPU semaphore, and a failure is an
+exception. None of it is ported.
+
+**Four models, and they do not label the same things.** DentalSegmentator and
+PediatricDentalSeg label 5 segments with the maxilla inside Upper Skull;
+NasoMaxillaDentSeg separates the maxilla, which shifts every later value;
+UniversalLab labels all 32 permanent teeth, 20 deciduous ones and 3 structures.
+The values are what the networks emit, so a wrong table does not fail, it
+renames anatomy — `AMASSS_report.json`'s counterpart publishes `labels` with
+every run for that reason.
+
+**The hosted bundle name IS the model.** `model` is a scalar
+`server_selectable`, and its directory name selects the weights and the label
+table together. The first version had a second `dental_model` choice beside it,
+which meant a caller could pair bundle X with the table of Y and get a
+plausible volume with every structure named wrong. One argument cannot express
+that.
+
+**The manifest could not have loaded.** `scripts/data-manifest.yml` already
+carried the four bundles, marked NOT PORTED YET, with the checkpoint written
+flat beside `dataset.json` and `plans.json`. nnUNet reads its fold from a
+subdirectory named after it, so every bundle would have downloaded perfectly
+(2.3 GB) and then no model would ever have been found. `dest` now puts the
+checkpoint under `<bundle>/fold_0/`, and `find_model_folder` confirms all three
+files before accepting a candidate — a half-downloaded bundle reports "not
+installed" rather than failing inside nnUNet's loader. A test pins the code and
+the manifest to the same folder names, which is why `docker-compose.yml`'s test
+services now mount `scripts/` read-only.
+
+**A defect the tests found, in this port's own code.** The scan-to-NIfTI
+conversion loop ran before inference with no per-scan guard, so one corrupt
+file in a cohort aborted the whole run before a single scan had been
+segmented. It is guarded now and reported per scan; a batch where *nothing*
+could be read is a 422 rather than a successful run of zero scans.
+
+**Also not ported, each for a stated reason:** the runtime model download from
+GitHub releases (a server holding patient data does not make outbound calls
+mid-request; bundles are staged with `setup-models.sh --tool BatchDentalSeg`);
+the auto-crop (upstream applies it only when its RAM preflight fails, as a
+laptop mitigation, and it changes what the network sees); the mirroring
+resolution (a button pressed after looking at the result, not part of the
+automatic pipeline); and the mesh exports (STL/OBJ/GLTF/VTK), which are the
+obvious next addition.
+
+`nnunet_runner.py` is deliberately a second copy of AMASSS's rather than an
+import: `registry.py` imports every tool at startup, so importing another
+tool's module would make one tool's missing dependency take both out of the
+registry — the same reason ASO and AREG each carry their own dicom.py. It does
+NOT carry AMASSS's GPU-resampling swap: that drops the input resampling from
+spline order 3 to order 1, and nothing has measured what that costs *these*
+models.
+
+**Core changes, both sanctioned:** two `config.Settings` fields
+(`BATCHDENTALSEG_MAX_GPU_JOBS`, `BATCHDENTALSEG_TILE_STEP_SIZE`). `main.py`,
+`registry.py` and `base.py` untouched, and no new dependency — the image
+already carries nnUNet v2 for AMASSS.
+
+**Tests:** 354 server tests (+26), no GPU, no weights and no network: inference
+is stubbed, everything around it runs for real. Not yet verified against the
+real bundles — they are 2.3 GB and have not been fetched on this machine.
 
 ### 2026-08-07 — `scripts/` stands the server up, not just fills `DATA/`
 

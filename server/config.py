@@ -81,6 +81,15 @@ class Settings(BaseSettings):
     # being a forward pass. A per-landmark budget.
     ALI_SEARCH_MAX_SECONDS: Optional[float] = None
 
+    # How many BatchDentalSeg inferences may touch the GPU at once. Same shape
+    # of work as AMASSS -- a 3d_fullres nnUNet over a CBCT -- so the same
+    # default and its own counter. Read once at import time.
+    BATCHDENTALSEG_MAX_GPU_JOBS: int = 1
+
+    # nnUNet's sliding-window overlap for BatchDentalSeg, left at nnUNet's own
+    # default. Raising it is faster and DOES move the segmentation.
+    BATCHDENTALSEG_TILE_STEP_SIZE: float = 0.5
+
     # How many CrownSeg segmentations may touch the GPU at once. One mesh at
     # 320x320 over an icosahedron's viewpoints already fills a typical card.
     CROWNSEG_MAX_GPU_JOBS: int = 1
