@@ -351,18 +351,51 @@ def effective_port() -> int:
         return DEFAULT_PORT
 
 
-def url_for(port=None) -> str:
-    return f"http://localhost:{port or effective_port()}"
+def url_for(port=None, bind_addr=None) -> str:
+    """Where this deployment answers, seen from the machine running it.
+
+    `localhost` is right when the port is published on loopback or on EVERY
+    interface. It is wrong when it is published on one specific address, which
+    is exactly what `--bind <vpn address>` is for: the port is then simply not
+    on 127.0.0.1, so a health check against localhost polls an address nothing
+    listens on and reports a perfectly healthy server as dead.
+
+    Read from `.env` rather than passed around, so every caller agrees without
+    having to thread the value through. `cmd_up` calls `ensure_env` first, so
+    what is read here is already the binding the container is about to get.
+    """
+    if bind_addr is None:
+        bind_addr = read_env().get("BIND_ADDR", "127.0.0.1")
+    host = "localhost"
+    # "" and 0.0.0.0/:: all mean "every interface", and loopback is included in
+    # that -- so localhost stays the right thing to talk to.
+    if bind_addr and bind_addr not in ("127.0.0.1", "localhost", "0.0.0.0", "::"):
+        host = f"[{bind_addr}]" if ":" in bind_addr else bind_addr
+    return f"http://{host}:{port or effective_port()}"
 
 
-def ensure_env(service: str, bind_addr: str, token=None, port=None) -> str:
+def ensure_env(service: str, bind_addr=None, token=None, port=None) -> str:
     """Make sure the deployment has a token and knows where to bind. Returns the token.
 
     An existing token is kept: regenerating one on every `up` would silently
     lock out every client already configured against this server.
+
+    `bind_addr` is kept the same way, and for the same kind of reason. It used
+    to default to "127.0.0.1" at the ARGPARSE level, so `update` -- which never
+    asks anyone where to bind -- rewrote BIND_ADDR to localhost on every run.
+    A deployment deliberately published on a network address went back to being
+    unreachable the first time someone pressed "Update server", with nothing
+    said about it. Passing None now means "leave it as it is".
+
+    `is not None` rather than a falsy test, because the EMPTY STRING is a real
+    and different value here: it is how the compose file is told to publish on
+    every interface (see its `${BIND_ADDR:+...}` comment), so "" and unset must
+    not collapse into the same branch.
     """
     existing = read_env()
     api_token = token or existing.get("API_TOKEN") or secrets.token_urlsafe(32)
+    if bind_addr is None:
+        bind_addr = existing.get("BIND_ADDR", "127.0.0.1")
     updates = {"API_TOKEN": api_token, "BIND_ADDR": bind_addr, "HOST_PORT": str(port or effective_port())}
     if service == GPU_SERVICE:
         updates["DEVICE"] = existing.get("DEVICE") or "cuda"
@@ -1059,11 +1092,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(up)
     up.add_argument("--token", help="Use this API token instead of generating/keeping one.")
     up.add_argument(
-        "--bind", default="127.0.0.1",
-        help="Host address the port is published on. Default: 127.0.0.1 — this deployment "
-             "speaks plain HTTP, so it stays on loopback. Pass an empty string to publish on "
-             "every interface (IPv4 and IPv6), which is only acceptable behind a TLS "
-             "terminator; '0.0.0.0' does the same for IPv4 only.",
+        "--bind", default=None,
+        help="Host address the port is published on. Omitted, it keeps whatever the "
+             "deployment already uses, and 127.0.0.1 on a first install — this deployment "
+             "speaks plain HTTP, so it stays on loopback unless someone says otherwise. "
+             "Pass an empty string to publish on every interface (IPv4 and IPv6), which is "
+             "only acceptable behind a TLS terminator; '0.0.0.0' does the same for IPv4 "
+             "only. A single address (say a VPN one) publishes on that interface alone.",
     )
     up.add_argument(
         "--port", type=int, default=None,
@@ -1077,7 +1112,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     update = subparsers.add_parser("update", help="Pull new commits and relaunch if anything changed.")
     add_common(update)
-    update.add_argument("--bind", default="127.0.0.1", help="See 'up --bind'.")
+    # No default, deliberately: `update` is not where anyone decides where the
+    # server listens, so it must carry the existing choice over rather than
+    # quietly reimpose loopback. See ensure_env.
+    update.add_argument("--bind", default=None, help="See 'up --bind'.")
     update.add_argument("--force", action="store_true", help="Recreate even when nothing changed.")
     update.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
     update.set_defaults(func=cmd_update, printer=None)
