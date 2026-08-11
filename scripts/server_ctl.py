@@ -164,15 +164,56 @@ def compose_info() -> dict:
     return {"available": True, "version": out, "command": command}
 
 
+def _has_nvidia_cdi_device(raw: str) -> bool:
+    """True when docker has discovered a CDI device for an nvidia GPU.
+
+    The entries look like `{"Source": "cdi", "ID": "nvidia.com/gpu=all"}`. The
+    vendor prefix is what identifies them: the same list carries every other
+    CDI vendor registered on the host.
+    """
+    try:
+        devices = json.loads(raw or "null")
+    except ValueError:
+        return False
+    if not isinstance(devices, list):
+        return False
+    return any(
+        isinstance(device, dict)
+        and device.get("Source") == "cdi"
+        and str(device.get("ID", "")).startswith("nvidia.com/gpu")
+        for device in devices
+    )
+
+
 def gpu_info() -> dict:
     """Whether docker can actually hand a container an nvidia device.
 
     `nvidia-smi` on the host is not the answer: the container toolkit is a
     separate install, and without it the GPU service fails to start on a
-    machine whose card works perfectly outside docker. What decides is whether
-    docker itself knows an "nvidia" runtime.
+    machine whose card works perfectly outside docker.
+
+    TWO mechanisms answer "yes", and checking only the first was a bug. The
+    legacy one is a runtime named "nvidia" in daemon.json, which is what
+    `nvidia-ctk runtime configure` writes. The current one is CDI: docker >= 25
+    reads /etc/cdi and /var/run/cdi and resolves `nvidia.com/gpu` devices with
+    no runtime registered at all -- and the toolkit has generated those specs
+    by itself since 1.17, so a host set up today commonly runs GPU containers
+    perfectly while `docker info` lists only runc.
+
+    Measured on exactly such a host (RTX 6000 Ada, driver 580, docker 29,
+    toolkit 1.18, no /etc/docker/daemon.json): `docker run --gpus all`, `docker
+    run --device nvidia.com/gpu=all` and a compose `driver: nvidia` reservation
+    -- the one this repository's `inference` service uses -- all reach the card,
+    while the runtime-only check reported "no GPU". `pick_service` therefore
+    started `inference-cpu`, and the panel told the user their card was unusable.
+
+    `nvidia_runtime` keeps its name: every caller means "can docker give a
+    container the card", which is what it still answers. `gpu_access` names the
+    mechanism that replied, so nothing has to print "no nvidia runtime" at
+    someone whose GPU works.
     """
     runtime = False
+    cdi = False
     error = None
     if _which("docker"):
         rc, out, err = _capture(["docker", "info", "--format", "{{json .Runtimes}}"], timeout=30)
@@ -183,7 +224,20 @@ def gpu_info() -> dict:
                 runtime = "nvidia" in out
         else:
             error = err or "could not read the docker runtimes"
-    return {"nvidia_runtime": runtime, "nvidia_smi": bool(_which("nvidia-smi")), "error": error}
+        # A second call, and a failure here is deliberately NOT an error:
+        # `.DiscoveredDevices` does not exist before docker 28, where an unknown
+        # field makes the whole template fail rather than return nothing. A host
+        # too old to have CDI must read as "no CDI", not as "could not check".
+        rc, out, _err = _capture(
+            ["docker", "info", "--format", "{{json .DiscoveredDevices}}"], timeout=30)
+        if rc == 0:
+            cdi = _has_nvidia_cdi_device(out)
+    return {
+        "nvidia_runtime": runtime or cdi,
+        "nvidia_smi": bool(_which("nvidia-smi")),
+        "gpu_access": "runtime" if runtime else ("cdi" if cdi else None),
+        "error": error,
+    }
 
 
 def pick_service(force=None) -> str:
@@ -688,9 +742,11 @@ def _preflight(service: str, port=None) -> None:
         )
     if service == GPU_SERVICE and not gpu_info()["nvidia_runtime"]:
         raise ServerCtlError(
-            "The GPU service was requested but docker has no 'nvidia' runtime, so the "
-            "container could not start at all. Install the NVIDIA Container Toolkit, or "
-            "run with --device cpu."
+            "The GPU service was requested but docker cannot reach a GPU -- it has neither "
+            "an 'nvidia' runtime nor a CDI device for one -- so the container could not "
+            "start at all. Install the NVIDIA Container Toolkit and register it with\n"
+            "    sudo nvidia-ctk runtime configure --runtime=docker && sudo systemctl restart docker\n"
+            "or run with --device cpu."
         )
 
     # Both checks below are about BINDING, so both are skipped when `port` is
@@ -736,7 +792,8 @@ def cmd_up(args) -> dict:
     url = args.url or url_for()
 
     if service == CPU_SERVICE:
-        log("No nvidia runtime in docker: starting the CPU service. Everything works, slowly.")
+        log("Docker cannot reach a GPU (no nvidia runtime, no CDI device): starting the CPU "
+            "service. Everything works, slowly.")
 
     command = compose_base(service) + ["up", "-d"]
     if args.force_recreate:
@@ -909,8 +966,17 @@ def _print_status(status: dict) -> None:
     compose = status["compose"]
     print(f"  {mark(compose['available'])}compose   {compose['version'] or 'not installed'}")
     gpu = status["gpu"]
-    print(f"  {mark(gpu['nvidia_runtime'])}gpu       "
-          f"{'nvidia runtime available' if gpu['nvidia_runtime'] else 'no nvidia runtime in docker'}")
+    access = gpu.get("gpu_access")
+    if access == "cdi":
+        gpu_text = "available to docker through CDI"
+    elif access == "runtime":
+        gpu_text = "available to docker through the nvidia runtime"
+    elif gpu["nvidia_smi"]:
+        gpu_text = ("a card is present, but docker cannot reach it "
+                    "(no nvidia runtime and no CDI device)")
+    else:
+        gpu_text = "no GPU on this host"
+    print(f"  {mark(gpu['nvidia_runtime'])}gpu       {gpu_text}")
 
     clone = status["clone"]
     if clone["is_git_repo"]:
@@ -957,7 +1023,8 @@ def build_parser() -> argparse.ArgumentParser:
     def add_common(sub, with_url=True):
         sub.add_argument(
             "--device", choices=("auto", "gpu", "cpu"), default="auto",
-            help="Which compose service to drive. Default: gpu when docker has an nvidia runtime.",
+            help="Which compose service to drive. Default: gpu when docker can reach a card, "
+                 "through either an nvidia runtime or a CDI device.",
         )
         sub.add_argument(
             "--branch",
