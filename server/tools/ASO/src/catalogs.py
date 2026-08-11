@@ -1,25 +1,21 @@
 """The vocabularies ASO works with: CBCT landmark names, IOS tooth names, IOS
 landmark types, and the tooth name <-> universal ID table.
 
-Ported from the Slicer module's `ASO_Method/CBCT.py::DicLandmark` and
-`ASO_Method/IOS.py`, which is where they used to live -- inside the Qt widget,
-duplicated between the UI (checkbox labels) and each CLI (the strings it
-parsed). The server owns them now and publishes them through
-`ArgSpec.choices`, so a client renders its checkboxes straight from
-GET /tools and the two can no longer disagree.
+These used to live inside the Qt widget, duplicated between the UI's checkbox
+labels and each CLI's parsed strings. The server owns them now and publishes
+them through `ArgSpec.choices`, so a client renders its checkboxes straight
+from GET /tools and the two can no longer disagree.
 
-Nothing here imports anything heavy: this module is read at registry
-discovery time.
+Nothing here imports anything heavy: this module is read at registry discovery
+time.
 """
 
 # ---------------------------------------------------------------------------
 # CBCT landmarks
 # ---------------------------------------------------------------------------
-# Grouped exactly as the Slicer UI grouped them, one tab per group. This is
-# published through `ArgSpec.groups`, so a client renders the tabs from the
-# schema: the alternative once considered here -- prefixing the option labels
-# with their group -- was rejected because those labels ARE the names the
-# server matches against a reference file. See ALI_PORT_CONTEXT.md section 3.1.
+# One tab per group, published through `ArgSpec.groups`. The option labels are
+# not decorated with their group name because those labels ARE the names the
+# server matches against a reference file.
 CBCT_LANDMARK_GROUPS = {
     "Cranial base": (
         "Ba", "C2", "C3", "C4", "LFZyg", "LPo", "N", "RFZyg", "RPo", "S",
@@ -63,8 +59,8 @@ CBCT_LANDMARK_CHOICES = {
 # IOS teeth
 # ---------------------------------------------------------------------------
 # The universal numbering a segmented mesh carries in its label array, and the
-# names a human uses. The original kept this table in five places (two CLIs,
-# two Method classes, and an exception class); it lives here once.
+# names a human uses. The original kept this table in five places; here it
+# lives once.
 TOOTH_IDS = {
     "UR8": 1, "UR7": 2, "UR6": 3, "UR5": 4, "UR4": 5, "UR3": 6, "UR2": 7,
     "UR1": 8,
@@ -81,11 +77,10 @@ TOOTH_NAMES = {number: name for name, number in TOOTH_IDS.items()}
 UPPER_TEETH = tuple(name for name, number in TOOTH_IDS.items() if number <= 16)
 LOWER_TEETH = tuple(name for name, number in TOOTH_IDS.items() if number > 16)
 
-# One row per arch, teeth left to right in universal-numbering order -- the
-# dental chart a clinician reads, published so a client lays the check boxes
-# out that way instead of stacking 32 of them in a column. Deriving it from
-# TOOTH_IDS rather than writing it out again is what keeps the chart and the
-# label array in step: a tooth added to TOOTH_IDS appears in its own arch.
+# One row per arch, in universal-numbering order: the dental chart a clinician
+# reads, published so a client does not stack 32 check boxes in a column.
+# Derived from TOOTH_IDS rather than written out again, so a tooth added there
+# appears in its own arch.
 TOOTH_GROUPS = {"Upper": UPPER_TEETH, "Lower": LOWER_TEETH}
 
 # Auto_IOS.Suggest(): three teeth per jaw, spread left/middle/right, which is
@@ -99,9 +94,8 @@ TOOTH_CHOICES = {name: name in DEFAULT_TEETH for name in TOOTH_IDS}
 # IOS landmark types
 # ---------------------------------------------------------------------------
 # Semi-automated IOS registers on <tooth><type> keys read from the user's own
-# markups file and the reference's, so every type the original UI offered is
-# legitimately selectable here -- unlike ALI's IOS mode, where three of them
-# had no model behind them and were published anyway.
+# markups file and the reference's, so every type is legitimately selectable
+# here -- unlike ALI's IOS mode, where three of them have no model behind them.
 IOS_LANDMARK_TYPES = ("O", "MB", "DB", "CB", "CL", "OIP", "R", "RIP")
 
 DEFAULT_IOS_LANDMARK_TYPES = ("O",)
@@ -118,10 +112,9 @@ JAWS = ("Upper", "Lower")
 
 JAW_CHOICES = {"Upper": True, "Lower": True}
 
-# The original had this as two arguments that could contradict each other: an
-# `occlusion` boolean and a `jaw` string the client built by joining the
-# checked jaws with "/", which the CLI then read as `jaw[0] == "Upper"`. One
-# argument, three states, no illegal combination.
+# One argument with three states, replacing two that could contradict each
+# other: an `occlusion` boolean plus a `jaw` string the client built by joining
+# the checked jaws with "/". No illegal combination is representable now.
 OCCLUSION_INDEPENDENT = "Orient each jaw independently"
 OCCLUSION_UPPER_DRIVES = "Upper drives Lower"
 OCCLUSION_LOWER_DRIVES = "Lower drives Upper"
@@ -155,9 +148,8 @@ AUTOMATION_CHOICES = {AUTOMATION_SEMI: True, AUTOMATION_FULLY: False}
 def teeth_to_ids(names) -> tuple:
     """Universal IDs for a list of tooth names, in the order given.
 
-    Raises KeyError on an unknown name, which cannot happen through the schema
-    (validate() rejects an option outside `choices` with a 422 first) but keeps
-    a direct call to the src API honest.
+    Raises KeyError on an unknown name. That cannot happen through the schema,
+    where validate() answers 422 first, but keeps a direct src call honest.
     """
     return tuple(TOOTH_IDS[name] for name in names)
 

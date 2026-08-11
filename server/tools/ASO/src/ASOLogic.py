@@ -11,20 +11,18 @@ engines, four modes:
 | **IOS**    | landmarks you send, ICP per jaw       | tooth centroids of an already         |
 |            |                                       | segmented mesh, ICP per jaw           |
 
-The Slicer envelope is gone entirely: no `slicer.modules.*` chaining, no
-`<filter-progress>` prints, no `time.sleep` progress theatre, no `sys.exit`, no
-log file the client polls, no `*Error.txt` written next to the results, and
-nothing whatsoever written into the caller's input tree.
+The Slicer envelope is gone entirely: no `<filter-progress>` prints, no
+`time.sleep` progress theatre, no `sys.exit`, no log file the client polls, no
+`*Error.txt` beside the results, and nothing written into the caller's input
+tree.
 
 Two entry points, for the same reason AMASSS has two:
 
-* `orient(...)` -> `OrientationRun`. The real API, returning the output
-  directory plus a structured report. **This is what other server-side tools
-  should call** (AREG needs oriented scans): it hands back the files, with no
-  zip round trip.
+* `orient(...)` -> `OrientationRun`, the real API. Returns the output directory
+  plus a structured report, with no zip round trip. This is what other
+  server-side tools call.
 * `main(...)` -> the output directory's path. The thin schema adapter used by
-  `ASO.py`; with `output_kind = "files"`, main.py zips that directory and
-  streams it, so no zip code lives here.
+  `ASO.py`; main.py zips that directory, so no zip code lives here.
 """
 
 import json

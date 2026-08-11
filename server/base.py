@@ -14,15 +14,12 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Optional, Union
 
-# File-typed arguments declare a specific kind here instead of a generic
-# "file", so both the server (extension check) and the client (GET /tools)
-# know exactly what's expected for that argument -- no shared global
-# whitelist to keep in sync across unrelated tools.
-# "file" is kept as a generic passthrough: None means "fall back to the
-# server-wide config.ALLOWED_EXTENSIONS whitelist" instead of a fixed list.
-# "folder" is the one type whose value reaches run() as a DIRECTORY: HTTP has
-# no notion of a folder, so the client sends it as a .zip and main.py extracts
-# it before calling run() (see FOLDER_TYPE below).
+# A file-typed argument declares a specific kind here rather than a generic
+# "file", so both the extension check and the client know what is expected.
+# "file" is the generic passthrough: None means "fall back to
+# config.ALLOWED_EXTENSIONS". "folder" is the one type whose value reaches
+# run() as a DIRECTORY -- HTTP has no notion of a folder, so the client sends
+# a .zip and main.py extracts it first.
 FILE_TYPES: dict = {
     "file": None,
     "folder": (".zip",),
@@ -31,10 +28,8 @@ FILE_TYPES: dict = {
     "xlsx_file": (".xlsx",),
     "ods_file": (".ods",),
     "nifti_file": (".nii", ".nii.gz"),
-    # A medical volume OR a zip archive of a folder of them: lets a single
-    # argument serve both "one scan" and "a batch" without the schema having
-    # to express "exactly one of these two arguments" (which it can't).
-    # The tool dispatches on what it actually received (file / zip / folder).
+    # One volume OR a zip of a folder of them, since the schema cannot express
+    # "exactly one of these two arguments". The tool dispatches on what it got.
     "volume_or_zip_file": (
         ".nii",
         ".nii.gz",
@@ -44,16 +39,12 @@ FILE_TYPES: dict = {
         ".gipl.gz",
         ".zip",
     ),
-    # A 3D surface mesh (intra-oral scan, segmentation surface, ...). Every
-    # extension listed here is one a tool declaring this type must be able to
-    # READ: advertising a format and then silently discovering only .vtk is
-    # what made ALI's IOS mode accept .stl files it never processed.
+    # A 3D surface mesh. Every extension listed is one a tool declaring this
+    # type must be able to READ: advertising a format and then only handling
+    # .vtk is what made ALI accept .stl files it never processed.
     "surface_file": (".vtk", ".vtp", ".stl", ".obj", ".off"),
-    # The surface counterpart of volume_or_zip_file: one mesh, or a zipped
-    # folder of them. A SEPARATE type from surface_file rather than an
-    # extension of it, and deliberately shorter: these are the formats ALI's
-    # discovery actually walks, and the same rule as above applies -- what is
-    # advertised has to be what is read.
+    # One mesh or a zipped folder of them. Deliberately shorter than
+    # surface_file: these are the formats ALI's discovery actually walks.
     "surface_or_zip_file": (".vtk", ".stl", ".zip"),
 }
 
@@ -62,27 +53,21 @@ FOLDER_TYPE = "folder"
 
 SCALAR_TYPES = (str, int, float, bool)
 
-# Types picking from a fixed set of named options the tool declares in
-# ArgSpec.choices. They exist so the client can render the right widget without
-# any tool-specific code, and so an out-of-range value is caught by validate()
-# instead of reaching run():
-#   "choice"      -> exactly one option        -> combo box  -> run() gets a str
-#   "multichoice" -> any number of options     -> check boxes -> run() gets a Selection
+# Types picking from the fixed set of options declared in ArgSpec.choices. The
+# client renders the right widget with no tool-specific code, and an
+# out-of-range value is caught by validate() instead of reaching run():
+#   "choice"      -> exactly one option    -> combo box   -> run() gets a str
+#   "multichoice" -> any number of options -> check boxes -> run() gets a Selection
 CHOICE_TYPE = "choice"
 MULTICHOICE_TYPE = "multichoice"
 CHOICE_TYPES = (CHOICE_TYPE, MULTICHOICE_TYPE)
 
-# How a client should lay a "multichoice" argument's options out (ArgSpec.ui).
-# Presentation only -- none of these changes what the argument means, what is
-# sent, or what run() receives. Absent (None) is the single-column stack every
-# tool gets today.
-#   "tabs"   -> one tab per entry of `groups`, options in a scrollable grid.
-#               For a catalog too long to scroll through (ASO's 130 landmarks).
-#   "grid"   -> one ROW per entry of `groups`, options as columns. For options
-#               whose position carries meaning (ASO's 32 teeth, upper arch
-#               above lower arch -- the dental chart clinicians read).
-#   "inline" -> a single horizontal row. For a handful of short options that
-#               waste a line each stacked vertically.
+# How a client lays a "multichoice" argument's options out (ArgSpec.ui). None
+# is the single-column stack.
+#   "tabs"   -> one tab per `groups` entry, for a catalog too long to scroll.
+#   "grid"   -> one ROW per `groups` entry, for options whose position carries
+#               meaning (ASO's 32 teeth, upper arch above lower arch).
+#   "inline" -> a single horizontal row, for a handful of short options.
 UI_LAYOUTS = ("tabs", "grid", "inline")
 
 # The layouts that are meaningless without ArgSpec.groups.
@@ -90,12 +75,11 @@ _GROUPED_LAYOUTS = ("tabs", "grid")
 
 
 class Selection(dict):
-    """What run() receives for a "multichoice" argument: every option the tool
-    declared, mapped to True/False, in declaration order.
+    """What run() receives for a "multichoice" argument: every declared option
+    mapped to True/False, in declaration order.
 
-    Being a plain dict means `selection["mandible"]` works and no option is
-    ever missing, so a tool never needs `.get(name, False)`. `.selected` is
-    there for the common case of looping over what's enabled.
+    Being a plain dict, `selection["mandible"]` always works and no option is
+    ever missing, so a tool never needs `.get(name, False)`.
     """
 
     @property
@@ -105,16 +89,13 @@ class Selection(dict):
 
 
 class ResolvedPath(str):
-    """Local path handed to Tool.run() for a file/folder argument, tagged with
-    the declared type it was actually resolved as.
+    """Local path handed to run() for a file/folder argument, tagged with the
+    declared type it was resolved as.
 
-    This is what makes an argument accepting SEVERAL types usable: a tool
-    declaring `type=("csv_file", "folder")` branches on `input.kind` instead
-    of guessing from the extension or probing the filesystem.
-
-    It subclasses `str`, so it stays a plain path everywhere else -- `open()`,
-    `os.path.*`, `pandas.read_csv()` all work unchanged, and a tool that
-    declares a single type can keep ignoring `.kind` entirely.
+    This is what makes a multi-type argument usable: a tool declaring
+    `type=("csv_file", "folder")` branches on `input.kind` instead of guessing
+    from the extension. It subclasses `str`, so it stays a plain path
+    everywhere else and a single-type tool can ignore `.kind` entirely.
     """
 
     kind: str
@@ -134,90 +115,73 @@ class ArgSpec:
     # A scalar type (str, int, float, bool), one of FILE_TYPES's keys, or a
     # TUPLE of FILE_TYPES keys when the argument accepts several -- typically
     # ("csv_file", "folder") for "one file or a whole folder of them". run()
-    # then reads `<arg>.kind` to know which one it got (see ResolvedPath).
-    # Mixing a scalar with a file type is rejected at startup (check_schema).
+    # then reads `<arg>.kind` to know which it got (see ResolvedPath). Mixing a
+    # scalar with a file type is rejected at startup by check_schema.
     type: Union[type, str, tuple]
     required: bool = True
     description: str = ""
-    # Lets the caller pick a file already present on the server (see
-    # data_store.py) by sending its name as a plain form value.
-    # "model" -> DATA_DIR/<tool_name>/models/, "testfile" ->
-    # DATA_DIR/<tool_name>/testfiles/. None (default) means upload-only.
-    # On a file-typed argument the caller may still upload its own file
-    # instead; on a scalar (str) argument the server-side file is the ONLY
-    # option -- uploads for non-file arguments are rejected (see main.py).
-    # Either way run() receives a local path to the resolved file.
+
+    # Lets the caller pick a file already on the server (see data_store.py) by
+    # sending its name as a plain form value. "model" ->
+    # DATA_DIR/<tool>/models/, "testfile" -> DATA_DIR/<tool>/testfiles/. None
+    # means upload-only. On a file-typed argument the caller may still upload
+    # its own file; on a scalar argument the server-side file is the ONLY
+    # option (main.py rejects uploads for non-file arguments). run() receives a
+    # local path either way.
     server_selectable: Optional[str] = None
+
     # Required by "choice"/"multichoice", forbidden elsewhere: the available
-    # options, each mapped to whether it is on by default --
-    # {"mandible": True, "maxilla": True, "skull": False}. One declaration
-    # gives the client its widget AND supplies the default when the caller
-    # doesn't send the argument, so defaults never live in two places.
-    # "choice" declares exactly one True: the initially selected option.
+    # options, each mapped to whether it is on by default. One declaration
+    # gives the client its widget AND supplies the value used when the caller
+    # omits the argument, so defaults never live in two places. "choice"
+    # declares exactly one True.
     choices: Optional[dict] = None
-    # SCALAR arguments only (int/float/bool/str): the value a client should
-    # pre-fill its widget with. Published through GET /tools, so a spin box
-    # starts at the value the tool means rather than at Qt's 0 -- which is what
-    # sent surface_smoothing=0 on every AMASSS run whose user never touched the
-    # field, silently disabling the smoothing whose default reads 5 in run().
-    #
-    # Advisory, and NOT applied server-side: an omitted optional argument still
-    # falls through to run()'s own Python default, which stays the single source
-    # of truth for what happens. Keep the two equal.
-    #
-    # A choice/multichoice argument must NOT use this -- its initial state is
-    # already in `choices`, and `default` derives from it (check_schema rejects
-    # the combination).
+
+    # SCALAR arguments only: the value a client pre-fills its widget with, so a
+    # spin box starts at the tool's default rather than at Qt's 0. Advisory and
+    # NOT applied server-side -- an omitted optional argument still falls
+    # through to run()'s own Python default, which stays the source of truth.
+    # Keep the two equal. Forbidden on choice types, whose initial state is
+    # already in `choices`.
     initial: Any = None
 
     # ------------------------------------------------------------------
     # Presentation hints
     # ------------------------------------------------------------------
     # Published through GET /tools and read by the client's form generator;
-    # `validate()` and `run()` ignore every one of them. They exist because a
+    # validate() and run() ignore every one of them. They exist because a
     # schema that only says WHAT an argument is produces an unusable panel past
-    # a certain size: ASO declares 130 CBCT landmarks, 32 teeth, 8 landmark
-    # types and 2 jaws, which a generic client renders as one column of ~180
-    # check boxes with CBCT and IOS options interleaved -- while any given run
-    # uses one half or the other. The alternative was a hand-written Qt panel
-    # per tool, which puts the anatomy back inside the widget and makes "add a
-    # landmark server-side" a client release again.
-    #
-    # Nothing here names an anatomical concept: `groups` says what to group,
-    # `ui` says how to lay it out, `visible_when` says when it applies.
+    # a certain size: ASO declares 130 landmarks, 32 teeth, 8 landmark types
+    # and 2 jaws, which a generic client renders as one column of ~180 check
+    # boxes. Nothing here names an anatomical concept: `groups` says what to
+    # group, `ui` how to lay it out, `visible_when` when it applies.
 
-    # What a client shows as this argument's field label. None -> the client
-    # falls back to prettifying the argument NAME ("output_suffix" ->
-    # "Output suffix"), which is a guess, not a name anyone chose: it cannot
-    # produce "Scan / Landmark Folder" from `input`, and it renders an acronym
-    # as "Cbct landmarks". The vocabulary a user reads belongs with the tool
-    # that defines it, next to `description` and `choices`, not in a Qt widget.
+    # The field label. None means "prettify the argument name", which cannot
+    # produce "Scan / Landmark Folder" from `input` and renders an acronym as
+    # "Cbct landmarks". The words a user reads belong with the tool.
     label: Optional[str] = None
 
-    # The collapsible box this argument is rendered in. None -> the client's
-    # default section ("Inputs"), i.e. exactly what every tool does today.
+    # The collapsible box this argument is rendered in. None is the client's
+    # default section.
     section: Optional[str] = None
 
     # Show this argument only while other arguments hold given values:
-    # {"modality": "CBCT"} or {"modality": "CBCT", "automation": "Fully-Automated"}
-    # (every entry must match; a tuple/list of values means "any of these").
-    # The named arguments must be "choice" arguments of the same tool and the
-    # values must exist in their `choices` -- check_schema enforces both, so a
-    # typo fails at boot instead of hiding a field forever.
+    # {"modality": "CBCT", "automation": "Fully-Automated"} -- every entry must
+    # match, and a tuple/list of values means "any of these". The named
+    # arguments must be "choice" arguments of the same tool, enforced by
+    # check_schema so a typo fails at boot instead of hiding a field forever.
     #
-    # This is presentation only: a hidden argument is simply not sent, so the
-    # server applies its declared default. It does NOT replace the tool's own
-    # cross-argument validation, which still has to hold for a direct API call.
+    # Presentation only: a hidden argument is simply not sent, so its declared
+    # default applies. It does NOT replace the tool's own cross-argument
+    # validation, which still has to hold for a direct API call.
     visible_when: Optional[dict] = None
 
-    # How a "multichoice" argument's check boxes are laid out. None keeps the
-    # single-column stack. See UI_LAYOUTS for what each value means.
+    # How a "multichoice" argument's check boxes are laid out (see UI_LAYOUTS).
     ui: Optional[str] = None
 
     # {group name: (option, ...)} for the layouts that need it. Every option
     # must exist in `choices`; options left out of every group are rendered
-    # after the groups rather than dropped (check_schema only rejects the
-    # reverse -- a group naming an option that does not exist).
+    # after the groups rather than dropped.
     groups: Optional[dict] = None
 
     @property
@@ -246,7 +210,7 @@ class ArgSpec:
     def extensions(self) -> Optional[tuple]:
         """Every extension accepted across the declared file types, in
         declaration order. None means "no specific type declared" -- fall back
-        to the server-wide config.ALLOWED_EXTENSIONS whitelist.
+        to config.ALLOWED_EXTENSIONS.
         """
         accepted: list = []
         for declared in self.types:
@@ -257,11 +221,10 @@ class ArgSpec:
         return tuple(accepted)
 
     def match_type(self, extension: str) -> str:
-        """Which of the declared types an upload with this extension resolves to.
+        """Which declared type an upload with this extension resolves to.
 
-        Declaration order breaks ties: with type=("zip_file", "folder") a .zip
-        is handed over as an archive, with ("folder", "zip_file") it is
-        extracted first. Only meaningful on a file-typed argument.
+        Declaration order breaks ties: with ("zip_file", "folder") a .zip is
+        handed over as an archive, with ("folder", "zip_file") it is extracted.
         """
         extension = extension.lower()
         for declared in self.types:
@@ -271,12 +234,9 @@ class ArgSpec:
         return self.types[0]
 
     # NOTE: do not declare a `default` FIELD here. `default` is the @property
-    # defined above, which derives the value from `choices`; a field of the
-    # same name silently shadows it (the class body is evaluated top to bottom,
-    # and @dataclass turns the later assignment into an instance attribute
-    # defaulting to None). Every optional choice/multichoice argument then
-    # reaches run() as None instead of its declared default -- which is exactly
-    # what broke AMASSS's `merge` and example_tool's `outputs`.
+    # above, which derives the value from `choices`; a field of the same name
+    # silently shadows it, and every optional choice argument then reaches
+    # run() as None instead of its declared default.
 
 
 class ToolArgumentError(Exception):
@@ -284,16 +244,14 @@ class ToolArgumentError(Exception):
 
 
 class ToolUnavailableError(Exception):
-    """Raised when this SERVER cannot perform the request, though the request
-    itself is valid -- typically a dependency the deployment image does not
-    carry (see the lazy-import rule in ADDING_A_TOOL.md 7).
+    """Raised when this SERVER cannot perform an otherwise valid request --
+    typically a dependency the deployment image does not carry (see the
+    lazy-import rule in ADDING_A_TOOL.md 7).
 
-    It exists because the alternative is a generic 500. A crash inside a tool
-    is rightly opaque to the client: it can name server-side paths and leak
-    internals. "This server has no pytorch3d, so the IOS engine cannot run" is
-    the opposite -- it is the one thing the caller needs to be told, it names
-    nothing sensitive, and no amount of retrying or fixing their arguments will
-    help. main.py maps this to 501 Not Implemented with the message.
+    Distinct from a generic 500: a crash inside a tool is rightly opaque, but
+    "this server has no pytorch3d" is the one thing the caller needs to be
+    told, names nothing sensitive, and no retry will help. main.py maps it to
+    501 Not Implemented with the message.
     """
 
 
@@ -304,16 +262,16 @@ class ToolSchemaError(Exception):
 class Tool(ABC):
     name: str = ""
     arguments: dict = {}
-    # "text"              -> run() returns any JSON-serializable value
+    # "text"                -> run() returns any JSON-serializable value
     # "file"/"segmentation" -> run() returns the path of ONE output file
-    # "files"             -> run() returns a list of paths, or one directory
-    #                        path; main.py zips them and streams the archive
+    # "files"               -> run() returns a list of paths, or one directory
+    #                          path; main.py zips them and streams the archive
     output_kind: str = "text"
 
     def check_schema(self) -> None:
         """Reject an invalid `arguments` declaration. Called by registry.py at
-        startup, so a malformed tool fails loudly on boot instead of on the
-        first request that happens to hit it.
+        startup, so a malformed tool fails on boot instead of on the first
+        request that happens to hit it.
         """
         for arg_name, spec in self.arguments.items():
             where = f"Tool '{self.name}', argument '{arg_name}'"
@@ -340,10 +298,9 @@ class Tool(ABC):
     def _check_presentation(self, where: str, spec: ArgSpec) -> None:
         """Reject a presentation hint that cannot be honored.
 
-        These are checked at startup precisely BECAUSE they are cosmetic: a
-        wrong `visible_when` hides a field for good and a client has no way to
-        tell that from a field the tool never declared, so the failure is
-        silent everywhere else. Here it is a boot error naming the typo.
+        Checked at startup precisely BECAUSE these are cosmetic: a wrong
+        `visible_when` hides a field for good, and a client cannot tell that
+        from a field the tool never declared.
         """
         if spec.label is not None and (not isinstance(spec.label, str) or not spec.label.strip()):
             raise ToolSchemaError(
@@ -421,9 +378,8 @@ class Tool(ABC):
                 )
             return
 
-        # A choice argument's initial state is the True entry (or entries) of
-        # `choices`; a second declaration would be the two-places-for-one-default
-        # problem `initial` exists to remove.
+        # A choice argument's initial state is the True entry of `choices`; a
+        # second declaration would put one default in two places.
         if spec.initial is not None:
             raise ToolSchemaError(
                 f"{where}: 'initial' does not apply to {sorted(CHOICE_TYPES)} arguments -- "
@@ -442,8 +398,8 @@ class Tool(ABC):
                 raise ToolSchemaError(
                     f"{where}: choice '{name}' must map to True or False, got {enabled!r}."
                 )
-        # A combo box has exactly one selected entry, and that entry is also
-        # what run() gets when the caller omits an optional argument.
+        # A combo box has exactly one selected entry, which is also what run()
+        # gets when the caller omits an optional argument.
         if spec.types[0] == CHOICE_TYPE and sum(spec.choices.values()) != 1:
             raise ToolSchemaError(
                 f"{where}: a 'choice' argument declares exactly one option as True "
@@ -453,8 +409,8 @@ class Tool(ABC):
     def validate(self, args: dict) -> dict:
         """Check args against self.arguments; return cleaned/coerced args.
 
-        Raises ToolArgumentError on missing required args, unknown args, or
-        a type mismatch that can't be sensibly coerced.
+        Raises ToolArgumentError on missing required args, unknown args, or a
+        type mismatch that can't be sensibly coerced.
         """
         unknown = set(args) - set(self.arguments)
         if unknown:
@@ -470,8 +426,8 @@ class Tool(ABC):
                         f"Missing required argument '{arg_name}' for tool '{self.name}'"
                     )
                 # A choice argument already declared its default in `choices`,
-                # so hand that over rather than making the tool repeat it in
-                # run()'s signature, where the two would eventually drift.
+                # so hand that over rather than making run()'s signature repeat
+                # it, where the two would eventually drift.
                 if spec.is_choice:
                     cleaned[arg_name] = spec.default
                 continue
@@ -531,13 +487,13 @@ class Tool(ABC):
         return value
 
     def _coerce_multichoice(self, arg_name: str, value: Any, spec: ArgSpec) -> Selection:
-        """A subset of the declared options. Accepted on the wire as either a
-        JSON object -- {"mandible": true, "skull": false} -- or the shorthand
-        comma-separated list of the enabled ones -- "mandible,maxilla".
+        """A subset of the declared options, sent either as a JSON object --
+        {"mandible": true, "skull": false} -- or as the comma-separated
+        shorthand of the enabled ones -- "mandible,maxilla".
 
-        Whatever arrives is the COMPLETE selection: an option that isn't
-        mentioned is off, regardless of the default declared in `choices`.
-        Omitting the argument entirely is what falls back to those defaults.
+        Whatever arrives is the COMPLETE selection: an option not mentioned is
+        off, whatever `choices` declares. Omitting the argument entirely is
+        what falls back to those defaults.
         """
         if isinstance(value, dict):
             provided = value

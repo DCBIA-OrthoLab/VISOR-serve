@@ -5,18 +5,15 @@ fixed set of camera directions, runs a 2D UNet on each image, and projects the
 predicted mask back onto the faces that produced those pixels. This module
 builds the renderer and holds the camera directions.
 
-Ported from ALI_IOS_utils/{render,mask_renderer,agent}.py. **The camera
-directions are reproduced byte for byte, including their inconsistencies** --
-several are divided by the norm of a *different* vector than the one being
-normalized, so the resulting directions are not unit length. That is not a
-typo to fix: the shipped weights were trained on the views these exact
-vectors produce, and "correcting" them silently changes every prediction.
+Ported from ALI_IOS_utils/{render,mask_renderer,agent}.py. The camera
+directions are reproduced byte for byte INCLUDING their inconsistencies:
+several are divided by the norm of a different vector than the one being
+normalized, so they are not unit length. That is not a typo to fix -- the
+shipped weights were trained on the views these exact vectors produce.
 
 pytorch3d is imported inside the functions that need it. It has no PyPI
-distribution at all and must be compiled into the deployment image, so on a
-server without it ALI still loads, still publishes its schema, and only an
-IOS run fails -- with a message naming what is missing. The CBCT engine is
-unaffected.
+distribution and must be compiled into the deployment image, so on a server
+without it ALI still loads and publishes its schema, and only an IOS run fails.
 """
 
 import numpy as np
@@ -146,10 +143,6 @@ def tooth_center(labels, vertices, tooth_number: int, device):
     cameras dutifully rendered the middle of the palate and the network was
     asked to find a cusp in it.
     """
-    from ..ALI_CBCT.brain import import_torch
-
-    torch = import_torch()
-
     label_table = labels[0]
     matches = (label_table == int(tooth_number)).nonzero(as_tuple=True)[0]
     if len(matches) == 0:

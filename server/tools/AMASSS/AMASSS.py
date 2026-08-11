@@ -18,13 +18,12 @@ from .src import AMASSSLogic
 class AMASSSTool(Tool):
     name = "AMASSS"
     arguments = {
-        # One argument, two use cases: a single scan, or a whole folder of them
-        # for a batch (sent as a .zip). The FILE type is declared first, like
-        # example_tool's ("csv_file", "folder"): GET /tools publishes types[0]
-        # as `type`, and a client keys its file picker -- and its own schema
-        # check -- off it, so leading with "folder" makes the argument look like
-        # a non-file one client-side. A .zip therefore reaches run() as an
-        # archive; discover_scans unpacks it.
+        # One argument, two use cases: a single scan, or a folder of them for a
+        # batch (sent as a .zip). The FILE type is declared FIRST because
+        # GET /tools publishes types[0] as `type` and a client keys its file
+        # picker off it -- leading with "folder" makes the argument look like a
+        # non-file one. A .zip therefore reaches run() as an archive, which
+        # discover_scans unpacks.
         "input": ArgSpec(
             type=("volume_or_zip_file", "folder"),
             required=True,
@@ -58,11 +57,10 @@ class AMASSSTool(Tool):
             description="Anatomical structures to segment",
         ),
         # "multichoice", NOT "choice": both forms may be selected at once, and
-        # the two types hand run() different values -- a Selection dict here,
-        # a bare option-name string for "choice". This shipped as "choice"
-        # once: the string fell through _codes_from's iterable branch as a
-        # tuple of CHARACTERS, no merge mode ever matched, and every run
-        # "succeeded" with a report and zero segmentation files.
+        # the two types hand run() different values (a Selection dict here, a
+        # bare string for "choice"). This shipped as "choice" once, and the
+        # string fell through _codes_from's iterable branch as a tuple of
+        # CHARACTERS: every run "succeeded" with zero segmentation files.
         "merge": ArgSpec(
             type="multichoice",
             required=False,
@@ -95,20 +93,11 @@ class AMASSSTool(Tool):
             description="Smoothing iterations for the surfaces (0-95), ignored without generate_surface",
         ),
         # Marching cubes runs on the original scan grid, so a 0.33mm CBCT gives
-        # a triangle per voxel face: 1.6M for a cranial base, 3.5M across a
-        # five-structure run, 11.8M for a merged nine-structure volume. Nothing
-        # downstream can use that -- it is minutes of parsing in a viewer and
-        # hundreds of MB on the wire -- and it is not real detail either, since
-        # the mask underneath is only accurate to about half a voxel.
-        #
-        # 90 drops nine triangles in ten and moves the cranial-base surface by
-        # 0.059mm on average (p95 0.171mm, max 0.692mm), against a 0.33mm voxel.
-        # Set it to 0 for the raw marching-cubes mesh.
-        #
-        # `initial` must match the Python default below: a form always sends
-        # every widget, so the default in run() is never what reaches the tool
-        # (this is exactly how surface_smoothing shipped unsmoothed, see the
-        # note above it).
+        # a triangle per voxel face: 3.5M across a five-structure run. That is
+        # minutes of parsing in a viewer for detail the mask does not have, it
+        # being accurate to about half a voxel. 90 drops nine triangles in ten
+        # and moves the cranial-base surface by 0.059mm on average (max
+        # 0.692mm); 0 keeps the raw mesh. `initial` must match run()'s default.
         "surface_decimation": ArgSpec(
             type=int,
             required=False,

@@ -38,7 +38,7 @@ from ..markups import write as write_markups
 from . import landmarks as catalog
 from . import preprocess
 from .agent import AGENT_FOV, MOVEMENT_COUNT, Agent, NotFound
-from .brain import Brain, import_torch
+from .brain import Brain, import_torch, resolve_device
 
 logger = logging.getLogger("ALI.cbct")
 if not logger.handlers:
@@ -64,21 +64,6 @@ def search_budget(device: str) -> float:
     if settings.ALI_SEARCH_MAX_SECONDS is not None:
         return float(settings.ALI_SEARCH_MAX_SECONDS)
     return _DEFAULT_BUDGET_SECONDS["cuda" if device.startswith("cuda") else "cpu"]
-
-
-def resolve_device(requested: str = None) -> str:
-    """The device to actually use, falling back to CPU when CUDA is absent.
-
-    Read from settings rather than decided by `torch.cuda.is_available()` deep
-    in the code -- which the original did independently in five modules, so a
-    server configured for CPU still used a card that happened to be present.
-    """
-    torch = import_torch()
-    wanted = (requested or settings.DEVICE or "cpu").strip().lower()
-    if wanted.startswith("cuda") and not torch.cuda.is_available():
-        logger.warning("DEVICE=%s requested but CUDA is unavailable; falling back to CPU", wanted)
-        return "cpu"
-    return wanted
 
 
 def check_dependencies() -> None:
@@ -160,21 +145,18 @@ def requested_landmarks(weights: dict, regions, landmarks=()):
     """(runnable, without_model, ungrouped) for a bundle and a selection.
 
     "Requested" is every catalog landmark of the selected regions, plus any
-    landmark the bundle itself provides whose region is selected -- so weights
-    published for a landmark this catalog has not heard of are not silently
-    ignored: they surface as `ungrouped`.
+    landmark the bundle provides whose region is selected -- so weights for a
+    landmark this catalog has not heard of surface as `ungrouped` rather than
+    being silently ignored.
 
-    **An explicit `landmarks` list replaces the regions entirely**, rather than
-    narrowing them. That is what lets a caller ask for exactly the points it
-    needs: ASO's fully-automated CBCT mode registers on seven
-    (Ba, S, N, RPo, LPo, ROr, LOr) which straddle two regions, so going through
-    `regions` would run 58 agents to use 7 -- and one agent is a full two-scale
-    walk of the volume. Narrowing instead of replacing would give the same
-    answer here only because ASO leaves the regions at their all-on default;
-    it would silently drop landmarks for any caller that set both.
+    An explicit `landmarks` list REPLACES the regions rather than narrowing
+    them, which is what lets a caller ask for exactly the points it needs: ASO
+    registers on seven landmarks straddling two regions, so going through
+    `regions` would run 58 agents to use 7. Narrowing would agree here only
+    because ASO leaves the regions all on, and would silently drop landmarks
+    for any caller that set both.
 
-    Empty (the default) means "not specified" and leaves the regions in charge,
-    which is every request that predates this argument.
+    Empty (the default) means "not specified" and leaves the regions in charge.
     """
     regions = set(regions)
     ungrouped = []

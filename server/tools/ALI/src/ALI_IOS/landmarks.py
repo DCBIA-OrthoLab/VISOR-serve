@@ -7,17 +7,13 @@ it is pointed at:
   cusps (`O`, `MB`, `DB`);
 * **Cervical** (`C`) -- the cervical lingual and buccal points (`CL`, `CB`).
 
-The original Slicer UI also offered `R`, `RIP` and `OIP` under "Cervical".
-They are deliberately absent: no shipped model predicts them, they are not in
-the type list either CLI uses, and ticking them did nothing at all -- neither
-selecting a network nor producing a label. An option that cannot work is worse
-than an option that is not offered.
+`R`, `RIP` and `OIP` were offered by the Slicer UI and are deliberately absent
+here: no shipped model predicts them, and ticking them did nothing at all.
 """
 
-# Teeth in Universal numbering, per jaw. Upper is 2..15 right-to-left, lower
-# is 18..31 left-to-right; the ALIDDM weights index their label tables this
-# way, so the order is part of the models' contract, not a presentation
-# choice.
+# Teeth in Universal numbering, per jaw. Upper is 2..15 right-to-left, lower is
+# 18..31 left-to-right; the weights index their label tables this way, so the
+# order is part of the models' contract, not a presentation choice.
 UPPER_TEETH = ["UL7", "UL6", "UL5", "UL4", "UL3", "UL2", "UL1",
                "UR1", "UR2", "UR3", "UR4", "UR5", "UR6", "UR7"]
 LOWER_TEETH = ["LL7", "LL6", "LL5", "LL4", "LL3", "LL2", "LL1",
@@ -72,9 +68,9 @@ JAWS = ("Upper", "Lower")
 def network_codes(selection) -> tuple:
     """Turn what `run()` received for `ios_networks` into network codes.
 
-    Accepts a `base.Selection` (the normal HTTP path), None for an omitted
-    optional argument, or a plain sequence of codes so the engine stays
-    callable by another server-side tool.
+    Accepts a `base.Selection` (the HTTP path), None for an omitted optional
+    argument, or a plain sequence of codes, so the engine stays callable by
+    another server-side tool.
     """
     if selection is None:
         return NETWORK_CODES

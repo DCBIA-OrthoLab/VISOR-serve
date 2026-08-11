@@ -1,16 +1,12 @@
 """The CBCT landmark vocabulary: which landmarks exist, and how they group.
 
 This is the single source of truth the schema publishes through `choices` and
-the engine validates against. The original had two copies that disagreed --
-the Slicer UI listed the impacted-canine landmarks as `UR3OI/UL3OI/UR3RI/UL3RI`
-while the CLI's tables spelled them `UR3OIP/UL3OIP/UR3RIP/UL3RIP` -- and the
-consequence was not a mislabelled point but a lost patient: `LABEL_GROUPS[...]`
-was indexed with no guard inside the save loop, so one unrecognized name raised
-a KeyError caught far above and *nothing at all* was written for that scan,
-including the landmarks that had been found correctly.
-
-Both spellings are accepted here (see `_ALIASES`) so either packaging of the
-weights resolves, and `group_of()` never raises.
+the engine validates against. The original had two copies that disagreed on the
+impacted-canine spelling (`UR3OI` vs `UR3OIP`), and the cost was a lost patient
+rather than a mislabelled point: an unguarded `LABEL_GROUPS[...]` in the save
+loop raised a KeyError caught far above, so nothing at all was written for that
+scan. Both spellings are accepted here (see `_ALIASES`) and `group_of()` never
+raises.
 """
 
 # Anatomical region -> the landmarks it contains. Region codes are the ones
@@ -72,15 +68,10 @@ LABEL_GROUPS.update({alias: LABEL_GROUPS[canonical] for alias, canonical in _ALI
 
 LABELS = tuple(label for labels in GROUP_LABELS.values() for label in labels)
 
-# What the schema publishes for the `landmarks` argument: every catalog
-# landmark, all off. "All off" is what "not specified" looks like for a
-# multichoice -- an omitted argument arrives as its declared defaults -- and it
-# is the state that hands the decision back to `cbct_regions`.
-#
-# Off rather than on, unlike REGION_CHOICES, and the asymmetry is deliberate:
-# a region left off is one the user never discovers, whereas 119 landmarks all
-# on would mean every panel that never touches this field silently overrides
-# the region selection with "all 119".
+# Every catalog landmark, all off. "All off" is what "not specified" looks like
+# for a multichoice, and it hands the decision back to `cbct_regions`. Off
+# rather than on, unlike REGION_CHOICES: 119 landmarks all on would mean every
+# panel that never touches this field silently overrides the region selection.
 LANDMARK_CHOICES = {label: False for label in LABELS}
 
 # The two spacings the agent walks, coarse first. The scale key is the spacing
@@ -91,11 +82,10 @@ SCALE_SPACINGS = (1.0, 0.3)
 # Region code -> a name a human reads. Used for the run report only.
 REGION_DISPLAY_NAMES = {code: display for display, code in REGION_NAMES.items()}
 
-# The tabs a client lays the 119 `landmarks` check boxes out in -- the SAME
+# The tabs a client lays the 119 `landmarks` check boxes out in: the SAME
 # grouping the engine names its output files by, published rather than
-# restated, so a landmark added to GROUP_LABELS appears in its own tab with no
-# client release. Regions in REGION_NAMES order, not GROUP_LABELS order, so the
-# tabs read in the order the region check boxes above them do.
+# restated, so a landmark added to GROUP_LABELS gets its tab with no client
+# release. In REGION_NAMES order, so the tabs read like the check boxes above.
 LANDMARK_GROUPS = {
     display: tuple(GROUP_LABELS[code]) for display, code in REGION_NAMES.items()
 }
@@ -118,22 +108,18 @@ def canonical(label: str) -> str:
 
 
 def group_of(label: str) -> str:
-    """The region a landmark belongs to, or "Other" for a name this
-    vocabulary does not know.
-
-    Never raises. The unguarded lookup this replaces is what cost a patient
-    every one of their landmarks when a bundle carried an unfamiliar name.
-    """
+    """The region a landmark belongs to, or "Other" for an unknown name. Never
+    raises: the unguarded lookup this replaces cost a patient every one of
+    their landmarks when a bundle carried an unfamiliar name."""
     return LABEL_GROUPS.get(label, UNGROUPED)
 
 
 def region_codes(selection) -> tuple:
     """Turn what `run()` received for `cbct_regions` into region codes.
 
-    Accepts the three shapes that legitimately reach here: a `base.Selection`
-    (the normal HTTP path), None for an omitted optional argument, or a plain
-    sequence of codes so the engine stays callable by another server-side tool
-    without knowing the display names exist.
+    Accepts a `base.Selection` (the HTTP path), None for an omitted optional
+    argument, or a plain sequence of codes, so the engine stays callable by
+    another server-side tool that does not know the display names.
     """
     if selection is None:
         return REGION_CODES
@@ -149,13 +135,9 @@ def region_codes(selection) -> tuple:
 def landmark_names(selection) -> tuple:
     """Turn what `run()` received for `landmarks` into canonical label names.
 
-    Empty is the normal case and means "not specified": the caller said nothing
-    about individual landmarks, so `cbct_regions` decides. Same three accepted
-    shapes as `region_codes`, for the same reason -- another server-side tool
-    drives this engine with a plain list.
-
-    Aliases are resolved here (`UR3OI` -> `UR3OIP`) so a caller may use either
-    spelling; the weights are only ever packaged under the canonical one.
+    Empty is the normal case and means "not specified": `cbct_regions` decides.
+    Same accepted shapes as `region_codes`. Aliases are resolved here
+    (`UR3OI` -> `UR3OIP`), the weights only ever using the canonical spelling.
     """
     if selection is None:
         return ()

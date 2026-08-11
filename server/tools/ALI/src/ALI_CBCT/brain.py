@@ -15,6 +15,7 @@ import logging
 import sys
 
 from base import ToolUnavailableError
+from config import settings
 
 logger = logging.getLogger("ALI.cbct.brain")
 if not logger.handlers:
@@ -43,6 +44,22 @@ def import_torch():
     except ImportError as exc:  # pragma: no cover - depends on the deployment
         raise ToolUnavailableError(f"{_INSTALL_HINT} (missing: torch)") from exc
     return torch
+
+
+def resolve_device(requested: str = None) -> str:
+    """The device to actually use, falling back to CPU when CUDA is absent.
+
+    Read from settings rather than decided by `torch.cuda.is_available()` deep
+    in the code -- which the original did independently in five modules, so a
+    server configured for CPU still used a card that happened to be present.
+    Shared by both engines.
+    """
+    torch = import_torch()
+    wanted = (requested or settings.DEVICE or "cpu").strip().lower()
+    if wanted.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning("DEVICE=%s requested but CUDA is unavailable; falling back to CPU", wanted)
+        return "cpu"
+    return wanted
 
 
 def _import_monai_densenet():

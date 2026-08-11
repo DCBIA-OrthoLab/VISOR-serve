@@ -1,24 +1,19 @@
 """ALI's dispatcher: work out what the input is, then run the right engine.
 
 ALI is one tool with two engines that share nothing but their output format.
-Which one applies is decided **here, from the data**, not from an argument the
-caller sets:
+Which applies is decided HERE, from the data, not from an argument: a `.zip`
+can hold either kind, a DICOM series has no extension at all, and a user who
+has to declare what they just sent can declare it wrong -- at which point the
+error arrives minutes into a GPU run rather than at the door.
 
-* a `.zip` can hold either kind, so its extension says nothing;
-* a DICOM series has no extension at all;
-* and a user who has to tell the server what they just gave it can tell it
-  wrong, at which point the error arrives several minutes into a GPU run
-  rather than at the door.
+Everything before inference lives here (unpacking, DICOM conversion, mode
+detection, crown segmentation for unlabelled meshes, the run report), so
+`ALI_CBCT/` and `ALI_IOS/` only have to know how to place landmarks.
 
-Everything before inference lives here -- unpacking, DICOM conversion, mode
-detection, crown segmentation for unlabelled meshes, and the run report --
-so that `ALI_CBCT/` and `ALI_IOS/` only have to know how to place landmarks.
-
-The one thing the schema cannot say is "this argument only applies in mode X".
-Both selections are therefore optional and both are always shown by the
-client; an empty selection for the mode that actually ran is a
-`ToolArgumentError`, which main.py turns into a 422 naming the argument to
-fill in. That 422 is how a mode mismatch explains itself.
+The schema cannot say "this argument only applies in mode X", so both
+selections are optional and both are always shown. An empty selection for the
+mode that actually ran raises `ToolArgumentError` -> 422 naming the argument to
+fill in, which is how a mode mismatch explains itself.
 """
 
 import json

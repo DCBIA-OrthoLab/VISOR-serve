@@ -47,11 +47,9 @@ os.makedirs(settings.TEMP_DIR, exist_ok=True)
 async def _reaper_loop() -> None:
     """Sweep expired transfer directories for as long as the server runs.
 
-    A timer, not only the opportunistic sweep transfer.py already does when a
-    session is created: the case where an abandoned upload or an undownloaded
-    result sits longest is exactly the case where no new request comes in to
-    trigger that sweep. On a server holding confidential imaging, "cleaned up
-    the next time somebody happens to use it" is not a bound.
+    A timer, not only the opportunistic sweep transfer.py does when a session
+    is created: an abandoned upload sits longest exactly when no new request
+    comes in to trigger that sweep.
     """
     while True:
         await anyio.sleep(settings.TRANSFER_SWEEP_SECONDS)
@@ -68,9 +66,8 @@ async def _lifespan(_app: FastAPI):
         try:
             yield
         finally:
-            # The loop never returns on its own; cancelling the scope is how it
-            # ends, and without this the task group waits for it forever on
-            # shutdown.
+            # The loop never returns on its own: without this cancel the task
+            # group would wait for it forever on shutdown.
             task_group.cancel_scope.cancel()
 
 
@@ -95,17 +92,15 @@ _ACCEPT_ALL_EXTENSIONS = "*"
 _UPLOADS_FIELD = "__uploads__"
 
 # Sent by a client that would rather be handed a reference to the result and
-# fetch the bytes itself, over as many parallel range requests as it wants,
-# than have them streamed down the same connection that carried the run. A
-# client that does not send it gets exactly the response it always got.
+# fetch the bytes over parallel range requests. A client that does not send it
+# gets exactly the response it always got.
 _RESULT_DELIVERY_HEADER = "X-Result-Delivery"
 _DELIVER_BY_REFERENCE = "reference"
 
-# Caps how many tool executions run at once (see settings.MAX_CONCURRENT_TOOLS).
-# Dedicated to tool runs only, so waiting inference jobs can never starve the
-# threadpool used for everything else (sync endpoints, background cleanup).
-# Created lazily on first use: anyio requires a running event loop to
-# instantiate a CapacityLimiter, so it can't be built at import time.
+# Caps how many tool executions run at once (settings.MAX_CONCURRENT_TOOLS).
+# Dedicated to tool runs, so waiting inference jobs never starve the threadpool
+# used for everything else. Created lazily: anyio needs a running event loop to
+# instantiate a CapacityLimiter.
 _tool_limiter: Optional[anyio.CapacityLimiter] = None
 
 
@@ -232,9 +227,9 @@ def _discard(work_dir: Optional[str], scratch_dirs: list) -> None:
 
 def _media_type_of(path: str) -> str:
     """Content-Type for a file about to be streamed. Derived from the real
-    extension so an .xlsx is never mislabeled as a generic zip (see the
-    2026-07-24 changelog entry); the gzip/octet-stream fallback covers bare
-    .gz files (e.g. .nii.gz), which mimetypes cannot name."""
+    extension so an .xlsx is never mislabeled as a generic zip; the
+    gzip/octet-stream fallback covers bare .gz files (e.g. .nii.gz), which
+    mimetypes cannot name."""
     media_type, _ = mimetypes.guess_type(str(path))
     if media_type is None:
         media_type = "application/gzip" if str(path).endswith(".gz") else "application/octet-stream"
@@ -242,12 +237,8 @@ def _media_type_of(path: str) -> str:
 
 
 def _human_bytes(size: int) -> str:
-    """Byte count in the largest unit that keeps it readable.
-
-    Logged alongside the exact figure, never instead of it: the round number
-    is what a human scans for, the exact one is what stays greppable and
-    comparable across requests.
-    """
+    """Byte count in the largest unit that keeps it readable. Logged alongside
+    the exact figure, never instead of it."""
     value = float(size)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024 or unit == "TB":
@@ -259,13 +250,10 @@ def _log_served(tool_name: str, start_time: float, received: int, sent: Optional
     """One line per successfully served request.
 
     Called at each return point rather than before them, so `duration` covers
-    packing the response too -- zipping a multi-GB segmentation is not free,
-    and a duration that stopped at the end of run() understated the request by
-    however long that took.
-
-    `sent` is None for a "text" tool: its result travels as JSON and no output
-    file exists to measure. Nothing here may name a file, an argument value,
-    or any patient metadata (see the note at the top of this module).
+    packing the response too -- zipping a multi-GB segmentation is not free.
+    `sent` is None for a "text" tool, whose result travels as JSON. Nothing
+    here may name a file, an argument value, or patient metadata (see the note
+    at the top of this module).
     """
     duration = time.monotonic() - start_time
     sent_field = (
@@ -301,14 +289,10 @@ def health() -> dict:
 def _extensions_of(spec) -> Optional[dict]:
     """{type name: [extension, ...]} for every file type an argument accepts.
 
-    Published so a client never has to mirror FILE_TYPES: a type name does not
-    reliably spell out its extensions ("nifti_file" is .nii/.nii.gz,
-    "volume_or_zip_file" is seven of them), so a client guessing from the name
-    alone gets them wrong the moment a type is added here.
-
-    Keyed by type rather than flattened because the caller needs the split:
-    the extensions of "folder" are what a zipped folder may be uploaded as,
-    not what its file picker should offer.
+    Published so a client never has to mirror FILE_TYPES. Keyed by type rather
+    than flattened because the caller needs the split: the extensions of
+    "folder" are what a zipped folder may be uploaded as, not what its file
+    picker should offer.
     """
     per_type = {}
     for declared in spec.types:
@@ -336,37 +320,26 @@ def list_tools() -> list:
                     "description": spec.description,
                     "server_selectable": spec.server_selectable,
                     # For "choice"/"multichoice": the options to render, each
-                    # with its initial state. None for every other type.
+                    # with its initial state. null for every other type.
                     "choices": spec.choices,
                     # For a SCALAR argument: the value a client should pre-fill
                     # its widget with, so a spin box does not start at Qt's 0
-                    # while the tool's own default reads 5. null when the tool
-                    # declares none, and for choice types (whose initial state
-                    # is in "choices" above).
+                    # while the tool's own default reads 5.
                     "initial": spec.initial,
-                    # {type name: accepted extensions} for the file types
-                    # above, so a client can build a file dialog's filters
-                    # without a copy of FILE_TYPES hardcoded on its side --
-                    # and without drifting when this table changes. null for
-                    # a type the server does not restrict (the generic
-                    # "file", which falls back to ALLOWED_EXTENSIONS), and
-                    # None for an argument that takes no file at all.
+                    # {type name: accepted extensions}, so a client builds its
+                    # file dialog filters without a copy of FILE_TYPES on its
+                    # side. null for the generic "file" type (which falls back
+                    # to ALLOWED_EXTENSIONS) and for a non-file argument.
                     "extensions": _extensions_of(spec),
-                    # Presentation hints (see ArgSpec). Purely about how a
-                    # client should lay this argument out and when to show it;
-                    # every one of them is null on a tool that declares none,
-                    # which is what keeps a client's default rendering the
-                    # rendering every existing tool already gets.
-                    # The field label. null means "prettify the argument name",
-                    # which is what every client already did on its own -- so a
-                    # tool declaring none renders exactly as before.
+                    # Presentation hints (see ArgSpec): how a client lays this
+                    # argument out and when to show it. All null on a tool that
+                    # declares none, so its panel renders exactly as before.
                     "label": spec.label,
                     "section": spec.section,
                     "visible_when": spec.visible_when,
                     "ui": spec.ui,
-                    # Tuples would serialize as JSON arrays anyway; listed
-                    # explicitly so the wire shape does not depend on how a
-                    # tool happened to spell its catalog.
+                    # Listed explicitly so the wire shape does not depend on
+                    # whether a tool spelled its catalog as a tuple or a list.
                     "groups": (
                         {name: list(options) for name, options in spec.groups.items()}
                         if spec.groups
@@ -408,16 +381,14 @@ def _remove_path(path: str) -> None:
 
 @app.get("/tools/{tool_name}/testfiles/{filename}", dependencies=[Depends(verify_token)])
 async def download_testfile(tool_name: str, filename: str, background_tasks: BackgroundTasks):
-    """Stream one of the tool's hosted test files to the client, so a user can
-    fill an input with reference data instead of hunting for a scan of their
-    own. The valid names are what GET /tools/{tool_name}/data lists.
+    """Stream one of the tool's hosted test files, so a user can fill an input
+    with reference data. The valid names are what GET /tools/{name}/data lists.
 
     Only test files are downloadable. Models are deliberately NOT: they are
-    selected by name and used in place (see ArgSpec.server_selectable), and
-    nothing a client does should ever pull one off the server.
+    selected by name and used in place (see ArgSpec.server_selectable).
 
-    A test entry that is a FOLDER is zipped on the fly — one response carries
-    one blob — and the client unpacks it back into a directory on its side.
+    A test entry that is a FOLDER is zipped on the fly and the client unpacks
+    it back into a directory on its side.
     """
     start_time = time.monotonic()
     try:
@@ -487,10 +458,10 @@ def _transfer_error(exc: transfer.TransferError) -> HTTPException:
 async def create_upload(spec: _NewUpload) -> dict:
     """Open a session the client then fills with parallel PUTs.
 
-    Answering with `chunk_size` rather than accepting the client's is what
-    keeps the layout single-sourced: part n is always
-    `[n * chunk_size, (n+1) * chunk_size)`, and both sides compute it from the
-    one number returned here.
+    Answering with `chunk_size` rather than accepting the client's keeps the
+    layout single-sourced: part n is always
+    `[n * chunk_size, (n+1) * chunk_size)`, computed by both sides from the one
+    number returned here.
     """
     try:
         session = await anyio.to_thread.run_sync(
@@ -529,12 +500,10 @@ async def upload_status(upload_id: str) -> dict:
 async def upload_part(upload_id: str, index: int, request: Request) -> dict:
     """Receive one part, verify it, write it at its offset.
 
-    The body is the raw bytes, no multipart framing, because there is exactly
-    one thing in it and parsing a boundary out of a 8 MB body buys nothing.
-    `Content-Encoding: gzip` is honoured for inputs that are not already
-    compressed (an uncompressed .nii or a .vtk mesh is 3-4x smaller deflated,
-    which on a remote link is 3-4x less time), and `X-Part-SHA256` is checked
-    against what lands on disk either way.
+    The body is the raw bytes, no multipart framing: there is exactly one thing
+    in it. `Content-Encoding: gzip` is honoured for inputs not already
+    compressed (an uncompressed .nii or .vtk is 3-4x smaller deflated), and
+    `X-Part-SHA256` is checked against what lands on disk either way.
     """
     body = await request.body()
     if request.headers.get("Content-Encoding", "").lower() == "gzip":
@@ -575,9 +544,8 @@ async def download_result(result_id: str, request: Request):
     """Serve a stored result, honouring `Range`.
 
     That header is the whole point: it lets the client pull one file down over
-    several connections at once, which on a long-haul link is the difference
-    between one congestion window's worth of throughput and several. A client
-    that sends no Range still gets the entire file in one response.
+    several connections at once. A client that sends no Range still gets the
+    entire file in one response.
     """
     try:
         stored = await anyio.to_thread.run_sync(transfer.get_result, result_id)
@@ -623,8 +591,8 @@ async def download_result(result_id: str, request: Request):
 @app.delete("/results/{result_id}", dependencies=[Depends(verify_token)])
 async def delete_result(result_id: str) -> dict:
     """Sent by a client that has the whole file. Not required for correctness
-   , the reaper collects what is never claimed, but it is what keeps TEMP_DIR
-    flat under load instead of holding every result for the full TTL."""
+    -- the reaper collects what is never claimed -- but it keeps TEMP_DIR flat
+    under load instead of holding every result for the full TTL."""
     await anyio.to_thread.run_sync(transfer.discard_result, result_id)
     return {"status": "ok"}
 
@@ -666,10 +634,9 @@ def _checked_extension(tool, field_name: str, filename: str) -> str:
 
 
 def _reject_upload_for_scalar(spec, field_name: str) -> None:
-    """A scalar-typed argument must never arrive as a file -- e.g. a
-    server-side-only model (ArgSpec(type=str, server_selectable="model")) is
-    selected by name, never sent by the client. Without this check the
-    uploaded file's temp path would be silently passed through as the
+    """A scalar-typed argument must never arrive as a file: a server-side-only
+    model (ArgSpec(type=str, server_selectable="model")) is selected by name.
+    Without this check the uploaded file's temp path would silently become the
     argument's string value."""
     if spec is not None and not spec.is_file:
         raise HTTPException(
@@ -700,11 +667,9 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     # Generic argument collection: whatever scalar fields and/or files the
-    # caller sends, regardless of which tool it targets. Each uploaded file
-    # is matched to the tool's argument of the same name (a tool can declare
-    # several "file"-typed arguments, e.g. "fixed_image" + "moving_image").
-    # The tool's own schema (validated in tool.invoke) decides what is
-    # actually accepted.
+    # caller sends, whichever tool it targets. Each uploaded file is matched to
+    # the tool's argument of the same name; the tool's own schema (validated in
+    # tool.invoke) decides what is actually accepted.
     form = await request.form()
     args: dict = {}
     uploaded_files: dict = {}
@@ -719,11 +684,11 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     # before `args` is looked at, so it can never reach a tool as an argument.
     upload_references = _upload_references(args.pop(_UPLOADS_FIELD, None))
 
-    # An argument declared with ArgSpec(server_selectable=...) can be sent as
-    # a plain form value (the file name) instead of an upload -- resolved
-    # below into a path already present on the server (see data_store.py).
-    # Pulled out of `args` before the upload loop below so a genuinely
-    # uploaded file for the same field name is never mistaken for one.
+    # An argument declared with ArgSpec(server_selectable=...) can be sent as a
+    # plain form value (the file name) instead of an upload, resolved below
+    # into a path already on the server (see data_store.py). Pulled out of
+    # `args` before the upload loop so a genuine upload for the same field name
+    # is never mistaken for one.
     server_file_args: dict = {}
     for field_name in list(args):
         spec = tool.arguments.get(field_name)
@@ -752,10 +717,9 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                     detail=f"File exceeds the {settings.MAX_UPLOAD_MB} MB limit.",
                 )
             input_paths.append(input_path)
-            # An argument can accept several types (e.g. ("csv_file", "folder")):
-            # decide here which one this upload actually is, and hand run() a
-            # path tagged with it. A "folder" arrives zipped and is unpacked
-            # now, so the tool only ever sees a directory.
+            # An argument can accept several types (e.g. ("csv_file",
+            # "folder")): decide here which one this upload is and tag the path
+            # with it. A "folder" arrives zipped and is unpacked now.
             args[field_name] = await _as_resolved_path(
                 spec, input_path, extension, work_dir, field_name
             )
@@ -779,10 +743,10 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                 spec, input_path, extension, work_dir, field_name
             )
     except HTTPException:
-        # Nothing has been queued for cleanup yet, and no response will stream,
-        # so the work dir has to go now. The sessions that were never claimed
-        # go too: the reaper would get them eventually, but "eventually" is a
-        # TTL's worth of confidential imaging sitting on disk.
+        # Nothing is queued for cleanup yet and no response will stream, so the
+        # work dir goes now. So do the unclaimed sessions: the reaper would get
+        # them eventually, but that is a TTL's worth of confidential imaging
+        # sitting on disk.
         if work_dir:
             shutil.rmtree(work_dir, ignore_errors=True)
         for upload_id in upload_references.values():
@@ -825,12 +789,11 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
 
     try:
         # Run the tool in a worker thread, NOT on the event loop: tool.invoke
-        # is synchronous CPU-bound work (model loading, inference) and would
-        # otherwise freeze the whole server -- even /health -- for its entire
-        # duration. Offloaded like this, requests are served fully in
-        # parallel, bounded by MAX_CONCURRENT_TOOLS. Tools are safe to run
-        # concurrently: they are stateless (everything arrives via args),
-        # each request gets its own work_dir, and DATA_DIR is read-only.
+        # is synchronous CPU-bound work and would otherwise freeze the whole
+        # server -- even /health -- for its entire duration. Concurrency is
+        # bounded by MAX_CONCURRENT_TOOLS and safe: tools are stateless
+        # (everything arrives via args), each request gets its own work_dir,
+        # and DATA_DIR is read-only.
         result = await anyio.to_thread.run_sync(
             tool.invoke, args, limiter=_get_tool_limiter()
         )
@@ -838,10 +801,9 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
     except ToolUnavailableError as exc:
-        # The request is fine; this deployment cannot serve it (a dependency
-        # the image does not carry). 501, not 500: nothing the caller changes
-        # will help, and unlike a crash the reason is exactly what they need to
-        # read -- it names a missing package, never a path or patient data.
+        # The request is fine; this deployment cannot serve it (a dependency the
+        # image does not carry). 501 rather than 500: nothing the caller changes
+        # will help, and the reason names a missing package, never a path.
         logger.warning("endpoint=/run/%s status=501", tool_name)
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc))
@@ -868,11 +830,10 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
 
         # A tool whose inputs all came from the read-only data store writes its
-        # output in its own scratch dir under TEMP_DIR instead of the upload
-        # work dir: those folders have to be cleaned up as well, whether the
-        # response goes out or the packing below fails. `scratch_dirs` covers
-        # everything requested through file_utils.make_scratch_dir();
-        # _output_roots also catches a tool that wrote under TEMP_DIR by hand.
+        # output in its own scratch dir under TEMP_DIR, which must be cleaned up
+        # too -- whether the response goes out or the packing below fails.
+        # `scratch_dirs` covers file_utils.make_scratch_dir(); _output_roots
+        # also catches a tool that wrote under TEMP_DIR by hand.
         try:
             outputs = _output_paths(result)
             if not outputs:
@@ -902,16 +863,13 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
 
         # A client asking for reference delivery gets the result MOVED out of
         # the work dir (a rename, not a copy) and a JSON pointer to it, so it
-        # can pull the bytes down over several range requests at once instead
-        # of through this one connection. Done before the cleanup tasks are
-        # queued, since those are what would otherwise take the file with them.
+        # can pull the bytes over several range requests. Done before the
+        # cleanup tasks are queued, which would otherwise take the file away.
         #
-        # Only above RESULT_REFERENCE_MIN_MB, and the reason is cleanup rather
-        # than speed. A streamed response deletes its file server-side the
-        # moment the response ends, with no dependency at all on the client
-        # coming back for it; a reference depends on a DELETE or on the reaper.
-        # Parallel ranges buy nothing on a small result, so there is no reason
-        # to trade the stronger guarantee away for one.
+        # Only above RESULT_REFERENCE_MIN_MB, for cleanup rather than speed: a
+        # streamed response deletes its file the moment the response ends, with
+        # no dependency on the client, while a reference waits for a DELETE or
+        # for the reaper. Parallel ranges buy nothing on a small result.
         deliver_by_reference = (
             request.headers.get(_RESULT_DELIVERY_HEADER, "").lower() == _DELIVER_BY_REFERENCE
             and os.path.getsize(result) >= _RESULT_REFERENCE_MIN_BYTES

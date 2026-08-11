@@ -5,15 +5,13 @@ Ported from `ASO_IOS/ASO_IOS_utils/utils.py` (ReadSurf/WriteSurf),
 
 Two changes worth knowing about:
 
-* **meshes are written BINARY.** `vtkPolyDataWriter` defaults to ASCII, and
-  the difference is not cosmetic: binary is smaller on disk, roughly a hundred
-  times faster to parse, and the MORE accurate of the two -- it round-trips
-  float32 coordinates exactly, while ASCII prints about six significant digits
-  and moves points on read-back. Measured on AMASSS's surfaces, see this
-  repository's 2026-07-30 changelog entry.
-* **the .off reader actually works.** The original referenced an undefined
-  `line` variable on the single-vertex branch, so any .off file containing one
-  raised NameError.
+* meshes are written BINARY. `vtkPolyDataWriter` defaults to ASCII, and the
+  difference is not cosmetic: binary is smaller, ~100x faster to parse, and the
+  MORE accurate of the two, round-tripping float32 exactly where ASCII prints
+  six significant digits and moves points on read-back.
+* the .off reader works. The original referenced an undefined `line` variable
+  on the single-vertex branch, so any .off file containing one raised
+  NameError.
 """
 
 import os

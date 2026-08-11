@@ -25,10 +25,9 @@ import tools as tools_package
 from base import Tool
 
 # This module runs at import time, BEFORE main.py reaches its own
-# logging.basicConfig call -- without this one, a load failure would only make
-# it to the console through logging's lastResort handler and the summary below
-# (INFO) would be swallowed entirely. basicConfig is a no-op once handlers
-# exist, so main.py's identical call later changes nothing.
+# logging.basicConfig call: without this one, the INFO summary below would be
+# swallowed entirely. basicConfig is a no-op once handlers exist, so main.py's
+# identical call later changes nothing.
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("inference_server")
 
@@ -83,8 +82,8 @@ def _discover_tool_classes() -> list:
                 )
             module = importlib.import_module(f"{tools_package.__name__}.{entry}.{entry}")
         except Exception as exc:
-            # Anything at all: ImportError on a missing dependency, SyntaxError,
-            # a module-level statement that raises. None of it is worth a dead
+            # Anything at all: a missing dependency, a syntax error, a
+            # module-level statement that raises. None of it is worth a dead
             # server.
             _record_failure(entry, exc)
             continue
@@ -142,9 +141,8 @@ def get_tool(name: str):
     except KeyError:
         if name in FAILED_TOOLS:
             # The tool exists in the source tree but didn't load. Say so rather
-            # than "unknown tool", which reads like a typo and sends the client
-            # developer hunting in the wrong place. The reason itself stays in
-            # the server logs -- it can name internal paths and modules.
+            # than "unknown tool", which reads like a typo. The reason stays in
+            # the server logs, where it may name internal paths.
             raise KeyError(
                 f"Tool '{name}' failed to load at server startup and is unavailable. "
                 f"See the server logs."

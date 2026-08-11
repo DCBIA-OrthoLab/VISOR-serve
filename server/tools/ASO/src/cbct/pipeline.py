@@ -17,42 +17,27 @@ import os
 import numpy as np
 import SimpleITK as sitk
 
+import file_utils
+
 from .. import markups
 from . import icp
 
 logger = logging.getLogger("ASO")
 
-SCAN_EXTENSIONS = (".nii.gz", ".nrrd.gz", ".gipl.gz", ".nii", ".nrrd", ".gipl")
-
-# See AMASSSLogic.compressed_extension for why this table is what it is: NIfTI
-# and GIPL take an external .gz, NRRD compresses inside the file and ITK has no
-# ".nrrd.gz" WRITER at all, so that spelling maps back down to ".nrrd".
-_COMPRESSED_EXTENSIONS = {".nii": ".nii.gz", ".gipl": ".gipl.gz", ".nrrd.gz": ".nrrd"}
+SCAN_EXTENSIONS = file_utils.SCAN_EXTENSIONS
+split_scan_extension = file_utils.split_scan_extension
+compressed_extension = file_utils.compressed_extension
 
 # Suffixes previous runs (of ASO, AMASSS or ALI) leave on a file name, stripped
 # to recover the patient they belong to. Longest first so "_Scanreg" is not cut
 # short by "_Scan".
 #
-# "_T1"/"_T2" are deliberately NOT here, although `GetPatients` stripped them:
-# they mark two timepoints of the same subject, which are two scans to orient,
-# not one. Collapsing them dropped the second scan and merged both landmark
-# sets into the survivor.
+# "_T1"/"_T2" are deliberately NOT here: they mark two timepoints of the same
+# subject, which are two scans to orient, not one. Collapsing them dropped the
+# second scan and merged both landmark sets into the survivor.
 PATIENT_SUFFIXES = (
     "_lm_Pred", "_Scanreg", "_MERGED", "_scan", "_Scan", "_Or", "_OR", "_lm",
 )
-
-
-def split_scan_extension(filename: str) -> tuple:
-    """('scan.nii.gz') -> ('scan', '.nii.gz'), compound extensions preserved."""
-    lower = filename.lower()
-    for extension in SCAN_EXTENSIONS:
-        if lower.endswith(extension):
-            return filename[: -len(extension)], filename[-len(extension):]
-    return os.path.splitext(filename)
-
-
-def compressed_extension(extension: str) -> str:
-    return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)
 
 
 def patient_stem(filename: str) -> str:
@@ -153,20 +138,17 @@ def discover(input_root: str, output_suffix: str = "Or") -> dict:
     """{patient key: {"scan": path, "markups": [paths]}} for one input tree.
 
     The key is the patient's path RELATIVE to the input root, not its base
-    name. `GetPatients` keyed on the base name, so two scans called `scan.nii.gz`
-    in different subfolders silently became one patient -- in the working dict
-    and again in the flat output folder. Here they stay apart, and the output
-    keeps the input's tree.
+    name: `GetPatients` keyed on the base name, so two scans called
+    `scan.nii.gz` in different subfolders became one patient. The output keeps
+    the input's tree.
 
-    A patient may have several markups files: fully-automated runs used to
-    produce one per landmark group, which `MergeJson` merged by rewriting the
-    caller's input folder and DELETING the sources. They are merged in memory
-    instead (see `load_landmarks`).
+    A patient may have several markups files (fully-automated runs produced one
+    per landmark group); they are merged in memory, where `MergeJson` rewrote
+    the caller's input folder and DELETED the sources.
 
     Files that look like a previous run's output are set aside and used only if
-    a patient has nothing else -- so re-running on an output folder still works,
-    while a folder holding both an original and its orientation uses the
-    original.
+    a patient has nothing else, so re-running on an output folder works while a
+    folder holding both an original and its orientation uses the original.
     """
     patients = _group_by_patient(input_root, output_suffix)
 

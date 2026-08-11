@@ -1,28 +1,21 @@
 """IOS registration: tooth centroids or landmarks in, a 4x4 matrix out.
 
-Ported from `ASO_IOS/ASO_IOS_utils/icp.py` (the `ICP`, `vtkICP`, `InitIcp`,
-`vtkMeanTeeth` and `SelectKey` classes). Three things changed.
+Ported from `ASO_IOS/ASO_IOS_utils/icp.py`, with three things changed:
 
-**The triplet search no longer goes through the filesystem.** `InitIcp` wrote
-`source.npy` and `target.npy` into `ASO_IOS_utils/cache/` -- a directory it
-created inside its own installed package -- and reloaded `source.npy` on every
-one of up to 2500 search iterations. On a server that is a write into the
-install tree, thousands of pointless round trips per patient, and, since the
-path is fixed, two concurrent requests overwriting each other's landmarks. The
-search is pure and in memory now (see `..geometry.best_triplet`).
-
-**The composition order is fixed.** The original built its final matrix as
-`M_init @ M_icp`, but the ICP is computed on points the initialisation has
-already moved, so the two must compose the other way round: `M_icp @ M_init`.
-The CBCT engine always did it correctly (`TransformMatrixBis @ TransformMatrix`
-in `SEMI_ASO_CBCT`), which is what makes this a transcription slip rather than
-a deliberate choice. It stayed invisible because the ICP that follows a good
-initialisation is nearly the identity.
-
-**Point sets must correspond.** `SameNumberPoint` silently subsampled the
-longer of the two with the global `np.random` and re-keyed both by index, so a
-patient missing one tooth was registered against a random correspondence
-instead of failing. A mismatch raises here.
+* The triplet search no longer goes through the filesystem. `InitIcp` wrote
+  `source.npy`/`target.npy` into its own installed package directory and
+  reloaded one of them on every one of up to 2500 iterations -- a write into
+  the install tree, and, the path being fixed, two concurrent requests
+  overwriting each other's landmarks. The search is pure and in memory now
+  (see `..geometry.best_triplet`).
+* The composition order is fixed. The original built `M_init @ M_icp`, but the
+  ICP runs on points the initialisation has already moved, so the two compose
+  the other way round: `M_icp @ M_init`. The CBCT engine always had it right,
+  which makes this a transcription slip; it stayed invisible because the ICP
+  after a good initialisation is nearly the identity.
+* Point sets must correspond. `SameNumberPoint` silently subsampled the longer
+  of the two and re-keyed both by index, so a patient missing one tooth was
+  registered against a random correspondence instead of failing.
 """
 
 import numpy as np

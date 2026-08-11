@@ -1,27 +1,23 @@
 """Crown segmentation on intraoral surface scans, via shapeaxi.
 
-Labels every tooth of a mesh with its Universal number, writing the result as
-a point-data array on a copy of the surface. That array is the precondition
-for ALI's IOS landmark identification, and for the IOS modes of ASO, AREG and
-FlexReg -- which is why this lives in its own tool rather than inside any of
-them (see ALI_PORT_CONTEXT.md 3.2).
+Labels every tooth of a mesh with its Universal number, as a point-data array
+on a copy of the surface. That array is the precondition for ALI's IOS landmark
+identification and for the IOS modes of ASO, AREG and FlexReg, which is why
+this is its own tool rather than a helper inside any of them.
 
-**Nothing here is ported.** The Slicer modules ran the `dentalmodelseg`
-executable out of Slicer's own Python bin directory; that executable is only
-the console-script entry point of the `shapeaxi` PyPI package
+Nothing here is ported. The Slicer modules ran the `dentalmodelseg` executable
+out of Slicer's own bin directory, and that executable is only the
+console-script entry point of the `shapeaxi` PyPI package
 (`dentalmodelseg = shapeaxi.dental_model_seg:cml`). Server-side there is no
 Slicer binary to shell out to, so `shapeaxi.dental_model_seg.main` is called
-directly with the argument namespace its own `cml()` would have built. The
-detour existed because the caller was inside Slicer, not because the work
-needed a subprocess.
+directly with the namespace its own `cml()` would have built.
 
 Two entry points, following the AMASSSLogic precedent:
 
-* `segment_crowns(...)` -> `CrownSegRun`. The reusable API: it returns the
-  produced meshes and a report, and zips nothing. **This is what another
-  server-side tool calls** -- ALI's IOS engine does exactly that.
-* `main(...)` -> path to the output directory, the thin schema adapter used
-  by CrownSeg.py.
+* `segment_crowns(...)` -> `CrownSegRun`, the reusable API: the produced meshes
+  and a report, zipping nothing. ALI's IOS engine calls exactly this.
+* `main(...)` -> path to the output directory, the schema adapter CrownSeg.py
+  uses.
 """
 
 import contextlib

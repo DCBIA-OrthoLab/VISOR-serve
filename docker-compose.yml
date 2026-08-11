@@ -1,14 +1,10 @@
 # Shared by the two server services below, which differ only in whether they
-# get the GPU — same reason the test services are split, one level up: a
-# compose device reservation is ALL-OR-NOTHING, so a service asking for an
-# nvidia device cannot start at all on a host that has none. An override file
-# cannot rescue that either: compose merges the `devices` list rather than
-# replacing it, so `devices: []` in a second -f file leaves the reservation in
-# place (measured). Hence two services sharing one anchor.
-#
-# `inference` is unchanged and stays the default; `inference-cpu` is what
-# scripts/server_ctl.py starts on a laptop with no card, which is the whole
-# point of the plug-and-play path.
+# get the GPU. Two services rather than one, because a compose device
+# reservation is ALL-OR-NOTHING: a service asking for an nvidia device cannot
+# start on a host that has none, and an override file cannot rescue it either
+# (compose merges the `devices` list rather than replacing it, so `devices: []`
+# leaves the reservation in place). `inference` stays the default;
+# `inference-cpu` is what scripts/server_ctl.py starts on a machine with no card.
 x-inference-base: &inference-base
   image: ghcr.io/jules-gp/lab-ai:2026.08
   shm_size: 8gb
@@ -17,50 +13,35 @@ x-inference-base: &inference-base
     - ./server:/workspace/server
     - ./DATA:/data:ro
   ports:
-    # Unset BIND_ADDR publishes on every interface — what a lab GPU server
-    # behind a TLS terminator wants, and byte-for-byte what this file did
-    # before the variable existed. server_ctl.py writes BIND_ADDR=127.0.0.1
-    # into .env for a local install instead: that one speaks plain HTTP, and
-    # plain HTTP carrying medical images must not be reachable from the rest
-    # of the network.
+    # Unset BIND_ADDR publishes on every interface, which is what a lab GPU
+    # server behind a TLS terminator wants. server_ctl.py writes
+    # BIND_ADDR=127.0.0.1 for a local install instead: that one speaks plain
+    # HTTP, and plain HTTP carrying medical images must not leave the machine.
     #
-    # The `:+` form is what keeps "unset" meaning *no host address at all*
-    # rather than the literal 0.0.0.0. They are not the same: with no address
-    # docker publishes on BOTH stacks (0.0.0.0 and [::]), while an explicit
-    # 0.0.0.0 is IPv4 only — so a default of "0.0.0.0" would silently drop
-    # IPv6 clients. Setting BIND_ADDR to an empty string means the same as
-    # leaving it out.
+    # The `:+` form keeps "unset" meaning NO host address rather than the
+    # literal 0.0.0.0: with no address docker publishes on both stacks, while
+    # an explicit 0.0.0.0 is IPv4 only and would silently drop IPv6 clients.
+    # The inner `:-` is not redundant -- without it compose warns "The
+    # BIND_ADDR variable is not set" on every command.
     #
-    # The inner `:-` looks redundant next to the outer `:+` and is not: without
-    # it compose prints "The BIND_ADDR variable is not set" on every single
-    # command, and a warning on `docker compose up` for a variable nobody has
-    # to set is noise this file should not have introduced.
-    #
-    # HOST_PORT only moves the HOST side. The container always serves 8000, so
-    # nothing inside the image or in server/ depends on this.
+    # HOST_PORT moves the HOST side only; the container always serves 8000.
     - "${BIND_ADDR:+${BIND_ADDR:-}:}${HOST_PORT:-8000}:8000"
-  # The install must NOT gate uvicorn, and that is a fix rather than a
-  # loosening. `pip install -r requirements.txt` cannot succeed offline even
-  # when every dependency is already installed: nnunetv2 -> batchgenerators ->
-  # unittest2 -> argparse, and pip never treats `argparse` as satisfied (the
-  # stdlib module shadows the distribution, so the version check finds
-  # nothing) — it re-downloads that one 23 kB wheel on EVERY start, measured.
-  # With `&&`, a laptop with no network therefore had a server that started
-  # once and never again, which is exactly the case the "stop when Slicer
-  # closes" setting creates.
+  # The install must NOT gate uvicorn. `pip install -r requirements.txt` cannot
+  # succeed offline even when everything is already installed: nnunetv2 ->
+  # batchgenerators -> unittest2 -> argparse, and pip never treats `argparse` as
+  # satisfied because the stdlib module shadows the distribution -- so it
+  # re-downloads that 23 kB wheel on every start. With `&&`, a machine off the
+  # network had a server that started once and never again.
   #
-  # A genuinely missing dependency still fails loudly, and explicitly rather
-  # than as a stack trace: the `import fastapi, uvicorn` probe separates "pip
-  # could not run but everything is already here" (warn, start) from "pip could
-  # not run AND nothing is installed" (one FATAL line, exit 1). Without that
-  # probe the second case became an ImportError traceback restarted for ever by
-  # `restart: unless-stopped` — measured, and far harder to read than the line
-  # below. server_ctl.py greps for both markers.
-  # NOTE ON LAYOUT: every operator sits at the END of its line. A `>` folded
-  # scalar keeps the newlines of its more-indented continuation lines, so a
-  # line STARTING with `||` reaches sh as its own command and is a syntax
-  # error — which is why the original `&&` was trailing too. Measured, after
-  # getting it wrong: "sh: 2: Syntax error: || unexpected", in a restart loop.
+  # A genuinely missing dependency still fails loudly: the `import fastapi,
+  # uvicorn` probe separates "pip could not run but everything is here" (warn,
+  # start) from "pip could not run AND nothing is installed" (one FATAL line,
+  # exit 1). Without it the second case was an ImportError traceback restarted
+  # for ever by `restart: unless-stopped`. server_ctl.py greps for both markers.
+  #
+  # LAYOUT: every operator sits at the END of its line. A `>` folded scalar
+  # keeps the newlines of its continuation lines, so a line STARTING with `||`
+  # reaches sh as its own command and is a syntax error.
   command: >
     sh -c "pip install --no-cache-dir --user --retries 1 --timeout 20 -r requirements.txt ||
            echo 'DEPENDENCY-INSTALL-SKIPPED: pip failed (offline?); continuing with what is already installed' >&2;
@@ -69,10 +50,10 @@ x-inference-base: &inference-base
            uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
   restart: unless-stopped
 
-# Shared by the two test services below, which differ only in whether they get
-# the GPU. Kept as an anchor rather than copied so the image, the mounts and
-# the pytest command cannot drift between "the suite the hook runs" and "the
-# suite a maintainer runs".
+# Shared by the two test services, which differ only in whether they get the
+# GPU. An anchor rather than a copy, so the image, the mounts and the pytest
+# command cannot drift between the suite the hook runs and the one a maintainer
+# runs.
 x-test-base: &test-base
   image: ghcr.io/jules-gp/lab-ai:2026.08
   profiles: ["test"]
@@ -100,12 +81,9 @@ services:
               count: all
               capabilities: [gpu]
 
-  # The same server without the card. Everything real still runs — every tool
-  # falls back to CPU through settings.DEVICE — it is only much slower, which
-  # is the right trade for "a clinician can try this on their own machine".
-  #
-  # The "cpu" profile keeps `docker compose up` from starting it alongside
-  # `inference` (they both bind port 8000). Start it explicitly:
+  # The same server without the card: every tool falls back to CPU through
+  # settings.DEVICE, only much slower. The "cpu" profile keeps `docker compose
+  # up` from starting it alongside `inference` (they both bind port 8000):
   #
   #     docker compose --profile cpu up -d inference-cpu
   #
@@ -118,14 +96,11 @@ services:
       - DATA_DIR=/data
       - DEVICE=cpu
 
-  # Runs the pytest suite in the same environment as `inference`, without the
-  # GPU reservation. Not an oversight: compose has no notion of an OPTIONAL
-  # device reservation, so asking for a GPU here would make the pre-push hook
-  # fail outright on any clone without an nvidia card. See .githooks/pre-push.
-  # The unit tests stub every model anyway, so they gain nothing from a GPU.
-  #
-  # The "test" profile keeps `docker compose up` from starting this container;
-  # it only runs when invoked explicitly with: docker compose run --rm test
+  # The pytest suite in the same environment as `inference`, without the GPU
+  # reservation: asking for a GPU here would make the pre-push hook fail on any
+  # clone without an nvidia card, and the unit tests stub every model anyway.
+  # The "test" profile keeps it out of `docker compose up`; run it with
+  # `docker compose run --rm test`.
   test:
     <<: *test-base
     environment:
@@ -136,15 +111,13 @@ services:
       # runs real inference against whatever is under DATA/, which is hours on a
       # CPU once a full ALI bundle is present. This suite stays seconds long.
 
-  # The same suite with the card attached, for the one part that genuinely
-  # wants it: tests/test_data_integration.py runs each tool end to end against
-  # the real bundles under DATA/, which is minutes on a GPU and hours on a CPU.
+  # The same suite with the card, for the one part that wants it: the real-data
+  # suite is minutes on a GPU and hours on a CPU.
   #
   #     docker compose run --rm test-gpu
   #
-  # A separate service rather than a flag on `test` because the reservation is
-  # all-or-nothing: this one cannot start without a GPU, and that is exactly
-  # why the hook must keep pointing at `test`.
+  # A separate service rather than a flag on `test`, the reservation being
+  # all-or-nothing -- which is why the hook keeps pointing at `test`.
   test-gpu:
     <<: *test-base
     environment:

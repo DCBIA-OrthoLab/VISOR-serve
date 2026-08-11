@@ -1,27 +1,21 @@
 """Surface (.vtk) generation from a segmentation, for AMASSS's
 "generate surface file" option.
 
-This stays SERVER-side on purpose. AMASSS is not only called by the Slicer
-module: the architecture is an API, and other modules (AREG today, others
-later) call AMASSS programmatically. Generating surfaces in the Slicer client
-would make them unavailable to every non-Slicer consumer, so the capability
-belongs where the segmentation is produced.
+This stays SERVER-side on purpose: AMASSS is an API other tools call (AREG
+today), so generating surfaces in the Slicer client would make them
+unavailable to every non-Slicer consumer.
 
-The mesh pipeline itself is kept identical to the original CLI's
-(SimpleITK -> temporary .nrrd -> vtkNrrdReader -> vtkDiscreteMarchingCubes ->
-vtkSmoothPolyDataFilter -> per-cell colors), because AMASSS surfaces are
-already consumed downstream and silently changing the geometry convention
-would be a regression, not an improvement. What IS fixed here is the crash:
+The mesh pipeline is kept identical to the original CLI's (SimpleITK ->
+temporary .nrrd -> vtkNrrdReader -> vtkDiscreteMarchingCubes ->
+vtkSmoothPolyDataFilter -> per-cell colors), because these surfaces are already
+consumed downstream and changing the geometry convention would be a regression.
 
-  the original resolved a structure's label by parsing it back out of the
-  output FILE NAME (`base.split('_')[-1]`) and looking it up in
-  `LABELS[model_size]` with model_size hardcoded to "LARGE"
-  (AMASSS_CLI.py:260) -- a KeyError for any structure absent from that table,
-  which aborted the whole scan. The structure code is now passed in
-  explicitly by the caller, which knows it for certain.
+What is fixed is the crash: the original resolved a structure's label by
+parsing it out of the output FILE NAME and looking it up in `LABELS["LARGE"]`,
+a KeyError for any structure absent from that table which aborted the whole
+scan. The structure code is passed in explicitly now.
 
-vtk is imported lazily so the server still boots (and every other tool still
-works) if it isn't installed.
+vtk is imported lazily so the server still boots without it.
 """
 
 import logging

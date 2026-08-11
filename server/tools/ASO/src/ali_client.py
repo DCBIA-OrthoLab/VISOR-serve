@@ -1,36 +1,19 @@
 """The seam between ASO's fully-automated CBCT mode and the landmark
 identification it needs.
 
-ASO's fully-automated mode is "orient a scan nobody has placed landmarks on".
-That works by predicting the landmarks first, which is exactly what ALI does --
-one deep-RL agent per landmark, one `.pth` weight set per (landmark, scale).
-Porting that engine into ASO would duplicate a tool that is on this server's
-roadmap in its own right and that AREG will need too, so ASO **calls** it
-instead of containing it.
+Fully-automated means "orient a scan nobody has placed landmarks on", so the
+landmarks are predicted first -- which is what ALI does. ASO calls it rather
+than containing it. The availability check stays even though ALI is deployed
+here: a deployment may legitimately not carry it, and must then refuse with a
+message pointing at the mode that does work.
 
-**`tools/ALI/` is registered on this server, so this mode is live.** It was
-written before ALI existed and needed no change when it arrived, which was the
-point: everything after the availability check speaks the server's ordinary
-tool contract. That check stays -- a deployment may legitimately not carry ALI,
-and it must then refuse with a message that says so and points at the mode that
-does work, rather than a 404 from somewhere inside the server.
-
-### Why the call is in-process and not an HTTP request to our own /run/ALI
-
-The decoupled-by-HTTP version is tempting and is a **deadlock**. `main.py`
-runs every tool inside an `anyio.CapacityLimiter` capped at
-`MAX_CONCURRENT_TOOLS` (4 by default). An ASO request holds one of those slots
-for its whole run. If it then blocks on an HTTP request to this same server
-asking for a slot of its own, four concurrent fully-automated ASO runs hold all
-four slots and each waits for a fifth that can never be freed -- the server
-stops serving anything, including `/health`, until they time out. It would also
-mean re-uploading the scans to ourselves and re-downloading the results.
-
-`Tool.invoke` is the same entry point `main.py` uses, validation included, so
-calling it directly gives the identical contract without any of that. The whole
-transport is `_invoke_ali` below: swapping it for an HTTP call to a *separate*
-ALI deployment (where the deadlock does not apply, because the slots are on
-another machine) is a change to that one function.
+The call is IN-PROCESS, not an HTTP request to our own /run/ALI, and that is
+load-bearing. main.py runs every tool inside a CapacityLimiter capped at
+MAX_CONCURRENT_TOOLS, and an ASO request holds one slot for its whole run: four
+concurrent fully-automated runs each waiting on a fifth slot would deadlock the
+server, /health included. `Tool.invoke` is the same entry point main.py uses,
+validation included. The whole transport is `_invoke_ali` below, so pointing it
+at a SEPARATE ALI deployment over HTTP is a change to that one function.
 """
 
 import logging
@@ -74,26 +57,16 @@ def predict_landmarks(
 ) -> dict:
     """Predict landmarks for every scan under `input_dir`.
 
-    `model_path` is optional, and None is the ordinary case. When given it is
-    already a local path: `landmark_models` is declared `server_selectable` on
-    ASO's schema, so main.py resolved the name the client picked against
-    `DATA/ASO/models/` before `run()` was called. It is forwarded as-is, which
-    is exactly the shape the landmark tool would have received had it been
-    called over HTTP.
+    `model_path` is optional and None is the ordinary case: the argument is
+    then left out of the call entirely, and the landmark tool picks the bundle
+    matching the input from the models hosted for IT. That is the better
+    default, since ASO's own folder also holds the reference bundles and
+    nothing in a flat list of names says which entries are landmark weights.
+    When given, it is already a local path resolved by main.py.
 
-    When it is None the argument is left out of the call entirely, and the
-    landmark tool picks the bundle matching the input from the models hosted
-    for IT (`DATA/ALI/models/`) -- which is the better default anyway: ASO's
-    own folder holds the reference bundles as well, and nothing in a flat list
-    of names says which entries are landmark weights.
-
-    Returns `{patient key: {landmark: np.ndarray}}` keyed exactly like
-    `cbct.pipeline.discover`, so the caller can look a patient up without
-    caring where the landmarks came from.
-
-    The results never touch the caller's input tree. `MergeJson` used to merge
-    ALI's per-group files by writing the merged one into the input folder and
-    **deleting the sources**; the merge happens in memory here.
+    Returns `{patient key: {landmark: np.ndarray}}` keyed like
+    `cbct.pipeline.discover`. The results never touch the caller's input tree:
+    the per-group files are merged in memory.
     """
     if not is_available(tool_name):
         raise ToolArgumentError(_NOT_AVAILABLE.format(tool=tool_name))
@@ -148,12 +121,10 @@ def _invoke_ali(
     try:
         result = tool.invoke(args)
     except ToolArgumentError as exc:
-        # The landmark tool judges the bundle, and its message says so in its
-        # own vocabulary ("No CBCT landmark weights found in '<name>'"). What
-        # it cannot know is that ASO offered that name: the caller picked it
-        # from ASO's model list, which also holds the reference bundles, so the
-        # likeliest way to get here is having chosen a reference by mistake.
-        # Say which field to clear rather than leaving them to guess.
+        # The landmark tool judges the bundle in its own vocabulary and cannot
+        # know ASO offered that name. The caller picked it from ASO's model
+        # list, which also holds the reference bundles, so the likeliest
+        # mistake is having chosen a reference: name the field to clear.
         if model_path:
             raise ToolArgumentError(
                 f"{exc} -- 'landmark_models' named "

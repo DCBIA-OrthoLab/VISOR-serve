@@ -1,26 +1,21 @@
 """AMASSS -- Automatic Multi-Anatomical Skull Structure Segmentation.
 
-Ported from SlicerAutomatedDentalTools/AMASSS_CLI/AMASSS_CLI.py. The business
-logic (nnUNet per structure, binary masks, optional multi-label merge,
-optional surfaces) is preserved; the CLI envelope is not -- `sys.argv`
-parsing, `sys.exit()`, the `<filter-progress>` Slicer CLI protocol, the
-caller-supplied `temp_fold` that got `rmtree`'d on startup, and the
-caller-supplied `output_folder` are all gone. On this server, scratch space
-and cleanup belong to main.py, and a failure must be an exception (a
-`SystemExit` raised inside a worker thread does not surface as a clean 500).
+Ported from AMASSS_CLI.py. The business logic (nnUNet per structure, binary
+masks, optional multi-label merge, optional surfaces) is preserved; the CLI
+envelope is not -- `sys.argv` parsing, `sys.exit()`, the `<filter-progress>`
+protocol and the caller-supplied temp/output folders are gone. Scratch space
+and cleanup belong to main.py, and a failure must be an exception, since a
+`SystemExit` raised in a worker thread does not surface as a clean 500.
 
 Two entry points, on purpose:
 
-* `segment(...)` -> `SegmentationRun`. The real API. Returns the output
-  directory plus a structured report. **This is what other server-side tools
-  should call** (e.g. a future AREG tool needing AMASSS masks): it hands back
-  the files themselves, with no zip/unzip round trip.
-* `main(...)` -> path to the output directory. The thin schema adapter used
-  by AMASSS.py; with `output_kind = "files"`, main.py zips that directory and
-  streams the archive, so no zip code lives here.
+* `segment(...)` -> `SegmentationRun`, the real API. Returns the output
+  directory plus a structured report, with no zip round trip. This is what
+  other server-side tools call.
+* `main(...)` -> path to the output directory, the schema adapter AMASSS.py
+  uses.
 
-See the module-level comments marked "FIX:" for the specific defects of the
-original CLI that are corrected here.
+See the comments marked "FIX:" for the original CLI's defects corrected here.
 """
 
 import glob
@@ -213,11 +208,18 @@ def structure_codes(selection) -> tuple:
 def merge_modes(selection) -> tuple:
     return _codes_from(selection, MERGE_MODE_NAMES, DEFAULT_MERGE_MODES)
 
-# FIX: .gipl / .gipl.gz were advertised by the Slicer UI and the README but
-# rejected by the CLI, which accepted only .nii/.nii.gz/.nrrd/.nrrd.gz. They
-# are genuinely supported now: every input goes through a real SimpleITK
+# Shared with the other tools that read volumes; see file_utils. .gipl and
+# .gipl.gz are genuinely supported: every input goes through a real SimpleITK
 # read/write conversion (see _convert_to_nifti) instead of being renamed.
-SCAN_EXTENSIONS = (".nii.gz", ".nrrd.gz", ".gipl.gz", ".nii", ".nrrd", ".gipl")
+SCAN_EXTENSIONS = file_utils.SCAN_EXTENSIONS
+split_scan_extension = file_utils.split_scan_extension
+
+# A segmentation output keeps its input's FORMAT but is always written
+# compressed. The masks are label volumes -- long runs of a single value -- so
+# gzip takes them roughly 100x down: uncompressed, a 0.33mm CBCT gives a 191 MB
+# file PER structure, and a nine-structure run wrote 1.75 GB against 14 MB
+# compressed. The scan the masks came from is untouched.
+compressed_extension = file_utils.compressed_extension
 
 
 class SegmentationRun:
@@ -247,54 +249,12 @@ class SegmentationRun:
 # Input discovery
 # ---------------------------------------------------------------------------
 
-def split_scan_extension(filename: str):
-    """('scan.nii.gz') -> ('scan', '.nii.gz'), compound extensions preserved."""
-    lower = filename.lower()
-    for extension in SCAN_EXTENSIONS:
-        if lower.endswith(extension):
-            return filename[: -len(extension)], filename[-len(extension):]
-    return os.path.splitext(filename)
-
-
-# A segmentation output keeps its input's FORMAT but is always written
-# compressed, whatever the input was.
-#
-# The masks are label volumes -- long runs of a single value -- so gzip takes
-# them roughly 100x down. Uncompressed, a 0.33mm CBCT gives a 191 MB file PER
-# structure: a nine-structure run wrote 1.75 GB, which the client then had to
-# receive and unpack. The same run compressed is 14 MB. The scan the masks came
-# from is untouched; only what AMASSS writes is affected.
-#
-# The two families compress differently, and the table is what ITK actually
-# accepts (measured, not assumed): NIfTI and GIPL take an external .gz wrapper,
-# while NRRD compresses INSIDE the file and keeps its own extension -- ITK has
-# no writer for ".nrrd.gz" at all, so mapping to it fails the write outright.
-# ".nrrd.gz" is therefore mapped back DOWN to ".nrrd": it is a legal input
-# spelling but not a legal output one.
-_COMPRESSED_EXTENSIONS = {
-    ".nii": ".nii.gz",
-    ".gipl": ".gipl.gz",
-    ".nrrd.gz": ".nrrd",
-}
-
-
-def compressed_extension(extension: str) -> str:
-    """The compressed spelling ITK can WRITE for a scan extension.
-
-    '.nii' -> '.nii.gz'; '.nrrd' stays '.nrrd' (compressed internally by
-    _write_segmentation's useCompression).
-    """
-    return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)
-
-
 def is_previous_output(filename: str, prediction_id: str) -> bool:
     """True if this file looks like a segmentation AMASSS itself produced.
 
-    FIX: the original only excluded names containing "MASK", so running twice
-    on the same folder fed the first run's outputs back in as input scans --
-    a snowball the Slicer UI avoided (it excluded "Pred"/"Seg") but the CLI
-    did not, leaving the two disagreeing about how many scans even existed.
-    Outputs are recognized here by the suffixes AMASSS actually writes.
+    Without this, running twice on the same folder feeds the first run's
+    outputs back in as input scans. Outputs are recognized by the suffixes
+    AMASSS actually writes.
     """
     base, _extension = split_scan_extension(os.path.basename(filename))
 

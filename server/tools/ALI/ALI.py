@@ -9,22 +9,18 @@ engines that share nothing but their output format:
   UNet predicts masks that are projected back onto the surface.
 
 Only the schema lives here; everything else is in src/, where `ALILogic`
-decides which engine applies and `ALI_CBCT/` and `ALI_IOS/` implement them.
-Another server-side tool should call `ALILogic.identify()` rather than going
-through this wrapper: it returns the run report, with the produced files named
-in it, and zips nothing.
+decides which engine applies. Another server-side tool should call
+`ALILogic.identify()` rather than this wrapper: it returns the run report and
+zips nothing.
 
-**There is no `mode` argument, on purpose.** A `.zip` can hold either kind of
-data and a DICOM series has no extension at all, so nothing in the request
-distinguishes them -- only the data does. The server looks, and an input
-holding both kinds is a 422 rather than a guess.
+There is no `mode` argument, on purpose: a `.zip` can hold either kind of data
+and a DICOM series has no extension at all, so only the data distinguishes
+them. The server looks, and an input holding both kinds is a 422, not a guess.
 
-The cost of one tool for two engines is that the schema cannot say "this
-argument only applies in mode X": both selections are optional, both are
-always rendered by the client, and one of them is inert on any given run. That
-is stated in each description, and emptying the selection for the mode that
-actually ran is a 422 naming the argument to fill in -- see
-`ALILogic.identify`.
+The cost is that the schema cannot say "this argument only applies in mode X":
+both selections are optional, both are always rendered, and one is inert on any
+given run. Emptying the selection for the mode that actually ran is a 422
+naming the argument to fill in (see `ALILogic.identify`).
 """
 
 from base import ArgSpec, Tool
@@ -34,10 +30,8 @@ from .src.ALI_CBCT import landmarks as cbct_catalog
 from .src.ALI_IOS import landmarks as ios_catalog
 
 # The collapsible boxes a client lays this panel out in. Both engines'
-# selections are always shown -- there is no `mode` argument to hide one behind
-# (see the module docstring) -- so the least a panel can do is not interleave
-# them: a CBCT user reads one box and ignores the other, instead of scanning a
-# flat list for the four rows that apply to them.
+# selections are always shown, so the least a panel can do is not interleave
+# them: a CBCT user reads one box and ignores the other.
 _INPUTS = "Inputs"
 _CBCT = "CBCT landmarks"
 _IOS = "IOS landmarks"
@@ -47,15 +41,12 @@ _OUTPUTS = "Outputs"
 class ALITool(Tool):
     name = "ALI"
     arguments = {
-        # Two FILE types and no "folder": a batch therefore reaches run() as
-        # an archive, which ALILogic unpacks. Declaring "folder" here instead
-        # would have main.py extract it, but the client would then have to
-        # guess which of the two kinds it is sending to pick a file filter --
-        # and that is exactly what it cannot know.
-        #
-        # A cohort, and *any* DICOM series, is a directory: the Slicer client
-        # offers a folder picker for this argument and zips the selection
-        # before uploading.
+        # Two FILE types and no "folder", so a batch reaches run() as an
+        # archive that ALILogic unpacks. Declaring "folder" would have main.py
+        # extract it, but the client would then have to know which of the two
+        # kinds it is sending in order to pick a file filter. A cohort, and any
+        # DICOM series, is a directory: the Slicer client offers a folder
+        # picker here and zips the selection before uploading.
         "input": ArgSpec(
             label="Scan or Folder",
             section=_INPUTS,
@@ -68,14 +59,11 @@ class ALITool(Tool):
                 "recognised inside the archive and converted automatically"
             ),
         ),
-        # Server-side only: the client sends the NAME of a bundle hosted on
-        # the server, never the weights. Optional, like the mode it depends
-        # on: the server already detects CBCT vs IOS from the data, so when
-        # no name is sent it also picks the hosted bundle whose CONTENT
-        # matches the detected mode (each engine recognises its own layout).
-        # Naming one is only needed to disambiguate when several bundles of
-        # the same kind are hosted -- and a name that does not match the
-        # detected mode is a 422, not a guess.
+        # Server-side only: the client sends the NAME of a hosted bundle, never
+        # the weights. Optional -- the server detects CBCT vs IOS from the data
+        # and picks the hosted bundle whose layout matches. Naming one is only
+        # needed to disambiguate several bundles of the same kind, and a name
+        # that does not match the detected mode is a 422, not a guess.
         "model": ArgSpec(
             label="Model Bundle",
             section=_INPUTS,
@@ -103,20 +91,15 @@ class ALITool(Tool):
             ui="inline",
             description="CBCT only: anatomical regions to predict",
         ),
-        # The precise counterpart of `cbct_regions`, and the argument another
-        # server-side tool drives this engine through.
-        #
-        # A region is the right granularity for a human placing a full set of
-        # points, and the wrong one for a caller that needs a named few: ASO's
-        # fully-automated CBCT mode registers on seven landmarks
-        # (Ba, S, N, RPo, LPo, ROr, LOr) that straddle the Cranial base and
-        # Upper regions, so asking by region would run 58 agents to use 7 --
-        # and one agent is a full two-scale walk of the volume.
+        # The counterpart of `cbct_regions`, and how another server-side tool
+        # drives this engine. A region is the right granularity for a human
+        # placing a full set of points and the wrong one for a caller needing a
+        # named few: ASO registers on seven landmarks straddling two regions,
+        # so asking by region would run 58 agents to use 7.
         #
         # All options off by default, unlike the regions: "off" is what an
-        # omitted multichoice arrives as, so the default state is exactly
-        # "nothing said here, the regions decide" -- which is what every
-        # request written before this argument existed keeps meaning.
+        # omitted multichoice arrives as, so the default state means "nothing
+        # said here, the regions decide".
         "landmarks": ArgSpec(
             label="Individual landmarks",
             section=_CBCT,

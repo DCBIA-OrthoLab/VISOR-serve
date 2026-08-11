@@ -429,8 +429,13 @@ Before writing your own zip/tabular handling, check `file_utils.py`:
 | `make_scratch_dir(prefix)` | Fresh writable directory under `TEMP_DIR` for this request; cleaned up for you |
 | `extract_zip(zip_path, extract_dir=None, strip_single_root=False, max_total_bytes=None)` | Safely extracts an archive (zip slip / symlink / size guards), returns the directory |
 | `make_zip(sources, destination)` | Bundles a list of paths, or one directory, into an archive — what backs `output_kind="files"` |
+| `split_scan_extension(name)` | `'scan.nii.gz'` → `('scan', '.nii.gz')`, compound extensions preserved |
+| `compressed_extension(ext)` | The compressed spelling ITK can write for a scan extension |
 | `load_tabular_file(path)` | Loads one `.csv` / `.xlsx` / `.ods` into a DataFrame |
 | `load_tabular_directory(path)` | Loads and concatenates every tabular file directly in a directory |
+
+A helper more than one tool needs belongs here, not copied into each of them —
+tools never import each other.
 
 ---
 

@@ -1,6 +1,8 @@
-"""Shared helpers for tools that need to unzip an upload and/or load tabular
-data files (CSV/XLSX/ODS). Factored out so multiple tools can reuse the same
-logic instead of each reimplementing zip extraction and tabular loading.
+"""Shared helpers for tools: scratch directories, zip extraction and creation,
+medical scan extensions, and tabular data loading (CSV/XLSX/ODS).
+
+Anything more than one tool needs belongs here rather than being reimplemented
+per tool. Tools never import each other.
 """
 
 import contextvars
@@ -15,11 +17,11 @@ from config import settings
 
 
 # Scratch dirs handed out during the request being served, so main.py can
-# remove them all even when run() raises before returning any path -- a crash
-# mid-inference must not leave patient data behind. A ContextVar (rather than a
-# module global) keeps concurrent requests from seeing each other's list; the
+# remove them all even when run() raises before returning a path -- a crash
+# mid-inference must not leave patient data behind. A ContextVar rather than a
+# module global keeps concurrent requests from seeing each other's list; the
 # list is mutated in place, never reassigned, so the copy anyio hands to the
-# worker thread stays the same object the request handler holds.
+# worker thread stays the object the request handler holds.
 _scratch_dirs: contextvars.ContextVar = contextvars.ContextVar("scratch_dirs", default=None)
 
 
@@ -33,10 +35,9 @@ def track_scratch_dirs() -> list:
 def make_scratch_dir(prefix: str = "tool_") -> str:
     """Fresh writable scratch dir under settings.TEMP_DIR for one request.
 
-    For tools whose inputs all come from the read-only data store: there is
-    no upload work dir to write next to, so extraction/output files go here
-    instead. main.py deletes this directory once the request is over --
-    whether it succeeded or run() raised.
+    For tools whose inputs all come from the read-only data store, which have
+    no upload work dir to write next to. main.py deletes it once the request is
+    over, whether it succeeded or run() raised.
     """
     os.makedirs(settings.TEMP_DIR, exist_ok=True)
     scratch_dir = tempfile.mkdtemp(prefix=prefix, dir=settings.TEMP_DIR)
@@ -124,12 +125,10 @@ def extract_zip(
 
 
 # Extensions whose bytes are already compressed. DEFLATE gains ~0% on them
-# while running at 30-46 MB/s on one core (measured 2026-08-07 on the real
-# 94 MB .nii.gz testfile: 3.3s of CPU to shave 0% off the archive), and the
-# client pays the same tax twice more on arrival -- its integrity pass CRCs
-# every member and its extraction inflates them again, both ~5x faster on a
-# STORED member. `.gz` covers the compound medical extensions (.nii.gz,
-# .nrrd.gz, .gipl.gz); the OOXML formats are zip containers by design.
+# while running at 30-46 MB/s on one core (3.3s of CPU to shave 0% off the
+# 94 MB .nii.gz testfile), and the client pays the same tax twice more on
+# arrival: its integrity pass CRCs every member and its extraction inflates
+# them again, both ~5x faster on a STORED member.
 _STORED_EXTENSIONS = (
     ".gz", ".bz2", ".xz", ".zip", ".7z",
     ".xlsx", ".ods", ".docx", ".pptx",
@@ -190,6 +189,30 @@ def _add_to_zip(zf: zipfile.ZipFile, file_path: str, arcname: str, written: set)
     # settings.ZIP_COMPRESSLEVEL); already-compressed members opt out of it.
     stored = arcname.lower().endswith(_STORED_EXTENSIONS)
     zf.write(file_path, arcname, compress_type=zipfile.ZIP_STORED if stored else None)
+
+
+# Medical volume formats the tools read and write, longest extension first so
+# ".nii.gz" is never cut short by ".nii".
+SCAN_EXTENSIONS = (".nii.gz", ".nrrd.gz", ".gipl.gz", ".nii", ".nrrd", ".gipl")
+
+# The compressed spelling ITK can WRITE for each scan extension. NIfTI and GIPL
+# take an external .gz; NRRD compresses inside the file and ITK has no
+# ".nrrd.gz" writer at all, so that spelling maps back down to ".nrrd".
+_COMPRESSED_EXTENSIONS = {".nii": ".nii.gz", ".gipl": ".gipl.gz", ".nrrd.gz": ".nrrd"}
+
+
+def split_scan_extension(filename: str) -> tuple:
+    """('scan.nii.gz') -> ('scan', '.nii.gz'), compound extensions preserved."""
+    lower = filename.lower()
+    for extension in SCAN_EXTENSIONS:
+        if lower.endswith(extension):
+            return filename[: -len(extension)], filename[-len(extension):]
+    return os.path.splitext(filename)
+
+
+def compressed_extension(extension: str) -> str:
+    """The compressed spelling ITK can write for a scan extension."""
+    return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)
 
 
 def load_tabular_file(file_path: str) -> pd.DataFrame:

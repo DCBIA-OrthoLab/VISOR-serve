@@ -6,22 +6,20 @@ mask is projected back onto the mesh faces that produced its pixels; the
 landmark is the surface point nearest the centroid of those faces.
 
 Restructured around what is loaded when. The original built a renderer,
-instantiated a UNet and called `load_state_dict` **inside the per-tooth
-loop** -- 28 model loads per scan per network, plus re-reading and re-scaling
-the mesh every time. Here the mesh is read once per scan, the renderer once
-per run, and the weights once per (network, jaw). Nothing about the inference
-itself changes.
+instantiated a UNet and called `load_state_dict` INSIDE the per-tooth loop --
+28 model loads per scan per network, re-reading the mesh every time. Here the
+mesh is read once per scan, the renderer once per run, and the weights once per
+(network, jaw). The inference itself is unchanged.
 
-Fixes carried over from the analysis, all of which cost results silently:
+Three defects fixed, all of which cost results silently:
 
-* a jaw whose weights are missing from the bundle raised a `KeyError` that was
-  caught and discarded, so the jaw simply vanished from the output. It is
-  reported now.
+* a jaw whose weights are missing raised a `KeyError` that was caught and
+  discarded, so the jaw vanished from the output. It is reported now.
 * a mesh with no tooth labels fell back to all-zeros, so no tooth was ever
   found and the run ended with no landmarks and no reason. ALILogic segments
-  such a mesh through CrownSeg before it gets here.
-* `.stl` input was accepted by the UI, copied along, and then never discovered
-  by the CLI, which globbed for `.vtk` only.
+  such a mesh through CrownSeg first.
+* `.stl` input was accepted by the UI and then never discovered by the CLI,
+  which globbed for `.vtk` only.
 """
 
 import logging
@@ -35,7 +33,7 @@ from config import settings
 
 from ..markups import MARKUPS_EXTENSION
 from ..markups import write as write_markups
-from ..ALI_CBCT.brain import import_torch
+from ..ALI_CBCT.brain import import_torch, resolve_device
 from . import landmarks as catalog
 from . import render, surface
 
@@ -62,15 +60,6 @@ def _import_unet():
     except ImportError as exc:  # pragma: no cover - depends on the deployment
         raise ToolUnavailableError(f"{_MONAI_HINT} (missing: monai)") from exc
     return UNet
-
-
-def resolve_device(requested: str = None) -> str:
-    torch = import_torch()
-    wanted = (requested or settings.DEVICE or "cpu").strip().lower()
-    if wanted.startswith("cuda") and not torch.cuda.is_available():
-        logger.warning("DEVICE=%s requested but CUDA is unavailable; falling back to CPU", wanted)
-        return "cpu"
-    return wanted
 
 
 def check_dependencies() -> None:

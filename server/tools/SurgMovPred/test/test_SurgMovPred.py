@@ -242,7 +242,6 @@ def test_main_full_pipeline_with_server_side_data(tmp_path, monkeypatch):
     """Data-store layout: the model is a plain folder and the input a bare
     XLSX, both served read-only -- nothing is zipped, and the output must land
     outside the (read-only) input directory."""
-    import file_utils
     from config import settings
 
     monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path / "server_tmp"))

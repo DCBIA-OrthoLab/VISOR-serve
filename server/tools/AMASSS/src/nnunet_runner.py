@@ -1,43 +1,22 @@
 """nnUNet v2 inference, isolated from the rest of the AMASSS pipeline.
 
-Four things this module exists to get right. The first three are defects the
-original Slicer CLI had, in ways that only hurt on a shared server; the fourth
-is where the run time actually goes.
+Four things this module gets right that the original Slicer CLI did not:
 
-1. **No `nnUNet_results` environment variable.** The CLI set
-   `os.environ['nnUNet_results']` before spawning `nnUNetv2_predict`. On this
-   server tools run concurrently in worker threads (see MAX_CONCURRENT_TOOLS
-   in config.py), and `os.environ` is process-global: two AMASSS requests
-   overlapping would silently overwrite each other's model path and predict
-   the wrong structure. `initialize_from_trained_model_folder` takes an
-   explicit path, so the race cannot happen by construction.
+1. No `nnUNet_results` environment variable. The CLI set it before spawning
+   `nnUNetv2_predict`, and `os.environ` is process-global: two overlapping
+   AMASSS requests would overwrite each other's model path.
+   `initialize_from_trained_model_folder` takes an explicit path instead.
+2. No output-file polling. The CLI killed the predictor once the output file
+   stopped growing for three seconds, which could interrupt nnUNet
+   mid-postprocessing. The Python API simply returns when it is done.
+3. GPU work is serialized by a semaphore: one card cannot hold several
+   concurrent 3d_fullres inferences, whatever MAX_CONCURRENT_TOOLS allows.
+4. The resampling runs on the GPU too (see `_enable_gpu_resampling`), which is
+   where the run time actually went -- the network was an eighth of it.
 
-2. **No output-file polling heuristic.** The CLI watched the output file's
-   size and killed the predictor process once it stopped growing for three
-   seconds, which could interrupt nnUNet mid-postprocessing. Calling the
-   Python API means the call simply returns when it is done.
-
-3. **GPU work is serialized.** MAX_CONCURRENT_TOOLS allows several tools to
-   run at once, but a single GPU cannot hold several concurrent 3d_fullres
-   inferences. A semaphore caps AMASSS's own GPU usage; extra requests wait
-   for a slot instead of pushing the card into an out-of-memory failure.
-
-4. **The resampling runs on the GPU too.** Profiling one structure on a
-   512x512x365 CBCT: 14.6s resampling the input to the model's grid, 4.5s of
-   inference, 6.9s resampling the logits back -- the network is an eighth of
-   the run and the card is idle for the rest. Both resamplings are scipy
-   splines pinned to one core; nnUNet ships torch versions of them, and
-   selecting those (see `_enable_gpu_resampling`) took the default
-   five-structure run on that scan from 195.9s to 77.0s, for a documented cost
-   in mask agreement. Bigger batches do NOT help here and were measured not to: at a
-   128^3 patch the network already saturates the SMs at batch 1, so throughput
-   is flat from batch 1 to 12 while using 2.7GB of a 48GB card. The idle memory
-   is not convertible into speed; the idle *time* is.
-
-torch and nnunetv2 are imported lazily, inside the functions that need them:
-registry.py imports every tool at server startup, and a heavy (or missing)
-deep-learning stack must not prevent the whole server from booting. If they
-are absent, only AMASSS fails, with an actionable message.
+torch and nnunetv2 are imported lazily: registry.py imports every tool at
+startup, and a missing deep-learning stack must fail AMASSS alone, not the
+whole server.
 """
 
 import glob
@@ -54,11 +33,8 @@ logger = logging.getLogger("AMASSS.nnunet")
 CHECKPOINT_NAME = "checkpoint_final.pth"
 PLANS_FOLDER_PATTERN = "*__nnUNetPlans__3d_fullres"
 
-# How many AMASSS inferences may touch the GPU at the same time -- see
-# settings.AMASSS_MAX_GPU_JOBS for what a higher value does and does not buy.
-# Read through config like every other setting rather than straight from
-# os.getenv, so the whole server configuration stays discoverable in one file
-# (and documented in .env.example).
+# See settings.AMASSS_MAX_GPU_JOBS for what a higher value does and does not
+# buy. Read through config like every other setting, never from os.getenv.
 _MAX_GPU_JOBS = max(1, int(settings.AMASSS_MAX_GPU_JOBS))
 _GPU_SEMAPHORE = threading.BoundedSemaphore(_MAX_GPU_JOBS)
 
@@ -104,10 +80,8 @@ def find_model_folder(model_root: str, structure_code: str):
     Layout expected under the model bundle:
         <model_root>/<CODE>/**/<Dataset...>__nnUNetPlans__3d_fullres/fold_0/checkpoint_final.pth
 
-    Unlike the original CLI -- which took the first matching plans folder and
-    only then discovered its checkpoint was missing -- a candidate is only
-    accepted once its fold_0 checkpoint is confirmed present. A bundle
-    containing a half-copied model therefore degrades to "this structure is
+    A candidate is only accepted once its fold_0 checkpoint is confirmed
+    present, so a half-copied bundle degrades to "this structure is
     unavailable" (reported to the caller) rather than crashing the run.
     """
     structure_root = os.path.join(model_root, structure_code)
@@ -129,9 +103,8 @@ def _build_predictor(device: str):
     """Instantiate an nnUNetPredictor, tolerating nnUNet's renamed kwargs.
 
     nnUNet 2.x renamed `perform_everything_on_gpu` to
-    `perform_everything_on_device` mid-series. Passing whichever the installed
-    version actually declares keeps this working across the range instead of
-    pinning the server to one nnUNet release.
+    `perform_everything_on_device` mid-series; passing whichever the installed
+    version declares keeps this working across the range.
     """
     torch = _import_torch()
     nnUNetPredictor = _import_predictor()
@@ -168,24 +141,19 @@ _RESAMPLING_KEYS = ("resampling_fn_data", "resampling_fn_probabilities")
 def _enable_gpu_resampling(predictor, device: str) -> bool:
     """Point this predictor's resamplers at the GPU. Returns whether it applied.
 
-    Resampling, not inference, is what makes AMASSS slow: nnUNet's default
-    resamplers are scipy splines running single-threaded on one core, and on a
-    CBCT they outweigh the network by roughly seven to one (the numbers are in
-    settings.AMASSS_GPU_RESAMPLING). nnUNet already ships torch equivalents, so
-    there is nothing to reimplement -- only to select.
+    Resampling, not inference, is what makes AMASSS slow: nnUNet's defaults are
+    scipy splines on one core and outweigh the network by roughly seven to one
+    (numbers in settings.AMASSS_GPU_RESAMPLING). nnUNet ships torch
+    equivalents, so there is nothing to reimplement, only to select.
 
-    It is selected by NAME: nnUNet resolves `resampling_fn_data` and
-    `resampling_fn_probabilities` out of the configuration dict through
-    `recursive_find_resampling_fn_by_name`, so rewriting those two names is
-    enough to redirect both ends of the pipeline. No monkeypatching, and no
-    reaching into nnUNet internals that a point release could rename.
+    Selected by NAME: nnUNet resolves both resampling functions out of the
+    configuration dict via `recursive_find_resampling_fn_by_name`, so rewriting
+    the two names redirects both ends. No monkeypatching.
 
-    Mutating that dict is safe on two counts worth stating, because both would
-    be silent bugs: `PlansManager._internal_resolve_configuration_inheritance`
-    hands out a `deepcopy`, so this touches neither the shared plans nor another
-    concurrent request's predictor -- and in particular the `torch.device` put
-    in here never reaches the `plans.json` nnUNet writes next to its output,
-    which `json.dump` could not serialize.
+    Mutating that dict is safe because PlansManager hands out a `deepcopy`: it
+    touches neither the shared plans nor a concurrent request, and the
+    `torch.device` put in here never reaches the `plans.json` nnUNet writes
+    beside its output (which `json.dump` could not serialize).
     """
     if not device.startswith("cuda"):
         return False
@@ -208,12 +176,10 @@ def _enable_gpu_resampling(predictor, device: str) -> bool:
 
     for key in _RESAMPLING_KEYS:
         configuration[key] = "resample_torch_fornnunet"
-        # 'linear' is order 1, which is already what the plans ask for on the
-        # probabilities. The input data is what changes: order 3 down to order 1,
-        # because torch has no 3D cubic interpolation. That is the whole of the
-        # numerical difference, and it is not nothing -- Dice against the scipy
-        # pipeline ran 0.998 on the mandible but 0.978 on the cervical vertebra.
-        # settings.AMASSS_GPU_RESAMPLING carries the full table.
+        # 'linear' is order 1, already what the plans ask for on the
+        # probabilities. The input data drops from order 3 to order 1 (torch
+        # has no 3D cubic interpolation): that is the whole numerical
+        # difference, and settings.AMASSS_GPU_RESAMPLING carries its Dice table.
         configuration[f"{key}_kwargs"] = {
             "is_seg": False,
             "device": torch.device(device),
@@ -232,10 +198,9 @@ def _enable_gpu_resampling(predictor, device: str) -> bool:
 def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: str) -> None:
     """Segment every `*_0000.nii.gz` in `input_dir`, writing masks to `output_dir`.
 
-    Predicting a whole folder in one call is deliberate: the model is loaded
-    once per structure instead of once per (scan x structure) as the original
-    CLI did, which is the difference between N*S and S checkpoint loads on a
-    batch run.
+    A whole folder per call is deliberate: the model is loaded once per
+    structure rather than once per (scan x structure), which on a batch run is
+    the difference between N*S and S checkpoint loads.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -251,14 +216,12 @@ def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: s
         on_gpu = bool(settings.AMASSS_GPU_RESAMPLING) and _enable_gpu_resampling(predictor, device)
 
         if on_gpu:
-            # `predict_from_files` fans preprocessing and export out to *spawned*
-            # processes. Each would have to build its own CUDA context to run a
-            # GPU resampler -- more VRAM and more start-up than the resampling
-            # itself -- so the GPU path runs everything in this process, where
-            # the model already lives. That costs the CPU/GPU overlap
-            # `predict_from_files` gets across a multi-scan batch; the
-            # resampling win is several times larger, but recovering the overlap
-            # (a reader thread feeding the GPU) is the obvious next step.
+            # `predict_from_files` fans preprocessing and export out to SPAWNED
+            # processes, each of which would need its own CUDA context to run a
+            # GPU resampler. The GPU path therefore runs everything in this
+            # process, trading away the CPU/GPU overlap on multi-scan batches --
+            # a smaller loss than the resampling win, and recovering it with a
+            # reader thread feeding the GPU is the obvious next step.
             predictor.predict_from_files_sequential(
                 input_dir,
                 output_dir,
@@ -274,8 +237,6 @@ def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: s
                 num_processes_preprocessing=2,
                 num_processes_segmentation_export=2,
             )
-        # TODO (deliberately not done here, see claude.md "out of scope"):
-        # cache predictors across requests keyed by (model_folder, device).
-        # Loading a checkpoint costs seconds and VRAM; a cache would need an
-        # explicit eviction policy and GPU-memory accounting, which is the
-        # model/GPU memory management work noted for later.
+        # TODO: cache predictors across requests, keyed by (model_folder,
+        # device). Deliberately not done here -- it needs an eviction policy and
+        # GPU-memory accounting, which CLAUDE.md lists as out of scope.

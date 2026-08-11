@@ -1,37 +1,27 @@
 """Chunked resumable uploads, and results served in byte ranges.
 
-Why this exists next to the plain multipart path in main.py: one HTTP request
-moves one file over one TCP connection, and on a long-haul link a single
-connection is bound by the congestion window long before it is bound by
-bandwidth. A 100 MB CBCT to a remote GPU server is minutes that way, and a
-connection dropped at 95% starts again from zero. Splitting the file into
-parts the client sends over SEVERAL connections at once removes both problems:
-the transfer scales with the number of streams instead of with one window, and
-a part that fails is a part that is retried, not a file that is restarted.
+One HTTP request moves one file over one TCP connection, which on a long-haul
+link is bound by the congestion window long before it is bound by bandwidth --
+and a connection dropped at 95% starts again from zero. Splitting the file into
+parts sent over SEVERAL connections fixes both: the transfer scales with the
+number of streams, and a part that fails is retried rather than the whole file.
 
-The endpoints in main.py are thin wrappers; everything that touches the
-filesystem, validates an id, or decides what a session is allowed to do lives
-here so it can be unit-tested without an HTTP client.
+The endpoints in main.py are thin wrappers; everything touching the filesystem
+lives here so it can be unit-tested without an HTTP client.
 
 Two invariants make the concurrency safe without a single lock:
 
-- **Parts never overlap.** Part `n` occupies `[n * chunk_size, (n+1) *
-  chunk_size)` and is written with `os.pwrite` at that offset, so concurrent
-  parts write disjoint ranges of one preallocated file. There is no
-  reassembly pass afterwards -- the blob IS the file as soon as the last part
-  lands, so each uploaded byte is written to disk exactly once.
-- **State lives on disk, not in this process.** A received part is recorded by
+- Parts never overlap. Part `n` occupies `[n * chunk_size, (n+1) * chunk_size)`
+  and is written with `os.pwrite` at that offset, so concurrent parts write
+  disjoint ranges of one preallocated file. There is no reassembly pass: the
+  blob IS the file as soon as the last part lands.
+- State lives on disk, not in this process. A received part is recorded by
   creating a zero-byte marker file, which is atomic. Nothing here is a module
-  global, so the server keeps working under `uvicorn --workers N` (parts of
-  one upload may legitimately be served by different workers) and a session
-  survives the `--reload` that a code edit triggers mid-transfer.
+  global, so a session survives `uvicorn --workers N` and `--reload`.
 
-Integrity is per part, not per file: the client sends each part's SHA-256 and
-the server refuses to write a part whose bytes do not match. Since the parts
-tile the file exactly and every one of them is checked, the assembled blob is
-verified in full without either side ever making a second pass over it. This
-matters more here than the speed does -- a truncated or corrupted CBCT that
-reaches a tool is a wrong result, not an error.
+Integrity is per part: each part carries its SHA-256 and is refused before
+anything is written if it does not match. The parts tile the file exactly, so
+the whole upload is verified without either side making a second pass over it.
 """
 
 import errno
@@ -111,14 +101,9 @@ def touch(directory: str) -> None:
 
     Called on every part written and every range read, which is what makes
     TRANSFER_TTL_SECONDS an IDLE timeout rather than an age limit: a transfer
-    that is still moving can take as long as it needs, and one whose client
-    vanished expires quickly. Without it the two cases are indistinguishable
-    and the TTL has to be sized for the slowest imaginable transfer, which is
-    the opposite of what a confidentiality bound wants.
-
-    Best effort: a failed `utime` costs a directory an early reap, never a
-    failed request, and the reap only happens if nothing touches it again for
-    the whole TTL.
+    still moving can take as long as it needs, one whose client vanished
+    expires quickly. Best effort -- a failed `utime` costs an early reap, never
+    a failed request.
     """
     try:
         os.utime(directory)
@@ -129,16 +114,10 @@ def touch(directory: str) -> None:
 def reap_expired(now: Optional[float] = None) -> int:
     """Delete upload sessions and results untouched for TRANSFER_TTL_SECONDS.
 
-    Runs both on a timer (see main.py's lifespan) and opportunistically when a
-    session or result is created. The timer is the one that matters: the case
-    where an abandoned transfer sits longest is precisely the case where no new
-    request arrives to trigger the opportunistic sweep, so creation-time
-    reaping alone would let an idle server hold patient data indefinitely.
-
-    An abandoned transfer is the only way these directories leak, since every
-    normal path deletes its own. But "abandoned" is the common case for the
-    very situation chunked transfer exists to survive: a client that lost its
-    connection, or a Slicer that was closed mid-download, and never came back.
+    Runs on a timer (see main.py's lifespan) and opportunistically when a
+    session is created. The timer is the one that matters: an abandoned
+    transfer sits longest exactly when no new request arrives to trigger the
+    opportunistic sweep, so an idle server would hold patient data forever.
     """
     now = time.time() if now is None else now
     deadline = now - settings.TRANSFER_TTL_SECONDS
@@ -203,11 +182,9 @@ def create_upload(filename: str, size: int, chunk_size: Optional[int] = None) ->
     """Reserve space for `size` bytes and hand back the session to fill it.
 
     The blob is created at its final length up front (`os.truncate`) so every
-    part can be written at its own offset from the first request onwards. On
-    every filesystem the server realistically runs on this is a sparse file:
-    it costs no blocks until the parts actually arrive, so a client that
-    abandons a 2 GB upload after one part leaves one part's worth of disk
-    behind, not 2 GB.
+    part can be written at its own offset from the first request onwards. This
+    is a sparse file, so an abandoned 2 GB upload leaves one part's worth of
+    disk behind rather than 2 GB.
     """
     if size < 0:
         raise TransferError("Declared size cannot be negative.")
@@ -256,10 +233,9 @@ def create_upload(filename: str, size: int, chunk_size: Optional[int] = None) ->
 def _clamped_chunk_size(requested: Optional[int]) -> int:
     """The client may ask for a part size; the server decides.
 
-    Left to the client, a too-small value turns a 2 GB upload into thousands of
-    requests (each with its own headers, auth check and fsync) and a too-large
-    one gives the parallelism nothing to work with -- one 2 GB part is exactly
-    the single-stream transfer this module exists to replace.
+    A too-small value turns a 2 GB upload into thousands of requests, and a
+    too-large one gives the parallelism nothing to work with -- one 2 GB part
+    is the single-stream transfer this module exists to replace.
     """
     default = settings.UPLOAD_CHUNK_MB * 1024 * 1024
     if not requested:
@@ -334,11 +310,9 @@ def claim_upload(upload_id: str, destination: str) -> str:
     close the session.
 
     `os.rename` rather than a copy: the session and the request work dir are
-    both under TEMP_DIR, so this is a directory entry change -- a 2 GB upload
-    becomes a tool's input in microseconds instead of a second full read and
-    write. The fallback covers the one case where that is not true (TEMP_DIR
-    spanning two mounts), which no supported deployment has but which would
-    otherwise fail the request outright.
+    both under TEMP_DIR, so this is a directory entry change and a 2 GB upload
+    becomes a tool's input in microseconds. The EXDEV fallback covers a
+    TEMP_DIR spanning two mounts.
     """
     session = get_upload(upload_id)
     missing = session.missing_parts()
@@ -467,13 +441,10 @@ def discard_result(result_id: str) -> None:
 def parse_range(header: Optional[str], size: int) -> Optional[tuple]:
     """`Range: bytes=start-end` -> inclusive (start, end), or None for "send it all".
 
-    Only the single-range form is honoured. A multipart/byteranges response is
-    a different content type with its own framing, and nothing needs it: a
-    client wanting several ranges at once gets more out of asking for them on
-    several connections, which is the entire point here.
-
-    Raises TransferError(416) for a range that cannot be satisfied, which is
-    what tells a client its idea of the file's length is stale.
+    Only the single-range form is honoured: a client wanting several ranges at
+    once gets more out of asking for them on several connections, which is the
+    point here. Raises TransferError(416) for a range that cannot be satisfied,
+    telling the client its idea of the file's length is stale.
     """
     if not header:
         return None
