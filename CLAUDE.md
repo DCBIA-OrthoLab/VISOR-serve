@@ -131,12 +131,16 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 .
 ├── CLAUDE.md
 ├── ADDING_A_TOOL.md         # the full contract for writing a tool
-├── docker-compose.yml       # inference service + test service (profile "test")
+├── docker-compose.yml       # inference (GPU) + inference-cpu (profile "cpu") + test services
+├── .env.example             # the three variables compose interpolates
 ├── .githooks/pre-push       # runs `docker compose run --rm test` before a push
-├── scripts/                 # populate DATA/ from the public GitHub releases
+├── scripts/                 # stand the server up, and populate DATA/
+│   ├── setup-server.sh      #   curl-pipeable: clone, check docker, start
+│   ├── install-docker.sh    #   Docker Engine + compose plugin (Linux, root)
+│   ├── server_ctl.py        #   the deployment engine: status/up/update/down/catalog/models
 │   ├── setup-models.sh      #   curl-pipeable entry points
 │   ├── setup-testfiles.sh
-│   ├── fetch_data.py        #   the engine (stdlib only)
+│   ├── fetch_data.py        #   the download engine (stdlib only)
 │   └── data-manifest.yml    #   what to download, and where it goes
 ├── server/
 │   ├── main.py              # FastAPI app: /run/{tool_name}, /uploads, /results
@@ -168,7 +172,12 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 ```
 
 The Slicer client (thin modules + the generic inference client) lives in its
-own repo, `SlicerAutomatedDentalToolsCloud` — not here.
+own repo, `SlicerAutomatedDentalToolsCloud` — not here. Its **Slicer Cloud**
+module is a panel over `scripts/server_ctl.py`: it clones this repository,
+checks Docker, starts the container, reports when the clone has fallen behind
+and relaunches it, and picks which tools' bundles land in `DATA/`. The logic
+stays here on purpose — a deployment fix ships with the server rather than
+needing an extension release.
 
 ---
 
@@ -404,127 +413,161 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
-### 2026-08-10, Transfers use several connections instead of one
+### 2026-08-07 — `scripts/` stands the server up, not just fills `DATA/`
 
-**Motivation: "a 100 MB file takes an eternity to upload".** The 2026-08-07
-entry below measured the HTTP stack as innocent *over loopback* and pointed at
-"the wire or the client's path to it". That was right, and this is that part: a
-remote deployment is the target, and one HTTP request rides one TCP connection,
-which is bound by its congestion window long before it is bound by bandwidth.
-No amount of tuning a single stream fixes that, only more streams do.
+**Motivation:** the answer to "how do I get one of these servers?" was a page
+of terminal instructions, and every tool in the extension is useless without
+one. The Slicer client now carries a **Slicer Cloud** module whose buttons are
+this repository's subcommands, so a clinician's first action is opening a panel
+and their last is typing nothing.
 
-**`transfer.py`: uploads arrive as independent parts, results leave as byte
-ranges.** `POST /uploads` opens a session and answers with the part size it
-actually chose; `PUT /uploads/{id}/parts/{n}` `os.pwrite`s each part at its
-offset into a pre-`truncate`d sparse blob. Parts never overlap, so there is no
-lock anywhere and **no reassembly pass**, the blob *is* the file once the last
-part lands, and `claim_upload` then *renames* it into the run's work dir. That
-also removes the double disk write the old path had (Starlette spools the
-multipart body to a temp file, `_stream_to_disk` copied it out again). On the
-way back, `X-Result-Delivery: reference` makes `/run` return a pointer instead
-of the bytes, and `GET /results/{id}` honours `Range`.
+**`scripts/server_ctl.py` — one engine, driven from a terminal or from Qt.**
+`status` / `up` / `update` / `down` / `logs` / `catalog` / `models`, standard
+library only (same rule as `fetch_data.py`, for one more reason: it also runs
+inside Slicer's interpreter, where nothing may be pip-installed on a user's
+behalf). Two conventions carry the whole GUI integration: **progress goes to
+stderr, machine-readable output to stdout**, so `--json` prints exactly one
+object whatever is being narrated at the same time; and **nothing prints the
+API token** except `server_ctl.py token`, because a status dump lands in log
+panes, screenshots and bug reports.
 
-Measured client-to-server for 100 MB, through a relay capping each connection
-at 12 MB/s (what a congestion-window-limited stream looks like to the
-application):
+**The compose file grew a second server service, and it had to.** A compose
+device reservation is all-or-nothing: `inference` cannot start *at all* on a
+machine with no nvidia device. An override file cannot rescue it either —
+compose **merges** the `devices` list rather than replacing it, so
+`devices: []` in a second `-f` file leaves the reservation in place (measured,
+not assumed). Hence `inference-cpu` under a `cpu` profile, sharing everything
+else through a YAML anchor — the same shape, and the same reasoning, as the
+`test`/`test-gpu` split one level up. `inference` is untouched, so every
+existing `docker compose up` behaves exactly as before.
 
-| | upload | download |
-|---|---|---|
-| one request, one connection | 9.1 s | 8.7 s |
-| 4 connections (the client default) | 2.5 s, **3.7x** | 2.5 s, **3.6x** |
-| 8 connections | 1.5 s, **6.2x** | 1.4 s, **6.2x** |
+Which one runs is decided by **whether docker has an `nvidia` runtime**, not by
+whether `nvidia-smi` exists: the container toolkit is a separate install, and a
+host whose card works perfectly outside docker still cannot start the GPU
+service without it. Guessing from `nvidia-smi` would fail with a compose error
+about a device, on a machine whose GPU is fine.
 
-Over loopback, where there is no window to be limited by, the upload is still
-1.5x faster from losing the double write, and the client's peak RSS for a
-100 MB upload drops from 200 MB to 32 MB (`requests` reads a `files=` argument
-entirely into memory, then builds the whole encoded body next to it).
+**`BIND_ADDR`, unset by default — i.e. today's behaviour — and written as
+`127.0.0.1` by `server_ctl.py up`.** A local plug-and-play deployment speaks
+plain HTTP, and plain HTTP carrying medical images must not be reachable from
+the rest of the network. The lab server behind a TLS terminator keeps binding
+every interface, unchanged.
 
-**Integrity is per part, not per file.** Each `PUT` carries `X-Part-SHA256` and
-is refused before anything is written if it does not match, so corruption costs
-one retried part. The parts tile the file exactly, so the assembled blob is
-verified in full without either side making a second pass over it, which
-matters more than the speed does: a silently truncated CBCT reaching a tool is a
-wrong result, not an error. `Content-Encoding: gzip` on a part is honoured (the
-checksum covers the decompressed bytes), worth ~3x on an uncompressed `.nii` or
-a `.vtk`.
+**Unset, though, and not `0.0.0.0` — the first version got this wrong.**
+Writing `${BIND_ADDR:-0.0.0.0}` looks like it preserves the default and does
+not: with no host address docker publishes on **both** stacks (`0.0.0.0` and
+`[::]`), while an explicit `0.0.0.0` is IPv4 only, so the "harmless default"
+silently dropped every IPv6 client. The `${BIND_ADDR:+${BIND_ADDR:-}:}` form
+keeps unset meaning *no address at all*; the inner `:-` is not redundant, it
+is what stops compose warning about an unset variable on every command.
+Verified by diffing `docker compose config` against `main` (the `inference`
+service is byte-identical) and by reading `docker compose ps` on a real
+container for both cases.
 
-**Resumability falls out of the same design.** A part that fails is a part that
-is retried; `GET /uploads/{id}` reports `missing_parts`, so a client coming back
-from a dropped connection sends only the gap instead of restarting 100 MB. State
-is on disk (immutable `meta.json` + one `O_EXCL` marker per part), not in a
-module global, so it survives `--reload` and works under `uvicorn --workers N`.
+**`HOST_PORT`, and the two conflicts that were found by running it.** The first
+attempt started a container while another clone of this repository was already
+serving 8000 — and compose's "port is already allocated", buried under twenty
+lines of layer output, reads as a broken machine. The preflight now refuses to
+start when *anything* is listening where it would publish, checked by
+connecting rather than by `compose ps`: a second clone is its **own compose
+project**, so `ps` here reports nothing at all while its container holds the
+port. `--port` is the way out, remembered in `.env` so it is passed once.
 
-**Nothing is mandatory.** A client that ignores all of this gets byte-identical
-behaviour to before; a client that uses it against an older server sees a `404`
-on `POST /uploads` and falls back. Abandoned sessions and unclaimed results are
-reaped after `TRANSFER_TTL_SECONDS` of **inactivity** (15 min) by a sweep that
-runs on a timer, so an idle server cleans up too. Every part written and every
-range read stamps its directory, so a transfer still moving is never reaped
-however long it takes. This is a confidentiality bound, not a disk-space one.
+**`--branch` on `status` and `update`, because a clone is created once.**
+`clone()` runs only when there is nothing there, and `update` fast-forwarded
+against whatever upstream the checked-out branch tracked — so a deployment
+repointed at another branch after its first install kept following the old one
+**in complete silence**. `status --branch X` now reports the mismatch and
+`update --branch X` checks the clone out onto it first, refusing a dirty tree
+exactly as the pull does. The Slicer panel passes its Branch field on every
+call, which is what makes that field mean anything after day one.
 
-**And the cleanup guarantee is deliberately not weakened for the common case.**
-A result under `RESULT_REFERENCE_MIN_MB` (16 MB) is streamed in the /run
-response and deleted server-side when that response ends, exactly as before,
-with no dependency on the client at all. Only results big enough to genuinely
-need several connections take the reference route, where the client `DELETE`s
-from a `finally` and the timed reaper is the backstop. Worst case for a client
-that dies mid-download: about 16 minutes.
+This forced the git half of `cmd_update` **above** the docker preflight:
+fetching new code needs neither a working docker nor a free port, and those
+are precisely what someone may be updating in order to fix.
 
-**The client-side note from 2026-08-07 is now closed too:** `slicer_io.zip_folder`
-deflated already-compressed uploads at level 6, on the user's own machine, on the
-main thread. 105 MB of gzipped CBCT took 2.3 s to pack into an archive of exactly
-the same size; it now stores those members and takes 0.16 s.
+**The dependency install no longer gates the server, and that is a fix.**
+Found while building the Slicer panel's "stop the server when Slicer closes"
+setting, which makes restarts routine: `pip install -r requirements.txt`
+**cannot succeed offline even when every dependency is already installed.**
+The chain is `nnunetv2` → `batchgenerators` → `unittest2` → `argparse`, and
+pip never treats `argparse` as satisfied — the stdlib module shadows the
+distribution, so the version check finds nothing and it re-downloads that one
+23 kB wheel on every single start (measured: 252 packages "already satisfied",
+1 downloaded, twice in a row). With `&&`, pip's exit 1 meant uvicorn never
+ran: a laptop off the network had a server that started once and never again.
 
-**Tests:** `server/tests/test_transfer.py` (+31), including the cleanup
-guarantees specifically: a transfer still making progress is never reaped, a
-result being range-read is never reaped, an abandoned one does expire, the
-timed sweep fires with no request at all, a small result is streamed and leaves
-nothing in `results/`, and a guard asserting the idle timeout stays in minutes.
-Plus parts in any order, resume
-from a reported gap, a refused checksum, a wrong-length part, gzip round-trip,
-an over-size file refused before transfer, traversal ids, the reaper, `/run`
-through a session, and range / suffix-range / 416 on results.
+The command now warns and continues, then hard-gates on `python -c 'import
+fastapi, uvicorn'` instead. That probe is what separates "pip could not run
+but everything is here" (warn, start) from "pip could not run and nothing is
+installed" (one `DEPENDENCY-INSTALL-FATAL` line, exit 1) — without it the
+second case was an ImportError traceback restarted for ever by
+`restart: unless-stopped`. `server_ctl.py` greps for both markers and repeats
+them in its own output, so a start that skipped its install says so rather
+than looking perfectly healthy while a `requirements.txt` change silently did
+not apply.
 
-### 2026-08-07 — Result archives stop re-deflating already-compressed members
+Verified on a container run with `--network none` and a fully populated
+`--user` layer: pip fails on `argparse`, the marker is emitted, and
+`Application startup complete` follows.
 
-**Motivation: "the zip and the unzip are super long, and a 90 MB transfer is
-slow on a 1 Gb link".** Measured before touching anything, on the live
-container: the HTTP stack is innocent — the 94 MB testfile downloads at
-~600 MB/s and uploads at ~450 MB/s over loopback (httptools+uvloop confirmed
-in the image; the double disk write on upload, Starlette's spool plus
-`_stream_to_disk`, is invisible on NVMe). A 1 Gb wire moves 90 MB in ~1 s. So
-if a *transfer* feels slow, the wire or the client's path to it is the place
-to look — everything slower than that here was CPU, and it was the zip.
+**Every operator in that command sits at the END of its line.** A YAML `>`
+folded scalar keeps the newlines of its more-indented continuation lines, so a
+line *starting* with `||` reaches `sh` as a command of its own — `sh: 2:
+Syntax error: "||" unexpected`, in a restart loop. The original trailing `&&`
+was load-bearing for the same reason.
 
-**`zipfile` DEFLATE level 6 runs at 30–46 MB/s on one core, and most of what
-this server ships is already compressed.** The 94 MB input everyone tests
-with is a `.nii.gz`; deflating it again cost 3.3 s to shrink the archive by
-0%. The client then pays the same tax twice more on arrival: its
-`_verify_download` CRCs every member (a full decompression) and its
-extraction inflates them again — both ~5x faster on a STORED member.
+**`wait_for_health` treats `restarting` as a failure**, alongside `exited` and
+`dead`. `restart: unless-stopped` turns any boot failure into a loop, and a
+loop never becomes healthy — before this the caller sat out the full
+30-minute timeout on a failure that was visible in three seconds.
 
-**`make_zip` now picks the compression per member** (`_STORED_EXTENSIONS`):
-`.gz`/`.zip`/OOXML/image members are stored as-is, everything else deflates
-at the new `settings.ZIP_COMPRESSLEVEL`, default 1 — measured twice as fast
-as level 6 for ~3% of size on the one member class still worth compressing
-(binary `.vtk`, ~2.7:1 at either level). Storing *everything* would have
-traded real wire bytes for nothing: the split keeps both wins. A mixed
-archive is an ordinary zip, so the Slicer client needs no change and still
-benefits on its CRC + extract passes. Measured on the real testfiles
-(94 MB `.nii.gz` + 16 MB `.vtk`): **3.32 s → 0.31 s** for a 105 MB archive
-where level 6 produced 104 MB.
+**`DATA/` is created before docker can create it.** `./DATA:/data:ro` is a
+bind mount, so a missing host path is created by the *daemon* — owned by root.
+Every subsequent `models` download then died on `Permission denied` against
+the very directory the server reads, on a brand-new install, with nothing on
+screen explaining why. `ensure_data_dir()` creates it as the invoking user
+before compose runs, and reports the one-line `chown` when docker already won
+that race. Found by running the thing, not by reading it.
 
-**Not touched, deliberately:** the client's `slicer_io.zip_folder` deflates
-uploads at level 6 with the same waste — that is where the biggest *perceived*
-win sits (it runs on the user's own machine), but it lives in the client repo
-and this change was server-only by instruction. Noted for a future client
-release; the extraction side (`extract_zip`, `extractall`) was measured fast
-enough to leave alone (~1 s per 200 MB).
+**`update` is `up -d --force-recreate`, never `restart`.** This is the
+2026-07-31 lesson turned into a button: the container installs
+`requirements.txt` as part of its *command*, into a writable layer `restart`
+keeps, so a pulled dependency change that is never re-resolved would be a
+silent no-op update — worse than a failed one. It also **fast-forwards only**
+and refuses to pull over uncommitted changes: an "Update" click must never
+invent a merge commit in someone's clone, or discard their edits.
 
-**Tests:** 297 server tests (+3, `tests/test_file_utils.py`): the `.nii.gz`
-and `.XLSX` members stored whatever their case, the `.vtk` still genuinely
-deflated, and a mixed archive round-tripping byte-identically through
-`extract_zip`.
+**`--progress always` on `fetch_data.py`.** Its per-file progress was drawn
+with `\r`, which is invisible to a reader collecting whole lines out of a pipe
+— so a 12 GB bundle printed *nothing at all* for an hour into the client's log
+pane. `always` emits a new line every few seconds instead. Terminal behaviour
+is unchanged.
+
+**`catalog` is what makes a partial install legible**: per tool, the manifest
+size *and* what a download would actually transfer, cross-referenced against
+what is already on disk. The distinction is the point — "ALI: 12.3 GB" printed
+next to an already-complete ALI is the number that makes someone skip a tool
+they could have for free. Everything already present is skipped by the engine,
+so there is no separate "resume" and no separate "add one more tool": re-running
+is both.
+
+**`install-docker.sh`** (Linux, needs root) runs Docker's own
+`https://get.docker.com`, adds the invoking user to the `docker` group, and
+says loudly that group membership only applies to a **new login session** —
+otherwise a successful install is followed by "permission denied" and reads as
+a failed one. `--nvidia` adds the container toolkit; it deliberately does not
+install a GPU *driver*, which can need a reboot and a specific kernel package.
+
+**`setup-server.sh`** is the curl-pipeable one-liner tying it together: clone
+(or fast-forward), check docker, optionally fetch named tools, start, print the
+URL and token. Re-running **keeps the existing token**, because regenerating it
+would silently lock out every client already configured against that server.
+
+**Also:** a root `.env.example` documenting the three variables compose
+interpolates (distinct from `server/.env.example`, which documents what the
+application reads), and `scripts/README.md` rewritten around the two jobs the
+folder now has.
 
 ### 2026-08-06 — ALI can be asked for named landmarks, which is what ASO needs
 
