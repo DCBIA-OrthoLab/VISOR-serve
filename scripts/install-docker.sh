@@ -100,8 +100,16 @@ if [ "$WITH_NVIDIA" -eq 1 ]; then
         echo "  on CPU in the meantime." >&2
         exit 1
     fi
-    echo "Installing the NVIDIA Container Toolkit..."
-    if command -v apt-get >/dev/null 2>&1; then
+    # Already installed: go straight to the registration below. Re-running the
+    # install would add an apt/dnf repository and can UPGRADE the toolkit --
+    # a change nobody asked for, on the very component being repaired, when
+    # what is usually missing is only the one-line runtime registration. This
+    # is the common case now that the toolkit ships CDI specs by itself: the
+    # card works, docker just has no runtime entry pointing at it.
+    if command -v nvidia-ctk >/dev/null 2>&1; then
+        echo "The NVIDIA Container Toolkit is already installed: $(nvidia-ctk --version | head -n1)"
+    elif command -v apt-get >/dev/null 2>&1; then
+        echo "Installing the NVIDIA Container Toolkit..."
         curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
             | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
         curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
@@ -110,6 +118,7 @@ if [ "$WITH_NVIDIA" -eq 1 ]; then
         apt-get update
         apt-get install -y nvidia-container-toolkit
     elif command -v dnf >/dev/null 2>&1; then
+        echo "Installing the NVIDIA Container Toolkit..."
         curl -fsSL https://nvidia.github.io/libnvidia-container/stable/rpm/nvidia-container-toolkit.repo \
             -o /etc/yum.repos.d/nvidia-container-toolkit.repo
         dnf install -y nvidia-container-toolkit
@@ -118,11 +127,15 @@ if [ "$WITH_NVIDIA" -eq 1 ]; then
         echo "  https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html" >&2
         exit 1
     fi
+    echo "Registering the 'nvidia' runtime with docker..."
     nvidia-ctk runtime configure --runtime=docker
     if command -v systemctl >/dev/null 2>&1; then
+        # This STOPS every running container, the tool server included. Callers
+        # that may have one up have to say so before asking for a password.
+        echo "Restarting the docker daemon -- running containers will stop."
         systemctl restart docker
     fi
-    echo "Done. 'docker info' should now list an 'nvidia' runtime."
+    echo "Done. 'docker info' now lists an 'nvidia' runtime."
 fi
 
 echo
