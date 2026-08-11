@@ -140,19 +140,27 @@ def discover_weights(model_path: str):
 # Inference
 # ---------------------------------------------------------------------------
 
-def _build_network(checkpoint: str, device: str):
+def _build_network(checkpoint: str, device: str, network_code: str = "O"):
     """The 2D UNet the IOS weights were trained as.
 
     Every argument here is part of the checkpoint's shape; changing one makes
-    `load_state_dict` fail rather than degrade.
+    `load_state_dict` fail rather than degrade -- which is why the two shapes
+    are declared rather than inferred.
+
+    **The mucogingival network is a different shape.** O and C take one image
+    per camera as a batch: 4 channels in (normals as RGB + depth), 4 classes out
+    (background plus their three or two landmark types). MG stacks its three
+    buccal views into ONE input of 12 channels and predicts 3 classes -- it has
+    a single landmark to find and needs the three views together to place it.
     """
     torch = import_torch()
     UNet = _import_unet()
 
+    in_channels, out_channels = (12, 3) if network_code == "MG" else (4, 4)
     network = UNet(
         spatial_dims=2,
-        in_channels=4,
-        out_channels=4,
+        in_channels=in_channels,
+        out_channels=out_channels,
         channels=(16, 32, 64, 128, 256, 512),
         strides=(2, 2, 2, 2, 2),
         num_res_units=4,
@@ -243,8 +251,20 @@ def _predict_one_scan(mesh_path, key, record, weights, networks, device, rendere
         )
 
     positions = {}
+    notes: dict = {}
     for network in networks:
         for jaw, teeth in teeth_by_jaw.items():
+            # MG was trained on the mandible alone, so a maxilla is not a
+            # missing model -- it is a question the network cannot be asked.
+            if jaw not in catalog.NETWORK_JAWS.get(network, catalog.JAWS):
+                continue
+            if network == "MG":
+                # Every MG tooth, not only the segmented ones: the ones with no
+                # label get their cameras aimed from a fit of the arch through
+                # the ones that have (see render.estimate_missing_teeth), which
+                # is what keeps a gap in the segmentation from becoming a gap in
+                # the mucogingival line.
+                teeth = list(catalog.MG_TEETH)
             if not teeth:
                 continue
             checkpoint = weights.get(network, {}).get(jaw)
@@ -265,7 +285,18 @@ def _predict_one_scan(mesh_path, key, record, weights, networks, device, rendere
                 mesh_index, mesh_total, pass_name, len(teeth),
             )
 
-            unet = _build_network(checkpoint, device)
+            unet = _build_network(checkpoint, device, network)
+            estimates = (
+                render.estimate_missing_teeth(labels, vertices, teeth, device)
+                if network == "MG"
+                else {}
+            )
+            if estimates:
+                logger.info(
+                    "mesh %d/%d: %s -- %d tooth/teeth absent from the segmentation, "
+                    "positions estimated from the arch",
+                    mesh_index, mesh_total, pass_name, len(estimates),
+                )
             try:
                 for tooth_number in teeth:
                     label_names = catalog.LABELS[network].get(str(tooth_number))
@@ -288,6 +319,8 @@ def _predict_one_scan(mesh_path, key, record, weights, networks, device, rendere
                             mesh_center=mesh_center,
                             scale_factor=scale_factor,
                             device=device,
+                            estimated=estimates.get(tooth_number),
+                            notes=notes,
                         )
                     except Exception as exc:
                         # One tooth failing must not cost the other 27.
@@ -314,20 +347,33 @@ def _predict_one_scan(mesh_path, key, record, weights, networks, device, rendere
         raise RuntimeError("no landmark was predicted on this mesh")
 
     record["landmarks_found"].sort()
+    if notes:
+        # In the report AND in the file (see write_markups): a point placed from
+        # an arch fit or forced out of the most likely pixels is a point to
+        # review, and it is indistinguishable from a good one otherwise.
+        record["landmarks_degraded"] = dict(sorted(notes.items()))
     destination = os.path.join(
         output_dir,
         os.path.dirname(key),
         f"{os.path.splitext(os.path.basename(mesh_path))[0]}_lm_{prediction_ID}"
         f"{MARKUPS_EXTENSION}",
     )
-    record["files"].append(write_markups(positions, destination))
+    record["files"].append(write_markups(positions, destination, descriptions=notes))
 
 
 def _predict_one_tooth(unet, renderer, mesh, network, jaw, tooth_number, label_names,
                        vertices, faces, labels, locator, scaled, mesh_center, scale_factor,
-                       device) -> dict:
+                       device, estimated=None, notes=None) -> dict:
     """Render one tooth, predict its landmarks, return {label: position}."""
     torch = import_torch()
+
+    if network == "MG":
+        return _predict_mucogingival(
+            unet=unet, renderer=renderer, mesh=mesh, tooth_number=tooth_number,
+            label_name=label_names[0], vertices=vertices, faces=faces, labels=labels,
+            locator=locator, scaled=scaled, mesh_center=mesh_center,
+            scale_factor=scale_factor, device=device, estimated=estimated, notes=notes,
+        )
 
     center = render.tooth_center(labels, vertices, tooth_number, device)
     if center is None:
@@ -357,6 +403,112 @@ def _predict_one_tooth(unet, renderer, mesh, network, jaw, tooth_number, label_n
         if position is not None:
             found[label_name] = surface.upscale(position, mesh_center, scale_factor)
     return found
+
+
+# How many most-likely pixels are kept when the mucogingival class wins none.
+MG_FORCE_TOPK = 50
+
+
+def _predict_mucogingival(unet, renderer, mesh, tooth_number, label_name, vertices, faces,
+                          labels, locator, scaled, mesh_center, scale_factor, device,
+                          estimated=None, notes=None) -> dict:
+    """One mucogingival landmark, from the three adaptive buccal views.
+
+    Three things differ from the crown networks, and each one is why the naive
+    version of this returned nothing:
+
+    * **the cameras are aimed per tooth**, at where the landmark is expected,
+      along the buccal normal of the arch at that tooth (see `render.mg_frame`);
+    * **the predicted faces are NOT filtered to the tooth.** The mucogingival
+      point is on the gingiva, and `faces_on_tooth` would drop every one of
+      them -- it keeps only faces whose vertices carry this tooth's label;
+    * **the whole point is placed, or nothing is.** There is one landmark per
+      tooth, and a mandible with gaps in its mucogingival line is what AREG then
+      has to fit a spline through, so a tooth that predicts no pixel at all
+      falls back to its most likely ones rather than being dropped.
+    """
+    torch = import_torch()
+
+    if estimated is not None:
+        center, tangent = estimated
+        center = center.view(1, 3)
+        tangent = tangent.clone()
+        tangent[2] = 0.0
+        norm = torch.norm(tangent)
+        tangent = tangent / norm if norm > 1e-6 else None
+    else:
+        center = render.tooth_center(labels, vertices, tooth_number, device)
+        if center is None:
+            return {}
+        tangent = render.arch_tangent(labels, vertices, tooth_number, device)
+
+    normal, aim = render.mg_frame(vertices, center, tangent, tooth_number, device)
+
+    with _GPU_SEMAPHORE:
+        images, pix_to_face = render.render_mg_views(
+            renderer=renderer,
+            mesh=mesh,
+            aim=aim,
+            directions=render.mg_camera_directions(normal, device),
+            radius=catalog.CAMERA_RADIUS["MG"],
+            device=device,
+        )
+        # The three views become the 12 channels of ONE input, not a batch of
+        # three: (1, 3, 4, H, W) -> (1, 12, H, W).
+        views = images[0].unsqueeze(0)
+        batch, cameras, channels, height, width = views.shape
+        with torch.no_grad():
+            predictions = unet(
+                views.reshape(batch, cameras * channels, height, width).float().to(device)
+            )
+
+    # argmax on the raw scores. Casting the logits to int16 first -- what the
+    # crown path inherited and this deliberately does not -- truncates every
+    # value toward zero, turning near ties into exact ties that argmax then
+    # resolves in favour of channel 0, the background.
+    logits = predictions.detach().float()
+    classes = torch.argmax(logits, dim=1)
+    chosen = (classes == 1).nonzero(as_tuple=False)
+
+    note = None
+    if len(chosen) == 0:
+        # Nothing won. Keep the pixels where the landmark class is most likely
+        # anyway: upstream measures a forced point at ~5 mm of error against
+        # ~1.2 mm for a won one, which is worth having as a point to be reviewed
+        # rather than a hole in the line.
+        probabilities = torch.softmax(logits, dim=1)[:, 1]
+        keep = min(MG_FORCE_TOPK, probabilities.numel())
+        if keep == 0:
+            return {}
+        confidence, flat = probabilities.reshape(-1).topk(keep)
+        chosen = torch.stack(
+            torch.unravel_index(flat, probabilities.shape), dim=1
+        )
+        note = f"forced (confidence {float(confidence.max()):.3f})"
+
+    # `chosen` indexes (view, row, column) of the stacked prediction; the same
+    # (view, row, column) of pix_to_face says which face was rendered there.
+    predicted = []
+    for entry in chosen:
+        view, row, column = (int(value) for value in entry.tolist())
+        face = int(pix_to_face[view, 0, row, column, 0].item())
+        if face >= 0:
+            predicted.append(face)
+
+    position = _landmark_position(predicted, faces, vertices, locator, scaled)
+    if position is None:
+        return {}
+
+    if estimated is not None:
+        note = "; ".join(
+            filter(None, [note, "cameras aimed from an arch fit, tooth not segmented"])
+        )
+    if note and notes is not None:
+        # Recorded rather than logged: a degraded point looks exactly like a
+        # good one in the output file, and whoever reads the landmarks is the
+        # one who needs to know which ones to review.
+        notes[label_name] = note
+    return {label_name: surface.upscale(position, mesh_center, scale_factor)}
 
 
 def predict_landmarks(

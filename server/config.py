@@ -129,6 +129,23 @@ class Settings(BaseSettings):
     # typical card.
     CROWNSEG_MAX_GPU_JOBS: int = 1
 
+    # The tool AREG asks for the mucogingival landmarks its lower-arch
+    # registration builds its patch from. Deployed here, so a caller who sends
+    # no landmarks gets them predicted; a server without it answers 422 saying
+    # to send them (see tools/AREG/src/tools_client.py). Every other AREG mode
+    # never goes near it.
+    AREG_LANDMARK_TOOL: str = "ALI"
+
+    # How many AREG IOS patch predictions may touch the GPU at the same time.
+    # The same shape of work as CrownSeg's -- a mesh rasterized at 320x320 from
+    # seven viewpoints, then a 2D UNet over the seven -- so it gets the same
+    # default and its own counter, because the two tools' footprints are free to
+    # diverge. AREG's CBCT engine is elastix on the CPU and never comes here.
+    #
+    # Read once, when tools/AREG/src/ios/butterfly.py is imported (the semaphore
+    # it sizes is a module global), so a change needs a server restart.
+    AREG_MAX_GPU_JOBS: int = 1
+
     # DataLoader worker processes shapeaxi uses to load meshes. Must be >= 1:
     # shapeaxi builds its loader with persistent_workers=True, which PyTorch
     # rejects at 0.

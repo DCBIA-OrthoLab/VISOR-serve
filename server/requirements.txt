@@ -15,6 +15,16 @@ SimpleITK
 # ALI's CBCT engine: itk resamples the volumes to the two spacings the agents
 # walk. Imported lazily like the stack below.
 itk
+# AREG's CBCT engine: the rigid voxel-based registration is elastix, which the
+# base `itk` package does not carry (no itk.ElastixRegistrationMethod).
+#
+# PINNED, and checked against the rule the monai entry below spells out: 0.25.4
+# depends on itk-core/itk-filtering 5.4.7 and nothing else -- no torch, so it
+# cannot shadow the image's CUDA build. It DOES move the image's own itk from
+# 5.4.6 to 5.4.7 in the pip --user layer, which is a patch bump of the same
+# 5.4 series ALI's CBCT engine already runs on. Bump this only after re-running
+# ALI's real-data suite.
+itk-elastix==0.25.4
 # DICOM series ASO's CBCT mode cannot read through SimpleITK's GDCM reader.
 # Imported lazily (tools/ASO/src/cbct/dicom.py): every other ASO mode works
 # without it.

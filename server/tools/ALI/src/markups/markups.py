@@ -73,18 +73,23 @@ _DISPLAY = {
 }
 
 
-def control_points(landmarks: dict) -> list:
+def control_points(landmarks: dict, descriptions: dict = None) -> list:
     """One markups control point per landmark, from {label: (x, y, z)}.
 
     Coordinates are cast to float: they arrive as numpy scalars, which
     `json.dump` cannot serialize -- and the failure would land at the very end
     of a run, after all the inference.
     """
+    descriptions = descriptions or {}
     return [
         {
             "id": str(index),
             "label": label,
-            "description": "",
+            # Where a point needs a caveat, it travels WITH the point. A
+            # degraded landmark looks exactly like a good one in the file, and
+            # whoever opens it is the one who has to know which to review --
+            # upstream puts the same text here.
+            "description": descriptions.get(label, ""),
             "associatedNodeID": "",
             "position": [float(position[0]), float(position[1]), float(position[2])],
             "orientation": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
@@ -97,8 +102,12 @@ def control_points(landmarks: dict) -> list:
     ]
 
 
-def write(landmarks: dict, output_path: str) -> str:
-    """Write {label: (x, y, z)} as a Slicer markups file; return its path."""
+def write(landmarks: dict, output_path: str, descriptions: dict = None) -> str:
+    """Write {label: (x, y, z)} as a Slicer markups file; return its path.
+
+    `descriptions` optionally maps a label to a caveat about how it was
+    placed, written into the control point's own `description` field.
+    """
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
     content = {
@@ -109,7 +118,7 @@ def write(landmarks: dict, output_path: str) -> str:
                 "coordinateSystem": COORDINATE_SYSTEM,
                 "locked": False,
                 "labelFormat": "%N-%d",
-                "controlPoints": control_points(landmarks),
+                "controlPoints": control_points(landmarks, descriptions),
                 "measurements": [],
                 "display": _DISPLAY,
             }

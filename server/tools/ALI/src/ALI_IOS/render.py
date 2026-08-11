@@ -19,6 +19,8 @@ IOS run fails -- with a message naming what is missing. The CBCT engine is
 unaffected.
 """
 
+import math
+
 import numpy as np
 
 from base import ToolUnavailableError
@@ -155,6 +157,212 @@ def tooth_center(labels, vertices, tooth_number: int, device):
     if len(matches) == 0:
         return None
     return vertices[0][matches].mean(dim=0).unsqueeze(0).to(device)
+
+
+# ---------------------------------------------------------------------------
+# Mucogingival cameras
+# ---------------------------------------------------------------------------
+# The O and C networks orbit a tooth on a fixed sphere of directions. MG cannot:
+# its landmark is on the gingival margin, buccal to the crown, and "buccal" is a
+# different direction for every tooth of the arch.
+#
+# The radial direction (tooth centre - mesh centre) that the sphere scheme
+# effectively uses is only buccal near the midline. Measured upstream against
+# the true normal: off by 2-5 degrees on the incisors, 35 degrees on teeth
+# 19/30 and 53 degrees on tooth 31 -- so on the molars the cameras looked ALONG
+# the arch and the landmark was not in the image at all.
+
+# Half-angle between the front camera and its two neighbours, in radians.
+MG_CAMERA_SPREAD = 0.35
+# How far the cameras drop below the aim point, as a fraction of the radius.
+MG_CAMERA_PLUNGE = 0.15
+
+
+def arch_tangent(labels, vertices, tooth_number: int, device):
+    """The arch's direction at one tooth, horizontal and unit length.
+
+    The lower teeth carry consecutive Universal ids along the arch (18 -> 31),
+    so the neighbours of `tooth_number` are its id minus and plus one, and their
+    centroids give the local tangent. At the ends of the arch one neighbour is
+    missing and a one-sided difference is used. Returns None when neither
+    neighbour is present -- the caller then falls back to the radial direction.
+    """
+    from ..ALI_CBCT.brain import import_torch
+
+    torch = import_torch()
+
+    def centroid(number):
+        matches = (labels[0] == int(number)).nonzero(as_tuple=True)[0]
+        return vertices[0][matches].mean(dim=0) if len(matches) else None
+
+    here, before, after = (
+        centroid(tooth_number), centroid(tooth_number - 1), centroid(tooth_number + 1)
+    )
+    if before is not None and after is not None:
+        tangent = after - before
+    elif after is not None and here is not None:
+        tangent = after - here
+    elif before is not None and here is not None:
+        tangent = here - before
+    else:
+        return None
+
+    tangent = tangent.clone()
+    tangent[2] = 0.0  # the arch is read in the horizontal plane
+    norm = torch.norm(tangent)
+    return (tangent / norm).to(device) if norm > 1e-6 else None
+
+
+def mg_frame(vertices, center, tangent, tooth_number: int, device):
+    """`(buccal normal, aim point)` for one tooth, in unit-sphere space.
+
+    The buccal normal is horizontal, perpendicular to the arch tangent, and
+    pointing away from the arch's centre -- at the cheek, not the tongue. The
+    aim point is where the landmark is expected (`MG_AIM_OFFSET`), so the
+    cameras frame the gingival margin rather than the crown.
+    """
+    from ..ALI_CBCT.brain import import_torch
+
+    from . import landmarks as catalog
+
+    torch = import_torch()
+
+    outward = (center[0] - vertices[0].mean(dim=0)).clone()
+    outward[2] = 0.0
+
+    if tangent is None:
+        normal = outward
+    else:
+        normal = torch.stack([-tangent[1], tangent[0], torch.zeros_like(tangent[0])])
+        if torch.norm(normal) < 1e-6:
+            normal = outward
+        if torch.dot(normal, outward) < 0:
+            normal = -normal
+    normal = normal / (torch.norm(normal) + 1e-6)
+
+    aim = center[0].clone()
+    offset = catalog.MG_AIM_OFFSET.get(int(tooth_number))
+    if offset is not None and tangent is not None:
+        buccal, along, vertical = offset
+        aim = aim + normal * buccal + tangent * along
+        aim[2] = aim[2] + vertical
+    else:
+        # What the code did before the offsets were measured, kept as the
+        # fallback for a tooth with no known neighbour.
+        aim[2] = aim[2] - 0.2
+
+    return normal.to(device), aim.to(device)
+
+
+def mg_camera_directions(normal, device):
+    """The three buccal directions: straight on, and rotated by +/- the spread.
+
+    Rotated about the vertical axis, so all three stay horizontal. Must match
+    the training code: the network sees three images in a fixed order and a
+    different geometry is a different input.
+    """
+    from ..ALI_CBCT.brain import import_torch
+
+    torch = import_torch()
+
+    cos_a, sin_a = math.cos(MG_CAMERA_SPREAD), math.sin(MG_CAMERA_SPREAD)
+    front = normal
+    left = front.clone()
+    right = front.clone()
+    left[0] = front[0] * cos_a - front[1] * sin_a
+    left[1] = front[0] * sin_a + front[1] * cos_a
+    right[0] = front[0] * cos_a + front[1] * sin_a
+    right[1] = -front[0] * sin_a + front[1] * cos_a
+    return torch.stack([front, left, right]).to(device)
+
+
+def render_mg_views(renderer, mesh, aim, directions, radius: float, device):
+    """Render the three buccal views of one tooth's gingival margin.
+
+    Returns `(images, pix_to_face)` shaped like `render_views`' output, so the
+    engine's projection back onto the mesh is the same code.
+
+    The renderer and the rasterizer are called with the SAME R and T, so
+    `pix_to_face` lines up with the pixels of the image it accompanies. The
+    sphere-scheme path below rasterizes the mesh with no R/T at all, which
+    happens to work there because the camera is baked into the meshes it is
+    handed; here the cameras differ per view and the pairing has to be explicit.
+    """
+    from ..ALI_CBCT.brain import import_torch
+
+    torch = import_torch()
+    p3d = import_pytorch3d()
+    look_at_rotation = p3d["look_at_rotation"]
+
+    images = torch.empty(0).to(device)
+    pix_to_faces = torch.empty(0).to(device)
+
+    for direction in directions:
+        camera_position = (aim + direction * radius).unsqueeze(0)
+        camera_position[:, 2] -= radius * MG_CAMERA_PLUNGE
+        target = aim.unsqueeze(0)
+        up = torch.tensor([[0.0, 0.0, 1.0]], device=device)
+
+        rotation = look_at_rotation(camera_position, at=target, up=up, device=device)
+        translation = -torch.bmm(rotation.transpose(1, 2), camera_position[:, :, None])[:, :, 0]
+
+        rendered = renderer(meshes_world=mesh.clone(), R=rotation, T=translation.to(device))
+        rendered = rendered.permute(0, 3, 1, 2)[:, :-1, :, :]
+
+        fragments = renderer.rasterizer(mesh.clone(), R=rotation, T=translation.to(device))
+        depth = fragments.zbuf.permute(0, 3, 1, 2)
+
+        view = torch.cat([rendered, depth], dim=1)
+        images = torch.cat((images, view.unsqueeze(0)), dim=0)
+        pix_to_faces = torch.cat((pix_to_faces, fragments.pix_to_face.unsqueeze(0)), dim=0)
+
+    return images.permute(1, 0, 2, 3, 4), pix_to_faces
+
+
+def estimate_missing_teeth(labels, vertices, wanted, device) -> dict:
+    """`{tooth number: (centre, tangent)}` for teeth absent from the labels.
+
+    The MG cameras need a tooth centre and an arch direction, both normally read
+    from the segmentation. When a tooth carries no label both can still be
+    estimated: the lower ids are consecutive along the arch, so the centroids of
+    the segmented teeth trace it and a quadratic fit of each coordinate against
+    the id fills the gaps.
+
+    Needs at least 4 segmented teeth spanning at least 4 ids, otherwise the
+    extrapolation is not trustworthy and `{}` is returned -- the caller then
+    skips those teeth, which is what happened to all of them before.
+    """
+    from ..ALI_CBCT.brain import import_torch
+
+    torch = import_torch()
+
+    present, centroids = [], []
+    for number in wanted:
+        matches = (labels[0] == int(number)).nonzero(as_tuple=True)[0]
+        if len(matches):
+            present.append(int(number))
+            centroids.append(vertices[0][matches].mean(dim=0).detach().cpu().numpy())
+
+    missing = [int(number) for number in wanted if int(number) not in present]
+    if not missing:
+        return {}
+    if len(present) < 4 or (max(present) - min(present)) < 4:
+        return {}
+
+    ids = np.array(present, dtype=float)
+    centroids = np.array(centroids)
+    fits = [np.polyfit(ids, centroids[:, axis], deg=2) for axis in range(3)]
+
+    def at(value):
+        return np.array([np.polyval(fit, value) for fit in fits])
+
+    return {
+        number: (
+            torch.tensor(at(number), dtype=torch.float32).to(device),
+            torch.tensor(at(number + 0.5) - at(number - 0.5), dtype=torch.float32).to(device),
+        )
+        for number in missing
+    }
 
 
 def render_views(renderer, mesh, center, radius: float, camera_positions, device):

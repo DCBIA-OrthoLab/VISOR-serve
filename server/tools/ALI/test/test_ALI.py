@@ -188,10 +188,51 @@ def test_region_codes_from_a_selection():
 def test_ios_offers_only_landmark_types_a_model_predicts():
     """R, RIP and OIP were selectable in the Slicer UI and predicted by
     nothing: no network produced them and no label table contained them.
-    Ticking them did literally nothing."""
+    Ticking them did literally nothing.
+
+    MG joined the list when the mucogingival network was ported, and it is here
+    on the same terms as the rest: a shipped model predicts it."""
     offered = {lm_type for types in ios_catalog.NETWORKS.values() for lm_type in types}
-    assert offered == {"O", "MB", "DB", "CL", "CB"}
+    assert offered == {"O", "MB", "DB", "CL", "CB", "MG"}
     assert not offered & {"R", "RIP", "OIP"}
+
+
+def test_the_mucogingival_network_is_lower_jaw_only():
+    """It was trained on the mandible. Asking for it on a maxilla is not a
+    missing model, it is a question with no answer -- and the engine skips the
+    upper jaw rather than reporting it as an absent checkpoint."""
+    assert ios_catalog.NETWORK_JAWS["MG"] == ("Lower",)
+    assert set(ios_catalog.LABELS["MG"]) == {str(n) for n in range(19, 32)}
+    assert "MG" not in ios_catalog.NETWORK_JAWS.get("O", ("Upper", "Lower"))
+
+
+def test_the_mucogingival_labels_are_shifted_against_the_tooth_numbers():
+    """L0MG is the midline (tooth 25), so the right side is shifted by one:
+    LR1MG sits on tooth 26, not 25. Six of these names also collide with the
+    TRAINING name of a different tooth, which is why the table is positional
+    and nothing translates a label on its own."""
+    assert ios_catalog.LABELS["MG"]["25"] == ["L0MG"]
+    assert ios_catalog.LABELS["MG"]["26"] == ["LR1MG"]
+    assert ios_catalog.LABELS["MG"]["19"] == ["LL6MG"]
+    assert ios_catalog.LABELS["MG"]["31"] == ["LR6MG"]
+    assert len(ios_catalog.MG_OUTPUT_NAME) == 13
+
+
+def test_the_mucogingival_network_is_off_by_default():
+    """One point per lower tooth on the gingival margin, wanted by AREG's
+    lower-arch registration and by nobody asking for crown landmarks. On by
+    default it would add a third pass over every mesh of every request that
+    exists today."""
+    assert ios_catalog.NETWORK_CHOICES["Mucogingival"] is False
+    assert ios_catalog.NETWORK_CHOICES["Occlusal"] is True
+
+
+def test_every_mucogingival_tooth_has_an_aim_offset():
+    """The cameras aim at where the landmark is expected rather than at a flat
+    0.2 below the tooth centre, which only ever framed the incisors -- on the
+    molars the landmark is ~0.15 further buccal and fell outside the render."""
+    assert set(ios_catalog.MG_AIM_OFFSET) == set(ios_catalog.MG_TEETH)
+    assert all(len(offset) == 3 for offset in ios_catalog.MG_AIM_OFFSET.values())
 
 
 def test_ios_tooth_numbering_matches_the_shipped_label_tables():

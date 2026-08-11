@@ -106,6 +106,9 @@ package at startup — e.g. import all modules in `tools/`, collect every subcla
   chosen from the data, not from an argument.
 - `CrownSeg` — per-tooth labelling of intraoral scans (shapeaxi). Its own tool
   rather than a helper inside ALI, because ASO, AREG and FlexReg need it too.
+- `AREG` — registering two timepoints of the same patient onto each other.
+  CBCT (masked elastix) and IOS (palatal-patch ICP); its automated modes drive
+  AMASSS, ASO and CrownSeg in-process.
 
 The extension will eventually expose ~15+ tools; the architecture must
 accommodate them without change to the core. See `ADDING_A_TOOL.md`.
@@ -403,6 +406,407 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-10 — ALI gains the mucogingival network, so AREG stops asking for landmarks
+
+**Motivation:** the entry below shipped AREG's lower-arch registration with the
+13 mucogingival landmarks as a *required upload*, because this server's ALI had
+the Occlusal and Cervical networks only. That is the wrong shape for a tool
+whose whole point is that the computation happens here. Ported from upstream's
+`ALI_IOS_utils/{model,agent}.py` ("ADD: MGL registration mode", "ADD: Estimate
+unsegmented teeth from the arch", 2026-08).
+
+**MG is a different network, not a third set of channels.** Occlusal and
+Cervical take one rendered image per camera as a batch — 4 channels in, 4
+classes out. MG stacks its **three** buccal views into ONE input of 12 channels
+and predicts 3 classes: it has a single landmark to find and needs the three
+views together to place it. `_build_network` declares both shapes rather than
+inferring one, since every argument there is part of the checkpoint's shape and
+a wrong one fails `load_state_dict` rather than degrading.
+
+**Its cameras are aimed per tooth, and that is the reason it works at all.**
+The crown networks orbit a tooth on a fixed sphere of directions. The
+mucogingival point is on the gingiva, buccal to the crown, and "buccal" is a
+different direction for every tooth: measured upstream against the true normal,
+the radial direction the sphere scheme effectively uses is off by 2-5 degrees on
+the incisors but **35 degrees on teeth 19/30 and 53 degrees on tooth 31** — so
+on the molars the cameras looked along the arch and the landmark was not in the
+image. The arch tangent comes from the neighbouring teeth's centroids (the lower
+Universal ids are consecutive along the arch), the buccal normal is its
+horizontal perpendicular pointing at the cheek, and the cameras aim at
+`MG_AIM_OFFSET`, an anatomical prior measured on upstream's 155 training scans.
+
+**Three things are deliberately not the crown path**, and each one is why a
+naive version returns nothing: the predicted faces are **not** filtered to the
+tooth (`faces_on_tooth` keeps only faces whose vertices carry that tooth's
+label, and the landmark is on gingiva — it would drop every one); the argmax is
+on the raw logits, never on an int16 cast of them; and a tooth that wins no
+pixel falls back to its 50 most likely ones rather than leaving a hole in a line
+AREG then fits a spline through.
+
+**A landmark that had to be helped says so, in the file.** `markups.write` takes
+a `descriptions` mapping now, so a point placed from an arch fit ("tooth not
+segmented") or forced ("confidence 0.31") carries the reason in its own control
+point, and the run report lists them under `landmarks_degraded`. Upstream puts
+the same text in the same field, and for the same reason: a degraded point is
+indistinguishable from a good one otherwise, and whoever opens the landmarks is
+who has to know which to review.
+
+**Mucogingival is OFF by default in `ios_networks`**, unlike the other two. It
+is one point per lower tooth wanted by AREG's lower-arch registration and by
+nobody asking for crown landmarks; on by default it would add a third pass over
+every mesh of every request that exists today. It is also declared lower-jaw
+only (`NETWORK_JAWS`), so a maxilla is skipped rather than reported as a missing
+checkpoint — it is a question the network cannot be asked, not a bundle problem.
+
+**AREG's side is one seam.** `mgl_landmarks` became optional: absent, AREG calls
+ALI in-process for both timepoints (`tools_client.predict_mucogingival`),
+merges the two into one folder — they cannot collide, being keyed on a scan key
+that carries the timepoint — and paints from that. Sending landmarks is now for
+reusing ones you already have, which also skips paying for the prediction twice.
+A deployment without ALI answers 422 saying to send them.
+
+**The model bundle moved with it.** `data-manifest.yml`'s ALI IOS entry now
+points at the 2026-08-05 release ("Occlusal, Cervical, Mucogingival", 236 MB)
+instead of ALIDDM v1.0.3, which held the same four crown checkpoints and no MG
+one. The MG file is `Lower_MG_v6.pth`, which `discover_weights`' single naming
+rule reads with no special case.
+
+**Verified live over HTTP, on the reference mandible published with ASO's IOS
+gold files** (101,463 points, PredictedID labels 18-31):
+
+* `POST /run/ALI` with Mucogingival alone → **all 13 landmarks in 9 s**, none
+  forced, none estimated, tracing a symmetric arch (LL6MG at x=+30.8, LR6MG at
+  x=-31.7, L0MG at x=-0.3);
+* `POST /run/AREG` on a T1/T2 pair of that mandible displaced by a known
+  3.5° + 2.7 mm, **sending no landmarks at all** → 200 in 5.5 s, report saying
+  `"mgl_landmarks": "predicted by 'ALI'"`. The patch covers 21% of the mesh with
+  **0 vertices on a crown**, and a 3.077 mm mean displacement comes back with a
+  residual of **0.004 mm mean, 0.008 mm max**.
+
+That last figure also settles the open question from the entry below: the ~1.1 mm
+residual measured there was the synthetic swept ridge having almost no relief for
+the ICP to lock onto, not the port. On real anatomy it is four micrometres.
+
+**Debugged against the caller's own data afterwards, and it found two things.**
+
+**A landmark file could not be named the way people name them.** The matching
+rule was a BLACKLIST of words to strip from a file name (`mg`, `pred`, `lm`)
+before comparing it to its scan's, so `H10_T1_L_MG_edited.mrk.json` -- a
+hand-corrected file sitting right beside `H10_T1_L.vtk` -- reduced to
+`H10_T1_edited`, matched nothing, and was reported missing. A blacklist can
+never cover what people actually append: `_edited`, `_corrected`, `_v2`, their
+initials. The rule is now "the scan's tokens are a PREFIX of the landmark
+file's", which is the rule people are already following when they name these,
+with an ambiguity refused rather than guessed. It stays safe because the
+comparison is on whole tokens: `('p1',)` is not a prefix of `('p10', ...)`, so
+the substring failure upstream's fallback had -- handing `P1` the file of `P10`
+-- cannot come back.
+
+**And the port reproduces the Slicer module exactly.** Run on the caller's real
+H10 mandible pair with their own edited landmarks, the registered T2 came out
+**0.53 mm** from the output their Slicer module had produced -- close, but not
+the "same code, same answer" a port should give. The whole difference was the
+band height: their run used 4 mm, the default here is 5. At 4 mm the patch is
+**identical point for point** (Jaccard 1.000, 15,330 of 15,330 vertices) and the
+registered mesh lands **0.0000 mm mean, 0.0001 mm max** from theirs. Worth
+recording as the strongest validation this port has: given the same inputs it
+is the same pipeline, and a millimetre of difference was a parameter, not a
+defect.
+
+Also measured on that pair, and worth knowing before trusting a fully automatic
+run: registering on ALI's predicted landmarks instead of the hand-corrected ones
+moves the result by **1.08 mm** on average.
+
+**Not ported:** upstream's `--force_topk` / `--no-force_landmarks` switches. The
+forcing is always on here (`MG_FORCE_TOPK = 50`, upstream's default), because
+the only caller is AREG's spline, which wants as many of the 13 points as it can
+get and now has the per-point caveat to judge them by.
+
+**Tests:** 409 server tests (+6 in ALI's suite): the MG type joining the offered
+list on the same terms as the rest (a shipped model predicts it), the lower-jaw
+restriction, the positional label table and its midline shift (L0MG is tooth 25,
+so LR1MG is tooth 26), the network being off by default, and every MG tooth
+having an aim offset. Plus AREG's two seam tests: the selection ALI receives
+passing ALI's own `validate()`, and the 422 that names `mgl_landmarks` when ALI
+is not deployed.
+
+**Also fixed, and it was the test suite's fault rather than the server's.**
+`file_utils.make_scratch_dir` registers what it hands out with the REQUEST being
+served, and `main.py` is what deletes it -- so a test calling `AREGLogic.main()`
+directly has no request and nothing cleans up. The suite had been leaving one
+scratch directory per such call in the server's real `TEMP_DIR`, which on this
+machine is the same `/tmp/inference_server` the live server uses. An autouse
+fixture points `TEMP_DIR` at the test's own `tmp_path`. Verified from both ends:
+a real HTTP run leaves zero directories behind, and so does the full suite now.
+
+### 2026-08-10 — AREG registers the LOWER arch too, on the mucogingival line
+
+**Motivation:** the rest of AREG was ported from `SlicerAutomatedDentalToolsCloud`,
+which predates the upstream repository's `AREG_IOS` MGL mode ("ADD: MGL
+registration mode for the lower arch in AREG_IOS", 2026-08). Ported now from
+`SlicerAutomatedDentalTools/AREG_IOS/AREG_IOS_utils/mgl_patch.py` and the
+`RunMGL`/`SortLower` half of its driver.
+
+**The upper arch is registered on the palate; the mandible has no palate.** It
+has the mucogingival line, where attached gingiva meets alveolar mucosa: ALI's
+MG model places 13 landmarks along it, they are joined into a spline, every
+sample is snapped onto the mesh, and a band grows around the curve. That band
+plays the same role as the palatal patch, and is written as a 0/1 point array of
+the same shape -- under its own name, `Bottom_MGL`, so a mandible is never
+labelled after the palate.
+
+**Picking the patch picks the arch, so it is one `choice`, not a toggle.**
+`ios_patch` selects Palate (upper) or Mucogingival line (lower); with the
+palate, the mandible is carried along by the maxilla's transform, and with the
+mucogingival line the maxillae are left untouched -- as upstream leaves them,
+the MG model covering the mandible only.
+
+**It needs no network at all**, which is the operational point here: the palatal
+patch needs pytorch3d, and this is a spline, a shortest-path walk and a label
+lookup. `net.check_dependencies()` is not called on this path, so a deployment
+without pytorch3d answers 501 for the upper arch and registers lower arches at
+full speed. What it needs instead is the landmarks, and **this server's ALI
+cannot predict them yet**: its IOS catalog has the Occlusal and Cervical
+networks only. The MG model is published upstream (`ALI_IOS_models`, 236 MB,
+2026-08-05) and porting it is ~700 changed lines in `ALI`'s IOS engine -- a
+different tool, and deliberately not folded in here. So `mgl_landmarks` is a
+required folder argument and the 422 says exactly that.
+
+**Two properties of the band are load-bearing, and both are upstream's:** every
+spline sample is snapped onto the mesh, because a curve interpolated between
+landmarks floats off the surface in the concavities between teeth; and the band
+grows **geodesically**, never through space, so a buccal patch cannot leak onto
+the lingual side wherever the ridge is thinner than the radius. `_adjacency`
+built a Python `set` per vertex by walking every cell through a `vtkIdList`;
+the walk is unchanged but reads the numpy adjacency `postprocess.Adjacency`
+already builds.
+
+**The defect an end-to-end run caught, in this port's own code.** The MG
+landmarks are **per scan**, and they were keyed **per patient**: both timepoints'
+files routinely sit in one folder (upstream points `lm_T1` and `lm_T2` at the
+same directory), so `P1_T1_..._MG_Pred.json` and `P1_T2_..._MG_Pred.json`
+collapsed to one ambiguous entry and every MGL run failed with "2 landmark files
+match 'P1'". A patient has one key and two scans; `landmarks.scan_key` keeps the
+timepoint token that `pairing.patient_stem` strips. Nothing in the unit tests
+would have found it -- one of them had encoded the wrong behaviour as if it were
+correct -- and the first real request did, immediately.
+
+**Upstream's own matching is not ported.** `FindLandmarkFile` fell back to any
+json whose name merely **contains** the scan's stem, taking `sorted(...)[0]`
+with a warning when several matched -- so with `P1`'s file missing, `P1` takes
+`P10`'s and registers a mandible against another patient's mucogingival line
+while reporting success. It is the same substring defect this repository has
+already fixed twice (`vtk_name in json_name` pairing patient 1 with patient 10;
+`"cb" in basename` making every CBCT a cranial base). Files are matched through
+the shared key rule, and an ambiguity is an error naming the candidates.
+
+**`SortLower` is why the pairing gained a `registered_jaw`.** `Sort` only kept a
+lower pair when the matching UPPER pair existed, since the palatal registration
+always starts from the maxilla -- so a study that only scanned mandibles paired
+to nothing at all.
+
+**Observed, not changed:** `LOWER_TOOTH_LABELS = range(18, 32)` leaves the two
+lower third molars (17 and 32) in the band if it ever reaches them, which reads
+like an off-by-one on both ends of "the lower teeth" -- and the synthetic
+mandible used to verify this port has 2 vertices of a tooth-32 crown inside its
+patch for exactly that reason. It is also precisely the span ALI's MG model is
+trained on, so it may be deliberate. Kept as-is with the observation written
+next to it: widening it changes which vertices drive a clinical registration,
+and that is the upstream author's call, not this port's.
+
+**Verified live over HTTP:** a lower-arch pair displaced by a known 4° + 2.6 mm
+rigid transform, 200 with the registered mandibles, the transform and the
+report; the maxillae untouched; the patch confined to -4.5..+4.8 mm around a
+line asked for a 5 mm half-height. The residual on that phantom is ~1.1 mm,
+which is ICP on a mathematically swept ridge with almost no relief to lock onto
+-- the same code registers a flat labelled patch to 2e-5 mm and an exact rigid
+point correspondence to 0.0000 mm. No real IOS pair with MG landmarks was
+available to measure clinical accuracy on, and none is claimed.
+
+**Tests:** 403 server tests (+22): the band's geodesic growth and its height,
+height 0 falling back to the landmarks alone, the crowns being excluded, an
+unsegmented mesh keeping its whole band, missing and legacy-named landmarks, the
+two timepoints sharing one folder, `P1` not borrowing `P10`'s landmarks, a
+mandible-only cohort pairing, and the MGL run writing two meshes where the
+palatal one writes four.
+
+### 2026-08-10 — AREG ported: five modes, and an 8 mm transform nobody could see
+
+**Motivation:** port AREG (Automated REGistration) from the Slicer extension's
+`AREG/` module and its `AREG_CBCT` / `AREG_IOS` CLIs. AREG is the step every
+longitudinal study runs *after* ASO — put two timepoints of one patient in the
+same frame so what changed can be measured — and it is the first tool here that
+is mostly **other tools**: its automated modes drive AMASSS, ASO and CrownSeg.
+
+**One tool, `server/tools/AREG/`, two engines, five modes:**
+
+|          | Semi-Automated                  | Fully-Automated               | Oriented + Fully-Automated |
+|----------|---------------------------------|-------------------------------|----------------------------|
+| **CBCT** | your T1 masks, masked elastix   | AMASSS segments the T1 masks  | ASO orients the T1 first   |
+| **IOS**  | your segmented, oriented meshes | CrownSeg labels + ASO orients | —                          |
+
+`modality` and `automation` are explicit `choice` arguments, never inferred —
+same reason as ASO's. The pair is validated (`IOS` has no oriented mode) and
+answered with a 422 naming what that modality offers, because the schema can
+hide an *argument* per mode but not one *option* of a choice.
+
+**The calls into AMASSS/ASO/CrownSeg go through `registry.TOOLS[...].invoke`,
+not through HTTP and not through an import** (`src/tools_client.py`). The HTTP
+version is a deadlock and bites harder here than it did for ASO: a tool run
+holds one of `MAX_CONCURRENT_TOOLS` slots for its whole duration, and an AREG
+run chains up to three of them. The registry rather than a direct
+`from ...AMASSSLogic import segment` because AREG needs the *availability*
+answer as much as the result — a deployment may legitimately not carry AMASSS,
+and AREG must then answer "use Semi-Automated and send your own masks" instead
+of failing at import and taking itself out of the registry too.
+
+**The defect that mattered most is one line, and it is worth 8 mm.** elastix
+reports a rigid result as three Euler angles, a translation, **and a centre of
+rotation** — the transform is `y = R(x - c) + c + t`. `MatrixRetrieval` read
+the angles and the translation and dropped `c`, building a SimpleITK
+`Euler3DTransform` rotating about the physical origin instead: a different
+transform by exactly `(I - R)c`, i.e. proportional to how far the scan sits
+from the origin. Measured against a known ground-truth transform on a phantom
+whose origin is at (-140, -90, 60) mm (itk-elastix 0.25.4, the tool's own tuned
+parameter map):
+
+| | max error vs. ground truth |
+|---|---|
+| centre dropped (what shipped) | **8.371 mm** |
+| centre honoured (here) | **0.025 mm** |
+
+It is invisible on data that happens to be centred — which is exactly what the
+oriented mode produces, since ASO recentres — and silently wrong on data that
+is not. When `c` is the origin the two agree to the float, so the fix cannot
+change a case that was already right. The same defect, in a different file,
+made `AREG_IOS_utils.transformation.read_matrix` build its 4x4 from
+`GetTranslation()`; SimpleITK has no accessor returning the composed offset, so
+`t + c - Rc` is computed rather than read, and a test pins it against what the
+transform actually does to a point.
+
+**Two lines removed rather than "fixed", both after measuring.**
+`ImagePyramidSchedule = 8,8, 4,4, 2,2` is six values for a *three*-dimensional
+image over *three* resolutions, where elastix wants nine — and elastix does not
+error, it discards a mismatched schedule and uses its default. Verified three
+ways: the original six-value schedule and no schedule at all give bit-identical
+results (0.025 mm), a corrected nine-value 8/4/2 schedule gives a different one
+(0.113 mm). Deleting the dead line keeps the behaviour every published result
+was produced with; "fixing" it would have changed a validated pipeline for no
+measured gain. `ErodeMask=true` is likewise inert (it applies to an elastix
+mask, and none is ever set — the region is imposed by zeroing the fixed image)
+and is kept with a comment saying so.
+
+**The T2 pre-centring is gone, and with it the reason the `.tfm` was
+unusable.** The original resampled every T2 onto a recentred grid before
+registering, then wrote the transform between the T1 and *that* — while the
+recentred copy lived in a `<t2_folder>_Center` directory next to the caller's
+own data and was never returned. So the one file that says how the scans were
+aligned referred to a volume the caller did not have.
+`AutomaticTransformInitialization` aligns the two volumes' centres by itself
+(now spelled out as `GeometricalCenter` rather than left to the default), so
+the pass bought nothing and cost every T2 an extra linear interpolation. The
+transform now maps the T1 frame to the T2 frame the caller sent, and a test
+asserts it by resampling the *original* T2 with the returned `.tfm` and
+checking it reproduces the archive's registered volume exactly.
+
+**The defects that cost data, all fixed by construction and each with a named
+test:**
+
+- **`"cb" in basename.lower()` makes every file whose name contains CBCT a
+  cranial-base mask.** So does `"max"` for a patient called MAX_01, and `"md"`
+  for almost anything. Masks are matched on whole tokens of the stem, and have
+  to say **both** that they are a segmentation (mask/seg/pred) and which
+  structure they cover.
+- **Patient keys collided.** `GetPatients` keyed on the base name, so
+  `scan.nii.gz` under two subject folders became one patient — in the working
+  dict and again in the flat output folder. Keys are paths relative to the
+  input root and the output mirrors the input tree. `.split(".")[0]` also
+  truncated a name at its first dot, merging `P1.2` and `P1.7`.
+- **A second run re-ingested the first.** `P1_CB_Reg.nii.gz` sorts before
+  `P1_scan.nii.gz`. Previous outputs are set aside and used only when a
+  patient has nothing else — and the suffix is matched as a trailing *token*,
+  so a patient called Regina is not a previous run of suffix "Reg".
+- **The masked fixed image was written to `<temp>/fixed_image_masked.nii.gz`**
+  — one fixed name shared by every patient of a run and by every concurrent
+  request on this server, so two overlapping runs registered against each
+  other's anatomy. The sitk→itk conversion is in memory; a test asserts
+  `TEMP_DIR` is untouched by a registration.
+- **A mask of a different geometry was forced into agreement**
+  (`fixed_seg.SetOrigin(fixed_image.GetOrigin())`, unconditionally), and a
+  `SegmentationLabel` the mask did not hold fell through to using the *whole*
+  mask. Both are per-patient failures naming the problem.
+- **IOS: a mesh whose name did not say its jaw was treated as a lower arch.**
+  `Sort` split on "is it Upper" and defaulted everything else to Lower, so a
+  maxillary mesh named `patient1.vtk` was registered against the mandibular
+  timepoint and returned as a success. The Upper vocabulary also matched the
+  bare `_U`/`U_` as substrings, so a patient identifier like `P_U12` was an
+  upper arch whatever the file held.
+- **`vtkICP.__call__` returned its source unmoved** — it built a
+  `vtkTransformPolyDataFilter`, ran it and threw the output away — so every
+  method after the first in `ICP`'s list ran on unaligned points while its
+  matrix was composed as if it had not. One method was ever configured, which
+  is why it never showed.
+- **`RemoveIslands(surf, labels, 33, 500)`** is the first of four
+  post-processing steps and has never run: the label array is binary, so
+  nothing was ever equal to 33. Not ported.
+- **Background pixels voted for the last face.** pytorch3d's pixel-to-face map
+  is **-1** where a pixel hit nothing, and -1 indexes the last element; those
+  pixels were zeroed before a softmax that turned the zeros back into an even
+  0.5/0.5 vote. Only pixels that hit a face contribute.
+- Two latent numerical bugs in the canonical orientation: `np.arccos` clamped
+  at +1 only, so a dot product rounding past -1 gave NaN that propagated into
+  every vertex; and `RotationMatrix` normalised an axis it never checked, so
+  two already-parallel vectors divided by zero. Also `reshape(-1, 4)` on a
+  non-triangle mesh, which does not fail — it reads the wrong point indices.
+
+**Also removed rather than ported:** the `ApproxReg` argument (passed to
+`VoxelBasedRegistration` as `approx=` and never referenced inside it), the
+`<filter-progress>` prints and their `time.sleep(0.2)` (0.6 s per patient), the
+log file the widget polled, `sys.exit()`, and the four-level nested
+`try/except` wrappers whose only effect was to log and re-raise. DICOM
+conversion no longer writes `<input>/NIFTI/` into the caller's own folder,
+which a later run then re-discovered as input scans.
+
+**Core changes, both sanctioned:** one `config.Settings` field
+(`AREG_MAX_GPU_JOBS`) and one `requirements.txt` entry (`itk-elastix==0.25.4`).
+The pin was checked against the rule the `monai` entry earns below: it depends
+on `itk-core`/`itk-filtering` and nothing else — no torch, so it cannot shadow
+the image's CUDA build — but it *does* move the image's own `itk` 5.4.6 → 5.4.7
+in the pip `--user` layer, a patch bump of the series ALI's CBCT engine already
+runs on. `main.py`, `registry.py` and `base.py` untouched.
+
+**Not ported: the IOSCBCT mode** (registering an intra-oral scan onto a CBCT of
+the same patient). Genuinely a different problem — cross-modality,
+landmark-driven, a four-folder input contract — and the CLI is the least
+settled of the three: its jaw detection is `re.search(r'[_]?[uU][_]?', filename)`,
+which matches any `u` anywhere in a name; its `run_icp_point_to_plane` computes
+the surface normals and then never uses them (it is a point-to-*point* Kabsch
+solve); and its patient ids are normalised so that `P001` and `P1` become one
+subject. Its test files stay in `data-manifest.yml` — every URL is checked —
+and it is next in line.
+
+**Tests:** 381 server tests (+53, `tools/AREG/test/test_AREG.py`), no GPU and
+no weights: the patch network is stubbed, everything else runs for real,
+including a full CBCT registration through elastix on a 48³ phantom.
+
+**Verified live end to end over HTTP**, both CBCT modes:
+
+* Semi-Automated, two synthetic patients: 200 in 11 s, with the registered
+  volumes, the transforms and the report, and `TEMP_DIR` clean afterwards.
+* **Fully-Automated on the real 512×512×365 CBCT at 0.33 mm** hosted as
+  AMASSS's test file, displaced by a known 2.9° + 3.2 mm rigid transform:
+  **200 in 66 s** — AMASSS segmenting the cranial-base mask on the GPU, the
+  mask found back under the `<scan>_seg_SegOut/` layout AMASSS writes, elastix,
+  and a 100 MB upload plus a 106 MB download. The known displacement came back
+  to **0.048 mm, a seventh of a voxel**.
+
+That last run is also the best illustration of why the centre-of-rotation
+defect survived: this scan's origin is (-84.5, -84.5, -60.1) mm for a
+169×169×120 mm field of view, so its geometric centre is within a millimetre of
+the physical origin — `(I - R)c` is 0.04 mm on it, and the shipped conversion
+and the corrected one agree. The reference scan everyone tests with is a
+centred one.
 
 ### 2026-08-10, Transfers use several connections instead of one
 
