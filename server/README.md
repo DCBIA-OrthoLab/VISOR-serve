@@ -267,10 +267,29 @@ offer it. An unknown key is a warning at startup, never a refusal: this is the
 seam between two repositories, and a field one side adds must not stop the
 other from starting.
 
-`run()` returns a path, a list of paths, or a mapping of name → path (with or
-without an `{"outputs": {...}}` wrapper). The names do not travel: what goes
-back is one file or one archive, so a tool that needs its outputs named writes
-a report beside them.
+### What `run()` returns
+
+The form to write is a **mapping of named outputs**:
+
+```json
+{ "result": { "outputs": { "mandible": "/jobs/a1b2c3d4/output/mand_seg.nii.gz" } } }
+```
+
+A bare path, or a list of them, is accepted too — every imported tool in this
+repo returns one, and for a tool with a single output it says the same thing.
+
+The names do not reach the client **yet**: an HTTP response is one file or one
+archive, so today they are documentation. They matter for what comes next.
+`depends_on` sequencing — the server running a dependency first and feeding its
+result into the dependent tool's `job.json` — needs to know which output goes
+into which parameter, and `outputs["mandible"]` is the only form that says so
+without guessing from a file extension or from the order paths happened to come
+back in.
+
+**Which means the names belong in `.schema.json` as well**, next to the
+arguments, the day that lands: a wiring that names an output no tool produces
+has to fail at startup, like every other schema mistake here, rather than
+half-way through a run.
 
 ### `source_hash`, and why a mismatch stops the server
 

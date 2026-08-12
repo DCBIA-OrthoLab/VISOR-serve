@@ -1310,12 +1310,15 @@ def test_log_line_carries_no_file_name_or_argument_value(caplog, tmp_path):
 # What run() may return for a file output
 # ----------------------------------------------------------------------
 
-def test_named_outputs_are_accepted_as_well_as_paths(tmp_path):
-    """A path, or a list of them, is the canonical return. A MAPPING of
-    name -> path is accepted too -- with or without the {"outputs": {...}}
-    wrapper -- because that is the shape a tool packaged against the
-    job/result contract returns. The names go no further than here: what
-    travels back is one file or one archive.
+def test_named_outputs_are_the_canonical_return_and_paths_still_work(tmp_path):
+    """`{"outputs": {name: path}}` is the form a packaged tool writes; a bare
+    path or a list of them is accepted too, and is what every imported tool
+    here returns.
+
+    The names stop at this function today -- what travels back is one file or
+    one archive. They exist for `depends_on` sequencing, where the server has
+    to know which output feeds which parameter of the next tool and a list of
+    paths would leave it guessing from an extension.
     """
     first = tmp_path / "mand.nii.gz"
     second = tmp_path / "max.nii.gz"

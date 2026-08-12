@@ -486,13 +486,17 @@ them changes anything for a tool that omits it:
   `.nii/.nii.gz/.nrrd/...`. This is how a schema tool narrows its own picker
   without a `FILE_TYPES` entry being invented for it.
 - **`description` per argument.** The client renders it under the field.
-- **`{"outputs": {name: path}}` as a return value.** The contract shows
-  `"returns": "path"` next to a `result.json` of `{"result": {"outputs":
-  {...}}}` — a mapping, not a path, which `_output_paths` refused and which
-  answered 500. A path or a list stays canonical; a mapping is accepted, with
-  or without the `outputs` wrapper. The names go no further than the response,
-  which is one file or one archive either way — a tool that needs its outputs
-  named writes a report beside them, as AMASSS does.
+- **`{"outputs": {name: path}}` as a return value, and it is the form to
+  write.** The contract shows `"returns": "path"` next to a `result.json` of
+  `{"result": {"outputs": {...}}}` — a mapping, not a path, which
+  `_output_paths` refused and which answered 500. Both work now, and the
+  mapping is canonical: the names buy nothing over HTTP (the response is one
+  file or one archive either way) but they are what `depends_on` sequencing
+  will wire on. Feeding AMASSS's mandible into AREG means
+  `params["scan"] = result["outputs"]["mandible"]`; with a list of paths the
+  server picks by extension or by position, which is a guess. When that lands,
+  the names have to be declared in `.schema.json` too, so a wiring naming an
+  output no tool produces fails at startup like every other schema mistake.
 - And a single-file tool returning SEVERAL paths is now a failure rather than
   the first of them streamed as if it were the result.
 
