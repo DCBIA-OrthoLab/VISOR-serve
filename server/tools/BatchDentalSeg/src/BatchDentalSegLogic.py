@@ -35,6 +35,7 @@ Deliberately NOT ported, each for a stated reason:
 import json
 import logging
 import os
+import shutil
 import time
 import zipfile
 
@@ -262,23 +263,36 @@ def _emit_failures(emit, failed_conversions: list, total: int) -> None:
         })
 
 
-def _scan_artifact(entry: dict, scratch_dir: str) -> str:
-    """Bundle ONE scan's outputs so they can be shipped on their own.
+def _stage_artifact(paths: list, scratch_dir: str, name: str) -> str:
+    """One shippable file for `paths`, staged where it can be moved away.
 
-    A zip rather than one event per file: a run with `separate_segments` and
-    three mesh formats produces dozens of files per patient, and each would
-    otherwise be its own stored result and its own round trip. The archive is
-    flat and the event carries `relative_dir`, so the client rebuilds the same
-    tree without a path from this server ever travelling.
+    **A single file is COPIED, not zipped.** The ordinary run produces exactly
+    one segmentation per scan, and wrapping it in an archive only to have the
+    client unpack it is two passes over the data for nothing -- a `.nii.gz` is
+    already compressed, so the zip saves nothing either. Several files (a run
+    with `separate_segments`, or mesh exports) still get one archive rather
+    than one round trip per file.
+
+    A copy rather than the file itself because `transfer.store_result` RENAMES
+    what it is given out of the work dir: handing it the real segmentation
+    would take it out of the output tree the report describes and the final
+    archive is built from.
     """
-    produced = list(entry.get("segmentations") or []) + list(entry.get("surfaces") or [])
-    if not produced:
+    if not paths:
         return ""
     staging = os.path.join(scratch_dir, "artifacts")
     os.makedirs(staging, exist_ok=True)
-    return file_utils.make_zip(
-        produced, os.path.join(staging, f"{entry['case_id']}.zip")
-    )
+    if len(paths) == 1:
+        destination = os.path.join(staging, os.path.basename(paths[0]))
+        shutil.copyfile(paths[0], destination)
+        return destination
+    return file_utils.make_zip(paths, os.path.join(staging, f"{name}.zip"))
+
+
+def _scan_artifact(entry: dict, scratch_dir: str) -> str:
+    """Everything one scan produced, ready to ship on its own."""
+    produced = list(entry.get("segmentations") or []) + list(entry.get("surfaces") or [])
+    return _stage_artifact(produced, scratch_dir, entry["case_id"])
 
 
 def _stream_batch(emit, runner, model_folder, nnunet_input, nnunet_output, device,
@@ -562,6 +576,21 @@ def segment(
     report_path = os.path.join(output_dir, "BatchDentalSeg_report.json")
     with open(report_path, "w", encoding="utf-8") as handle:
         json.dump(report, handle, indent=2)
+
+    if emit is not None:
+        # The report has to travel too, and it can only be written once every
+        # scan is done. Without this a streamed run left the client with the
+        # segmentations and nothing saying what their integers mean -- so the
+        # segments loaded unnamed and uncoloured, which is most of what the
+        # panel is for.
+        staged = _stage_artifact([report_path], scratch_dir, "report")
+        if staged:
+            emit({
+                "event": "artifact",
+                "name": os.path.basename(report_path),
+                "relative_dir": ".",
+                "path": staged,
+            })
 
     return SegmentationRun(output_dir, report, report_scans)
 

@@ -772,12 +772,16 @@ def test_a_streamed_run_hands_over_each_scan_as_it_finishes(tmp_path, stub_nnune
     )
     assert first_artifact < second_start, kinds
 
+    # Two scans plus the run report, which can only be written at the end.
     artifacts = [e for e in events if e["event"] == "artifact"]
-    assert len(artifacts) == 2
+    assert len(artifacts) == 3
     for artifact in artifacts:
         assert os.path.isfile(artifact["path"])
-        with zipfile.ZipFile(artifact["path"]) as archive:
-            assert archive.namelist()
+    # A scan that produced ONE file ships that file, not an archive of it:
+    # wrapping a .nii.gz in a zip only to have the client unpack it is two
+    # passes over the data for nothing, and gzip saves nothing on it either.
+    scans = [a for a in artifacts if a["name"].endswith(".nii.gz")]
+    assert [os.path.basename(a["path"]) for a in scans] == ["p1_Seg.nii.gz", "p2_Seg.nii.gz"]
 
 
 def test_a_streamed_artifact_says_where_it_belongs_in_the_tree(tmp_path, stub_nnunet):
@@ -795,7 +799,10 @@ def test_a_streamed_artifact_says_where_it_belongs_in_the_tree(tmp_path, stub_nn
         model_path=str(tmp_path / "models" / "DentalSegmentator"),
         emit=_collect(events),
     )
-    relatives = sorted(e["relative_dir"] for e in events if e["event"] == "artifact")
+    relatives = sorted(
+        e["relative_dir"] for e in events
+        if e["event"] == "artifact" and not e["name"].endswith(".json")
+    )
     assert relatives == ["subjectA", "subjectB"]
 
 
@@ -828,7 +835,8 @@ def test_an_unreadable_scan_is_announced_and_the_others_still_ship(
 
     failed = [e for e in events if e["event"] == "item" and e["status"] == "failed"]
     assert [e["name"] for e in failed] == ["broken.nii.gz"]
-    assert [e["name"] for e in events if e["event"] == "artifact"] == ["good.nii.gz"]
+    shipped = [e["name"] for e in events if e["event"] == "artifact"]
+    assert shipped == ["good.nii.gz", "BatchDentalSeg_report.json"]
     assert run.report["summary"] == "1/2 scan(s) segmented"
 
 
@@ -1030,3 +1038,65 @@ def test_a_bundle_pinning_its_own_resampler_opts_itself_out(monkeypatch):
 
 def test_gpu_resampling_never_applies_on_cpu():
     assert not nnunet_runner._enable_gpu_resampling(_FakePredictor(), "cpu")
+
+
+def test_the_run_report_is_shipped_to_a_streaming_client(tmp_path, stub_nnunet):
+    """It can only be written once every scan is done, so it is the LAST
+    artifact -- and without it a streamed client has the segmentations and
+    nothing saying what their integers mean, so the segments load unnamed and
+    uncoloured. That is most of what the panel is for."""
+    stub_nnunet()
+    _write_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    events = []
+    BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        emit=_collect(events),
+    )
+    artifacts = [e for e in events if e["event"] == "artifact"]
+    assert artifacts[-1]["name"] == "BatchDentalSeg_report.json"
+    with open(artifacts[-1]["path"], encoding="utf-8") as handle:
+        shipped = json.load(handle)
+    assert shipped["labels"] and shipped["label_colors"]
+
+
+def test_several_files_for_one_scan_still_travel_as_one_archive(tmp_path, stub_nnunet):
+    """`separate_segments` (or a mesh export) makes dozens of files per patient;
+    one round trip each would be worse than one archive."""
+    stub_nnunet(labels_present=(1, 2))
+    _write_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    events = []
+    BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        separate_segments=True,
+        emit=_collect(events),
+    )
+    scan_artifact = next(e for e in events if e["event"] == "artifact" and e["name"] == "p1.nii.gz")
+    assert scan_artifact["path"].endswith(".zip")
+    with zipfile.ZipFile(scan_artifact["path"]) as archive:
+        assert len(archive.namelist()) == 3
+
+
+def test_a_shipped_artifact_never_removes_the_file_from_the_output_tree(tmp_path, stub_nnunet):
+    """transfer.store_result RENAMES what it is given, so an artifact has to be
+    a copy: handing over the real segmentation would take it out of the tree
+    the report describes and the final archive is built from."""
+    stub_nnunet()
+    _write_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    events = []
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        emit=_collect(events),
+    )
+    produced = run.segmentation_files[0]
+    artifact = next(e for e in events if e["event"] == "artifact")
+    assert artifact["path"] != produced
+    assert os.path.isfile(produced)
