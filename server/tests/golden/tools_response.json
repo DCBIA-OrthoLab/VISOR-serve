@@ -1,0 +1,1553 @@
+[
+  {
+    "name": "ALI",
+    "arguments": {
+      "input": {
+        "type": "volume_or_zip_file",
+        "types": [
+          "volume_or_zip_file",
+          "surface_or_zip_file"
+        ],
+        "required": true,
+        "description": "A CBCT scan (.nii/.nii.gz/.nrrd/.nrrd.gz/.gipl/.gipl.gz), an IOS surface (.vtk/.stl), or a .zip archive of a folder of either -- DICOM series are recognised inside the archive and converted automatically",
+        "server_selectable": "testfile",
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "volume_or_zip_file": [
+            ".nii",
+            ".nii.gz",
+            ".nrrd",
+            ".nrrd.gz",
+            ".gipl",
+            ".gipl.gz",
+            ".zip"
+          ],
+          "surface_or_zip_file": [
+            ".vtk",
+            ".stl",
+            ".zip"
+          ]
+        },
+        "label": "Scan or Folder",
+        "section": "Inputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "model": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": false,
+        "description": "Name of a model bundle hosted on the server (see GET /tools/ALI/data). Leave empty to let the server pick the bundle matching the detected mode. CBCT bundles hold <landmark>/<scale>/*.pth; IOS bundles hold checkpoints named with an 'O' or 'C' token and an 'Upper' or 'Lower' one, e.g. Upper_O_model.pth",
+        "server_selectable": "model",
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": "Model Bundle",
+        "section": "Inputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "cbct_regions": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "CBCT only: anatomical regions to predict",
+        "server_selectable": null,
+        "choices": {
+          "Cranial base": true,
+          "Upper": true,
+          "Lower": true,
+          "Impacted canine": true
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Regions",
+        "section": "CBCT landmarks",
+        "visible_when": null,
+        "ui": "inline",
+        "groups": null
+      },
+      "landmarks": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "CBCT only: predict exactly these landmarks. Leave every box unchecked to select by region instead -- naming any landmark here REPLACES the region selection rather than narrowing it",
+        "server_selectable": null,
+        "choices": {
+          "Ba": false,
+          "S": false,
+          "N": false,
+          "RPo": false,
+          "LPo": false,
+          "RFZyg": false,
+          "LFZyg": false,
+          "C2": false,
+          "C3": false,
+          "C4": false,
+          "RInfOr": false,
+          "LInfOr": false,
+          "LMZyg": false,
+          "RPF": false,
+          "LPF": false,
+          "PNS": false,
+          "ANS": false,
+          "A": false,
+          "UR3O": false,
+          "UR1O": false,
+          "UL3O": false,
+          "UR6DB": false,
+          "UR6MB": false,
+          "UL6MB": false,
+          "UL6DB": false,
+          "IF": false,
+          "ROr": false,
+          "LOr": false,
+          "RMZyg": false,
+          "RNC": false,
+          "LNC": false,
+          "UR7O": false,
+          "UR5O": false,
+          "UR4O": false,
+          "UR2O": false,
+          "UL1O": false,
+          "UL2O": false,
+          "UL4O": false,
+          "UL5O": false,
+          "UL7O": false,
+          "UL7R": false,
+          "UL5R": false,
+          "UL4R": false,
+          "UL2R": false,
+          "UL1R": false,
+          "UR2R": false,
+          "UR4R": false,
+          "UR5R": false,
+          "UR7R": false,
+          "UR6MP": false,
+          "UL6MP": false,
+          "UL6R": false,
+          "UR6R": false,
+          "UR6O": false,
+          "UL6O": false,
+          "UL3R": false,
+          "UR3R": false,
+          "UR1R": false,
+          "RCo": false,
+          "RGo": false,
+          "Me": false,
+          "Gn": false,
+          "Pog": false,
+          "PogL": false,
+          "B": false,
+          "LGo": false,
+          "LCo": false,
+          "LR1O": false,
+          "LL6MB": false,
+          "LL6DB": false,
+          "LR6MB": false,
+          "LR6DB": false,
+          "LAF": false,
+          "LAE": false,
+          "RAF": false,
+          "RAE": false,
+          "LMCo": false,
+          "LLCo": false,
+          "RMCo": false,
+          "RLCo": false,
+          "RMeF": false,
+          "LMeF": false,
+          "RSig": false,
+          "RPRa": false,
+          "RARa": false,
+          "LSig": false,
+          "LARa": false,
+          "LPRa": false,
+          "LR7R": false,
+          "LR5R": false,
+          "LR4R": false,
+          "LR3R": false,
+          "LL3R": false,
+          "LL4R": false,
+          "LL5R": false,
+          "LL7R": false,
+          "LL7O": false,
+          "LL5O": false,
+          "LL4O": false,
+          "LL3O": false,
+          "LL2O": false,
+          "LL1O": false,
+          "LR2O": false,
+          "LR3O": false,
+          "LR4O": false,
+          "LR5O": false,
+          "LR7O": false,
+          "LL6R": false,
+          "LR6R": false,
+          "LL6O": false,
+          "LR6O": false,
+          "LR1R": false,
+          "LL1R": false,
+          "LL2R": false,
+          "LR2R": false,
+          "UR3OIP": false,
+          "UL3OIP": false,
+          "UR3RIP": false,
+          "UL3RIP": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Individual landmarks",
+        "section": "CBCT landmarks",
+        "visible_when": null,
+        "ui": "tabs",
+        "groups": {
+          "Cranial base": [
+            "Ba",
+            "S",
+            "N",
+            "RPo",
+            "LPo",
+            "RFZyg",
+            "LFZyg",
+            "C2",
+            "C3",
+            "C4"
+          ],
+          "Upper": [
+            "RInfOr",
+            "LInfOr",
+            "LMZyg",
+            "RPF",
+            "LPF",
+            "PNS",
+            "ANS",
+            "A",
+            "UR3O",
+            "UR1O",
+            "UL3O",
+            "UR6DB",
+            "UR6MB",
+            "UL6MB",
+            "UL6DB",
+            "IF",
+            "ROr",
+            "LOr",
+            "RMZyg",
+            "RNC",
+            "LNC",
+            "UR7O",
+            "UR5O",
+            "UR4O",
+            "UR2O",
+            "UL1O",
+            "UL2O",
+            "UL4O",
+            "UL5O",
+            "UL7O",
+            "UL7R",
+            "UL5R",
+            "UL4R",
+            "UL2R",
+            "UL1R",
+            "UR2R",
+            "UR4R",
+            "UR5R",
+            "UR7R",
+            "UR6MP",
+            "UL6MP",
+            "UL6R",
+            "UR6R",
+            "UR6O",
+            "UL6O",
+            "UL3R",
+            "UR3R",
+            "UR1R"
+          ],
+          "Lower": [
+            "RCo",
+            "RGo",
+            "Me",
+            "Gn",
+            "Pog",
+            "PogL",
+            "B",
+            "LGo",
+            "LCo",
+            "LR1O",
+            "LL6MB",
+            "LL6DB",
+            "LR6MB",
+            "LR6DB",
+            "LAF",
+            "LAE",
+            "RAF",
+            "RAE",
+            "LMCo",
+            "LLCo",
+            "RMCo",
+            "RLCo",
+            "RMeF",
+            "LMeF",
+            "RSig",
+            "RPRa",
+            "RARa",
+            "LSig",
+            "LARa",
+            "LPRa",
+            "LR7R",
+            "LR5R",
+            "LR4R",
+            "LR3R",
+            "LL3R",
+            "LL4R",
+            "LL5R",
+            "LL7R",
+            "LL7O",
+            "LL5O",
+            "LL4O",
+            "LL3O",
+            "LL2O",
+            "LL1O",
+            "LR2O",
+            "LR3O",
+            "LR4O",
+            "LR5O",
+            "LR7O",
+            "LL6R",
+            "LR6R",
+            "LL6O",
+            "LR6O",
+            "LR1R",
+            "LL1R",
+            "LL2R",
+            "LR2R"
+          ],
+          "Impacted canine": [
+            "UR3OIP",
+            "UL3OIP",
+            "UR3RIP",
+            "UL3RIP"
+          ]
+        }
+      },
+      "ios_networks": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "IOS only: landmark families to predict",
+        "server_selectable": null,
+        "choices": {
+          "Occlusal": true,
+          "Cervical": true
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Landmark families",
+        "section": "IOS landmarks",
+        "visible_when": null,
+        "ui": "inline",
+        "groups": null
+      },
+      "prediction_ID": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": false,
+        "description": "Suffix used in output file names, e.g. scan_lm_Pred.mrk.json",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": "Prediction ID",
+        "section": "Outputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "files"
+  },
+  {
+    "name": "AMASSS",
+    "arguments": {
+      "input": {
+        "type": "volume_or_zip_file",
+        "types": [
+          "volume_or_zip_file",
+          "folder"
+        ],
+        "required": true,
+        "description": "A CBCT scan (.nii/.nii.gz/.nrrd/.nrrd.gz/.gipl/.gipl.gz), or a folder of scans for batch segmentation (sent as a .zip archive)",
+        "server_selectable": "testfile",
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "volume_or_zip_file": [
+            ".nii",
+            ".nii.gz",
+            ".nrrd",
+            ".nrrd.gz",
+            ".gipl",
+            ".gipl.gz",
+            ".zip"
+          ],
+          "folder": [
+            ".zip"
+          ]
+        },
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "model": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "Name of a model bundle hosted on the server (see GET /tools/AMASSS/data): one subfolder per structure code (MAND/, MAX/, ...), each holding an nnUNet v2 model",
+        "server_selectable": "model",
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "structures": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": true,
+        "description": "Anatomical structures to segment",
+        "server_selectable": null,
+        "choices": {
+          "Mandible": true,
+          "Maxilla": true,
+          "Cranial base": true,
+          "Cervical vertebra": true,
+          "Upper airway": true,
+          "Skin": false,
+          "Cranial base (Mask)": false,
+          "Mandible (Mask)": false,
+          "Maxilla (Mask)": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "merge": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "Merged: one multi-label file per scan. Separated: one binary file per structure. Both may be selected",
+        "server_selectable": null,
+        "choices": {
+          "One merged segmentation file": true,
+          "Separated segmentation files": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "prediction_ID": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": false,
+        "description": "Suffix used in output file names, e.g. scan_Pred_MAND.nii.gz",
+        "server_selectable": null,
+        "choices": null,
+        "initial": "Pred",
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "generate_surface": {
+        "type": "bool",
+        "types": [
+          "bool"
+        ],
+        "required": false,
+        "description": "Also export a 3D surface (.vtk) alongside each segmentation",
+        "server_selectable": null,
+        "choices": null,
+        "initial": false,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "surface_smoothing": {
+        "type": "int",
+        "types": [
+          "int"
+        ],
+        "required": false,
+        "description": "Smoothing iterations for the surfaces (0-95), ignored without generate_surface",
+        "server_selectable": null,
+        "choices": null,
+        "initial": 5,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "surface_decimation": {
+        "type": "int",
+        "types": [
+          "int"
+        ],
+        "required": false,
+        "description": "Percentage of surface triangles to drop (0-99). 90 keeps the shape to well under a voxel while making the .vtk usable; 0 keeps every triangle. Ignored without generate_surface",
+        "server_selectable": null,
+        "choices": null,
+        "initial": 90,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "files"
+  },
+  {
+    "name": "ASO",
+    "arguments": {
+      "modality": {
+        "type": "choice",
+        "types": [
+          "choice"
+        ],
+        "required": true,
+        "description": "CBCT: cone-beam CT volumes. IOS: intra-oral surface scans",
+        "server_selectable": null,
+        "choices": {
+          "CBCT": true,
+          "IOS": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Input Type",
+        "section": "Inputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "automation": {
+        "type": "choice",
+        "types": [
+          "choice"
+        ],
+        "required": true,
+        "description": "Semi-Automated: you send the landmarks (.mrk.json) alongside each scan. Fully-Automated: CBCT landmarks are predicted server-side, IOS meshes are oriented from their tooth labels",
+        "server_selectable": null,
+        "choices": {
+          "Semi-Automated": true,
+          "Fully-Automated": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Mode",
+        "section": "Inputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "input": {
+        "type": "volume_or_zip_file",
+        "types": [
+          "volume_or_zip_file",
+          "surface_file",
+          "folder"
+        ],
+        "required": true,
+        "description": "One CBCT scan (.nii/.nii.gz/.nrrd/.nrrd.gz/.gipl/.gipl.gz) or one intra-oral mesh (.vtk/.vtp/.stl/.obj/.off), or a folder of them for batch orientation (sent as a .zip). In Semi-Automated mode the landmark files go in the same folder as the scans they belong to",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "volume_or_zip_file": [
+            ".nii",
+            ".nii.gz",
+            ".nrrd",
+            ".nrrd.gz",
+            ".gipl",
+            ".gipl.gz",
+            ".zip"
+          ],
+          "surface_file": [
+            ".vtk",
+            ".vtp",
+            ".stl",
+            ".obj",
+            ".off"
+          ],
+          "folder": [
+            ".zip"
+          ]
+        },
+        "label": "Scan / Landmark Folder",
+        "section": "Inputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "reference": {
+        "type": "zip_file",
+        "types": [
+          "zip_file",
+          "folder"
+        ],
+        "required": true,
+        "description": "The already-oriented case defining the target coordinate frame. Pick one hosted on this server (see GET /tools/ASO/data) or send your own. CBCT: one landmark file. IOS: one file per jaw, named so a token says which jaw it is (e.g. 'Gold_Upper.vtk')",
+        "server_selectable": "model",
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "zip_file": [
+            ".zip"
+          ],
+          "folder": [
+            ".zip"
+          ]
+        },
+        "label": "Reference",
+        "section": "Inputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "landmark_models": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": false,
+        "description": "Fully-Automated CBCT only. Leave empty -- the server then picks the bundle matching the scans from the ones hosted for the landmark tool, which is almost always what you want. Name one (see GET /tools/ASO/data) only to force a particular vintage; note that list also holds the reference bundles, which are not landmark weights",
+        "server_selectable": "model",
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": "Landmark Models",
+        "section": "Inputs",
+        "visible_when": {
+          "modality": "CBCT",
+          "automation": "Fully-Automated"
+        },
+        "ui": null,
+        "groups": null
+      },
+      "cbct_landmarks": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "CBCT only: the landmarks to register on. At least 3 are needed; the defaults are the points the published reference planes are built on. A landmark missing from your file or from the reference is reported in ASO_report.json, not silently dropped",
+        "server_selectable": null,
+        "choices": {
+          "Ba": true,
+          "C2": false,
+          "C3": false,
+          "C4": false,
+          "LFZyg": false,
+          "LPo": true,
+          "N": true,
+          "RFZyg": false,
+          "RPo": true,
+          "S": true,
+          "A": false,
+          "ANS": false,
+          "IF": false,
+          "LInfOr": false,
+          "LMZyg": false,
+          "LNC": false,
+          "LOr": true,
+          "LPF": false,
+          "PNS": false,
+          "RInfOr": false,
+          "RMZyg": false,
+          "RNC": false,
+          "ROr": true,
+          "RPF": false,
+          "UL1O": false,
+          "UL1R": false,
+          "UL2O": false,
+          "UL2R": false,
+          "UL3O": false,
+          "UL3R": false,
+          "UL4O": false,
+          "UL4R": false,
+          "UL5O": false,
+          "UL5R": false,
+          "UL6DB": false,
+          "UL6MB": false,
+          "UL6MP": false,
+          "UL6O": false,
+          "UL6R": false,
+          "UL7O": false,
+          "UL7R": false,
+          "UR1O": false,
+          "UR1R": false,
+          "UR2O": false,
+          "UR2R": false,
+          "UR3O": false,
+          "UR3R": false,
+          "UR4O": false,
+          "UR4R": false,
+          "UR5O": false,
+          "UR5R": false,
+          "UR6DB": false,
+          "UR6MB": false,
+          "UR6MP": false,
+          "UR6O": false,
+          "UR6R": false,
+          "UR7O": false,
+          "UR7R": false,
+          "B": false,
+          "Gn": false,
+          "LAE": false,
+          "LAF": false,
+          "LARa": false,
+          "LCo": false,
+          "LGo": false,
+          "LLCo": false,
+          "LMCo": false,
+          "LMeF": false,
+          "LPRa": false,
+          "LSig": false,
+          "Me": false,
+          "Pog": false,
+          "PogL": false,
+          "LL1O": false,
+          "LL1R": false,
+          "LL2O": false,
+          "LL2R": false,
+          "LL3O": false,
+          "LL3R": false,
+          "LL4O": false,
+          "LL4R": false,
+          "LL5O": false,
+          "LL5R": false,
+          "LL6DB": false,
+          "LL6MB": false,
+          "LL6O": false,
+          "LL6R": false,
+          "LL7O": false,
+          "LL7R": false,
+          "LR1O": false,
+          "LR1R": false,
+          "LR2O": false,
+          "LR2R": false,
+          "LR3O": false,
+          "LR3R": false,
+          "LR4O": false,
+          "LR4R": false,
+          "LR5O": false,
+          "LR5R": false,
+          "LR6DB": false,
+          "LR6MB": false,
+          "LR6O": false,
+          "LR6R": false,
+          "LR7O": false,
+          "LR7R": false,
+          "RAE": false,
+          "RAF": false,
+          "RARa": false,
+          "RCo": false,
+          "RGo": false,
+          "RLCo": false,
+          "RMCo": false,
+          "RMeF": false,
+          "RPRa": false,
+          "RSig": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Landmarks",
+        "section": "Landmark Reference",
+        "visible_when": {
+          "modality": "CBCT"
+        },
+        "ui": "tabs",
+        "groups": {
+          "Cranial base": [
+            "Ba",
+            "C2",
+            "C3",
+            "C4",
+            "LFZyg",
+            "LPo",
+            "N",
+            "RFZyg",
+            "RPo",
+            "S"
+          ],
+          "Upper": [
+            "A",
+            "ANS",
+            "IF",
+            "LInfOr",
+            "LMZyg",
+            "LNC",
+            "LOr",
+            "LPF",
+            "PNS",
+            "RInfOr",
+            "RMZyg",
+            "RNC",
+            "ROr",
+            "RPF",
+            "UL1O",
+            "UL1R",
+            "UL2O",
+            "UL2R",
+            "UL3O",
+            "UL3R",
+            "UL4O",
+            "UL4R",
+            "UL5O",
+            "UL5R",
+            "UL6DB",
+            "UL6MB",
+            "UL6MP",
+            "UL6O",
+            "UL6R",
+            "UL7O",
+            "UL7R",
+            "UR1O",
+            "UR1R",
+            "UR2O",
+            "UR2R",
+            "UR3O",
+            "UR3R",
+            "UR4O",
+            "UR4R",
+            "UR5O",
+            "UR5R",
+            "UR6DB",
+            "UR6MB",
+            "UR6MP",
+            "UR6O",
+            "UR6R",
+            "UR7O",
+            "UR7R"
+          ],
+          "Lower": [
+            "B",
+            "Gn",
+            "LAE",
+            "LAF",
+            "LARa",
+            "LCo",
+            "LGo",
+            "LLCo",
+            "LMCo",
+            "LMeF",
+            "LPRa",
+            "LSig",
+            "Me",
+            "Pog",
+            "PogL",
+            "LL1O",
+            "LL1R",
+            "LL2O",
+            "LL2R",
+            "LL3O",
+            "LL3R",
+            "LL4O",
+            "LL4R",
+            "LL5O",
+            "LL5R",
+            "LL6DB",
+            "LL6MB",
+            "LL6O",
+            "LL6R",
+            "LL7O",
+            "LL7R",
+            "LR1O",
+            "LR1R",
+            "LR2O",
+            "LR2R",
+            "LR3O",
+            "LR3R",
+            "LR4O",
+            "LR4R",
+            "LR5O",
+            "LR5R",
+            "LR6DB",
+            "LR6MB",
+            "LR6O",
+            "LR6R",
+            "LR7O",
+            "LR7R",
+            "RAE",
+            "RAF",
+            "RARa",
+            "RCo",
+            "RGo",
+            "RLCo",
+            "RMCo",
+            "RMeF",
+            "RPRa",
+            "RSig"
+          ]
+        }
+      },
+      "ios_teeth": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "IOS only: the teeth to register on. Fully-Automated needs exactly 3 or 4 per jaw, spread across the arch",
+        "server_selectable": null,
+        "choices": {
+          "UR8": false,
+          "UR7": false,
+          "UR6": true,
+          "UR5": false,
+          "UR4": false,
+          "UR3": false,
+          "UR2": false,
+          "UR1": false,
+          "UL1": true,
+          "UL2": false,
+          "UL3": false,
+          "UL4": false,
+          "UL5": false,
+          "UL6": true,
+          "UL7": false,
+          "UL8": false,
+          "LL8": false,
+          "LL7": false,
+          "LL6": true,
+          "LL5": false,
+          "LL4": false,
+          "LL3": false,
+          "LL2": false,
+          "LL1": false,
+          "LR1": true,
+          "LR2": false,
+          "LR3": false,
+          "LR4": false,
+          "LR5": false,
+          "LR6": true,
+          "LR7": false,
+          "LR8": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Teeth",
+        "section": "Teeth & Landmarks",
+        "visible_when": {
+          "modality": "IOS"
+        },
+        "ui": "grid",
+        "groups": {
+          "Upper": [
+            "UR8",
+            "UR7",
+            "UR6",
+            "UR5",
+            "UR4",
+            "UR3",
+            "UR2",
+            "UR1",
+            "UL1",
+            "UL2",
+            "UL3",
+            "UL4",
+            "UL5",
+            "UL6",
+            "UL7",
+            "UL8"
+          ],
+          "Lower": [
+            "LL8",
+            "LL7",
+            "LL6",
+            "LL5",
+            "LL4",
+            "LL3",
+            "LL2",
+            "LL1",
+            "LR1",
+            "LR2",
+            "LR3",
+            "LR4",
+            "LR5",
+            "LR6",
+            "LR7",
+            "LR8"
+          ]
+        }
+      },
+      "ios_landmark_types": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "Semi-Automated IOS only: which landmark per tooth to register on. Combined with the selected teeth into the labels looked up in your landmark file, e.g. UR6 + O -> 'UR6O'",
+        "server_selectable": null,
+        "choices": {
+          "O": true,
+          "MB": false,
+          "DB": false,
+          "CB": false,
+          "CL": false,
+          "OIP": false,
+          "R": false,
+          "RIP": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Landmark Types",
+        "section": "Teeth & Landmarks",
+        "visible_when": {
+          "modality": "IOS",
+          "automation": "Semi-Automated"
+        },
+        "ui": "inline",
+        "groups": null
+      },
+      "ios_jaws": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "IOS only: which jaws to orient",
+        "server_selectable": null,
+        "choices": {
+          "Upper": true,
+          "Lower": true
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Jaws",
+        "section": "Teeth & Landmarks",
+        "visible_when": {
+          "modality": "IOS"
+        },
+        "ui": "inline",
+        "groups": null
+      },
+      "ios_occlusion": {
+        "type": "choice",
+        "types": [
+          "choice"
+        ],
+        "required": false,
+        "description": "IOS only: orienting each jaw on its own is the default. Letting one drive the other applies a single transform to both, which preserves the occlusion but only makes sense if the two meshes were in occlusion to begin with",
+        "server_selectable": null,
+        "choices": {
+          "Orient each jaw independently": true,
+          "Upper drives Lower": false,
+          "Lower drives Upper": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": "Occlusion",
+        "section": "Teeth & Landmarks",
+        "visible_when": {
+          "modality": "IOS"
+        },
+        "ui": null,
+        "groups": null
+      },
+      "dicom_input": {
+        "type": "bool",
+        "types": [
+          "bool"
+        ],
+        "required": false,
+        "description": "CBCT only: the input is a zip of DICOM folders, one per patient, to convert server-side before orienting",
+        "server_selectable": null,
+        "choices": null,
+        "initial": false,
+        "extensions": null,
+        "label": "DICOM Input",
+        "section": "Inputs",
+        "visible_when": {
+          "modality": "CBCT"
+        },
+        "ui": null,
+        "groups": null
+      },
+      "output_suffix": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": false,
+        "description": "Added to every output file name, e.g. patient1_Or.nii.gz",
+        "server_selectable": null,
+        "choices": null,
+        "initial": "Or",
+        "extensions": null,
+        "label": "Suffix",
+        "section": "Outputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "files"
+  },
+  {
+    "name": "BatchDentalSeg",
+    "arguments": {
+      "input": {
+        "type": "volume_or_zip_file",
+        "types": [
+          "volume_or_zip_file",
+          "folder"
+        ],
+        "required": true,
+        "description": "A dental CT/CBCT scan (.nii/.nii.gz/.nrrd/.nrrd.gz/.gipl/.gipl.gz), or a folder of scans for batch segmentation (sent as a .zip archive)",
+        "server_selectable": "testfile",
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "volume_or_zip_file": [
+            ".nii",
+            ".nii.gz",
+            ".nrrd",
+            ".nrrd.gz",
+            ".gipl",
+            ".gipl.gz",
+            ".zip"
+          ],
+          "folder": [
+            ".zip"
+          ]
+        },
+        "label": "Scan or Folder",
+        "section": "Inputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "model": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "Name of a model hosted on the server (see GET /tools/BatchDentalSeg/data). DentalSegmentator and PediatricDentalSeg label 5 segments (the maxilla is inside Upper Skull); NasoMaxillaDentSeg separates the maxilla; UniversalLab labels every tooth individually. The run report says what the values mean",
+        "server_selectable": "model",
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": "Model",
+        "section": "Inputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "separate_segments": {
+        "type": "bool",
+        "types": [
+          "bool"
+        ],
+        "required": false,
+        "description": "In addition to the multi-label volume, write a binary mask per segment the model actually found. Empty segments are not written",
+        "server_selectable": null,
+        "choices": null,
+        "initial": false,
+        "extensions": null,
+        "label": "Also write one file per segment",
+        "section": "Outputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "prediction_ID": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": false,
+        "description": "Suffix used in output file names, e.g. scan_Seg.nii.gz",
+        "server_selectable": null,
+        "choices": null,
+        "initial": "Seg",
+        "extensions": null,
+        "label": "Prediction ID",
+        "section": "Outputs",
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "files"
+  },
+  {
+    "name": "CrownSeg",
+    "arguments": {
+      "input": {
+        "type": "surface_or_zip_file",
+        "types": [
+          "surface_or_zip_file",
+          "folder"
+        ],
+        "required": true,
+        "description": "An intraoral surface scan (.vtk/.stl), or a folder of them for batch segmentation (sent as a .zip archive)",
+        "server_selectable": "testfile",
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "surface_or_zip_file": [
+            ".vtk",
+            ".stl",
+            ".zip"
+          ],
+          "folder": [
+            ".zip"
+          ]
+        },
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "model": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": false,
+        "description": "Name of a segmentation checkpoint hosted on the server (see GET /tools/CrownSeg/data). Leave empty to use the server's default",
+        "server_selectable": "model",
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "array_name": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": false,
+        "description": "Name of the point-data array the tooth labels are written to. Leave as Universal_ID unless a downstream tool expects another name",
+        "server_selectable": null,
+        "choices": null,
+        "initial": "Universal_ID",
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "numbering": {
+        "type": "choice",
+        "types": [
+          "choice"
+        ],
+        "required": false,
+        "description": "Tooth numbering system used for the labels",
+        "server_selectable": null,
+        "choices": {
+          "Universal": true,
+          "FDI": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "suffix": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": false,
+        "description": "Suffix used in output file names, e.g. scan_Seg.vtk",
+        "server_selectable": null,
+        "choices": null,
+        "initial": "Seg",
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "skip_segmented": {
+        "type": "bool",
+        "types": [
+          "bool"
+        ],
+        "required": false,
+        "description": "Pass a mesh that already carries tooth labels through unchanged instead of re-running the network on it",
+        "server_selectable": null,
+        "choices": null,
+        "initial": true,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "files"
+  },
+  {
+    "name": "SurgMovPred",
+    "arguments": {
+      "input": {
+        "type": "zip_file",
+        "types": [
+          "zip_file"
+        ],
+        "required": true,
+        "description": "Input data: a zip archive of a folder containing CSV / XLSX / ODS files; a server-side test file may also be a single such file",
+        "server_selectable": "testfile",
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "zip_file": [
+            ".zip"
+          ]
+        },
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "model": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "Name of a model hosted on the server (see GET /tools/SurgMovPred/data); a folder (or zip archive) containing one or more stacking_package.pkl files",
+        "server_selectable": "model",
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "file"
+  },
+  {
+    "name": "example_tool",
+    "arguments": {
+      "label": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "Free-text label for this run",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "input": {
+        "type": "csv_file",
+        "types": [
+          "csv_file",
+          "folder"
+        ],
+        "required": true,
+        "description": "A single .csv file, or a folder of .csv/.xlsx/.ods files sent as a .zip archive",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "csv_file": [
+            ".csv"
+          ],
+          "folder": [
+            ".zip"
+          ]
+        },
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "threshold": {
+        "type": "float",
+        "types": [
+          "float"
+        ],
+        "required": true,
+        "description": "Numeric threshold parameter",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "iterations": {
+        "type": "int",
+        "types": [
+          "int"
+        ],
+        "required": false,
+        "description": "Optional number of iterations",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "outputs": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "Which result files to produce",
+        "server_selectable": null,
+        "choices": {
+          "summary": true,
+          "preview": true,
+          "columns": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "preview_format": {
+        "type": "choice",
+        "types": [
+          "choice"
+        ],
+        "required": false,
+        "description": "Format of the preview file",
+        "server_selectable": null,
+        "choices": {
+          "csv": true,
+          "json": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "files"
+  },
+  {
+    "name": "test_tool",
+    "arguments": {
+      "text_1": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "First string",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "text_2": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "Second string",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "text"
+  }
+]
