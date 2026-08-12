@@ -12,11 +12,13 @@ import os
 import sys
 
 
-def run(a, b, out_name="probe.txt", fail=False):
+def run(a, b, out_name="probe.txt", fail=False, tags=None):
     """Add two numbers, write a file into the job's output/, describe the run.
 
     `fail` raises instead, which is the other half of the contract: the runner
-    must then write no result.json and exit non-zero.
+    must then write no result.json and exit non-zero. `tags` is here for one
+    reason: it is the only argument shape a .schema.json can declare that the
+    server had no type for, so something has to carry it across the wire.
     """
     if fail:
         raise RuntimeError("_dispatch_probe was asked to fail")
@@ -29,6 +31,7 @@ def run(a, b, out_name="probe.txt", fail=False):
 
     return {
         "total": total,
+        "tags": list(tags or []),
         "output_path": output_path,
         # The proof: the server compares this against its own sys.executable.
         "executable": sys.executable,

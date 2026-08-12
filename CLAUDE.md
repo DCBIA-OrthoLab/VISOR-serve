@@ -149,9 +149,13 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 ├── server/
 │   ├── main.py              # FastAPI app: /run/{tool_name}, /uploads, /results
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError
-│   ├── registry.py          # auto-discovery of Tool subclasses in tools/
+│   ├── registry.py          # discovery: .schema.json tools, and Tool subclasses in tools/
 │   ├── dispatch.py          # runs a tool in its own venv, as a subprocess (SADT_DISPATCH_MODE)
 │   ├── runner.py            # the other side of that: stdlib only, executed BY a tool's venv
+│   ├── schema_tool.py       # a tool built from its .schema.json, never imported
+│   ├── schema_hash.py       # source_hash: the reference implementation, executable
+│   ├── deployment.py        # deployment.toml: per-tool server-side config
+│   ├── deployment.toml.example
 │   ├── data_store.py        # DataStore interface + LocalDataStore (server-side models/testfiles)
 │   ├── file_utils.py        # shared helpers: scratch dirs, zip, scan extensions, tabular loading
 │   ├── transfer.py          # chunked resumable uploads, range-served results
@@ -415,6 +419,71 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-12 — A tool can be declared without being imported (phase 2)
+
+Phase 1 gave a tool its own process. This gives it its own *declaration*: a
+folder holding `.schema.json`, `.venv/` and `src/`, from which the server
+builds a `Tool` without importing a line of it. `registry.py` now discovers
+both kinds, and dropping a `.schema.json` into a folder is what moves a tool
+from one to the other — a folder that has one is never imported.
+
+**Both kinds at once, and that is not a compromise.** The two bullets of the
+phase — "registry reads schemas instead of importing" and "the golden
+`GET /tools` test must still pass" — are only simultaneously satisfiable that
+way: the eight tools here have no schema, and the contract's type vocabulary
+(`path`, `str`, `int`, `float`, `bool`, `list[str]`) *cannot* express what they
+publish — `volume_or_zip_file` and its extensions, a `multichoice` over 119
+landmarks, `visible_when`, `ui`, `groups`. A schema-only registry today means
+either no tools or a different response. The server stops importing tools when
+the tools leave this repo, which is phase 4.
+
+- **`source_hash` is fatal, alone among discovery failures.** Everything else
+  costs one tool (skipped, reported, `FAILED_TOOLS`); a schema that no longer
+  matches the source beside it takes the server down, because it would
+  otherwise keep serving — validating requests against a signature that has
+  changed under it, accepting arguments `run()` no longer takes and refusing
+  ones it now does. A schema with NO hash is unverifiable and skipped instead:
+  it must not serve, but it endangers only itself.
+- **`schema_hash.py` is executable**, `python server/schema_hash.py <src>`.
+  The generator lives in the other repository and the two must agree byte for
+  byte or nothing starts, so this ships a reference implementation to check
+  against rather than a description to reimplement. The rule: sha256 over
+  `<relative posix path>\0<sha256 of contents>\n` per file, sorted,
+  `__pycache__` and `*.pyc` excluded — every clause of which exists to make the
+  hash reproducible on another machine.
+- **The folder must be named after the tool.** Not cosmetic: `dispatch.py`
+  looks the interpreter up at `<TOOLS_DIR>/<tool name>/.venv/bin/python`, so a
+  mismatch registers a tool that cannot be run.
+- **`deployment.toml` is the server's half of the declaration.** A schema is
+  generated from the tool's source and is the same wherever it is installed;
+  which arguments may be filled from *this* machine's `DATA_DIR`, and how much
+  *this* machine accepts as an upload, are not properties of the tool. Absent
+  is the normal case. A `server_selectable` entry naming an argument the tool
+  does not declare, or one that is not a `path`, is a startup error — the
+  failure is otherwise a dropdown that silently never appears.
+- **`max_upload_mb` is enforced where the tool is known**: on the multipart
+  body, and when a chunked upload is *claimed*. `POST /uploads` opens a session
+  for a file, not for a tool, and keeps applying the global `MAX_UPLOAD_MB`
+  while the transfer runs.
+- **An unknown key in a schema is a WARNING, not a refusal.** This is the seam
+  between two repositories: a field one side adds must not stop the other from
+  starting, and must not vanish in silence either. An unknown key in
+  `deployment.toml` is the opposite — that file is ours, and
+  `server_selectible` would just leave every argument upload-only.
+- **`base.LIST_TYPE`** (`"list[str]"`), the one argument shape the schema can
+  declare that nothing here could express. Not `multichoice`, which picks from
+  a catalog the tool declares; this is free text. A type-system addition of the
+  same kind as the choice types, made once.
+
+**Two gaps this leaves, both needing the other repository or a client
+release:** a `path` argument publishes no extensions (the schema does not say
+which it accepts, so the client's file dialog falls back to
+`ALLOWED_EXTENSIONS`), and the schema's tool-level `description` is read and
+kept but not published — `GET /tools` has no field for it, and adding one is a
+shape change.
+
+**Tests:** 417 server tests (+37), no GPU, no weights and no network.
 
 ### 2026-08-12 — A tool can run in its own interpreter (phase 1: the path, no tool on it)
 

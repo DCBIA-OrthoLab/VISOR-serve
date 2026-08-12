@@ -1,19 +1,30 @@
-"""Auto-discovery of Tool subclasses under the tools/ package.
+"""Discovery of the tools this server serves, from two sources.
 
-Each tool is a folder under tools/ (e.g. tools/example_tool/) containing
-exactly one recognized file: tools/example_tool/example_tool.py -- the file
-name must match the folder name. That file defines one or more Tool
-subclasses. Any other file in the folder (helpers, data, ...) is ignored by
+**A tool declared by a `.schema.json`** (the one this is moving to). A folder
+under TOOLS_DIR holding `.schema.json`, `.venv/` and `src/`. The server reads
+the JSON, checks it against the hash of the source next to it, and builds the
+tool from it -- it imports NOTHING. That is the whole point: a tool's
+dependencies then have nothing to agree with the server's, and two tools
+wanting incompatible versions of numpy or torch are no longer each other's
+problem.
+
+**A tool imported into this process** (what every tool here still is). A
+folder under tools/ containing exactly one recognized file,
+tools/<name>/<name>.py -- the file name must match the folder name -- defining
+one or more Tool subclasses. Any other file in the folder is ignored by
 discovery, though the recognized file is free to import from them.
 
-Adding a tool = dropping a new folder in tools/ with its <name>/<name>.py
-file. No central list to edit, no route to add.
+Dropping a `.schema.json` into a folder is what moves a tool from the second
+to the first: a folder that has one is never imported.
 
-A tool that fails to load -- missing dependency, syntax error, bad schema --
-is SKIPPED, not fatal: it would otherwise take the whole server down with it,
-and with 15+ tools that means one unavailable model blocks all the others. The
-failure is reported as loudly as possible instead (see _record_failure), kept
-in FAILED_TOOLS, and surfaced again by get_tool().
+**Two failure policies, and the difference is deliberate.** A tool that will
+not LOAD -- missing dependency, syntax error, bad schema -- is SKIPPED, not
+fatal: with 15+ tools, one unavailable model must not block all the others.
+The failure is reported as loudly as possible (see _record_failure), kept in
+FAILED_TOOLS, and surfaced again by get_tool(). A tool whose schema no longer
+matches its source is the opposite case and REFUSES TO START the server: it
+would otherwise keep serving, validating requests against a signature that has
+changed under it.
 """
 
 import importlib
@@ -23,6 +34,9 @@ import traceback
 
 import tools as tools_package
 from base import Tool
+from config import settings
+from deployment import deployment_config
+from schema_tool import SchemaTool, SourceHashMismatch, has_schema, load_tool
 
 # This module runs at import time, BEFORE main.py reaches its own
 # logging.basicConfig call: without this one, the INFO summary below would be
@@ -60,18 +74,56 @@ def _record_failure(folder: str, exc: Exception) -> None:
     )
 
 
-def _discover_tool_classes() -> list:
+def _tool_folders(root: str) -> list:
+    """Candidate tool folders directly under `root`, in a stable order.
+
+    A leading underscore or dot excludes a folder from discovery, which is how
+    a fixture like tools/_dispatch_probe/ stays out of GET /tools.
+    """
+    if not os.path.isdir(root):
+        return []
+    return [
+        entry
+        for entry in sorted(os.listdir(root))
+        if os.path.isdir(os.path.join(root, entry))
+        and not entry.startswith("_")
+        and not entry.startswith(".")
+    ]
+
+
+def _discover_schema_tools(root: str) -> list:
+    """(folder name, SchemaTool) for every folder under `root` declaring one.
+
+    Nothing here imports the tool: the schema is read, checked against the
+    source it claims to describe, and turned into a Tool object. A mismatch is
+    re-raised -- it is the one failure that takes the server with it.
+    """
+    discovered = []
+    for entry in _tool_folders(root):
+        folder = os.path.join(root, entry)
+        if not has_schema(folder):
+            continue
+        try:
+            discovered.append((entry, load_tool(folder, deployment_config)))
+        except SourceHashMismatch:
+            raise
+        except Exception as exc:
+            _record_failure(entry, exc)
+    return discovered
+
+
+def _discover_tool_classes(root: str) -> list:
     """(folder name, Tool subclass) pairs found under tools/.
 
     The folder name is carried along so a failure further down -- during
     instantiation or schema validation -- can still name the tool it came from.
     """
     discovered = []
-    package_dir = tools_package.__path__[0]
 
-    for entry in sorted(os.listdir(package_dir)):
-        folder_path = os.path.join(package_dir, entry)
-        if not os.path.isdir(folder_path) or entry.startswith("_") or entry.startswith("."):
+    for entry in _tool_folders(root):
+        folder_path = os.path.join(root, entry)
+        # A tool that declares a schema is served from it and never imported.
+        if has_schema(folder_path):
             continue
 
         try:
@@ -95,26 +147,79 @@ def _discover_tool_classes() -> list:
     return discovered
 
 
+def _instantiate(folder: str, cls, registry: dict):
+    instance = cls()
+    if not instance.name:
+        raise RuntimeError(f"Tool class '{cls.__name__}' has no 'name' set.")
+    _reject_duplicate(instance.name, registry)
+    # Catch a malformed argument declaration here, at import time, rather
+    # than on the first request that happens to reach that tool.
+    instance.check_schema()
+    return instance
+
+
+def _reject_duplicate(name: str, registry: dict) -> None:
+    if name in registry:
+        raise RuntimeError(f"Duplicate tool name detected: '{name}'")
+
+
+def _check_deployment_config(registry: dict) -> None:
+    """Every [tools.X] in deployment.toml must name a tool this server carries.
+
+    A typo'd or leftover section is otherwise dead config that looks live: the
+    dropdown it was meant to add simply never appears, and nothing says why.
+    """
+    unknown = [name for name in deployment_config.configured_tools if name not in registry]
+    if unknown:
+        logger.warning(
+            "deployment.toml configures %s, which this server does not serve. "
+            "Check the tool name against GET /tools.",
+            unknown,
+        )
+    for name in deployment_config.configured_tools:
+        tool = registry.get(name)
+        if tool is None or not deployment_config.for_tool(name).server_selectable:
+            continue
+        if not isinstance(tool, SchemaTool):
+            # An imported tool declares server_selectable in its own ArgSpec,
+            # where it travels with the code. Honouring it from here as well
+            # would make GET /tools depend on a file the tool knows nothing
+            # about.
+            logger.warning(
+                "deployment.toml sets server_selectable for '%s', which is an imported tool: "
+                "it declares that in its own ArgSpec and this entry is ignored.",
+                name,
+            )
+
+
 def _build_registry() -> dict:
     registry: dict = {}
 
-    for folder, cls in _discover_tool_classes():
+    for folder, tool in _discover_schema_tools(settings.TOOLS_DIR):
         try:
-            instance = cls()
-            if not instance.name:
-                raise RuntimeError(f"Tool class '{cls.__name__}' has no 'name' set.")
-            if instance.name in registry:
-                raise RuntimeError(f"Duplicate tool name detected: '{instance.name}'")
-            # Catch a malformed argument declaration here, at import time, rather
-            # than on the first request that happens to reach that tool.
-            instance.check_schema()
+            _reject_duplicate(tool.name, registry)
+        except Exception as exc:
+            _record_failure(folder, exc)
+            continue
+        registry[tool.name] = tool
+
+    schema_tools = len(registry)
+
+    for folder, cls in _discover_tool_classes(tools_package.__path__[0]):
+        try:
+            instance = _instantiate(folder, cls, registry)
         except Exception as exc:
             _record_failure(folder, exc)
             continue
         registry[instance.name] = instance
 
+    _check_deployment_config(registry)
+
     logger.info(
-        "Tool registry: %d loaded (%s)", len(registry), ", ".join(sorted(registry)) or "none"
+        "Tool registry: %d loaded, %d of them from a schema (%s)",
+        len(registry),
+        schema_tools,
+        ", ".join(sorted(registry)) or "none",
     )
     if FAILED_TOOLS:
         # Repeated here, at the very end of startup, so it survives the wall of
@@ -132,7 +237,30 @@ def _build_registry() -> dict:
     return registry
 
 
-TOOLS: dict = _build_registry()
+def _refuse_to_start(exc: SourceHashMismatch) -> None:
+    """A stale schema is the one discovery failure that must not be survivable.
+
+    Logged before it is re-raised, because what follows is a traceback out of
+    an import and the reason has to be readable above it.
+    """
+    logger.error(
+        "\n%s\n"
+        "  THE SERVER WILL NOT START\n"
+        "  %s\n\n"
+        "  A schema that no longer matches its source means every request for that tool is\n"
+        "  validated against a signature that has changed under it.\n"
+        "%s",
+        _BANNER,
+        exc,
+        _BANNER,
+    )
+
+
+try:
+    TOOLS: dict = _build_registry()
+except SourceHashMismatch as exc:
+    _refuse_to_start(exc)
+    raise
 
 
 def get_tool(name: str):

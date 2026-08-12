@@ -35,6 +35,7 @@ from base import (
 )
 from config import settings
 from data_store import DataNotFoundError, data_store
+from deployment import deployment_config
 from registry import TOOLS, get_tool
 from security import verify_token
 
@@ -74,7 +75,6 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(lifespan=_lifespan)
 
 _CHUNK_SIZE_BYTES = 1024 * 1024  # read/write in 1 MB chunks, never load the full file into RAM
-_MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_MB * 1024 * 1024
 _MAX_EXTRACTED_BYTES = settings.MAX_EXTRACTED_MB * 1024 * 1024
 _RESULT_REFERENCE_MIN_BYTES = settings.RESULT_REFERENCE_MIN_MB * 1024 * 1024
 
@@ -152,16 +152,28 @@ def _matched_extension(filename: str, expected: Optional[tuple]) -> Optional[str
     return None
 
 
-async def _stream_to_disk(upload: UploadFile, destination: str) -> int:
+async def _stream_to_disk(upload: UploadFile, destination: str, max_bytes: int) -> int:
     """Write the upload to disk in chunks, never buffering the whole file in RAM."""
     size = 0
     with open(destination, "wb") as out_file:
         while chunk := await upload.read(_CHUNK_SIZE_BYTES):
             size += len(chunk)
-            if size > _MAX_UPLOAD_BYTES:
+            if size > max_bytes:
                 raise _UploadTooLargeError()
             out_file.write(chunk)
     return size
+
+
+def _upload_limit_mb(tool) -> int:
+    """The upload limit for this tool: deployment.toml's `max_upload_mb` when
+    it declares one, MAX_UPLOAD_MB otherwise.
+
+    Applied here rather than in POST /uploads because that endpoint opens a
+    session for a file, not for a tool, and does not know which tool the bytes
+    are for. The chunked path is therefore bounded by the global limit while
+    the transfer runs, and by the tool's own the moment it is claimed below.
+    """
+    return deployment_config.upload_limit_mb(tool.name)
 
 
 def _type_name(arg_type) -> str:
@@ -699,6 +711,8 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     input_paths = []
     resolved_files = []
     size = 0
+    upload_limit_mb = _upload_limit_mb(tool)
+    upload_limit_bytes = upload_limit_mb * 1024 * 1024
 
     if uploaded_files or upload_references:
         work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
@@ -710,11 +724,11 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             extension = _checked_extension(tool, field_name, upload.filename or "")
             input_path = os.path.join(work_dir, f"{field_name}{extension}")
             try:
-                size += await _stream_to_disk(upload, input_path)
+                size += await _stream_to_disk(upload, input_path, upload_limit_bytes)
             except _UploadTooLargeError:
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"File exceeds the {settings.MAX_UPLOAD_MB} MB limit.",
+                    detail=f"File exceeds the {upload_limit_mb} MB limit.",
                 )
             input_paths.append(input_path)
             # An argument can accept several types (e.g. ("csv_file",
@@ -733,6 +747,14 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             try:
                 session = await anyio.to_thread.run_sync(transfer.get_upload, upload_id)
                 extension = _checked_extension(tool, field_name, session.filename)
+                # The tool is only known here, so this is where a per-tool
+                # limit lower than the global one is enforced -- before the
+                # blob is claimed, never after.
+                if session.size > upload_limit_bytes:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"File exceeds the {upload_limit_mb} MB limit.",
+                    )
                 input_path = os.path.join(work_dir, f"{field_name}{extension}")
                 await anyio.to_thread.run_sync(transfer.claim_upload, upload_id, input_path)
             except transfer.TransferError as exc:

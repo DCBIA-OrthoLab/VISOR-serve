@@ -54,6 +54,12 @@ class Settings(BaseSettings):
     # deliberately NOT passed along with it.
     SADT_API: str = "http://127.0.0.1:8000"
 
+    # Per-tool server-side configuration: which arguments may be filled from
+    # DATA_DIR, and the upload limit for that tool (see deployment.py). A
+    # missing file is the normal case, not an error -- it means every path
+    # argument is upload-only and MAX_UPLOAD_MB applies everywhere.
+    DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
+
     # Seconds a tool process may run before it is killed. 0 (the default) means
     # no limit, which is what the in-process path does today -- a full cohort
     # segmentation legitimately takes hours.

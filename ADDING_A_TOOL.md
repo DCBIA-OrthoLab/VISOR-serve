@@ -9,6 +9,14 @@ and tests.
 edit `main.py`, `registry.py`, or `base.py` to add one. No route, no
 registration list.
 
+> **Which kind of tool is this?** Everything below describes a tool the server
+> **imports** — a `Tool` subclass under `server/tools/`. There is now a second
+> kind, declared by a `.schema.json` and run in its own virtualenv, which the
+> server never imports; it is packaged in the `sadt-tools` repository and
+> described in [`server/README.md`](server/README.md#how-a-tool-is-declared).
+> The two are discovered side by side and are indistinguishable over the wire.
+> Follow this guide for a tool that lives in this repository.
+
 ---
 
 ## 1. The 30-second version

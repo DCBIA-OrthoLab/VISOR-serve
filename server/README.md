@@ -218,6 +218,87 @@ its CUDA version, so pip skips it there), but on a machine where they are
 missing the server still starts normally, every other tool works, and only
 AMASSS fails — with a message saying what to install.
 
+## How a tool is declared
+
+Two kinds, discovered side by side. `GET /tools` publishes them identically —
+a client cannot tell which is which.
+
+**Imported** (every tool in this repo today). `tools/<name>/<name>.py`
+subclasses `Tool` and the server imports it at startup. See *How to add a new
+tool* above.
+
+**Declared by a `.schema.json`** (where this is going). A folder holding the
+schema, the tool's own `.venv/`, and its `src/` — none of which the server
+imports:
+
+```
+/tools/amasss/
+├── .schema.json     what run() takes, and the hash of the src/ it was read from
+├── .venv/           the tool's own interpreter and dependencies
+└── src/             the tool's code
+```
+
+```json
+{
+  "name": "amasss",
+  "description": "Segment craniofacial structures on a CBCT scan.",
+  "arguments": {
+    "scan":       {"type": "path", "required": true},
+    "structures": {"type": "list[str]", "required": false, "default": ["Mandible"]}
+  },
+  "returns": "path",
+  "source_hash": "<sha256 of src/>"
+}
+```
+
+Types are `path`, `str`, `int`, `float`, `bool`, `list[str]`; `returns` is
+`path` (one file), `paths` (several, zipped) or `text` (JSON). **Dropping a
+`.schema.json` into a folder is what moves a tool off the imported path** — a
+folder that has one is never imported. The folder must be named after the tool:
+its interpreter is looked up by tool name.
+
+### `source_hash`, and why a mismatch stops the server
+
+The schema declares the signature requests are validated against; the hash says
+which source tree that signature was read from. If the two drift, the server
+validates against a function that no longer exists — an argument the tool has
+since renamed passes validation and fails inside the tool, and one it has since
+added can never be sent.
+
+So it is the one discovery failure that is **not** survivable. Everything else
+costs a single tool (skipped, logged, listed in `FAILED_TOOLS`); this refuses
+to start, naming the tool and both hashes.
+
+Regenerate it where the tool is packaged. To check a tree by hand — this is the
+reference implementation, and any generator has to agree with it exactly:
+
+```bash
+python server/schema_hash.py /tools/amasss/src
+```
+
+### `deployment.toml` — the server's half
+
+A schema is generated from the tool's source and is the same wherever that tool
+is installed. Which of its arguments may be filled from *this* server's
+`DATA_DIR`, and how much *this* server accepts as an upload, are properties of
+the deployment, not of the tool:
+
+```toml
+[tools.amasss]
+server_selectable = { model = "model", scan = "testfile" }
+max_upload_mb = 2000
+```
+
+Entirely optional — with no file, every `path` argument is upload-only and
+`MAX_UPLOAD_MB` applies. See `deployment.toml.example`. An entry naming an
+argument the tool does not declare, or a non-`path` one, is a startup error;
+one naming a tool this server does not serve is a warning.
+
+`max_upload_mb` is enforced where the tool is known: on the multipart body, and
+when a chunked upload is claimed by a run. `POST /uploads` opens a session for a
+file rather than for a tool, so the global limit still bounds the transfer
+itself.
+
 ## How a tool run is executed (`SADT_DISPATCH_MODE`)
 
 Two paths, one contract. `Tool.invoke` validates the arguments and then either

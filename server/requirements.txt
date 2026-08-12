@@ -3,6 +3,9 @@ anyio
 uvicorn[standard]
 python-multipart
 pydantic-settings
+# deployment.toml (see deployment.py). tomllib is in the standard library from
+# 3.11, which the deployment image ships; this is only for an older local one.
+tomli; python_version < "3.11" 
 pandas
 scikit-learn
 lightgbm
