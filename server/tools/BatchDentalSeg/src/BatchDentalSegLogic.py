@@ -45,7 +45,7 @@ import file_utils
 from base import ToolArgumentError
 from config import settings
 
-from . import catalogs, nnunet_runner
+from . import catalogs, nnunet_runner, surface_export
 
 logger = logging.getLogger("BatchDentalSeg")
 
@@ -68,6 +68,10 @@ class SegmentationRun:
     @property
     def segmentation_files(self) -> list:
         return [path for scan in self.scans for path in scan.get("segmentations", [])]
+
+    @property
+    def surface_files(self) -> list:
+        return [path for scan in self.scans for path in scan.get("surfaces", [])]
 
 
 # ---------------------------------------------------------------------------
@@ -223,18 +227,143 @@ def _split_segments(labels: sitk.Image, model: catalogs.Model, base: str,
 # The run
 # ---------------------------------------------------------------------------
 
+def _requested_formats(export_formats) -> list:
+    """The mesh formats a caller asked for, in the schema's own order.
+
+    Accepts what `validate()` produces (a `Selection`, i.e. every option mapped
+    to a boolean) as well as a plain list or a single name, so a server-side
+    caller of `segment()` is not forced to build a Selection by hand.
+    """
+    if not export_formats:
+        return []
+    if isinstance(export_formats, dict):
+        chosen = {name for name, enabled in export_formats.items() if enabled}
+    elif isinstance(export_formats, str):
+        chosen = {export_formats}
+    else:
+        chosen = set(export_formats)
+    return [name for name in surface_export.ALL_FORMATS if name in chosen]
+
+
+def _emit_failures(emit, failed_conversions: list, total: int) -> None:
+    """Announce the scans that never made it as far as the GPU.
+
+    They are already in the report, but a client watching a queue would show
+    them as pending forever otherwise -- the run would end with rows that never
+    moved and no explanation on screen.
+    """
+    for entry in failed_conversions:
+        emit({
+            "event": "item",
+            "name": entry["input"],
+            "status": "failed",
+            "error": entry.get("error"),
+            "total": total,
+        })
+
+
+def _scan_artifact(entry: dict, scratch_dir: str) -> str:
+    """Bundle ONE scan's outputs so they can be shipped on their own.
+
+    A zip rather than one event per file: a run with `separate_segments` and
+    three mesh formats produces dozens of files per patient, and each would
+    otherwise be its own stored result and its own round trip. The archive is
+    flat and the event carries `relative_dir`, so the client rebuilds the same
+    tree without a path from this server ever travelling.
+    """
+    produced = list(entry.get("segmentations") or []) + list(entry.get("surfaces") or [])
+    if not produced:
+        return ""
+    staging = os.path.join(scratch_dir, "artifacts")
+    os.makedirs(staging, exist_ok=True)
+    return file_utils.make_zip(
+        produced, os.path.join(staging, f"{entry['case_id']}.zip")
+    )
+
+
+def _stream_batch(emit, runner, model_folder, nnunet_input, nnunet_output, device,
+                  cases, finish, collected, scratch_dir) -> None:
+    """Run the batch one scan at a time, reporting and shipping as it goes.
+
+    nnUNet's own loop drives this through `on_case_start`/`on_case_done`, so
+    the checkpoint is still loaded once -- what is given up is its cross-scan
+    pipelining, which is the price of knowing where the run is.
+    """
+    case_ids = list(cases)
+
+    def started(case_id, index, total):
+        emit({
+            "event": "item",
+            "index": index + 1,
+            "total": total,
+            "name": _basename_of(cases[case_id]),
+            "status": "running",
+        })
+
+    def done(case_id, index, total):
+        entry = finish(case_id, index)
+        collected.append(entry)
+        emit({
+            "event": "item",
+            "index": index + 1,
+            "total": total,
+            "name": entry["input"],
+            "status": entry["status"],
+            "error": entry.get("error"),
+        })
+        if entry.get("status") != "ok":
+            return
+        # **This is the point of the whole exercise**: the patient's files
+        # leave the server now, so a failure on scan 27 cannot cost the
+        # twenty-six that already worked.
+        archive = _scan_artifact(entry, scratch_dir)
+        if archive:
+            emit({
+                "event": "artifact",
+                "name": entry["input"],
+                "relative_dir": entry.get("relative_dir") or ".",
+                "path": archive,
+            })
+
+    runner.predict_folder(
+        model_folder, nnunet_input, nnunet_output, device,
+        on_case_start=started, on_case_done=done,
+    )
+
+    # A runner that ignored the callbacks would otherwise leave the report
+    # missing exactly the scans it ran. Finish whatever the loop did not.
+    reported = {entry.get("case_id") for entry in collected}
+    for index, case_id in enumerate(case_ids):
+        if case_id not in reported:
+            collected.append(finish(case_id, index))
+
+
+def _basename_of(path: str) -> str:
+    return os.path.basename(path)
+
+
 def segment(
     input_path: str,
     model_path: str,
     separate_segments: bool = False,
     prediction_ID: str = "Seg",
+    export_formats=None,
+    surface_smoothing: int = 5,
+    surface_decimation: int = 90,
     device: str = None,
     scratch_dir: str = None,
+    emit=None,
 ) -> SegmentationRun:
     """Segment every scan under `input_path` with one hosted model bundle.
 
     `model_path` is the resolved path of the bundle the caller picked; its
     directory name is which of catalogs.MODELS it is.
+
+    `emit`, when given, turns the run into a reported one: each scan is
+    announced as it starts and again as it finishes, and its files are handed
+    over the moment they exist so a later failure cannot cost them. Passing it
+    changes the nnUNet call granularity (see nnunet_runner.predict_folder) and
+    nothing else -- the outputs, the tree and the report are identical.
     """
     started = time.monotonic()
     scratch_dir = scratch_dir or file_utils.make_scratch_dir("batchdentalseg_")
@@ -245,6 +374,15 @@ def segment(
     nnunet_runner.check_dependencies()
     model, model_folder = resolve_model(model_path)
     device = nnunet_runner.resolve_device(device)
+
+    # Same rule, one step further: a deployment without VTK cannot make meshes,
+    # and finding that out after an hour of inference would waste the whole run.
+    formats = _requested_formats(export_formats)
+    if formats and not surface_export.is_available():
+        raise ToolArgumentError(
+            "Mesh export was requested but VTK is not installed on this server. "
+            "Install requirements.txt, or run with no export format selected."
+        )
 
     scans = discover_scans(input_path, prediction_ID, scratch_dir)
     if not scans:
@@ -297,18 +435,36 @@ def segment(
         )
 
     logger.info("BatchDentalSeg: %d scan(s), model=%s, device=%s", len(cases), model.name, device)
-    nnunet_runner.predict_folder(model_folder, nnunet_input, nnunet_output, device)
+
+    # Scratch for the mesh writer's intermediate .nrrd files, inside the
+    # request's own directory so cleanup takes them.
+    surface_temp = os.path.join(scratch_dir, "surface_tmp")
+    if formats:
+        os.makedirs(surface_temp, exist_ok=True)
 
     report_scans = list(failed_conversions)
-    for case_id, scan in cases.items():
-        entry = {"case_id": case_id, "input": _describe(scan)}
+    case_ids = list(cases)
+    # Reported to a streaming caller as the denominator, so "3/40" counts the
+    # scans that are actually going to run -- a file that could not even be
+    # read is already reported as failed above and will never produce an event.
+    total = len(case_ids)
+
+    def finish(case_id: str, index: int) -> dict:
+        """Post-process one predicted scan: write it, mesh it, report it.
+
+        Called from inside nnUNet's loop on a streamed run (so each patient is
+        written and shipped while the next one is still on the GPU) and after
+        the whole batch otherwise. One implementation either way, because two
+        would drift on exactly the details that decide what a clinician gets.
+        """
+        scan = cases[case_id]
+        entry = {"case_id": case_id, "input": _describe(scan), "index": index + 1, "total": total}
         predicted = os.path.join(nnunet_output, f"{case_id}.nii.gz")
         if not os.path.isfile(predicted):
             # Reported per scan rather than raised: one unreadable patient in a
             # cohort of forty must not lose the other thirty-nine.
             entry.update(status="failed", error="nnUNet produced no output for this scan")
-            report_scans.append(entry)
-            continue
+            return entry
 
         try:
             reference = sitk.ReadImage(scan)
@@ -334,12 +490,50 @@ def segment(
                 produced.extend(
                     _split_segments(labels, model, base, extension, scan_output_dir, prediction_ID)
                 )
-            entry.update(status="ok", segmentations=produced)
+            entry.update(status="ok", segmentations=produced, relative_dir=relative)
+
+            if formats:
+                # After the segmentation is on disk, never before: the label
+                # volume is what every downstream tool consumes, and a mesh
+                # that fails must not take it with it.
+                entry["surfaces"] = surface_export.write_surfaces(
+                    labels=labels,
+                    model=model,
+                    formats=formats,
+                    base=base,
+                    output_dir=scan_output_dir,
+                    suffix=prediction_ID,
+                    temp_dir=surface_temp,
+                    smoothing=surface_smoothing,
+                    decimation=surface_decimation,
+                )
         except Exception as exc:  # noqa: BLE001 - one bad scan must not end the batch
             logger.exception("BatchDentalSeg: scan failed")
             entry.update(status="failed", error=f"{type(exc).__name__}: {exc}")
 
-        report_scans.append(entry)
+        return entry
+
+    if emit is None:
+        # The blocking contract, unchanged: one nnUNet call for the whole
+        # batch, so it can overlap the preprocessing of one scan with the
+        # inference of the previous one.
+        nnunet_runner.predict_folder(model_folder, nnunet_input, nnunet_output, device)
+        for index, case_id in enumerate(case_ids):
+            report_scans.append(finish(case_id, index))
+    else:
+        _emit_failures(emit, failed_conversions, total)
+        _stream_batch(
+            emit=emit,
+            runner=nnunet_runner,
+            model_folder=model_folder,
+            nnunet_input=nnunet_input,
+            nnunet_output=nnunet_output,
+            device=device,
+            cases=cases,
+            finish=finish,
+            collected=report_scans,
+            scratch_dir=scratch_dir,
+        )
 
     succeeded = [entry for entry in report_scans if entry.get("status") == "ok"]
     report = {
@@ -349,9 +543,16 @@ def segment(
         # Published with the results: the segmentation is a label volume, and
         # without this table its integers mean nothing to whoever opens it.
         "labels": model.labels,
+        # And what colour each structure is. A surface export bakes the colour
+        # into the .vtk it writes, so a client naming its own would disagree
+        # with the mesh from the same run; one table serves both.
+        "label_colors": model.label_colors,
         "device": device,
         "prediction_ID": prediction_ID,
         "separate_segments": separate_segments,
+        "export_formats": formats,
+        "surface_smoothing": int(surface_smoothing) if formats else None,
+        "surface_decimation": int(surface_decimation) if formats else None,
         "tile_step_size": settings.BATCHDENTALSEG_TILE_STEP_SIZE,
         "scans": report_scans,
         "summary": f"{len(succeeded)}/{len(report_scans)} scan(s) segmented",
@@ -370,12 +571,25 @@ def main(
     model: str,
     separate_segments: bool = False,
     prediction_ID: str = "Seg",
+    export_formats=None,
+    surface_smoothing: int = 5,
+    surface_decimation: int = 90,
+    emit=None,
 ) -> str:
-    """The schema adapter: returns the output directory, which main.py zips."""
+    """The schema adapter: returns the output directory, which main.py zips.
+
+    The directory is returned in every case, streamed or not: a streamed run
+    has already delivered each scan, but the report is written at the end and
+    the archive is what a client that ignored the events still gets.
+    """
     run = segment(
         input_path=str(input),
         model_path=str(model),
         separate_segments=separate_segments,
         prediction_ID=prediction_ID,
+        export_formats=export_formats,
+        surface_smoothing=surface_smoothing,
+        surface_decimation=surface_decimation,
+        emit=emit,
     )
     return run.output_dir

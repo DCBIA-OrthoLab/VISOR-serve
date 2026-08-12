@@ -12,6 +12,8 @@ trained in. Renaming an entry is safe, renumbering one silently mislabels
 anatomy.
 """
 
+import colorsys
+
 # Each model is one nnUNet v2 3d_fullres bundle. `folder` is its directory
 # under DATA/BatchDentalSeg/models/, matching what scripts/data-manifest.yml
 # downloads; `labels` is {segment name: the integer the network emits}.
@@ -103,6 +105,50 @@ _UNIVERSAL_LABELS = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Colours
+# ---------------------------------------------------------------------------
+#
+# Presentation, not anatomy -- but it belongs HERE rather than in a client,
+# because a surface export has to bake a colour into the .vtk it writes, and a
+# viewer opening that file must not disagree with the Slicer panel that ran it.
+# Published in the run report as `label_colors`, so both come from one table.
+#
+# Looked up by NAME, never by value: NasoMaxillaDentSeg separates the maxilla
+# and so shifts every later integer, and a palette indexed by integer would
+# recolour the mandible as the teeth on that one model alone.
+_NAMED_COLORS = {
+    "upper skull": "#E3DD90",
+    "mandible": "#D4A1E6",
+    "maxilla": "#6AC4A4",
+    "upper teeth": "#DC9565",
+    "lower teeth": "#EBDFB4",
+    "mandibular canal": "#D8654F",
+}
+
+# The golden angle, walked in hue space: any two consecutive label values land
+# far apart on the colour wheel. This is what covers UniversalLab's 52 teeth
+# without a 52-entry table, and any structure a future model adds.
+_GOLDEN_RATIO_CONJUGATE = 0.618033988749895
+
+
+def color_of(name: str, value: int) -> str:
+    """`"#RRGGBB"` for one structure, from its name when the table knows it."""
+    known = _NAMED_COLORS.get((name or "").strip().lower())
+    if known:
+        return known
+    red, green, blue = colorsys.hsv_to_rgb(
+        (max(int(value), 0) * _GOLDEN_RATIO_CONJUGATE) % 1.0, 0.55, 0.95
+    )
+    return "#%02X%02X%02X" % (round(red * 255), round(green * 255), round(blue * 255))
+
+
+def rgb_of(hex_color: str) -> tuple:
+    """`"#RRGGBB"` -> `(r, g, b)` in 0..255, what VTK's cell colours want."""
+    value = hex_color.lstrip("#")
+    return tuple(int(value[index: index + 2], 16) for index in (0, 2, 4))
+
+
 class Model:
     """One trained bundle: what it is called, and what it labels."""
 
@@ -115,6 +161,16 @@ class Model:
     def label_names(self) -> dict:
         """{integer the network emits: segment name}."""
         return {value: name for name, value in self.labels.items()}
+
+    @property
+    def label_colors(self) -> dict:
+        """`{segment name: "#RRGGBB"}`, published with every run."""
+        return {name: color_of(name, value) for name, value in self.labels.items()}
+
+    @property
+    def rgb_by_label(self) -> dict:
+        """`{the integer the network emits: (r, g, b)}`, for the mesh writers."""
+        return {value: rgb_of(color_of(name, value)) for name, value in self.labels.items()}
 
 
 # Keyed by the folder name the manifest downloads each bundle into, which is

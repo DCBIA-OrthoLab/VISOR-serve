@@ -35,6 +35,8 @@ CHECKPOINT_NAME = "checkpoint_final.pth"
 # fold_0/, and DentalSegmentator arrives as a zip with its own Dataset<n>/
 # tree inside.
 _REQUIRED_FILES = ("dataset.json", "plans.json")
+# What BatchDentalSegLogic names an input case: one modality, index 0000.
+_CASE_SUFFIX = "_0000.nii.gz"
 _FOLD_DIR = "fold_0"
 
 # See settings.BATCHDENTALSEG_MAX_GPU_JOBS. One by default, like AMASSS: these
@@ -139,11 +141,27 @@ def _build_predictor(device: str):
     return nnUNetPredictor(**{key: value for key, value in options.items() if key in accepted})
 
 
-def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: str) -> None:
+def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: str,
+                   on_case_start=None, on_case_done=None) -> None:
     """Segment every `*_0000.nii.gz` in `input_dir`, writing masks to `output_dir`.
 
-    A whole folder per call, so the checkpoint is loaded once for the batch
-    rather than once per scan.
+    The checkpoint is loaded ONCE for the batch either way. What the callbacks
+    change is the granularity of the nnUNet call:
+
+    * without it, one `predict_from_files` over the whole folder, which lets
+      nnUNet overlap the preprocessing of scan N+1 with the inference of scan N
+      in its worker processes;
+    * with it, one call per scan, so the caller learns which scan just finished
+      and can post-process, report and SHIP it while the rest of the batch is
+      still running.
+
+    That is the trade: a streamed run gives up nnUNet's cross-scan pipelining
+    to gain per-scan boundaries. It is the caller's choice rather than a
+    setting, because it is a property of the request (did the client ask to be
+    told?) and not of the deployment. Both callbacks take
+    `(case_id, index, total)`; `on_case_done` fires once the mask is on disk,
+    which is what lets the caller post-process and ship that patient while the
+    next one is on the GPU.
 
     NOTE: AMASSS additionally redirects nnUNet's resamplers to the GPU
     (settings.AMASSS_GPU_RESAMPLING), which is worth ~2.5x there. It is
@@ -162,11 +180,37 @@ def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: s
             use_folds=(0,),
             checkpoint_name=CHECKPOINT_NAME,
         )
-        predictor.predict_from_files(
-            input_dir,
-            output_dir,
-            save_probabilities=False,
-            overwrite=True,
-            num_processes_preprocessing=2,
-            num_processes_segmentation_export=2,
+
+        if on_case_start is None and on_case_done is None:
+            predictor.predict_from_files(
+                input_dir,
+                output_dir,
+                save_probabilities=False,
+                overwrite=True,
+                num_processes_preprocessing=2,
+                num_processes_segmentation_export=2,
+            )
+            return
+
+        cases = sorted(
+            name for name in os.listdir(input_dir) if name.endswith(_CASE_SUFFIX)
         )
+        for index, name in enumerate(cases):
+            case_id = name[: -len(_CASE_SUFFIX)]
+            if on_case_start is not None:
+                on_case_start(case_id, index, len(cases))
+            # A list of lists is nnUNet's "one case, one modality" shape; the
+            # predictor object -- and therefore the loaded checkpoint -- is the
+            # same one across the whole loop.
+            predictor.predict_from_files(
+                [[os.path.join(input_dir, name)]],
+                [os.path.join(output_dir, f"{case_id}.nii.gz")],
+                save_probabilities=False,
+                overwrite=True,
+                num_processes_preprocessing=2,
+                num_processes_segmentation_export=2,
+            )
+            if on_case_done is not None:
+                # The caller post-processes and ships this patient HERE, while
+                # the loop moves on to the next one.
+                on_case_done(case_id, index, len(cases))

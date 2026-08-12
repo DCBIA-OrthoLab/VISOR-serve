@@ -8,6 +8,7 @@ report.
 
 import json
 import os
+import zipfile
 
 import numpy as np
 import pytest
@@ -55,22 +56,30 @@ def _model_bundle(root: str, folder: str) -> str:
 
 
 def _stub_prediction(labels_present):
-    """Stand in for nnUNet: write one label volume per input case."""
+    """Stand in for nnUNet: write one label volume per input case.
 
-    def predict_folder(model_folder, input_dir, output_dir, device):
+    Honours `on_case_start`/`on_case_done` like the real runner does, so the
+    streamed path is exercised end to end rather than only its callers.
+    """
+
+    def predict_folder(model_folder, input_dir, output_dir, device,
+                       on_case_start=None, on_case_done=None):
         os.makedirs(output_dir, exist_ok=True)
-        for name in sorted(os.listdir(input_dir)):
-            if not name.endswith("_0000.nii.gz"):
-                continue
+        names = [n for n in sorted(os.listdir(input_dir)) if n.endswith("_0000.nii.gz")]
+        for index, name in enumerate(names):
             case_id = name[: -len("_0000.nii.gz")]
+            if on_case_start is not None:
+                on_case_start(case_id, index, len(names))
             reference = sitk.ReadImage(os.path.join(input_dir, name))
             array = np.zeros(sitk.GetArrayViewFromImage(reference).shape, dtype=np.uint8)
             # One slice per label, so every requested value is present.
-            for index, value in enumerate(labels_present):
-                array[index] = value
+            for slice_index, value in enumerate(labels_present):
+                array[slice_index] = value
             mask = sitk.GetImageFromArray(array)
             mask.CopyInformation(reference)
             sitk.WriteImage(mask, os.path.join(output_dir, f"{case_id}.nii.gz"))
+            if on_case_done is not None:
+                on_case_done(case_id, index, len(names))
 
     return predict_folder
 
@@ -79,6 +88,57 @@ def _stub_prediction(labels_present):
 def stub_nnunet(monkeypatch):
     def _install(labels_present=(1, 2, 3)):
         monkeypatch.setattr(nnunet_runner, "predict_folder", _stub_prediction(labels_present))
+        monkeypatch.setattr(nnunet_runner, "check_dependencies", lambda: None)
+        monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested=None: "cpu")
+
+    return _install
+
+
+
+# Marching cubes needs a real volume: at 8x8x8 (the default above, which is all
+# the segmentation tests need) vtkNrrdReader hands VTK a single slice and every
+# mesh comes out empty. Measured: it reads the file correctly from 16^3 up.
+# Meshing is the ONE thing here that depends on the data being three-
+# dimensional, so the mesh tests carry their own scan.
+_MESH_SCAN_SIZE = (24, 24, 24)
+
+
+def _write_mesh_scan(path: str) -> str:
+    return _write_scan(path, size=_MESH_SCAN_SIZE)
+
+
+def _blocks(labels_present):
+    """Stand in for nnUNet with SOLID BLOCKS rather than single slices, so each
+    label has a closed surface to contour."""
+
+    def predict_folder(model_folder, input_dir, output_dir, device,
+                       on_case_start=None, on_case_done=None):
+        os.makedirs(output_dir, exist_ok=True)
+        names = [n for n in sorted(os.listdir(input_dir)) if n.endswith("_0000.nii.gz")]
+        for case_index, name in enumerate(names):
+            case_id = name[: -len("_0000.nii.gz")]
+            if on_case_start is not None:
+                on_case_start(case_id, case_index, len(names))
+            reference = sitk.ReadImage(os.path.join(input_dir, name))
+            shape = sitk.GetArrayViewFromImage(reference).shape
+            array = np.zeros(shape, dtype=np.uint8)
+            depth = shape[0] // (len(labels_present) + 1)
+            for index, value in enumerate(labels_present):
+                start = 2 + index * depth
+                array[start: start + depth - 1, 2:-2, 2:-2] = value
+            mask = sitk.GetImageFromArray(array)
+            mask.CopyInformation(reference)
+            sitk.WriteImage(mask, os.path.join(output_dir, f"{case_id}.nii.gz"))
+            if on_case_done is not None:
+                on_case_done(case_id, case_index, len(names))
+
+    return predict_folder
+
+
+@pytest.fixture
+def stub_nnunet_meshable(monkeypatch):
+    def _install(labels_present=(1, 2)):
+        monkeypatch.setattr(nnunet_runner, "predict_folder", _blocks(labels_present))
         monkeypatch.setattr(nnunet_runner, "check_dependencies", lambda: None)
         monkeypatch.setattr(nnunet_runner, "resolve_device", lambda requested=None: "cpu")
 
@@ -438,3 +498,397 @@ def test_unexpected_arguments_are_refused():
         tool.validate(
             {"input": "/tmp/scan.nii.gz", "model": "bundle", "dental_model": "NotAModel"}
         )
+
+
+# ---------------------------------------------------------------------------
+# Colours
+# ---------------------------------------------------------------------------
+
+def test_a_structure_keeps_its_colour_across_models():
+    """NasoMaxillaDentSeg separates the maxilla, so the upper teeth are 3 under
+    one model and 4 under another. The palette is keyed by NAME for that
+    reason: indexed by value it would recolour the teeth on that one model."""
+    five = catalogs.get("DentalSegmentator").label_colors
+    naso = catalogs.get("NasoMaxillaDentSeg").label_colors
+    assert five["Upper Teeth"] == naso["Upper Teeth"]
+    assert five["Mandible"] == naso["Mandible"]
+
+
+def test_every_structure_gets_a_colour_including_the_unnamed_ones():
+    """UniversalLab's 52 teeth are in no colour table; they are generated, and
+    every one of them must come out as a real hex colour."""
+    colors = catalogs.get("UniversalLab").label_colors
+    assert len(colors) == 55
+    assert all(len(value) == 7 and value.startswith("#") for value in colors.values())
+
+
+def test_consecutive_generated_colours_are_distinguishable():
+    """Adjacent teeth are what a clinician has to tell apart."""
+    for value in range(1, 33):
+        here = catalogs.rgb_of(catalogs.color_of(f"tooth {value}", value))
+        following = catalogs.rgb_of(catalogs.color_of(f"tooth {value + 1}", value + 1))
+        assert sum(abs(a - b) for a, b in zip(here, following)) > 60
+
+
+# ---------------------------------------------------------------------------
+# Mesh export
+# ---------------------------------------------------------------------------
+
+def test_no_export_format_selected_writes_no_mesh(tmp_path, stub_nnunet_meshable):
+    """The default. Meshing a UniversalLab scan is 55 surfaces, minutes of CPU
+    and hundreds of MB nobody asked for."""
+    stub_nnunet_meshable()
+    _write_mesh_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+    )
+    assert run.surface_files == []
+    assert run.report["export_formats"] == []
+    # Reported as None rather than as their defaults: a number recorded for a
+    # run that built nothing reads as a setting that was applied.
+    assert run.report["surface_smoothing"] is None
+
+
+@pytest.mark.parametrize(
+    "selection, extension",
+    [({"VTK": True}, ".vtk"), ({"STL": True}, ".stl"), ({"OBJ": True}, ".obj")],
+)
+def test_each_format_writes_one_file_per_present_structure(
+    tmp_path, stub_nnunet_meshable, selection, extension
+):
+    pytest.importorskip("vtk")
+    stub_nnunet_meshable(labels_present=(1, 2))
+    _write_mesh_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        export_formats=selection,
+    )
+
+    produced = sorted(os.path.basename(path) for path in run.surface_files)
+    # Only the labels PRESENT in this scan: an empty mesh is indistinguishable
+    # from a structure the model failed on.
+    assert produced == [f"p1_Seg_Mandible{extension}", f"p1_Seg_Upper-Skull{extension}"]
+    assert all(os.path.getsize(path) > 0 for path in run.surface_files)
+
+
+def test_the_merged_format_is_one_file_for_the_whole_scan(tmp_path, stub_nnunet_meshable):
+    pytest.importorskip("vtk")
+    stub_nnunet_meshable(labels_present=(1, 2, 3))
+    _write_mesh_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        export_formats={"VTK (merged)": True},
+    )
+    assert [os.path.basename(path) for path in run.surface_files] == ["p1_Seg_merged.vtk"]
+
+
+def test_several_formats_can_be_asked_for_at_once(tmp_path, stub_nnunet_meshable):
+    pytest.importorskip("vtk")
+    stub_nnunet_meshable(labels_present=(1,))
+    _write_mesh_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        export_formats={"VTK": True, "STL": True, "OBJ": False, "VTK (merged)": True},
+    )
+    produced = sorted(os.path.basename(path) for path in run.surface_files)
+    assert produced == ["p1_Seg_Upper-Skull.stl", "p1_Seg_Upper-Skull.vtk", "p1_Seg_merged.vtk"]
+    # An option left unchecked is not a selection: what is sent IS the choice.
+    assert run.report["export_formats"] == ["VTK", "STL", "VTK (merged)"]
+
+
+def test_the_segmentation_is_still_written_alongside_the_meshes(tmp_path, stub_nnunet_meshable):
+    """The label volume is what every downstream tool consumes; a mesh is an
+    addition to it, never a replacement."""
+    pytest.importorskip("vtk")
+    stub_nnunet_meshable(labels_present=(1,))
+    _write_mesh_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        export_formats={"STL": True},
+    )
+    assert [os.path.basename(path) for path in run.segmentation_files] == ["p1_Seg.nii.gz"]
+
+
+def test_a_binary_vtk_is_written_not_ascii(tmp_path, stub_nnunet_meshable):
+    """vtkPolyDataWriter defaults to ASCII, and that default is what made
+    AMASSS's merged surface 848.5 MB against 6.4 MB for its segmentations.
+    Binary is also the more accurate of the two: it round-trips the float32
+    vertices exactly."""
+    pytest.importorskip("vtk")
+    stub_nnunet_meshable(labels_present=(1,))
+    _write_mesh_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        export_formats={"VTK": True},
+    )
+    with open(run.surface_files[0], "rb") as handle:
+        header = handle.read(200)
+    assert b"BINARY" in header and b"ASCII" not in header
+
+
+def test_a_requested_format_without_vtk_fails_before_inference(tmp_path, stub_nnunet, monkeypatch):
+    """Discovering it after an hour of inference would waste the whole run."""
+    stub_nnunet()
+    _write_mesh_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+    monkeypatch.setattr(BatchDentalSegLogic.surface_export, "is_available", lambda: False)
+
+    called = []
+    monkeypatch.setattr(
+        nnunet_runner, "predict_folder", lambda *a, **k: called.append(True)
+    )
+    with pytest.raises(ToolArgumentError, match="VTK"):
+        BatchDentalSegLogic.segment(
+            input_path=str(tmp_path / "in"),
+            model_path=str(tmp_path / "models" / "DentalSegmentator"),
+            export_formats={"STL": True},
+        )
+    assert called == []
+
+
+def test_the_selection_survives_the_schema_round_trip():
+    """`validate()` turns a multichoice into a Selection (every option mapped
+    to a boolean). _requested_formats has to read that, a plain list, and a
+    single name -- a server-side caller must not have to build a Selection."""
+    tool = BatchDentalSegTool()
+    cleaned = tool.validate(
+        {"input": "/tmp/scan.nii.gz", "model": "DentalSegmentator", "export_formats": "STL,VTK"}
+    )
+    assert BatchDentalSegLogic._requested_formats(cleaned["export_formats"]) == ["VTK", "STL"]
+    assert BatchDentalSegLogic._requested_formats(["OBJ"]) == ["OBJ"]
+    assert BatchDentalSegLogic._requested_formats("VTK") == ["VTK"]
+    assert BatchDentalSegLogic._requested_formats(None) == []
+
+
+def test_an_unknown_export_format_is_refused_by_the_schema():
+    tool = BatchDentalSegTool()
+    with pytest.raises(ToolArgumentError, match="gltf"):
+        tool.validate(
+            {"input": "/tmp/scan.nii.gz", "model": "DentalSegmentator", "export_formats": "gltf"}
+        )
+
+
+def test_a_structure_that_meshes_to_nothing_produces_no_file(tmp_path, stub_nnunet):
+    """A label too thin to contour must leave NO file, not an empty one.
+
+    The three writers disagree on what an empty mesh means: vtkPolyDataWriter
+    writes a valid .vtk with a header and no triangle, while vtkSTLWriter and
+    vtkOBJWriter write nothing at all and only complain on the console. Neither
+    raises. So without an explicit check, the same run would ship an empty .vtk
+    as a success -- a structure the clinician believes was found and cannot
+    see -- and list .stl paths in the report that are not on disk.
+
+    The default fixture's 8^3 volume is what produces this, and not by
+    accident: vtkNrrdReader hands VTK a single slice below 16^3, so marching
+    cubes returns nothing. It is the cheapest way to reach the empty-mesh path.
+    """
+    pytest.importorskip("vtk")
+    stub_nnunet(labels_present=(1, 2))
+    _write_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        export_formats={"VTK": True, "STL": True, "OBJ": True, "VTK (merged)": True},
+    )
+
+    assert run.surface_files == []
+    # Every path the report DOES carry has to exist: that is the whole point.
+    assert all(os.path.isfile(path) for path in run.surface_files)
+    # And the run is still a success -- the segmentation is the deliverable.
+    assert run.report["summary"] == "1/1 scan(s) segmented"
+    assert [os.path.basename(path) for path in run.segmentation_files] == ["p1_Seg.nii.gz"]
+
+
+# ---------------------------------------------------------------------------
+# Streamed runs
+# ---------------------------------------------------------------------------
+
+def _collect(events: list):
+    return lambda event: events.append(event)
+
+
+def test_a_streamed_run_reports_every_scan_twice(tmp_path, stub_nnunet):
+    """Once as it starts and once as it ends: a queue row that only appears
+    when a scan is finished shows nothing at all during the minutes it takes."""
+    stub_nnunet()
+    _write_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _write_scan(str(tmp_path / "in" / "p2.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    events = []
+    BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        emit=_collect(events),
+    )
+
+    items = [e for e in events if e["event"] == "item"]
+    assert [(e["index"], e["status"]) for e in items] == [
+        (1, "running"), (1, "ok"), (2, "running"), (2, "ok"),
+    ]
+    assert all(e["total"] == 2 for e in items)
+
+
+def test_a_streamed_run_hands_over_each_scan_as_it_finishes(tmp_path, stub_nnunet):
+    """The artifact for scan 1 is emitted BEFORE scan 2 even starts -- which is
+    the whole reason for the mechanism."""
+    stub_nnunet()
+    _write_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _write_scan(str(tmp_path / "in" / "p2.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    events = []
+    BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        emit=_collect(events),
+    )
+
+    kinds = [(e["event"], e.get("status"), e.get("name")) for e in events]
+    first_artifact = next(i for i, e in enumerate(events) if e["event"] == "artifact")
+    second_start = next(
+        i for i, e in enumerate(events)
+        if e["event"] == "item" and e.get("index") == 2 and e["status"] == "running"
+    )
+    assert first_artifact < second_start, kinds
+
+    artifacts = [e for e in events if e["event"] == "artifact"]
+    assert len(artifacts) == 2
+    for artifact in artifacts:
+        assert os.path.isfile(artifact["path"])
+        with zipfile.ZipFile(artifact["path"]) as archive:
+            assert archive.namelist()
+
+
+def test_a_streamed_artifact_says_where_it_belongs_in_the_tree(tmp_path, stub_nnunet):
+    """Two patients whose scans share a file name must not collide on the
+    client either, so each artifact carries its directory relative to the
+    output root -- never a path on this server."""
+    stub_nnunet()
+    _write_scan(str(tmp_path / "in" / "subjectA" / "scan.nii.gz"))
+    _write_scan(str(tmp_path / "in" / "subjectB" / "scan.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    events = []
+    BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        emit=_collect(events),
+    )
+    relatives = sorted(e["relative_dir"] for e in events if e["event"] == "artifact")
+    assert relatives == ["subjectA", "subjectB"]
+
+
+def test_an_unreadable_scan_is_announced_and_the_others_still_ship(
+    tmp_path, stub_nnunet, monkeypatch
+):
+    """A scan that never reaches the GPU would otherwise sit in the client's
+    queue as pending forever, with the run ending on a row that never moved."""
+    stub_nnunet()
+    _write_scan(str(tmp_path / "in" / "good.nii.gz"))
+    broken = tmp_path / "in" / "broken.nii.gz"
+    broken.write_bytes(b"not a volume")
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    real_read = BatchDentalSegLogic.sitk.ReadImage
+
+    def failing_read(path, *args, **kwargs):
+        if str(path).endswith("broken.nii.gz"):
+            raise RuntimeError("unreadable")
+        return real_read(path, *args, **kwargs)
+
+    monkeypatch.setattr(BatchDentalSegLogic.sitk, "ReadImage", failing_read)
+
+    events = []
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        emit=_collect(events),
+    )
+
+    failed = [e for e in events if e["event"] == "item" and e["status"] == "failed"]
+    assert [e["name"] for e in failed] == ["broken.nii.gz"]
+    assert [e["name"] for e in events if e["event"] == "artifact"] == ["good.nii.gz"]
+    assert run.report["summary"] == "1/2 scan(s) segmented"
+
+
+def test_a_streamed_run_produces_the_same_files_as_a_blocking_one(tmp_path, stub_nnunet):
+    """The events are additional, not an alternative: the output tree, the
+    report and the archive are identical either way. Two implementations would
+    drift on exactly the details that decide what a clinician gets."""
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+    produced = {}
+    for label, emit in (("blocking", None), ("streamed", _collect([]))):
+        stub_nnunet()
+        root = tmp_path / label
+        _write_scan(str(root / "in" / "p1.nii.gz"))
+        _write_scan(str(root / "in" / "sub" / "p2.nii.gz"))
+        run = BatchDentalSegLogic.segment(
+            input_path=str(root / "in"),
+            model_path=str(tmp_path / "models" / "DentalSegmentator"),
+            emit=emit,
+        )
+        produced[label] = sorted(
+            os.path.relpath(path, run.output_dir) for path in run.segmentation_files
+        )
+        assert run.report["summary"] == "2/2 scan(s) segmented"
+
+    assert produced["blocking"] == produced["streamed"]
+
+
+def test_the_report_is_written_whether_or_not_anyone_was_listening(tmp_path, stub_nnunet):
+    stub_nnunet()
+    _write_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        emit=_collect([]),
+    )
+    assert os.path.isfile(os.path.join(run.output_dir, "BatchDentalSeg_report.json"))
+
+
+def test_a_runner_that_ignores_the_callbacks_still_produces_a_full_report(
+    tmp_path, stub_nnunet, monkeypatch
+):
+    """Defensive, and cheap: an older runner copy (or a stub) that never calls
+    back would otherwise report a run with no scans in it at all."""
+    stub_nnunet()
+    _write_scan(str(tmp_path / "in" / "p1.nii.gz"))
+    _model_bundle(str(tmp_path / "models"), "DentalSegmentator")
+
+    silent = _stub_prediction((1, 2, 3))
+
+    def ignores_callbacks(model_folder, input_dir, output_dir, device, **_kwargs):
+        silent(model_folder, input_dir, output_dir, device)
+
+    monkeypatch.setattr(nnunet_runner, "predict_folder", ignores_callbacks)
+
+    events = []
+    run = BatchDentalSegLogic.segment(
+        input_path=str(tmp_path / "in"),
+        model_path=str(tmp_path / "models" / "DentalSegmentator"),
+        emit=_collect(events),
+    )
+    assert run.report["summary"] == "1/1 scan(s) segmented"

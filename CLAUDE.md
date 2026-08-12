@@ -413,6 +413,93 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-08-12 — Streamed runs: progress while it works, results as they land
+
+Two complaints, one mechanism. A cohort was minutes to hours whose only visible
+sign was elapsed time, and a batch that failed late returned **nothing** — 39
+patients segmented and the 40th unreadable lost all 39.
+
+`X-Result-Delivery: stream` turns the response body into line-delimited JSON:
+each item announced as it starts and again as it finishes, each finished file
+handed over as a `result_ref` the client pulls from `GET /results/{id}` **while
+the run continues**, then releases with `DELETE`. Reusing the existing transfer
+machinery is what keeps this small — the stream carries events, never bytes.
+
+**Not a job API, deliberately.** The run still answers in ONE request, so there
+is no job registry, no polling, no lifecycle: the body simply becomes a stream
+instead of a blob. `CLAUDE.md`'s "no job queue / async polling" stands.
+
+Decisions worth keeping:
+
+- **The status code is committed with the first byte.** Everything that can
+  answer 4xx — unknown tool, bad extension, argument validation — runs in
+  `main.py` *before* the response starts, which is why `tool.validate()` is
+  called there rather than through `invoke`. After that a failure is an in-band
+  `error` event, and the client raises on it naming **how many results were
+  already saved**: "it failed" and "it failed after writing 26 of your 40
+  patients" call for different next steps.
+- **Opt-in on both sides.** A tool declares `streaming = True` and `invoke()`
+  passes `emit` only then, so every other tool's `run()` sees the signature it
+  always had. A client that does not send the header gets the single archive,
+  byte for byte. `emit` is a reserved argument name (`check_schema` refuses it),
+  since it is injected into `run()`.
+- **No anyio task group in the generator.** A task group must not span a
+  `yield` — its cancel scope would be entered and exited in different tasks —
+  so the tool runs on a plain thread and `MAX_CONCURRENT_TOOLS` is honoured
+  through `acquire_on_behalf_of`, whose borrower token makes the acquire and
+  the release independent of the task.
+- **Cancellation is the client hanging up**, which the blocking contract could
+  never offer: `_Emitter.cancelled` flips and the tool stops at its next emit
+  point instead of burning GPU for nobody.
+- **Stored artifacts are discarded ONLY when nobody is coming for them.** A
+  finished run has just announced its last artifact and the client may still be
+  pulling it; deleting on completion would take a result away between the
+  announcement and the GET. The client `DELETE`s each reference as it gets it,
+  and the idle reaper is the backstop — same contract as reference delivery.
+- **A heartbeat every 15s.** An idle TCP connection is indistinguishable from a
+  dead one, and nnUNet loading a checkpoint is exactly such a silence.
+
+**What it cost BatchDentalSeg.** Per-scan boundaries mean one
+`predict_from_files` per scan instead of one for the folder, so nnUNet's
+cross-scan pipelining (preprocessing scan N+1 during inference of scan N) is
+given up. The checkpoint is still loaded once. It is the caller's choice, not a
+setting: it is a property of the request (did anyone ask to be told?) rather
+than of the deployment, and `emit=None` keeps the old path exactly.
+
+### 2026-08-12 — BatchDentalSeg exports meshes, and publishes its colours
+
+The local module's STL/OBJ/VTK export, which the port had left out. The mesh
+pipeline is AMASSS's `vtk_export.py`, copied rather than imported (the
+registry-import rule: one tool's missing dependency must not take another out),
+with its measured decimation default — 90% costs a fifth of a voxel and buys a
+factor of ten.
+
+- **`export_formats`** (multichoice, all off), plus `surface_smoothing` and
+  `surface_decimation`. All off by default because a UniversalLab scan is 55
+  structures, minutes of CPU and hundreds of MB nobody asked for.
+- **glTF is not offered.** Upstream produced it through the OpenAnatomy Slicer
+  extension; VTK's own exporter needs a live render window, which a headless
+  container has no GL context for. Exporting it from the loaded segmentation is
+  the client's job, not a server argument that would fail on most deployments.
+- **`label_colors` is published in the run report**, and that is the point of
+  putting the palette in `catalogs.py`: a surface export bakes a colour into
+  the `.vtk` it writes, so a client picking its own would draw the segmentation
+  in one colour and the mesh from the same run in another. Looked up by NAME,
+  never by value — NasoMaxillaDentSeg shifts every integer after the maxilla.
+
+**A defect the tests found, in this port's own code.** The three writers
+disagree on an empty mesh and none of them raises: `vtkPolyDataWriter` writes a
+valid `.vtk` with a header and no triangle, `vtkSTLWriter` and `vtkOBJWriter`
+write nothing at all and only complain on the console. So an empty `.vtk` would
+have shipped as a success — a structure the clinician believes was found and
+cannot see — while the report listed `.stl` paths that were not on disk. Both
+are checked against the filesystem now.
+
+(Found via a fixture quirk worth writing down: `vtkNrrdReader` reads an 8³
+volume as a single slice, so marching cubes returns nothing below 16³. The
+segmentation tests use 8³ and are right to; the mesh tests carry their own.)
+
+
 ### 2026-08-11 — BatchDentalSeg ported: four models, and a manifest that could not load
 
 Port `BATCHDENTALSEG` (teeth and jaw structures on dental CT/CBCT, nnUNet v2).
