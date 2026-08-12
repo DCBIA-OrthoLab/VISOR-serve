@@ -168,6 +168,29 @@ def test_a_path_argument_is_published_as_a_generic_file(make_tool_folder):
     assert tool.arguments["scan"].extensions is None
 
 
+def test_a_path_argument_can_narrow_its_own_file_picker(make_tool_folder):
+    """`extensions` is optional and not in the contract's example, but read if
+    present: it is the only way a schema tool's file dialog can be as precise
+    as an imported tool's, which declares a FILE_TYPES entry instead."""
+    folder = make_tool_folder(
+        "precise",
+        arguments={
+            "scan": {"type": "path", "required": True, "extensions": [".nii", ".nii.gz"]}
+        },
+    )
+
+    tool = schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    assert tool.arguments["scan"].extensions == (".nii", ".nii.gz")
+
+
+def test_extensions_on_something_that_is_not_a_path_is_refused(make_tool_folder):
+    folder = make_tool_folder("odd", arguments={"a": {"type": "int", "extensions": [".nii"]}})
+
+    with pytest.raises(schema_tool.SchemaError, match="extensions"):
+        schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+
 def test_returns_decides_how_the_response_is_built(make_tool_folder):
     for declared, expected in (("path", "file"), ("paths", "files"), ("text", "text")):
         folder = make_tool_folder(f"returns_{declared}", returns=declared)

@@ -73,10 +73,15 @@ RETURN_KINDS = {
 }
 DEFAULT_RETURN_KIND = "text"
 
-# Per-argument keys this server reads. `description` is not in the frozen
-# contract's example but is read if present -- a client shows it, and the
-# alternative is a panel of unexplained fields.
-_ARGUMENT_KEYS = ("type", "required", "default", "description")
+# Per-argument keys this server reads. `description` and `extensions` are not
+# in the frozen contract's example but are read if present, so a generator can
+# start emitting them without anything here changing:
+#   description  a client shows it under the field; without it a panel is a
+#                list of unexplained inputs.
+#   extensions   [".nii", ".nii.gz"] for a path argument -- what the client's
+#                file dialog offers. Without it the schema says only "a path"
+#                and the dialog falls back to ALLOWED_EXTENSIONS.
+_ARGUMENT_KEYS = ("type", "required", "default", "description", "extensions")
 
 _TOP_LEVEL_KEYS = ("name", "description", "arguments", "returns", "source_hash")
 
@@ -177,11 +182,19 @@ def _argument_spec(
             f"as {declared_type!r} rather than 'path'."
         )
 
+    accepts = declaration.get("extensions")
+    if accepts is not None and declared_type != "path":
+        raise SchemaError(
+            f"{where}: 'extensions' describes what a path argument accepts, and this one is "
+            f"declared as {declared_type!r}."
+        )
+
     return ArgSpec(
         type=ARGUMENT_TYPES[declared_type],
         required=required,
         description=declaration.get("description", ""),
         server_selectable=selectable,
+        accepts=tuple(accepts) if accepts else None,
         # Advisory, exactly as for a ported tool: the value a client pre-fills
         # its widget with. Not applied server-side -- an omitted optional
         # argument is left out of job.json entirely, so the tool's own Python

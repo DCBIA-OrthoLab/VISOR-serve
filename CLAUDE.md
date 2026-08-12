@@ -476,14 +476,31 @@ the tools leave this repo, which is phase 4.
   a catalog the tool declares; this is free text. A type-system addition of the
   same kind as the choice types, made once.
 
-**Two gaps this leaves, both needing the other repository or a client
-release:** a `path` argument publishes no extensions (the schema does not say
-which it accepts, so the client's file dialog falls back to
-`ALLOWED_EXTENSIONS`), and the schema's tool-level `description` is read and
-kept but not published — `GET /tools` has no field for it, and adding one is a
-shape change.
+**Where the two repositories could disagree, this server takes both.** Each of
+these is read if present and costs the generator one optional field; none of
+them changes anything for a tool that omits it:
 
-**Tests:** 417 server tests (+37), no GPU, no weights and no network.
+- **`extensions` on a `path` argument** (`ArgSpec.accepts`, new). The contract's
+  types cannot say more than "a path", so the client's file dialog would fall
+  back to `ALLOWED_EXTENSIONS` where AMASSS today offers exactly
+  `.nii/.nii.gz/.nrrd/...`. This is how a schema tool narrows its own picker
+  without a `FILE_TYPES` entry being invented for it.
+- **`description` per argument.** The client renders it under the field.
+- **`{"outputs": {name: path}}` as a return value.** The contract shows
+  `"returns": "path"` next to a `result.json` of `{"result": {"outputs":
+  {...}}}` — a mapping, not a path, which `_output_paths` refused and which
+  answered 500. A path or a list stays canonical; a mapping is accepted, with
+  or without the `outputs` wrapper. The names go no further than the response,
+  which is one file or one archive either way — a tool that needs its outputs
+  named writes a report beside them, as AMASSS does.
+- And a single-file tool returning SEVERAL paths is now a failure rather than
+  the first of them streamed as if it were the result.
+
+**Still needing a client release, so left alone:** the schema's tool-level
+`description` is read and kept but not published — `GET /tools` has no field
+for it, and adding one is a shape change.
+
+**Tests:** 423 server tests (+43), no GPU, no weights and no network.
 
 ### 2026-08-12 — A tool can run in its own interpreter (phase 1: the path, no tool on it)
 

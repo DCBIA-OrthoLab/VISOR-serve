@@ -243,7 +243,9 @@ imports:
   "name": "amasss",
   "description": "Segment craniofacial structures on a CBCT scan.",
   "arguments": {
-    "scan":       {"type": "path", "required": true},
+    "scan":       {"type": "path", "required": true,
+                   "description": "A CBCT scan",
+                   "extensions": [".nii", ".nii.gz", ".nrrd"]},
     "structures": {"type": "list[str]", "required": false, "default": ["Mandible"]}
   },
   "returns": "path",
@@ -256,6 +258,19 @@ Types are `path`, `str`, `int`, `float`, `bool`, `list[str]`; `returns` is
 `.schema.json` into a folder is what moves a tool off the imported path** — a
 folder that has one is never imported. The folder must be named after the tool:
 its interpreter is looked up by tool name.
+
+`description` and `extensions` are **optional** and a tool works without them,
+but both are what the client shows: the first under the field, the second as
+the file dialog's filter. Omit `extensions` and the picker falls back to
+`ALLOWED_EXTENSIONS` — it will accept a `.nii.gz` either way, it just will not
+offer it. An unknown key is a warning at startup, never a refusal: this is the
+seam between two repositories, and a field one side adds must not stop the
+other from starting.
+
+`run()` returns a path, a list of paths, or a mapping of name → path (with or
+without an `{"outputs": {...}}` wrapper). The names do not travel: what goes
+back is one file or one archive, so a tool that needs its outputs named writes
+a report beside them.
 
 ### `source_hash`, and why a mismatch stops the server
 

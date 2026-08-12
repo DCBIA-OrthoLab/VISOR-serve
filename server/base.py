@@ -145,6 +145,14 @@ class ArgSpec:
     # declares exactly one True.
     choices: Optional[dict] = None
 
+    # FILE arguments only: the exact extensions this argument accepts, when
+    # they are not the ones its declared type carries. A tool declared by a
+    # .schema.json can only say "path" -- the generic file type, whose fallback
+    # is settings.ALLOWED_EXTENSIONS -- so this is how it narrows its own file
+    # picker to .nii.gz without a FILE_TYPES entry being added for it. None
+    # keeps the declared type's own list, which is every tool in this repo.
+    accepts: Optional[tuple] = None
+
     # SCALAR arguments only: the value a client pre-fills its widget with, so a
     # spin box starts at the tool's default rather than at Qt's 0. Advisory and
     # NOT applied server-side -- an omitted optional argument still falls
@@ -220,6 +228,8 @@ class ArgSpec:
         declaration order. None means "no specific type declared" -- fall back
         to config.ALLOWED_EXTENSIONS.
         """
+        if self.accepts is not None:
+            return tuple(self.accepts)
         accepted: list = []
         for declared in self.types:
             allowed = FILE_TYPES[declared]
@@ -302,7 +312,26 @@ class Tool(ABC):
                     f"must stand alone (got {spec.types})."
                 )
             self._check_choices(where, spec)
+            self._check_accepts(where, spec)
             self._check_presentation(where, spec)
+
+    @staticmethod
+    def _check_accepts(where: str, spec: ArgSpec) -> None:
+        if spec.accepts is None:
+            return
+        if not spec.is_file:
+            raise ToolSchemaError(f"{where}: 'accepts' only applies to file arguments.")
+        if not isinstance(spec.accepts, (tuple, list)) or not spec.accepts:
+            raise ToolSchemaError(f"{where}: 'accepts' must be a non-empty list of extensions.")
+        wrong = [
+            extension
+            for extension in spec.accepts
+            if not isinstance(extension, str) or not extension.startswith(".")
+        ]
+        if wrong:
+            raise ToolSchemaError(
+                f"{where}: 'accepts' entries must be extensions starting with a dot, got {wrong}."
+            )
 
     def _check_presentation(self, where: str, spec: ArgSpec) -> None:
         """Reject a presentation hint that cannot be honored.
