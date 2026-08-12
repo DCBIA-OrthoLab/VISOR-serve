@@ -857,6 +857,14 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         # this" let their message through.
         code = TOOL_ERROR_STATUS.get(exc.error_type, 500)
         logger.warning("endpoint=/run/%s status=%d error=%s", tool_name, code, exc.error_type)
+        if code == 500:
+            # The ONLY place this exists. A 4xx carries its message to the
+            # caller, but a 500 answers "Tool execution failed." and the job
+            # directory holding stderr.log is discarded on the next line, so
+            # without this the tool's traceback is gone -- which is exactly
+            # what makes a failing tool undiagnosable from the outside.
+            # Server-side only, as _stderr_tail intends.
+            logger.error("endpoint=/run/%s failure:\n%s", tool_name, exc.message)
         _discard(work_dir, scratch_dirs)
         raise HTTPException(
             status_code=code,
