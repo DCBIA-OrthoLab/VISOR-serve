@@ -413,6 +413,67 @@ Provide a small, generic client mirroring the server:
 
 ## Changelog
 
+### 2026-08-12 — BatchDentalSeg on the GPU: 5.8x, and a guard AMASSS never needed
+
+Port AMASSS's `_enable_gpu_resampling`, whose rationale is starker here.
+Measured on a three-scan UniversalLab cohort: the GPU did **40 seconds** of
+inference and nnUNet then spent **8 minutes 19** resampling the logits back on
+one CPU core. On a single scan, end to end: **283s -> 48.5s (5.83x)**, with
+99.96% of voxels identical and a worst-case Dice of **0.9839** — better than
+AMASSS's worst (0.978). The changelog said nothing had measured what the
+spline-order drop costs THESE models; now something has.
+
+**The optimisation does not always fit, and that is new.** The resampled array
+is `(classes, Z, Y, X)` float32, so its cost scales with the class count —
+AMASSS's models emit two or three, UniversalLab emits **56**. On a 561x561x442
+CBCT that is 28.5 GiB for the output array alone and ~57 GiB of peak, against
+6.2 GiB for the six-class models. `_gpu_resampling_fits` reads the input
+HEADERS (never the pixels), estimates, and falls back to scipy when it will not
+fit: without it, a 16 or 24 GB card takes the whole run down with a CUDA OOM
+minutes in. So the model that suffers most from the CPU resampler is also the
+one that strains the card — the remaining fix is chunking the resample over the
+class axis, which is memory, not accuracy.
+
+**The first estimate was calibrated wrong** and would have refused the very
+card the 5.83x was measured on. A guard that rejects the machine its own
+measurement came from is worse than no guard; the factor is now pinned to the
+observed allocations by a test naming that exact configuration.
+
+**Per-scan streaming became nearly free on this path.** `predict_from_files_
+sequential` is already sequential and in-process, so splitting the call to get
+per-scan boundaries loses no cross-scan overlap. On the CPU path the same split
+costs **+62%** (601s -> 972s, measured) — which is why the granularity is the
+caller's choice and not a setting.
+
+### 2026-08-12 — What a streamed run hands over, and what it costs
+
+Three defects found by watching a real cohort run, not by reading code.
+
+- **nnUNet APPENDS its own file ending** to the output path it is given
+  (`isfile(i + file_ending)`). The per-scan call passed `case_0000.nii.gz`, so
+  nnUNet wrote `case_0000.nii.gz.nii.gz` and the caller reported "nnUNet
+  produced no output for this scan" — for every scan. The folder form hides
+  this, because nnUNet builds the names itself there. A test pins the boundary,
+  since the stubs stand in for nnUNet and cannot catch it.
+- **A streamed run never shipped `BatchDentalSeg_report.json`.** It can only be
+  written once every scan is done. Without it the client has the segmentations
+  and nothing saying what their integers mean, so segments load unnamed and
+  uncoloured — most of what the panel is for.
+- **A single-file scan was zipped only to be unzipped.** The ordinary run
+  produces one segmentation per scan, and a `.nii.gz` is already compressed, so
+  the archive saved nothing and cost two passes. One file now ships as itself;
+  several still travel as one bundle. Artifacts are COPIED into a staging dir,
+  because `transfer.store_result` renames what it is given — handing over the
+  real segmentation would take it out of the tree the report describes.
+
+**The streamed log line now carries what was sent** (`sent=42269031B (40.3 MB)`).
+That number is what a slow-looking run is diagnosed with, and its absence sent
+this investigation down two wrong paths: bundles were assumed to be ~280 MB
+from a guessed transfer rate, when they were 13 MB. A server that reports how
+long it took but not what it handed over cannot be reasoned about from the
+outside.
+
+
 ### 2026-08-12 — Streamed runs: progress while it works, results as they land
 
 Two complaints, one mechanism. A cohort was minutes to hours whose only visible
