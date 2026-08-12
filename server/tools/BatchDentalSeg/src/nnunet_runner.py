@@ -202,9 +202,16 @@ def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: s
             # A list of lists is nnUNet's "one case, one modality" shape; the
             # predictor object -- and therefore the loaded checkpoint -- is the
             # same one across the whole loop.
+            #
+            # The output path is TRUNCATED: nnUNet appends the file ending from
+            # its own dataset.json (`isfile(i + file_ending)` in
+            # _manage_input_and_output_lists), so passing "case_0000.nii.gz"
+            # here writes "case_0000.nii.gz.nii.gz" and the caller finds
+            # nothing where it looked. The folder form above hides this,
+            # because nnUNet builds the names itself from the case ids.
             predictor.predict_from_files(
                 [[os.path.join(input_dir, name)]],
-                [os.path.join(output_dir, f"{case_id}.nii.gz")],
+                [os.path.join(output_dir, case_id)],
                 save_probabilities=False,
                 overwrite=True,
                 num_processes_preprocessing=2,

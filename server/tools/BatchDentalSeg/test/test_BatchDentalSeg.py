@@ -892,3 +892,61 @@ def test_a_runner_that_ignores_the_callbacks_still_produces_a_full_report(
         emit=_collect(events),
     )
     assert run.report["summary"] == "1/1 scan(s) segmented"
+
+
+def test_the_per_scan_call_hands_nnunet_a_truncated_output_path(tmp_path, monkeypatch):
+    """nnUNet APPENDS its own file ending to the output path it is given.
+
+    This is the one thing the stubs above cannot catch, because they stand in
+    for nnUNet entirely -- and it is what made the first streamed run report
+    "nnUNet produced no output for this scan" for every scan: the path carried
+    `.nii.gz`, nnUNet wrote `case_0000.nii.gz.nii.gz`, and the caller looked
+    for `case_0000.nii.gz`. So the boundary is pinned here instead.
+    """
+    calls = []
+
+    class FakePredictor:
+        def initialize_from_trained_model_folder(self, *args, **kwargs):
+            pass
+
+        def predict_from_files(self, inputs, outputs, **kwargs):
+            calls.append((inputs, outputs))
+
+    monkeypatch.setattr(nnunet_runner, "_build_predictor", lambda device: FakePredictor())
+
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    (input_dir / "case_0000_0000.nii.gz").write_bytes(b"")
+
+    nnunet_runner.predict_folder(
+        str(tmp_path / "model"), str(input_dir), str(tmp_path / "out"), "cpu",
+        on_case_start=lambda *a: None, on_case_done=lambda *a: None,
+    )
+
+    (_inputs, outputs), = calls
+    assert outputs == [os.path.join(str(tmp_path / "out"), "case_0000")]
+    assert not outputs[0].endswith(".nii.gz")
+
+
+def test_the_batch_call_still_hands_nnunet_the_folder(tmp_path, monkeypatch):
+    """The blocking path is unchanged: nnUNet builds the names itself there."""
+    calls = []
+
+    class FakePredictor:
+        def initialize_from_trained_model_folder(self, *args, **kwargs):
+            pass
+
+        def predict_from_files(self, inputs, outputs, **kwargs):
+            calls.append((inputs, outputs))
+
+    monkeypatch.setattr(nnunet_runner, "_build_predictor", lambda device: FakePredictor())
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    (input_dir / "case_0000_0000.nii.gz").write_bytes(b"")
+
+    nnunet_runner.predict_folder(
+        str(tmp_path / "model"), str(input_dir), str(tmp_path / "out"), "cpu"
+    )
+    (inputs, outputs), = calls
+    assert inputs == str(input_dir)
+    assert outputs == str(tmp_path / "out")
