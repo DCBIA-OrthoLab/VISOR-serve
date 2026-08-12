@@ -46,10 +46,19 @@ FILE_TYPES: dict = {
     # One mesh or a zipped folder of them. Deliberately shorter than
     # surface_file: these are the formats ALI's discovery actually walks.
     "surface_or_zip_file": (".vtk", ".stl", ".zip"),
+    # What a `.schema.json` argument of type "path" becomes. Any extension, and
+    # a .zip sent for one is UNPACKED rather than handed over: a packaged tool
+    # never sees an archive -- the server unpacks before run() is called and
+    # passes a real file or directory, with the zip-bomb cap and the
+    # single-root strip that used to live in each tool.
+    "path": None,
 }
 
 # The type whose resolved path is a directory rather than a file.
 FOLDER_TYPE = "folder"
+
+# The one a schema-declared tool uses for every file or folder it takes.
+PATH_TYPE = "path"
 
 SCALAR_TYPES = (str, int, float, bool)
 

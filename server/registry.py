@@ -17,14 +17,16 @@ discovery, though the recognized file is free to import from them.
 Dropping a `.schema.json` into a folder is what moves a tool from the second
 to the first: a folder that has one is never imported.
 
-**Two failure policies, and the difference is deliberate.** A tool that will
-not LOAD -- missing dependency, syntax error, bad schema -- is SKIPPED, not
-fatal: with 15+ tools, one unavailable model must not block all the others.
-The failure is reported as loudly as possible (see _record_failure), kept in
-FAILED_TOOLS, and surfaced again by get_tool(). A tool whose schema no longer
-matches its source is the opposite case and REFUSES TO START the server: it
-would otherwise keep serving, validating requests against a signature that has
-changed under it.
+**A tool that will not load is SKIPPED, never fatal** -- missing dependency,
+syntax error, a schema that cannot be generated. With 15+ tools, one
+unavailable model must not block all the others. The failure is reported as
+loudly as possible (see _record_failure), kept in FAILED_TOOLS, and surfaced
+again by get_tool().
+
+A schema whose `source_hash` no longer matches the source beside it is not a
+failure at all: it is a stale cache, and it is regenerated (see
+schema_tool.resolve_schema). Only a tool that can neither be read nor
+described is skipped.
 """
 
 import importlib
@@ -45,7 +47,7 @@ except ModuleNotFoundError:
 from base import Tool
 from config import settings
 from deployment import deployment_config
-from schema_tool import SchemaTool, SourceHashMismatch, has_schema, load_tool
+from schema_tool import SchemaTool, is_packaged, load_tool
 
 # This module runs at import time, BEFORE main.py reaches its own
 # logging.basicConfig call: without this one, the INFO summary below would be
@@ -110,12 +112,10 @@ def _discover_schema_tools(root: str) -> list:
     discovered = []
     for entry in _tool_folders(root):
         folder = os.path.join(root, entry)
-        if not has_schema(folder):
+        if not is_packaged(folder):
             continue
         try:
             discovered.append((entry, load_tool(folder, deployment_config)))
-        except SourceHashMismatch:
-            raise
         except Exception as exc:
             _record_failure(entry, exc)
     return discovered
@@ -135,7 +135,7 @@ def _discover_tool_classes(root: str) -> list:
     for entry in _tool_folders(root):
         folder_path = os.path.join(root, entry)
         # A tool that declares a schema is served from it and never imported.
-        if has_schema(folder_path):
+        if is_packaged(folder_path):
             continue
 
         try:
@@ -250,30 +250,7 @@ def _build_registry() -> dict:
     return registry
 
 
-def _refuse_to_start(exc: SourceHashMismatch) -> None:
-    """A stale schema is the one discovery failure that must not be survivable.
-
-    Logged before it is re-raised, because what follows is a traceback out of
-    an import and the reason has to be readable above it.
-    """
-    logger.error(
-        "\n%s\n"
-        "  THE SERVER WILL NOT START\n"
-        "  %s\n\n"
-        "  A schema that no longer matches its source means every request for that tool is\n"
-        "  validated against a signature that has changed under it.\n"
-        "%s",
-        _BANNER,
-        exc,
-        _BANNER,
-    )
-
-
-try:
-    TOOLS: dict = _build_registry()
-except SourceHashMismatch as exc:
-    _refuse_to_start(exc)
-    raise
+TOOLS: dict = _build_registry()
 
 
 def get_tool(name: str):

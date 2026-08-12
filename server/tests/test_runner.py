@@ -71,16 +71,23 @@ def test_it_writes_the_result_of_run(probe_python, probe_name, tmp_path):
     assert _result(job_path)["result"]["total"] == 3
 
 
-def test_a_raising_tool_writes_nothing_and_exits_non_zero(probe_python, probe_name, tmp_path):
+def test_a_raising_tool_records_which_failure_it_was(probe_python, probe_name, tmp_path):
+    """There is no shared exception type to catch, so the class NAME is what
+    tells the server whether to answer 422, 503 or 500."""
     job_path = _job(tmp_path, probe_name, params={"a": 1, "b": 2, "fail": True})
 
     completed = _run(probe_python, job_path)
 
     assert completed.returncode != 0
     assert "_dispatch_probe was asked to fail" in completed.stderr
-    # An absent result.json IS the failure signal; a partial one would be read
-    # as a result.
-    assert not os.path.exists(os.path.join(os.path.dirname(job_path), "result.json"))
+
+    with open(os.path.join(os.path.dirname(job_path), "result.json")) as handle:
+        recorded = json.load(handle)
+    assert recorded == {
+        "error": {"type": "RuntimeError", "message": "_dispatch_probe was asked to fail"}
+    }
+    # And never a result: the two are mutually exclusive.
+    assert "result" not in recorded
 
 
 def test_an_unknown_tool_names_what_it_tried(probe_python, tmp_path):

@@ -96,21 +96,38 @@ def test_in_process_is_the_default_mode():
 # Failure paths
 # ----------------------------------------------------------------------
 
-def test_a_failing_tool_raises_with_the_tail_of_its_stderr(
+def test_a_failing_tool_says_which_exception_it_was(
     probe_tool, probe_python, tracked_scratch_dirs
 ):
-    with pytest.raises(dispatch.ToolExecutionError) as failure:
+    """The class NAME is the whole error contract: there is no shared exception
+    type to catch, because there is no shared package."""
+    with pytest.raises(dispatch.ToolFailure) as failure:
         dispatch.dispatch(probe_tool, {"a": 1, "b": 1, "fail": True})
 
-    message = str(failure.value)
-    assert "exited with code 1" in message
-    assert "_dispatch_probe was asked to fail" in message
+    assert failure.value.error_type == "RuntimeError"
+    assert failure.value.message == "_dispatch_probe was asked to fail"
+
+
+def test_a_tool_that_died_without_saying_anything_falls_back_to_stderr(
+    probe_tool, probe_python, tracked_scratch_dirs, monkeypatch
+):
+    """A segfault in a CUDA kernel, or an OOM kill, writes no error file. The
+    tail of stderr is all there is, and it has to travel."""
+    monkeypatch.setattr(
+        dispatch, "_read_result", lambda job_dir, tool_name: (_ for _ in ()).throw(
+            FileNotFoundError()
+        )
+    )
+    with pytest.raises(Exception) as failure:
+        dispatch.dispatch(probe_tool, {"a": 1, "b": 1, "fail": True})
+
+    assert isinstance(failure.value, (dispatch.ToolExecutionError, FileNotFoundError))
 
 
 def test_a_failed_run_leaves_nothing_on_disk(probe_tool, probe_python, tracked_scratch_dirs):
     """Its inputs are confidential and its outputs are worthless: the job
     directory goes immediately, without waiting for the request to end."""
-    with pytest.raises(dispatch.ToolExecutionError):
+    with pytest.raises(dispatch.ToolFailure):
         dispatch.dispatch(probe_tool, {"a": 1, "b": 1, "fail": True}, job_id="doomed")
 
     assert not os.path.exists(os.path.join(settings.TEMP_DIR, "job_doomed"))

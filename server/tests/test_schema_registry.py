@@ -9,6 +9,7 @@ deliberately not the tool's.
 
 import json
 import os
+import sys
 
 import pytest
 
@@ -85,33 +86,81 @@ def test_compiled_python_does_not_count(make_tool_folder):
     assert schema_hash.hash_source_tree(src) == before
 
 
-def test_a_stale_schema_refuses_to_start_the_server(make_tool_folder, monkeypatch):
-    """The one discovery failure that is fatal: the server would otherwise keep
-    serving the tool, validating requests against a signature that has changed
-    under it."""
-    make_tool_folder("stale", source_hash="0" * 64)
-    monkeypatch.setattr(settings, "TOOLS_DIR", make_tool_folder.root)
-
-    with pytest.raises(schema_tool.SourceHashMismatch, match="stale"):
-        registry._discover_schema_tools(make_tool_folder.root)
+def _fake_venv(folder: str) -> None:
+    """A .venv whose python is this interpreter, so describe.py can be run."""
+    bin_dir = os.path.join(folder, ".venv", "bin")
+    os.makedirs(bin_dir, exist_ok=True)
+    os.symlink(sys.executable, os.path.join(bin_dir, "python"))
 
 
-def test_a_stale_schema_says_which_tool_and_both_hashes(make_tool_folder):
-    folder = make_tool_folder("named", source_hash="0" * 64)
+def _stub_describe(tmp_path, schema: dict) -> str:
+    """Stands in for sadt-tools' scripts/describe.py: prints a schema."""
+    script = tmp_path / "describe.py"
+    # The JSON is embedded as a STRING literal, not as a Python dict: `true`
+    # is not a Python name.
+    script.write_text("print({!r})".format(json.dumps(schema)))
+    return str(script)
 
-    with pytest.raises(schema_tool.SourceHashMismatch) as failure:
+
+def test_a_stale_schema_is_regenerated_rather_than_served(make_tool_folder, monkeypatch, tmp_path):
+    """The schema is a CACHE of what the source says, and `source_hash` is how
+    the server notices the cache is behind. Regenerating is what it is for --
+    refusing to start would be right for a schema a human wrote, and this one
+    is derived."""
+    folder = make_tool_folder("stale", source_hash="0" * 64)
+    _fake_venv(folder)
+    actual = schema_hash.hash_source_tree(os.path.join(folder, "src"))
+    monkeypatch.setattr(
+        settings,
+        "DESCRIBE_PATH",
+        _stub_describe(
+            tmp_path,
+            {
+                "name": "stale",
+                "description": "regenerated",
+                "arguments": {"a": {"type": "int", "required": True}},
+                "returns": "text",
+                "source_hash": actual,
+            },
+        ),
+    )
+
+    tool = schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    assert tool.description == "regenerated"
+    assert set(tool.arguments) == {"a"}
+
+
+def test_a_regenerated_schema_is_cached_for_the_next_start(make_tool_folder, monkeypatch, tmp_path):
+    folder = make_tool_folder("cached", source_hash="0" * 64)
+    _fake_venv(folder)
+    actual = schema_hash.hash_source_tree(os.path.join(folder, "src"))
+    schema = {"name": "cached", "arguments": {}, "returns": "text", "source_hash": actual}
+    monkeypatch.setattr(settings, "DESCRIBE_PATH", _stub_describe(tmp_path, schema))
+
+    schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    assert os.path.isfile(os.path.join(settings.SCHEMA_CACHE_DIR, "cached.schema.json"))
+
+
+def test_a_tool_that_cannot_describe_itself_is_skipped(make_tool_folder, monkeypatch):
+    """describe.py exits 2 on anything it cannot represent rather than emitting
+    a schema that is almost right, and a tool that cannot be described must not
+    be served."""
+    folder = make_tool_folder("undescribable", source_hash="0" * 64)
+
+    with pytest.raises(schema_tool.SchemaError, match="cannot be generated"):
         schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
 
-    message = str(failure.value)
-    assert "named" in message and "000000000000" in message
 
+def test_a_failing_generator_reports_what_it_printed(make_tool_folder, monkeypatch, tmp_path):
+    folder = make_tool_folder("broken_generator", source_hash="0" * 64)
+    _fake_venv(folder)
+    script = tmp_path / "describe.py"
+    script.write_text("import sys; print('torch is imported at module level', file=sys.stderr); sys.exit(2)")
+    monkeypatch.setattr(settings, "DESCRIBE_PATH", str(script))
 
-def test_a_schema_without_a_hash_is_skipped_not_fatal(make_tool_folder):
-    """Unverifiable, so it must not serve -- but it endangers only itself."""
-    folder = make_tool_folder("unverifiable")
-    _rewrite(folder, source_hash=None)
-
-    with pytest.raises(schema_tool.SchemaError, match="source_hash"):
+    with pytest.raises(schema_tool.SchemaError, match="module level"):
         schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
 
 
@@ -192,7 +241,13 @@ def test_extensions_on_something_that_is_not_a_path_is_refused(make_tool_folder)
 
 
 def test_returns_decides_how_the_response_is_built(make_tool_folder):
-    for declared, expected in (("path", "file"), ("paths", "files"), ("text", "text")):
+    """A packaged tool returns the output DIRECTORY it was given, or a
+    dict[str, Path] of named files -- both of which are zipped."""
+    for declared, expected in (
+        ("path", "files"),
+        ("dict[str, path]", "files"),
+        ("text", "text"),
+    ):
         folder = make_tool_folder(f"returns_{declared}", returns=declared)
         assert schema_tool.load_tool(folder, deployment.DeploymentConfig({})).output_kind == expected
 
@@ -286,7 +341,7 @@ def test_a_folder_with_a_schema_is_never_imported(make_tool_folder, monkeypatch)
     package_dir = tools_package.__path__[0]
     assert "test_tool" in [name for name, _ in registry._discover_tool_classes(package_dir)]
 
-    monkeypatch.setattr(registry, "has_schema", lambda folder: folder.endswith("test_tool"))
+    monkeypatch.setattr(registry, "is_packaged", lambda folder: folder.endswith("test_tool"))
 
     assert "test_tool" not in [name for name, _ in registry._discover_tool_classes(package_dir)]
 
@@ -316,8 +371,10 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
 
     assert entry["output_kind"] == "files"
     assert entry["arguments"]["scan"] == {
-        "type": "file",
-        "types": ["file"],
+        # "path", not "file": a .zip sent for one is unpacked before run() is
+        # called, which a generic "file" argument must never be.
+        "type": "path",
+        "types": ["path"],
         "required": True,
         "description": "A CBCT scan",
         "server_selectable": None,
@@ -325,7 +382,7 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         "initial": None,
         # null, so the client falls back to ALLOWED_EXTENSIONS: the schema
         # says "a path" and nothing about which extensions are acceptable.
-        "extensions": {"file": None},
+        "extensions": {"path": None},
         "label": None,
         "section": None,
         "visible_when": None,

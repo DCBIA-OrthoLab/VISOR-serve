@@ -15,21 +15,24 @@ so the generator in `sadt-tools` can be checked against it byte for byte
 rather than against a description of it. Both sides have to agree exactly --
 if they do not, every tool refuses to start.
 
-The rule, in one sentence: sha256 over one line per file, `<relative path>\\0
-<sha256 of its bytes>\\n`, for every file under src/ in sorted order, with
-compiled-Python artifacts left out.
+**This is a port of `scripts/describe.py::source_hash` in the sadt-tools
+repository, and it has to stay byte-for-byte equivalent to it.** That side
+generates the hash; this side only checks it. The two disagreeing by one
+separator means every tool looks stale and nothing loads — which is exactly
+what happened the first time, before the two were compared on a real tool.
 
-Every part of that is chosen to be reproducible somewhere else:
+The rule: sha256 over `<relative posix path>\\0<the file's bytes>\\0`, for
+every file under src/ in sorted order, with compiled-Python artifacts left out.
 
 - **Relative POSIX paths**, so the hash does not depend on where the tool
   happens to be checked out, or on which OS wrote it.
-- **Sorted**, so it does not depend on the order the filesystem hands entries
-  back -- which differs between machines for the same tree.
+- **Sorted as PATHS, not as strings.** `sorted(src.rglob("*"))` orders by path
+  parts, so `a/b.py` sorts before `a.py`; sorting the relative strings instead
+  puts them the other way round, because "." is 0x2E and "/" is 0x2F. Same
+  files, different digest.
 - **The path is hashed as well as the content**, so renaming a file changes
   the hash. A tool that moved run() into another module has a different
   signature even when every byte is otherwise the same.
-- **Per-file digests rather than concatenated content**, so no file's bytes
-  can be read as another's (`a.py` + `b.py` and one file holding both).
 - **`__pycache__` and `*.pyc`/`*.pyo` excluded.** They are generated, they
   differ between interpreter versions, and importing the tool once would
   otherwise change its own hash.
@@ -39,6 +42,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pathlib
 import sys
 
 # Everything a Python interpreter generates on its own. Kept deliberately
@@ -49,26 +53,19 @@ IGNORED_SUFFIXES = (".pyc", ".pyo")
 _READ_CHUNK = 1024 * 1024
 
 
-def _file_digest(path: str) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while chunk := handle.read(_READ_CHUNK):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def source_files(src_dir: str) -> list:
-    """Every file that counts, as relative POSIX paths, sorted."""
-    found = []
-    for dir_path, dir_names, file_names in os.walk(src_dir):
-        # Pruned in place, which is what stops os.walk descending into them.
-        dir_names[:] = sorted(name for name in dir_names if name not in IGNORED_DIRECTORIES)
-        for file_name in file_names:
-            if file_name.endswith(IGNORED_SUFFIXES):
-                continue
-            absolute = os.path.join(dir_path, file_name)
-            found.append(os.path.relpath(absolute, src_dir).replace(os.sep, "/"))
-    return sorted(found)
+    """Every file that counts, in the order the digest consumes them.
+
+    `pathlib.Path` ordering, not string ordering: see the note in the module
+    docstring. Kept in this shape because the generating side is written this
+    way, and the two have to agree.
+    """
+    root = pathlib.Path(src_dir)
+    return [
+        path
+        for path in sorted(candidate for candidate in root.rglob("*") if candidate.is_file())
+        if "__pycache__" not in path.parts and path.suffix not in IGNORED_SUFFIXES
+    ]
 
 
 def hash_source_tree(src_dir: str) -> str:
@@ -76,13 +73,17 @@ def hash_source_tree(src_dir: str) -> str:
     if not os.path.isdir(src_dir):
         raise FileNotFoundError(f"No such source directory: {src_dir}")
 
+    root = pathlib.Path(src_dir)
     digest = hashlib.sha256()
-    for relative_path in source_files(src_dir):
-        absolute = os.path.join(src_dir, relative_path)
-        digest.update(relative_path.encode("utf-8"))
+    for path in source_files(src_dir):
+        digest.update(path.relative_to(root).as_posix().encode())
         digest.update(b"\0")
-        digest.update(_file_digest(absolute).encode("ascii"))
-        digest.update(b"\n")
+        # Read in chunks rather than whole: the digest is identical either way,
+        # and a tool is free to keep a large file under src/.
+        with open(path, "rb") as handle:
+            while chunk := handle.read(_READ_CHUNK):
+                digest.update(chunk)
+        digest.update(b"\0")
     return digest.hexdigest()
 
 

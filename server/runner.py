@@ -19,9 +19,12 @@ Three constraints shape this file, and all three are load-bearing:
   then always the same version, and there is no cross-repo version skew to
   negotiate.
 
-The error channel is stderr plus a non-zero exit code. On failure nothing is
-written -- an absent result.json IS the failure signal, so a half-written one
-must never be mistaken for a result (hence the atomic replace below).
+On failure it exits non-zero, prints the traceback to stderr, and writes the
+exception's CLASS NAME into the result file -- `{"error": {"type": ...}}`.
+There is no shared exception type to catch, because there is no shared package,
+so the name is what tells the server whether the caller sent something wrong
+(422) or the tool itself broke (500). A successful result is written whole and
+replaced into place, so a half-written one is never read as a result.
 """
 
 from __future__ import annotations
@@ -29,9 +32,12 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import logging
 import os
 import sys
 import traceback
+import typing
+from pathlib import Path
 
 # Where the tool's code lives inside its folder, and the environment variable
 # that overrides the folder itself (tests and dev checkouts, where the venv is
@@ -40,6 +46,12 @@ SRC_DIR_NAME = "src"
 TOOL_DIR_ENV = "SADT_TOOL_DIR"
 
 RESULT_FILE = "result.json"
+
+# The tool's package under src/, when there is exactly one. sadt-tools names it
+# `sadt_<tool>`, but the rule is the one its own describe.py uses -- the single
+# importable package -- rather than the prefix, so a tool that names its
+# package something else still loads.
+_FALLBACK_PREFIX = "sadt_"
 
 
 class RunnerError(Exception):
@@ -68,21 +80,38 @@ def _tool_dir() -> str:
     return os.path.dirname(os.path.abspath(sys.prefix))
 
 
-def _import_tool(tool_name: str, src_dir: str):
-    """Import the module defining run(), from the tool's src/ and nowhere else.
+def _package_under(src_dir: str):
+    """The one importable package under src/, or None.
 
-    The module is named after the tool -- src/<tool>.py or src/<tool>/ -- which
-    is the same "the file is named after the folder" rule the in-process
-    registry has always used. `src/tool.py` is accepted as well so a tool whose
-    name is awkward as an identifier has a way out.
+    Same rule as sadt-tools' own describe.py: exactly one directory holding an
+    __init__.py. Deriving it rather than hardcoding `sadt_<tool>` means the
+    runner and the schema generator agree on what they load, which is the only
+    way the schema can describe what actually runs.
+    """
+    candidates = sorted(
+        entry
+        for entry in os.listdir(src_dir)
+        if os.path.isfile(os.path.join(src_dir, entry, "__init__.py"))
+    )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _import_tool(tool_name: str, src_dir: str):
+    """Import the module defining run(), from the tool's src/.
+
+    `uv sync` installs the tool into its own virtualenv, so the package is
+    importable without any of this; src/ goes on the path first anyway, so the
+    runner also works against a checkout that was never synced.
     """
     if not os.path.isdir(src_dir):
         raise RunnerError(f"Tool '{tool_name}' has no '{SRC_DIR_NAME}/' directory at {src_dir}")
 
     sys.path.insert(0, src_dir)
-    candidates = [tool_name, "tool"] if tool_name != "tool" else ["tool"]
+    package = _package_under(src_dir)
+    candidates = [name for name in (package, f"{_FALLBACK_PREFIX}{tool_name}", tool_name, "tool") if name]
+
     tried = []
-    for candidate in candidates:
+    for candidate in dict.fromkeys(candidates):
         if not candidate.isidentifier():
             tried.append(f"{candidate} (not a valid module name)")
             continue
@@ -96,7 +125,8 @@ def _import_tool(tool_name: str, src_dir: str):
                 raise
             tried.append(f"{candidate} ({exc})")
             continue
-        _reject_module_from_elsewhere(module, candidate, src_dir)
+        if package is not None:
+            _reject_module_from_elsewhere(module, candidate, src_dir)
         return module
 
     raise RunnerError(
@@ -131,6 +161,34 @@ def _run_function(module, tool_name: str):
     return run
 
 
+def _coerce(value, annotation):
+    """Turn a JSON value into what run()'s annotation asks for.
+
+    Only paths need it: JSON has no path type, so they travel as strings and a
+    tool annotating `scans: Path` would receive a `str` and fail on the first
+    `.glob()`. Everything else the schema allows -- str, int, float, bool and
+    lists of them -- arrives as the right type already.
+
+    Deliberately identical to sadt-tools' testkit driver
+    (`testkit/src/sadt_testkit/_driver.py`): every tool's integration tests run
+    against that one, so a difference here is a suite that passes while
+    production fails.
+    """
+    if annotation is Path:
+        return Path(value)
+    if typing.get_origin(annotation) is list and typing.get_args(annotation) == (Path,):
+        return [Path(item) for item in value]
+    return value
+
+
+def _call_arguments(run, params: dict) -> dict:
+    try:
+        hints = typing.get_type_hints(run)
+    except Exception:  # noqa: BLE001 - an unresolvable annotation is not fatal
+        hints = {}
+    return {name: _coerce(value, hints.get(name)) for name, value in params.items()}
+
+
 def _jsonable(value):
     """json.dump fallback: a returned Path is a path, anything else is a bug.
 
@@ -161,6 +219,38 @@ def _write_result(job_dir: str, result) -> None:
     os.replace(temp_path, final_path)
 
 
+def _write_error(job_dir: str, exc: Exception) -> None:
+    """Record WHICH failure happened, next to where a result would have gone.
+
+    There is no shared exception type -- there is no shared package -- so the
+    server maps the class NAME: ToolInputError/ValueError/FileNotFoundError are
+    the caller's problem (422, message passed through), ToolUnavailableError is
+    the deployment's (503), anything else is opaque (500). The exit code stays
+    non-zero either way, so a caller that reads nothing but that still sees a
+    failure.
+    """
+    payload = {"error": {"type": type(exc).__name__, "message": str(exc)}}
+    try:
+        with open(os.path.join(job_dir, RESULT_FILE), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    except OSError:
+        pass  # the traceback on stderr is still the record
+
+
+def _configure_logging() -> None:
+    """The runner owns handlers, levels and formatting.
+
+    Tools attach none -- a library that configures logging takes the decision
+    away from whatever runs it -- so without this their log records go nowhere
+    at all.
+    """
+    logging.basicConfig(
+        level=os.environ.get("SADT_LOG_LEVEL", "INFO").upper(),
+        stream=sys.stderr,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+
 def _load_job(job_path: str) -> dict:
     try:
         with open(job_path, encoding="utf-8") as handle:
@@ -183,20 +273,29 @@ def main(argv=None) -> int:
     parser.add_argument("--job", required=True, help="Path to the job.json written by the server")
     arguments = parser.parse_args(argv)
 
+    _configure_logging()
+
+    job = None
     try:
         job = _load_job(arguments.job)
         module = _import_tool(job["tool"], os.path.join(_tool_dir(), SRC_DIR_NAME))
-        result = _run_function(module, job["tool"])(**job["params"])
+        run = _run_function(module, job["tool"])
+        result = run(**_call_arguments(run, job["params"]))
         _write_result(job["job_dir"], result)
     except RunnerError as exc:
         # Ours, and already precise: the traceback would only point back here.
         print(str(exc), file=sys.stderr)
+        if job:
+            _write_error(job["job_dir"], exc)
         return 1
-    except Exception:
+    except Exception as exc:
         # The tool's own failure. The whole traceback goes to stderr because
         # the server keeps only its tail, and that tail is all anyone will have
-        # to work from.
+        # to work from; the class name goes in the result file, because it is
+        # what decides the status code.
         traceback.print_exc()
+        if job:
+            _write_error(job["job_dir"], exc)
         return 1
     return 0
 

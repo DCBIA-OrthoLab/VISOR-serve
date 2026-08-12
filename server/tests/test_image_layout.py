@@ -67,7 +67,7 @@ def test_no_heavy_dependency_creeps_into_the_api():
 
 
 def _fixture_folders() -> list:
-    fixtures = os.path.join(DOCKER_DIR, "fixtures")
+    fixtures = os.path.join(DOCKER_DIR, "fixtures", "tools")
     if not os.path.isdir(fixtures):
         return []
     return [

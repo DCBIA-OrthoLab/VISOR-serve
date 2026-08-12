@@ -69,6 +69,13 @@ def _is_usable(interpreter: str) -> bool:
     return probe.returncode == 0
 
 
+@pytest.fixture(autouse=True)
+def schema_cache(tmp_path, monkeypatch):
+    """A .schema.json is a cache the server may regenerate, so no test is
+    allowed to write one into the repository."""
+    monkeypatch.setattr(settings, "SCHEMA_CACHE_DIR", str(tmp_path / "schema-cache"))
+
+
 @pytest.fixture(scope="session")
 def probe_tools_dir(tmp_path_factory) -> str:
     """A TOOLS_DIR holding one tool: <root>/_dispatch_probe/{src,.venv}."""
