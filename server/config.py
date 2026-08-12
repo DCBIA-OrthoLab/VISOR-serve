@@ -4,9 +4,18 @@ No secrets are hardcoded: API_TOKEN and every other setting come from the
 environment (or a local .env file, see .env.example).
 """
 
+import os
 from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# How a tool run is executed (SADT_DISPATCH_MODE).
+DISPATCH_INPROCESS = "inprocess"
+DISPATCH_SUBPROCESS = "subprocess"
+DISPATCH_MODES = (DISPATCH_INPROCESS, DISPATCH_SUBPROCESS)
 
 
 class Settings(BaseSettings):
@@ -14,6 +23,50 @@ class Settings(BaseSettings):
 
     # Bearer token required on /run/{tool_name}. No default: must be set.
     API_TOKEN: str
+
+    # ------------------------------------------------------------------
+    # Tool execution
+    # ------------------------------------------------------------------
+    # "inprocess" imports every tool into the server and calls run() directly,
+    # which is what the server has always done. "subprocess" runs it in the
+    # tool's own virtualenv through runner.py (see dispatch.py), which is where
+    # this is going: the server then never imports torch, is not pinned to the
+    # lowest common Python across all tools, and releases a tool's VRAM when
+    # its process exits.
+    #
+    # TEMPORARY. It exists so the subprocess path can be proven tool by tool
+    # while the in-process one keeps serving, and is removed once every tool
+    # has moved.
+    SADT_DISPATCH_MODE: str = DISPATCH_INPROCESS
+
+    # Root of the per-tool folders, each holding .venv/ and src/. The tools
+    # currently live inside the server tree; the deployment image puts them at
+    # /tools/<name>/ instead.
+    TOOLS_DIR: str = os.path.join(_SERVER_DIR, "tools")
+
+    # runner.py, injected into the tool's interpreter BY PATH rather than
+    # installed into each venv, so the runner and the server are always the
+    # same version.
+    RUNNER_PATH: str = os.path.join(_SERVER_DIR, "runner.py")
+
+    # Passed to the tool process as SADT_API. Points at this server from inside
+    # the container, which is where a tool process runs; API_TOKEN is
+    # deliberately NOT passed along with it.
+    SADT_API: str = "http://127.0.0.1:8000"
+
+    # Seconds a tool process may run before it is killed. 0 (the default) means
+    # no limit, which is what the in-process path does today -- a full cohort
+    # segmentation legitimately takes hours.
+    TOOL_TIMEOUT_SECONDS: float = 0
+
+    @field_validator("SADT_DISPATCH_MODE")
+    @classmethod
+    def _known_dispatch_mode(cls, value: str) -> str:
+        # Checked at startup: a typo here would otherwise silently fall back to
+        # whichever branch the comparison happened to take.
+        if value not in DISPATCH_MODES:
+            raise ValueError(f"SADT_DISPATCH_MODE must be one of {DISPATCH_MODES}, got {value!r}")
+        return value
 
     # "cuda" on the GPU server, "cpu" for local development. Tools read this
     # to decide where to run.

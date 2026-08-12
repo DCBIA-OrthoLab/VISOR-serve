@@ -32,6 +32,19 @@ def track_scratch_dirs() -> list:
     return created
 
 
+def register_scratch_dir(directory: str) -> str:
+    """Record an already-created directory for the same cleanup; returns it.
+
+    For a caller that has to choose the name itself -- dispatch.py names a job
+    directory after its job id, so a directory left behind by a crash can be
+    matched to a log line.
+    """
+    tracked = _scratch_dirs.get()
+    if tracked is not None:  # None when a tool is called outside a request
+        tracked.append(directory)
+    return directory
+
+
 def make_scratch_dir(prefix: str = "tool_") -> str:
     """Fresh writable scratch dir under settings.TEMP_DIR for one request.
 
@@ -40,11 +53,7 @@ def make_scratch_dir(prefix: str = "tool_") -> str:
     over, whether it succeeded or run() raised.
     """
     os.makedirs(settings.TEMP_DIR, exist_ok=True)
-    scratch_dir = tempfile.mkdtemp(prefix=prefix, dir=settings.TEMP_DIR)
-    tracked = _scratch_dirs.get()
-    if tracked is not None:  # None when a tool is called outside a request
-        tracked.append(scratch_dir)
-    return scratch_dir
+    return register_scratch_dir(tempfile.mkdtemp(prefix=prefix, dir=settings.TEMP_DIR))
 
 
 class BadArchiveError(Exception):

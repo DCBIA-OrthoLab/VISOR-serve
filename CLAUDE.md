@@ -150,12 +150,15 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 │   ├── main.py              # FastAPI app: /run/{tool_name}, /uploads, /results
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError
 │   ├── registry.py          # auto-discovery of Tool subclasses in tools/
+│   ├── dispatch.py          # runs a tool in its own venv, as a subprocess (SADT_DISPATCH_MODE)
+│   ├── runner.py            # the other side of that: stdlib only, executed BY a tool's venv
 │   ├── data_store.py        # DataStore interface + LocalDataStore (server-side models/testfiles)
 │   ├── file_utils.py        # shared helpers: scratch dirs, zip, scan extensions, tabular loading
 │   ├── transfer.py          # chunked resumable uploads, range-served results
 │   ├── security.py          # Bearer token verification
 │   ├── config.py            # config from environment variables
 │   ├── tools/               # one folder per tool: tools/<name>/<name>.py (+ src/, test/)
+│   │   ├── _dispatch_probe/ # test fixture, NOT a tool: underscore = never discovered
 │   │   ├── test_tool/
 │   │   ├── example_tool/
 │   │   ├── SurgMovPred/
@@ -412,6 +415,67 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-12 — A tool can run in its own interpreter (phase 1: the path, no tool on it)
+
+`registry.py` imports every tool INTO the server, which pins the server's
+Python to the lowest common denominator across all of them and makes two
+incompatible pins simply unresolvable — `SurgMovPred` wants `numpy==2.4.0`
+while AREG/MedX/CLIC want `numpy<2.0.0`, and two versions of torch cannot
+coexist in one process at all. Holding torch in the API process also keeps a
+CUDA context alive for the life of the server (VRAM is never fully released
+between jobs) and turns a segfault in a CUDA kernel into a dead API rather than
+a failed job.
+
+`dispatch.py` + `runner.py` are the two halves of the way out:
+
+    <TOOLS_DIR>/<tool>/.venv/bin/python <RUNNER_PATH> --job <job dir>/job.json
+
+with `SADT_API`, `SADT_JOB_ID`, `SADT_JOB_DIR` in the environment. The server
+writes `job.json` (`job_id`, `tool`, `job_dir`, `params`), the runner imports
+the tool from its `src/`, calls `run(**params)` and writes
+`{"result": ...}` to `result.json`. On failure it writes NOTHING and exits
+non-zero — an absent `result.json` is the failure signal, which is why it is
+serialized in full and `os.replace`d into place rather than streamed.
+
+- **Nothing switches over yet.** `SADT_DISPATCH_MODE` defaults to `inprocess`,
+  and the flag is temporary. `Tool.invoke` validates first either way, so a bad
+  request still costs no process; `main.py`, `registry.py` and every tool are
+  untouched.
+- **`runner.py` ships with the SERVER and is injected by path**, never
+  installed into the tool venvs: runner and server are then always the same
+  version and there is no cross-repo skew to negotiate. It is standard-library
+  only and has to run on 3.9 through 3.13, since each tool pins its own
+  interpreter. `tools/_dispatch_probe/` proves exactly that — its venv holds no
+  third-party package at all, not even pip.
+- **The job directory is a tracked scratch dir** (new
+  `file_utils.register_scratch_dir`, for a caller that must name its own), so
+  the request handler already removes it — outputs included — once the response
+  has streamed, and `_discard` takes it on every error path. A failed run is
+  deleted immediately instead of waiting: its inputs are confidential and its
+  outputs are worthless.
+- **stdout/stderr go to files, not pipes.** nnUNet prints for hours and a pipe
+  means holding all of it in the server's memory. Only the last 8 kB of stderr
+  travels with the failure, into the server log — `ToolExecutionError` is
+  deliberately not one of `base.py`'s typed errors, so it falls through to the
+  generic 500 and the client is told only that the run failed, exactly as an
+  in-process crash is today. A missing venv is the opposite case and answers
+  501 through `ToolUnavailableError`.
+- **`API_TOKEN` is stripped from the child environment.** The rest is
+  inherited (PATH, LD_LIBRARY_PATH, CUDA_VISIBLE_DEVICES), but the server's
+  bearer token has no business in a venv full of third-party code.
+- **`cwd` is the job directory**, so a tool writing a relative path lands
+  there rather than in the server's source tree — which is what ALI's original
+  module did, into the extension's own sources.
+
+**The golden fixture comes first.** `tests/golden/tools_response.json` is
+`GET /tools` as the in-process server produces it, captured before a line of
+this was written and asserted per tool, per argument, in order. The Slicer
+client builds its entire UI from that response; the point of the whole
+migration is that it cannot tell the difference. If that test fails, the client
+breaks — the fixture is not what gets updated.
+
+**Tests:** 380 server tests (+25), no GPU, no weights and no network.
 
 ### 2026-08-11 — BatchDentalSeg ported: four models, and a manifest that could not load
 

@@ -4,8 +4,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
-# Virtual environment
+# Virtual environments, the server's own and the per-tool ones
 venv/
+.venv/
 
 # Secrets / local config
 .env

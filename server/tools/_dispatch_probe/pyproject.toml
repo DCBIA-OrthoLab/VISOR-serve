@@ -1,0 +1,9 @@
+# The probe's own environment, declared the way a real tool declares one, so
+# `uv sync` here exercises the same layout the deployment image builds:
+# /tools/<name>/{.venv,src}. It just happens to need nothing at all.
+[project]
+name = "dispatch-probe"
+version = "0.0.0"
+description = "Dispatch-path test fixture: arithmetic, a file, and which interpreter ran it."
+requires-python = ">=3.9"
+dependencies = []

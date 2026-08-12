@@ -218,6 +218,39 @@ its CUDA version, so pip skips it there), but on a machine where they are
 missing the server still starts normally, every other tool works, and only
 AMASSS fails — with a message saying what to install.
 
+## How a tool run is executed (`SADT_DISPATCH_MODE`)
+
+Two paths, one contract. `Tool.invoke` validates the arguments and then either
+calls `run()` or hands the job to another process; the HTTP request blocks for
+the run either way, and the client cannot tell which happened.
+
+| `SADT_DISPATCH_MODE` | what happens |
+|---|---|
+| `inprocess` (default) | `registry.py` imported the tool at startup; `run()` is called in a worker thread |
+| `subprocess` | the server writes a `job.json` and runs the tool in **its own virtualenv** through `runner.py` |
+
+```
+<TOOLS_DIR>/<tool>/.venv/bin/python <RUNNER_PATH> --job <job dir>/job.json
+```
+
+with `SADT_API`, `SADT_JOB_ID` and `SADT_JOB_DIR` in the environment (and
+`API_TOKEN` deliberately removed from it). The runner imports the tool from
+`<TOOLS_DIR>/<tool>/src/`, calls `run(**params)`, and writes
+`{"result": ...}` to `result.json`. On failure it writes **nothing** and exits
+non-zero, with stderr as the error channel — so a missing `result.json` is
+itself the failure signal.
+
+Why: importing every tool into the server pins the server's Python to the
+lowest common denominator across all of them, makes two incompatible pins
+(`numpy==2.4.0` against `numpy<2.0.0`) unresolvable, keeps a CUDA context alive
+for the life of the process, and lets a segfault in a CUDA kernel take the API
+down with the job.
+
+`inprocess` is still the default and nothing has moved over yet; the flag is
+temporary and goes away once every tool has. `tools/_dispatch_probe/` is the
+fixture the path is tested with — a tool that needs no dependency at all, so a
+failure there is a failure of the dispatch machinery and of nothing else.
+
 ## AMASSS: CBCT skull structure segmentation
 
 ```bash
