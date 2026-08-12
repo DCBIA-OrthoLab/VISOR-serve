@@ -268,6 +268,23 @@ class Tool(ABC):
     #                          path; main.py zips them and streams the archive
     output_kind: str = "text"
 
+    # Opt-in: `run()` additionally accepts `emit`, a callable it may use to
+    # report progress and to hand over a finished file WHILE it keeps working.
+    # A client asks for it with `X-Result-Delivery: stream` (see
+    # streaming.py); when it does not, `emit` is never passed and the tool runs
+    # exactly as it always did, returning its result at the end. So a streaming
+    # tool stays usable by an older client, by another server-side tool calling
+    # it in-process, and by curl.
+    #
+    # Why this rather than a job API: the run still answers in ONE request, so
+    # there is no job registry, no polling and no lifecycle to get wrong -- the
+    # response body simply becomes a stream instead of a blob.
+    streaming: bool = False
+
+    # `emit` is injected by invoke(), so a tool cannot also declare an argument
+    # by that name -- it would be silently shadowed. check_schema refuses it.
+    RESERVED_ARGUMENT_NAMES = ("emit",)
+
     def check_schema(self) -> None:
         """Reject an invalid `arguments` declaration. Called by registry.py at
         startup, so a malformed tool fails on boot instead of on the first
@@ -275,6 +292,11 @@ class Tool(ABC):
         """
         for arg_name, spec in self.arguments.items():
             where = f"Tool '{self.name}', argument '{arg_name}'"
+            if arg_name in self.RESERVED_ARGUMENT_NAMES:
+                raise ToolSchemaError(
+                    f"{where}: '{arg_name}' is reserved -- invoke() injects it into run() "
+                    f"for a streaming tool, so an argument of that name would be shadowed."
+                )
             if not spec.types:
                 raise ToolSchemaError(f"{where}: no type declared.")
             for declared in spec.types:
@@ -530,9 +552,16 @@ class Tool(ABC):
             for name in spec.choices
         )
 
-    def invoke(self, args: dict):
-        """Validate args, then run the tool. This is what the server calls."""
+    def invoke(self, args: dict, emit=None):
+        """Validate args, then run the tool. This is what the server calls.
+
+        `emit` is passed on ONLY to a tool that opts in with
+        `streaming = True`; every other tool's `run()` sees exactly the
+        signature it always did.
+        """
         cleaned = self.validate(args)
+        if self.streaming and emit is not None:
+            return self.run(**cleaned, emit=emit)
         return self.run(**cleaned)
 
     @abstractmethod

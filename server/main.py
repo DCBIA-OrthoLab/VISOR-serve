@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 import file_utils
+import streaming
 import transfer
 from base import (
     FILE_TYPES,
@@ -96,6 +97,13 @@ _UPLOADS_FIELD = "__uploads__"
 # gets exactly the response it always got.
 _RESULT_DELIVERY_HEADER = "X-Result-Delivery"
 _DELIVER_BY_REFERENCE = "reference"
+# `stream`: the response body becomes a line-delimited JSON stream of progress
+# events, each finished file announced as a reference the client fetches while
+# the run keeps going (see streaming.py). Honoured only for a tool that opts in
+# with `streaming = True`; anything else falls through to the blocking path, so
+# asking for it is never an error.
+_DELIVER_BY_STREAM = "stream"
+_NDJSON_MEDIA_TYPE = "application/x-ndjson"
 
 # Caps how many tool executions run at once (settings.MAX_CONCURRENT_TOOLS).
 # Dedicated to tool runs, so waiting inference jobs never starve the threadpool
@@ -246,6 +254,19 @@ def _human_bytes(size: int) -> str:
         value /= 1024
 
 
+def _log_streaming(tool_name: str, received: int) -> None:
+    """A streamed run is logged when it STARTS, because its response has no
+    single end this function could be called from -- streaming.py logs the
+    duration and the artifact count when the generator finishes. Same rule as
+    everywhere else: no file name, no argument value, no patient metadata."""
+    logger.info(
+        "endpoint=/run/%s status=200 delivery=stream received=%dB (%s)",
+        tool_name,
+        received,
+        _human_bytes(received),
+    )
+
+
 def _log_served(tool_name: str, start_time: float, received: int, sent: Optional[int]) -> None:
     """One line per successfully served request.
 
@@ -349,6 +370,10 @@ def list_tools() -> list:
                 for arg_name, spec in tool.arguments.items()
             },
             "output_kind": tool.output_kind,
+            # Whether this tool can report as it works, so a client knows
+            # whether asking for `X-Result-Delivery: stream` is worth it
+            # without keeping a list of which tools do.
+            "streaming": tool.streaming,
         }
         for tool in TOOLS.values()
     ]
@@ -786,6 +811,41 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     # Anything the tool creates through file_utils.make_scratch_dir() lands
     # here, so it can be removed even if run() raises before returning a path.
     scratch_dirs = file_utils.track_scratch_dirs()
+
+    # A client asking to be told what is happening, for a tool able to say. The
+    # arguments are validated HERE, before the response starts, because a
+    # streamed body commits its 200 with the first byte and an argument error
+    # has to stay a 422 (see streaming.py).
+    if (
+        request.headers.get(_RESULT_DELIVERY_HEADER, "").lower() == _DELIVER_BY_STREAM
+        and tool.streaming
+    ):
+        try:
+            cleaned = await anyio.to_thread.run_sync(tool.validate, args)
+        except ToolArgumentError as exc:
+            _discard(work_dir, scratch_dirs)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)
+            )
+        # Uploaded inputs stay alive for the whole run here, unlike the
+        # blocking path which removes them as soon as invoke() returns: the
+        # generator below owns every cleanup, because it outlives this function.
+        stream_work_dir = work_dir or tempfile.mkdtemp(dir=settings.TEMP_DIR)
+        _log_streaming(tool_name, size)
+        return StreamingResponse(
+            streaming.stream_run(
+                tool=tool,
+                cleaned_args=cleaned,
+                work_dir=stream_work_dir,
+                cleanup_paths=[stream_work_dir] + list(scratch_dirs),
+                limiter=_get_tool_limiter(),
+                media_type_of=_media_type_of,
+            ),
+            media_type=_NDJSON_MEDIA_TYPE,
+            # Proxies that buffer a response would hold every event until the
+            # run ended, which is precisely what this exists to avoid.
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
 
     try:
         # Run the tool in a worker thread, NOT on the event loop: tool.invoke

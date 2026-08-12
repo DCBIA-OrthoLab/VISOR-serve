@@ -9,6 +9,8 @@ import json
 import os
 import zipfile
 
+import pytest
+
 # Set before importing main, so config.Settings() picks up a known token
 # regardless of whatever is in the developer's local .env.
 os.environ["API_TOKEN"] = "test-token"
@@ -1300,3 +1302,230 @@ def test_log_line_carries_no_file_name_or_argument_value(caplog, tmp_path):
     )
     assert "patient_ident_0042" not in line
     assert "secret_patient_label" not in line
+
+
+# ---------------------------------------------------------------------------
+# Streamed delivery (X-Result-Delivery: stream)
+# ---------------------------------------------------------------------------
+
+def _stream_events(response) -> list:
+    """The NDJSON records of a streamed run, in order."""
+    return [
+        json.loads(line)
+        for line in response.text.splitlines()
+        if line.strip()
+    ]
+
+
+def _install_streaming_probe(monkeypatch, tmp_path, fail_on=()):
+    """A streaming tool that writes one file per item and reports each one."""
+    import base
+    import registry
+
+    class StreamProbeTool(base.Tool):
+        name = "stream_probe_tool"
+        arguments = {"count": base.ArgSpec(type=int, required=True)}
+        output_kind = "files"
+        streaming = True
+
+        def run(self, count: int, emit=None) -> str:
+            output_dir = tmp_path / "out"
+            output_dir.mkdir(exist_ok=True)
+            for index in range(count):
+                name = f"item_{index}"
+                if emit is not None:
+                    emit({"event": "item", "index": index + 1, "total": count,
+                          "name": name, "status": "running"})
+                if index in fail_on:
+                    if emit is not None:
+                        emit({"event": "item", "index": index + 1, "total": count,
+                              "name": name, "status": "failed", "error": "boom"})
+                    continue
+                path = output_dir / f"{name}.txt"
+                path.write_text(f"payload {index}")
+                if emit is not None:
+                    emit({"event": "item", "index": index + 1, "total": count,
+                          "name": name, "status": "ok"})
+                    emit({"event": "artifact", "name": name,
+                          "relative_dir": ".", "path": str(path)})
+            return str(output_dir)
+
+    monkeypatch.setitem(registry.TOOLS, "stream_probe_tool", StreamProbeTool())
+
+
+def test_streamed_run_reports_each_item_then_done(monkeypatch, tmp_path):
+    _install_streaming_probe(monkeypatch, tmp_path)
+    response = client.post(
+        "/run/stream_probe_tool",
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Result-Delivery": "stream"},
+        data={"count": "3"},
+    )
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/x-ndjson")
+
+    events = _stream_events(response)
+    assert events[0]["event"] == "start"
+    assert events[-1]["event"] == "done"
+    finished = [e for e in events if e["event"] == "item" and e["status"] == "ok"]
+    assert [e["name"] for e in finished] == ["item_0", "item_1", "item_2"]
+
+
+def test_each_finished_item_is_fetchable_before_the_run_ends(monkeypatch, tmp_path):
+    """The point of the whole mechanism: a file exists on the client side while
+    the rest of the batch is still running."""
+    _install_streaming_probe(monkeypatch, tmp_path)
+    response = client.post(
+        "/run/stream_probe_tool",
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Result-Delivery": "stream"},
+        data={"count": "2"},
+    )
+    artifacts = [e for e in _stream_events(response) if e["event"] == "artifact"]
+    assert len(artifacts) == 2
+
+    for artifact in artifacts:
+        reference = artifact["result_ref"]
+        # The server-side path must never travel; only a reference does.
+        assert "path" not in artifact
+        fetched = client.get(
+            f"/results/{reference['result_id']}",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        assert fetched.status_code == 200
+        # A single file is passed through as itself; only a DIRECTORY artifact
+        # is zipped (see streaming._package). The client tells them apart from
+        # the reference's filename, the same rule it already uses for a
+        # non-streamed result.
+        assert reference["filename"] == f"{artifact['name']}.txt"
+        assert fetched.content.decode() == f"payload {artifact['name'].rsplit('_', 1)[1]}"
+        client.delete(
+            f"/results/{reference['result_id']}",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+
+def test_a_failed_item_does_not_stop_the_ones_after_it(monkeypatch, tmp_path):
+    """A batch that fails on item 2 of 4 still delivers 1, 3 and 4 -- which is
+    exactly what the single-archive contract could not do."""
+    _install_streaming_probe(monkeypatch, tmp_path, fail_on=(1,))
+    response = client.post(
+        "/run/stream_probe_tool",
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Result-Delivery": "stream"},
+        data={"count": "4"},
+    )
+    events = _stream_events(response)
+    failed = [e for e in events if e["event"] == "item" and e["status"] == "failed"]
+    assert [e["name"] for e in failed] == ["item_1"]
+    delivered = [e["name"] for e in events if e["event"] == "artifact"]
+    assert delivered == ["item_0", "item_2", "item_3"]
+    assert events[-1]["event"] == "done"
+
+
+def test_an_argument_error_is_still_a_422_not_an_in_band_event(monkeypatch, tmp_path):
+    """The status code is committed with the first byte of a streamed body, so
+    everything that can answer 4xx has to happen before the stream starts."""
+    _install_streaming_probe(monkeypatch, tmp_path)
+    response = client.post(
+        "/run/stream_probe_tool",
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Result-Delivery": "stream"},
+        data={"wrong_argument": "1"},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "wrong_argument" in detail
+    # And nothing was streamed: the body is the error, not a run that started.
+    assert "event" not in response.text
+
+
+def test_a_tool_failing_mid_stream_reports_an_error_event(monkeypatch, tmp_path):
+    """Once the 200 is out there is no status left to change, so the failure
+    has to arrive in-band -- and after whatever was already delivered."""
+    import base
+    import registry
+
+    class HalfwayFailingTool(base.Tool):
+        name = "stream_failing_tool"
+        arguments = {}
+        output_kind = "files"
+        streaming = True
+
+        def run(self, emit=None) -> str:
+            path = tmp_path / "half.txt"
+            path.write_text("done before the failure")
+            emit({"event": "item", "name": "half", "status": "ok"})
+            emit({"event": "artifact", "name": "half", "relative_dir": ".",
+                  "path": str(path)})
+            raise RuntimeError("inference exploded")
+
+    monkeypatch.setitem(registry.TOOLS, "stream_failing_tool", HalfwayFailingTool())
+    response = client.post(
+        "/run/stream_failing_tool",
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Result-Delivery": "stream"},
+    )
+    assert response.status_code == 200
+    events = _stream_events(response)
+    assert [e["event"] for e in events if e["event"] in ("artifact", "error")] == [
+        "artifact", "error",
+    ]
+    # A crash inside a tool never names a server-side path or a traceback.
+    assert events[-1]["detail"] == "RuntimeError"
+    assert events[-1]["delivered"] == 1
+
+
+def test_a_non_streaming_tool_ignores_the_header(monkeypatch):
+    """Asking a tool that cannot stream is not an error: it answers exactly
+    what it always did, so a client may send the header unconditionally."""
+    response = client.post(
+        "/run/test_tool",
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Result-Delivery": "stream"},
+        data={"text_1": "a", "text_2": "b"},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"result": "a b"}
+
+
+def test_a_client_that_never_asks_gets_the_single_archive(monkeypatch, tmp_path):
+    """The compatibility guarantee: `streaming = True` changes nothing for a
+    client that does not opt in."""
+    _install_streaming_probe(monkeypatch, tmp_path)
+    response = client.post(
+        "/run/stream_probe_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={"count": "2"},
+    )
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        assert sorted(archive.namelist()) == ["item_0.txt", "item_1.txt"]
+
+
+def test_emit_is_a_reserved_argument_name():
+    """invoke() injects it into run(), so an argument of that name would be
+    silently shadowed. Caught at startup by check_schema, not at call time."""
+    import base
+
+    class ShadowingTool(base.Tool):
+        name = "shadowing_tool"
+        arguments = {"emit": base.ArgSpec(type=str, required=False)}
+        output_kind = "text"
+
+        def run(self, emit=None):
+            return "never"
+
+    with pytest.raises(base.ToolSchemaError, match="reserved"):
+        ShadowingTool().check_schema()
+
+
+def test_emit_reaches_only_a_tool_that_opts_in():
+    """A tool that never declared `streaming` must not suddenly receive a
+    keyword its run() has no parameter for."""
+    import base
+
+    class PlainTool(base.Tool):
+        name = "plain_tool"
+        arguments = {}
+        output_kind = "text"
+
+        def run(self):
+            return "no emit here"
+
+    # Passing emit to a non-streaming tool is a no-op, not a TypeError.
+    assert PlainTool().invoke({}, emit=lambda event: None) == "no emit here"
