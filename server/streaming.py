@@ -160,6 +160,7 @@ async def stream_run(
     started = time.monotonic()
     artifacts = 0
     delivered = 0
+    sent_bytes = 0
     stored_ids = []
 
     # The tool runs on a plain thread rather than inside an anyio task group:
@@ -211,6 +212,7 @@ async def stream_run(
                     continue
                 stored_ids.append(stored.result_id)
                 delivered += 1
+                sent_bytes += stored.size
                 # The server-side path never travels: the client gets a
                 # reference to fetch, not a location on this machine.
                 event = {key: value for key, value in event.items() if key != "path"}
@@ -259,9 +261,16 @@ async def stream_run(
         # notices.
         limiter.release_on_behalf_of(borrower)
         logger.info(
-            "endpoint=/run/%s streamed=%d artifact(s) duration=%.2fs%s",
+            # The byte count is what a slow-looking run is diagnosed with:
+            # a client spends its time in proportion to what it is sent, and
+            # a mesh export is two orders of magnitude bigger than the
+            # segmentation beside it. Without this the server could say how
+            # long IT took and nothing about what it handed over.
+            "endpoint=/run/%s streamed=%d artifact(s) sent=%dB (%s) duration=%.2fs%s",
             tool.name,
             delivered,
+            sent_bytes,
+            f"{sent_bytes / (1024 * 1024):.1f} MB",
             time.monotonic() - started,
             " (client gone)" if cancelled_by_client or outcome.get("cancelled") else "",
         )
