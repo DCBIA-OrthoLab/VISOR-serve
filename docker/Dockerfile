@@ -149,7 +149,12 @@ ENV SADT_DISPATCH_MODE=subprocess \
     RUNNER_PATH=/opt/sadt/runner.py \
     DESCRIBE_PATH=/tools/scripts/describe.py \
     SCHEMA_CACHE_DIR=/var/cache/sadt \
-    DEPLOYMENT_CONFIG=/opt/sadt/deployment.toml \
+    # Next to the server, which is where COPY server/ actually puts it and
+    # what config.py defaults to. Pointed at /opt/sadt/ it named a file that
+    # never existed, so every packaged tool fell back to its own name for
+    # the DATA lookup: `amasss` instead of `AMASSS`, no models, no test
+    # files, and a `model` argument the client could not fill in.
+    DEPLOYMENT_CONFIG=/opt/sadt/server/deployment.toml \
     DATA_DIR=/DATA \
     TEMP_DIR=/jobs \
     PYTHONDONTWRITEBYTECODE=1
