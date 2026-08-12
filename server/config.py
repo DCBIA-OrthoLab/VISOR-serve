@@ -90,6 +90,19 @@ class Settings(BaseSettings):
     # default. Raising it is faster and DOES move the segmentation.
     BATCHDENTALSEG_TILE_STEP_SIZE: float = 0.5
 
+    # Run nnUNet's resamplers on the GPU instead of scipy-on-one-core, the same
+    # swap AMASSS_GPU_RESAMPLING makes and for a starker reason: measured on a
+    # three-scan UniversalLab cohort, the GPU did 40 SECONDS of inference and
+    # nnUNet then spent 8 MINUTES 19 resampling the logits back -- that model
+    # emits 55 classes, so the array being resampled is (55, Z, Y, X) float32.
+    #
+    # NOT numerically free: torch has no 3D cubic interpolation, so the input
+    # resampling drops from spline order 3 to order 1. See the changelog for
+    # the measured Dice on these models. Set to false for bit-identical nnUNet
+    # output. Ignored on CPU, and skipped for a bundle whose plans ask for a
+    # non-default resampler.
+    BATCHDENTALSEG_GPU_RESAMPLING: bool = True
+
     # How many CrownSeg segmentations may touch the GPU at once. One mesh at
     # 320x320 over an icosahedron's viewpoints already fills a typical card.
     CROWNSEG_MAX_GPU_JOBS: int = 1

@@ -950,3 +950,83 @@ def test_the_batch_call_still_hands_nnunet_the_folder(tmp_path, monkeypatch):
     (inputs, outputs), = calls
     assert inputs == str(input_dir)
     assert outputs == str(tmp_path / "out")
+
+
+# ---------------------------------------------------------------------------
+# GPU resampling
+# ---------------------------------------------------------------------------
+
+class _FakeLabelManager:
+    def __init__(self, heads):
+        self.num_segmentation_heads = heads
+
+
+class _FakePredictor:
+    def __init__(self, heads=55):
+        self.label_manager = _FakeLabelManager(heads)
+
+
+def _free_vram(monkeypatch, free_bytes):
+    """Stand in for torch.cuda.mem_get_info without a card."""
+    class _Device:
+        def __init__(self, name):
+            pass
+
+    fake_torch = type("torch", (), {
+        "cuda": type("cuda", (), {"mem_get_info": staticmethod(lambda device: (free_bytes, free_bytes))}),
+        "device": _Device,
+    })
+    monkeypatch.setattr(nnunet_runner, "_import_torch", lambda: fake_torch)
+
+
+def test_gpu_resampling_is_refused_when_it_would_not_fit(tmp_path, monkeypatch):
+    """UniversalLab emits 55 classes, so the resampled array is
+    (55, Z, Y, X) float32 -- around 20 GiB on a 512x512x365 CBCT. On a 16 GB
+    card that is a CUDA OOM minutes into the run; falling back to the slow but
+    correct scipy path is always better than failing."""
+    _free_vram(monkeypatch, 16 * 2**30)
+    monkeypatch.setattr(nnunet_runner, "_largest_scan_voxels", lambda d: 512 * 512 * 365)
+    assert not nnunet_runner._gpu_resampling_fits(_FakePredictor(55), "cuda", str(tmp_path))
+
+
+def test_gpu_resampling_is_accepted_on_the_card_it_was_measured_on(tmp_path, monkeypatch):
+    """47 GiB free, 55 classes, 512x512x365: this is the exact configuration
+    the 5.83x was measured on, so the guard must say yes to it. An estimate
+    that refuses the card the measurement came from is worse than no guard."""
+    _free_vram(monkeypatch, 47 * 2**30)
+    monkeypatch.setattr(nnunet_runner, "_largest_scan_voxels", lambda d: 512 * 512 * 365)
+    assert nnunet_runner._gpu_resampling_fits(_FakePredictor(55), "cuda", str(tmp_path))
+
+
+def test_a_five_class_model_fits_where_the_universal_one_does_not(tmp_path, monkeypatch):
+    """The guard is about CLASSES, not about the card: the same scan on
+    DentalSegmentator needs an eleventh of the memory."""
+    _free_vram(monkeypatch, 16 * 2**30)
+    monkeypatch.setattr(nnunet_runner, "_largest_scan_voxels", lambda d: 512 * 512 * 365)
+    assert nnunet_runner._gpu_resampling_fits(_FakePredictor(5), "cuda", str(tmp_path))
+
+
+def test_the_largest_scan_of_the_batch_is_what_decides(tmp_path):
+    """A cohort is sized by its biggest member: one large scan among small ones
+    would OOM on its own."""
+    input_dir = tmp_path / "in"
+    input_dir.mkdir()
+    _write_scan(str(input_dir / "small_0000.nii.gz"), size=(8, 8, 8))
+    _write_scan(str(input_dir / "big_0000.nii.gz"), size=(24, 24, 24))
+    assert nnunet_runner._largest_scan_voxels(str(input_dir)) == 24 * 24 * 24
+
+
+def test_a_bundle_pinning_its_own_resampler_opts_itself_out(monkeypatch):
+    """We have no idea what a non-default resampler was trained to expect."""
+    class _ConfigurationManager:
+        configuration = {"resampling_fn_data": "something_custom",
+                         "resampling_fn_probabilities": "something_custom"}
+
+    predictor = _FakePredictor()
+    predictor.configuration_manager = _ConfigurationManager()
+    monkeypatch.setattr(nnunet_runner, "_import_torch", lambda: __import__("types"))
+    assert not nnunet_runner._enable_gpu_resampling(predictor, "cuda")
+
+
+def test_gpu_resampling_never_applies_on_cpu():
+    assert not nnunet_runner._enable_gpu_resampling(_FakePredictor(), "cpu")

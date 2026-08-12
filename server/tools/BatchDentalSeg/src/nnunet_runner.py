@@ -35,6 +35,11 @@ CHECKPOINT_NAME = "checkpoint_final.pth"
 # fold_0/, and DentalSegmentator arrives as a zip with its own Dataset<n>/
 # tree inside.
 _REQUIRED_FILES = ("dataset.json", "plans.json")
+
+# What nnUNet's plans name when they ask for the stock (scipy) resampler, and
+# the two configuration keys that select one. See _enable_gpu_resampling.
+_STOCK_RESAMPLER = "resample_data_or_seg_to_shape"
+_RESAMPLING_KEYS = ("resampling_fn_data", "resampling_fn_probabilities")
 # What BatchDentalSegLogic names an input case: one modality, index 0000.
 _CASE_SUFFIX = "_0000.nii.gz"
 _FOLD_DIR = "fold_0"
@@ -141,6 +146,142 @@ def _build_predictor(device: str):
     return nnUNetPredictor(**{key: value for key, value in options.items() if key in accepted})
 
 
+def _largest_scan_voxels(input_dir: str) -> int:
+    """Voxels in the biggest scan of the batch, read from the HEADERS only.
+
+    The resampled array lives on the original scan's grid, so this is what
+    decides whether the GPU resampler fits. Reading headers costs milliseconds;
+    loading the pixels would cost what we are trying to save.
+    """
+    try:
+        import SimpleITK as sitk
+    except ImportError:  # pragma: no cover - SimpleITK is a hard dependency
+        return 0
+
+    largest = 0
+    reader = sitk.ImageFileReader()
+    for name in os.listdir(input_dir):
+        if not name.endswith(_CASE_SUFFIX):
+            continue
+        reader.SetFileName(os.path.join(input_dir, name))
+        try:
+            reader.ReadImageInformation()
+        except Exception:  # noqa: BLE001 - an unreadable scan is reported later, per scan
+            continue
+        voxels = 1
+        for extent in reader.GetSize():
+            voxels *= int(extent)
+        largest = max(largest, voxels)
+    return largest
+
+
+def _gpu_resampling_fits(predictor, device: str, input_dir: str) -> bool:
+    """Whether the torch resampler's biggest allocation fits in free VRAM.
+
+    **This guard is why the port is not a copy of AMASSS's.** The array being
+    resampled is `(classes, Z, Y, X)` float32, so the cost scales with the
+    number of classes -- and UniversalLab emits 55 of them. Measured on a
+    512x512x365 CBCT: nnUNet asked for a single 11.2 GiB allocation, and around
+    20 GiB peak. AMASSS never had to think about this because its models emit
+    two or three classes; here the very model that suffers most from the CPU
+    resampler is also the one that strains the card.
+
+    Without the guard a 16 or 24 GB card would take the whole run down with a
+    CUDA OOM deep inside nnUNet, minutes in. Falling back to the (slow, correct)
+    scipy path is always better than failing.
+    """
+    torch = _import_torch()
+    try:
+        free_bytes, _total = torch.cuda.mem_get_info(torch.device(device))
+    except Exception:  # noqa: BLE001 - an exotic device; assume we cannot tell
+        logger.info("Cannot read free VRAM; keeping the scipy resampler")
+        return False
+
+    classes = int(getattr(predictor.label_manager, "num_segmentation_heads", 0) or 0)
+    voxels = _largest_scan_voxels(input_dir)
+    if classes <= 0 or voxels <= 0:
+        return False
+
+    # Calibrated against the measured run rather than guessed. On a 512x512x365
+    # CBCT with UniversalLab's 55 classes, the output array alone is 19.6 GiB
+    # (torch asked for exactly that) and the model-grid input another 11.2 GiB,
+    # so the real peak is around 31 GiB -- and it ran on a card with 47 GiB
+    # free. A factor of 2 on the output array covers that with slack; 2.5
+    # would have refused the very card the measurement was taken on, which is
+    # the failure mode a guard must not have.
+    needed = int(classes * voxels * 4 * 2)
+    fits = needed < free_bytes
+    logger.info(
+        "BatchDentalSeg GPU resampling: %d class(es) x %.1f Mvox needs ~%.1f GiB, "
+        "%.1f GiB free -> %s",
+        classes, voxels / 1e6, needed / 2**30, free_bytes / 2**30,
+        "on" if fits else "off (falling back to the CPU resampler)",
+    )
+    return fits
+
+
+def _enable_gpu_resampling(predictor, device: str) -> bool:
+    """Point this predictor's resamplers at the GPU. Returns whether it applied.
+
+    Ported from AMASSS, where it was worth 2.5x, and for the same reason: the
+    network is not what makes these runs long. Measured here on a 512x512x365
+    CBCT with UniversalLab, the GPU spends **40 seconds** on three scans and
+    nnUNet then spends **8 minutes 19** resampling the logits back on CPU --
+    scipy splines on one core, over a (55, Z, Y, X) float32 array. nnUNet ships
+    torch equivalents, so there is nothing to reimplement, only to select.
+
+    Selected by NAME: nnUNet resolves both resampling functions out of the
+    configuration dict via `recursive_find_resampling_fn_by_name`, so rewriting
+    the two names redirects both ends. No monkeypatching.
+
+    Mutating that dict is safe because PlansManager hands out a `deepcopy`: it
+    touches neither the shared plans nor a concurrent request, and the
+    `torch.device` put in here never reaches the `plans.json` nnUNet writes
+    beside its output (which `json.dump` could not serialize).
+    """
+    if not device.startswith("cuda"):
+        return False
+
+    try:
+        from nnunetv2.preprocessing.resampling.resample_torch import (  # noqa: F401
+            resample_torch_fornnunet,
+        )
+    except ImportError:
+        logger.info("This nnUNet has no torch resampler; keeping the scipy one")
+        return False
+
+    torch = _import_torch()
+    configuration_manager = predictor.configuration_manager
+    configuration = configuration_manager.configuration
+
+    if any(configuration.get(key) != _STOCK_RESAMPLER for key in _RESAMPLING_KEYS):
+        # A bundle whose plans pin their own resampler opts itself out: we have
+        # no idea what it was trained to expect.
+        logger.info("Model plans request a non-default resampler; leaving it alone")
+        return False
+
+    for key in _RESAMPLING_KEYS:
+        configuration[key] = "resample_torch_fornnunet"
+        # 'linear' is order 1, already what the plans ask for on the
+        # probabilities. The input data drops from order 3 to order 1 (torch
+        # has no 3D cubic interpolation): that is the whole numerical
+        # difference, and settings.BATCHDENTALSEG_GPU_RESAMPLING carries its
+        # measured Dice.
+        configuration[f"{key}_kwargs"] = {
+            "is_seg": False,
+            "device": torch.device(device),
+            "mode": "linear",
+        }
+
+    # Both are `@property @lru_cache`, so a value read before this point would
+    # otherwise outlive the swap.
+    manager_class = type(configuration_manager)
+    for key in _RESAMPLING_KEYS:
+        getattr(manager_class, key).fget.cache_clear()
+
+    return True
+
+
 def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: str,
                    on_case_start=None, on_case_done=None) -> None:
     """Segment every `*_0000.nii.gz` in `input_dir`, writing masks to `output_dir`.
@@ -155,18 +296,17 @@ def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: s
       and can post-process, report and SHIP it while the rest of the batch is
       still running.
 
-    That is the trade: a streamed run gives up nnUNet's cross-scan pipelining
-    to gain per-scan boundaries. It is the caller's choice rather than a
-    setting, because it is a property of the request (did the client ask to be
-    told?) and not of the deployment. Both callbacks take
-    `(case_id, index, total)`; `on_case_done` fires once the mask is on disk,
-    which is what lets the caller post-process and ship that patient while the
-    next one is on the GPU.
+    **What that split costs depends entirely on the path.** On the CPU
+    resampler it is expensive: nnUNet overlaps the export of scan N with the
+    inference of N+1 across worker processes, and splitting the call loses that
+    AND respawns those processes per scan -- measured at +62% wall clock on a
+    three-scan cohort (601s -> 972s). On the GPU path (see
+    _enable_gpu_resampling) it is nearly free, because that path is sequential
+    and in-process to begin with: there is no cross-scan overlap left to lose.
 
-    NOTE: AMASSS additionally redirects nnUNet's resamplers to the GPU
-    (settings.AMASSS_GPU_RESAMPLING), which is worth ~2.5x there. It is
-    deliberately not done here yet: it drops the input resampling from spline
-    order 3 to order 1, and nothing has measured what that costs THESE models.
+    Both callbacks take `(case_id, index, total)`; `on_case_done` fires once
+    the mask is on disk, which is what lets the caller post-process and ship
+    that patient while the next one is still running.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -181,15 +321,37 @@ def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: s
             checkpoint_name=CHECKPOINT_NAME,
         )
 
+        on_gpu = (
+            bool(settings.BATCHDENTALSEG_GPU_RESAMPLING)
+            and device.startswith("cuda")
+            and _gpu_resampling_fits(predictor, device, input_dir)
+            and _enable_gpu_resampling(predictor, device)
+        )
+
+        def predict(inputs, outputs) -> None:
+            """One nnUNet call, on whichever path this run is taking.
+
+            The GPU path must run everything IN THIS PROCESS:
+            `predict_from_files` fans preprocessing and export out to spawned
+            processes, and each would need its own CUDA context to run a GPU
+            resampler.
+            """
+            if on_gpu:
+                predictor.predict_from_files_sequential(
+                    inputs, outputs, save_probabilities=False, overwrite=True
+                )
+            else:
+                predictor.predict_from_files(
+                    inputs,
+                    outputs,
+                    save_probabilities=False,
+                    overwrite=True,
+                    num_processes_preprocessing=2,
+                    num_processes_segmentation_export=2,
+                )
+
         if on_case_start is None and on_case_done is None:
-            predictor.predict_from_files(
-                input_dir,
-                output_dir,
-                save_probabilities=False,
-                overwrite=True,
-                num_processes_preprocessing=2,
-                num_processes_segmentation_export=2,
-            )
+            predict(input_dir, output_dir)
             return
 
         cases = sorted(
@@ -209,14 +371,7 @@ def predict_folder(model_folder: str, input_dir: str, output_dir: str, device: s
             # here writes "case_0000.nii.gz.nii.gz" and the caller finds
             # nothing where it looked. The folder form above hides this,
             # because nnUNet builds the names itself from the case ids.
-            predictor.predict_from_files(
-                [[os.path.join(input_dir, name)]],
-                [os.path.join(output_dir, case_id)],
-                save_probabilities=False,
-                overwrite=True,
-                num_processes_preprocessing=2,
-                num_processes_segmentation_export=2,
-            )
+            predict([[os.path.join(input_dir, name)]], [os.path.join(output_dir, case_id)])
             if on_case_done is not None:
                 # The caller post-processes and ships this patient HERE, while
                 # the loop moves on to the next one.
