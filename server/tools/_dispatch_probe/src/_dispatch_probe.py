@@ -30,9 +30,11 @@ def run(a, b, out_name="probe.txt", fail=False, tags=None):
         handle.write(str(total))
 
     return {
+        # The canonical return: outputs named, so a caller -- and the parity
+        # harness -- finds the file without guessing which string is a path.
+        "outputs": {"probe": output_path},
         "total": total,
         "tags": list(tags or []),
-        "output_path": output_path,
         # The proof: the server compares this against its own sys.executable.
         "executable": sys.executable,
         "cwd": os.getcwd(),

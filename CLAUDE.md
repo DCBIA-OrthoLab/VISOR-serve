@@ -135,6 +135,7 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 .
 ├── CLAUDE.md
 ├── ADDING_A_TOOL.md         # the full contract for writing a tool
+├── MIGRATING_A_TOOL.md      # moving one tool out of the server, and proving it
 ├── docker-compose.yml       # inference (GPU) + inference-cpu + inference-venvs + test services
 ├── docker/                  # the deployment image: one container, N tool virtualenvs
 │   ├── Dockerfile           #   /opt/sadt (API, no torch) + /tools/<name>/.venv
@@ -155,6 +156,7 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 │   ├── main.py              # FastAPI app: /run/{tool_name}, /uploads, /results
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError
 │   ├── registry.py          # discovery: .schema.json tools, and Tool subclasses in tools/
+│   ├── parity.py            # run a tool both ways and compare what a caller receives
 │   ├── dispatch.py          # runs a tool in its own venv, as a subprocess (SADT_DISPATCH_MODE)
 │   ├── runner.py            # the other side of that: stdlib only, executed BY a tool's venv
 │   ├── schema_tool.py       # a tool built from its .schema.json, never imported
@@ -424,6 +426,50 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-12 — The gate phase 4 has to pass through: running a tool both ways
+
+Phase 4 deletes `server/tools/`, and every deletion there is one line and no
+way back. What licenses it is not that the subprocess path *works* — phases 1
+to 3 showed that — but that a given tool produces the same thing on both
+sides. `server/parity.py` runs one tool in both forms and compares **what a
+caller receives**:
+
+- every file produced, keyed by name and hashed. Absolute paths are never
+  compared: one run wrote into a job directory, the other into a scratch
+  directory, and neither name means anything to a client;
+- the returned value, with each path replaced by the artifact it names, so
+  `{"outputs": {"mandible": "/jobs/ab12/output/x.nii.gz"}}` and
+  `/tmp/inference_server/tool_9f/x.nii.gz` compare equal;
+- minus the keys that differ between two runs of the *same* code — duration,
+  timestamp, job id.
+
+**It does not claim a difference is a defect.** The packaged tool runs against
+its own pinned dependencies; a different numpy moves voxels and a newer
+SimpleITK writes a different header. It makes the difference visible, per
+file, so it is read rather than discovered by a clinician. Exit code 1 on any
+difference, and the report says which file and which side.
+
+Tested in both directions on `_dispatch_probe`, which now exists in both forms
+— packaged with its own venv, and an in-process twin in the test: agreement is
+reported as agreement, a twin returning a different total is caught, and a twin
+writing a *different file with the same answer* is caught. That last one is
+the failure a smoke test misses.
+
+`file_utils.output_paths` (moved out of `main.py`) is now what both the
+response builder and the harness use to find what a run produced, so "what
+counts as an output" is written once.
+
+**`MIGRATING_A_TOOL.md`**: the loop, per tool — package, translate the schema,
+move `server_selectable` to `deployment.toml`, build, prove, flip — plus what
+the translation *costs*, measured against the current registry. `test_tool`,
+`SurgMovPred` and `BatchDentalSeg` are nearly free; `ASO` loses 3 choices, 4
+multichoices and **7 `visible_when`** rules, whose whole job is hiding the
+inert half of its four modes, so it should go last. Rolling a tool back is
+deleting its `.schema.json`, which is why the in-process copies stay until the
+very end.
+
+**Tests:** 434 server tests (+7).
 
 ### 2026-08-12 — One image, N virtualenvs, and the server imports none of them (phase 3)
 

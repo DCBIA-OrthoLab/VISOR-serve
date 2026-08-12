@@ -1325,19 +1325,19 @@ def test_named_outputs_are_the_canonical_return_and_paths_still_work(tmp_path):
     first.write_bytes(b"one")
     second.write_bytes(b"two")
 
-    assert main._output_paths(str(first)) == [str(first)]
-    assert main._output_paths([str(first), str(second)]) == [str(first), str(second)]
-    assert main._output_paths({"mandible": str(first)}) == [str(first)]
-    assert main._output_paths({"outputs": {"mandible": str(first), "maxilla": str(second)}}) == [
+    assert file_utils.output_paths(str(first)) == [str(first)]
+    assert file_utils.output_paths([str(first), str(second)]) == [str(first), str(second)]
+    assert file_utils.output_paths({"mandible": str(first)}) == [str(first)]
+    assert file_utils.output_paths({"outputs": {"mandible": str(first), "maxilla": str(second)}}) == [
         str(first),
         str(second),
     ]
 
 
 def test_a_result_that_is_not_path_shaped_is_still_refused():
-    assert main._output_paths({"count": 3}) == []
-    assert main._output_paths({"outputs": {}}) == []
-    assert main._output_paths(42) == []
+    assert file_utils.output_paths({"count": 3}) == []
+    assert file_utils.output_paths({"outputs": {}}) == []
+    assert file_utils.output_paths(42) == []
 
 
 def test_a_single_file_tool_returning_several_paths_is_a_failure(monkeypatch, tmp_path):

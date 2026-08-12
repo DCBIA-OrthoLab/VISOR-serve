@@ -220,32 +220,6 @@ def _temp_root_of(path: str) -> Optional[str]:
     return os.path.join(temp_dir, relative.split(os.sep)[0])
 
 
-def _output_paths(result) -> list:
-    """Normalize what run() returned into a list of output paths. Empty when
-    the returned value isn't path-shaped at all.
-
-    A path, or a list of them, is the canonical form and what every tool here
-    returns. A MAPPING of name -> path is accepted too -- with or without the
-    `{"outputs": {...}}` wrapper -- because that is the shape a tool packaged
-    against the job/result contract may return. The names are not carried into
-    the response: what goes back is one file or one archive, and a tool that
-    needs its outputs named writes a report next to them (AMASSS does).
-    """
-    if isinstance(result, (str, os.PathLike)):
-        return [str(result)]
-    if isinstance(result, (list, tuple)):
-        return [str(path) for path in result]
-    if isinstance(result, dict):
-        outputs = result.get("outputs", result)
-        if (
-            isinstance(outputs, dict)
-            and outputs
-            and all(isinstance(path, (str, os.PathLike)) for path in outputs.values())
-        ):
-            return [str(path) for path in outputs.values()]
-    return []
-
-
 def _discard(work_dir: Optional[str], scratch_dirs: list) -> None:
     """Remove everything this request created, right now. Used on the error
     paths, where no response will ever stream and background tasks won't run."""
@@ -876,7 +850,7 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         # `scratch_dirs` covers file_utils.make_scratch_dir(); _output_roots
         # also catches a tool that wrote under TEMP_DIR by hand.
         try:
-            outputs = _output_paths(result)
+            outputs = file_utils.output_paths(result)
             if not outputs:
                 raise ValueError(
                     f"Tool '{tool.name}' declares output_kind={tool.output_kind!r} but "
@@ -909,7 +883,10 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                 )
         except Exception:
             logger.exception("endpoint=/run/%s status=500 (packing output)", tool_name)
-            _discard(work_dir, _output_roots(_output_paths(result), work_dir) | set(scratch_dirs))
+            _discard(
+                work_dir,
+                _output_roots(file_utils.output_paths(result), work_dir) | set(scratch_dirs),
+            )
             raise HTTPException(status_code=500, detail="Tool execution failed.")
 
         media_type = _media_type_of(str(result))
