@@ -217,12 +217,33 @@ def _build_registry() -> dict:
 
     schema_tools = len(registry)
 
+    packaged = {name.casefold(): name for name in registry}
+
     legacy_root = tools_package.__path__[0] if tools_package is not None else ""
     for folder, cls in _discover_tool_classes(legacy_root):
         try:
             instance = _instantiate(folder, cls, registry)
         except Exception as exc:
             _record_failure(folder, exc)
+            continue
+        # The packaged tool wins over the one this server still imports, and
+        # the comparison is case-insensitive because that is the only thing
+        # separating them: a tool is named after its folder, and packaging it
+        # lowercased the name -- `AMASSS` became `amasss`.
+        #
+        # Without this both are served, they differ by nothing a person reads,
+        # and the imported one fails on any deployment that does not carry the
+        # whole inference stack in the SERVER's environment -- which is the
+        # situation packaging exists to end. The failure is a 500 several
+        # frames deep in the tool ("missing: nnunetv2"), and nothing tells the
+        # caller they picked the superseded one.
+        superseded = packaged.get(instance.name.casefold())
+        if superseded is not None:
+            logger.info(
+                "Not serving imported tool '%s': superseded by the packaged '%s'. "
+                "Delete server/tools/%s once that one is merged.",
+                instance.name, superseded, instance.name,
+            )
             continue
         registry[instance.name] = instance
 
