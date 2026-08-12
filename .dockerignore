@@ -1,0 +1,26 @@
+# The build context is the repository root, and almost none of it belongs in
+# the image.
+
+.git
+.githooks
+**/__pycache__
+**/*.pyc
+
+# Virtualenvs are build artifacts: the image makes its own, and a host venv
+# points at interpreters that do not exist inside it.
+**/venv
+**/.venv
+
+# Confidential data and models. DATA/ is a read-only MOUNT at runtime, never
+# a layer -- an image is copied around, a mount is not.
+DATA
+
+# The tools that still run in-process. This image serves tools from /tools,
+# and importing these would need the very stack the API venv is built without.
+server/tools
+
+# Not the server's business.
+server/tests
+docker/fixtures
+scripts
+*.md

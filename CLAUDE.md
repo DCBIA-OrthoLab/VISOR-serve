@@ -135,7 +135,12 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 .
 ├── CLAUDE.md
 ├── ADDING_A_TOOL.md         # the full contract for writing a tool
-├── docker-compose.yml       # inference (GPU) + inference-cpu (profile "cpu") + test services
+├── docker-compose.yml       # inference (GPU) + inference-cpu + inference-venvs + test services
+├── docker/                  # the deployment image: one container, N tool virtualenvs
+│   ├── Dockerfile           #   /opt/sadt (API, no torch) + /tools/<name>/.venv
+│   ├── verify_dedup.py      #   are the venvs hardlinked, or silently copied?
+│   ├── fixtures/            #   three tools with incompatible pins, no GPU needed
+│   └── README.md
 ├── .env.example             # the three variables compose interpolates
 ├── .githooks/pre-push       # runs `docker compose run --rm test` before a push
 ├── scripts/                 # stand the server up, and populate DATA/
@@ -419,6 +424,69 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-12 — One image, N virtualenvs, and the server imports none of them (phase 3)
+
+`docker/Dockerfile`: `/opt/sadt/{.venv,server,runner.py}` for the API on the
+newest Python, `/tools/<name>/{.venv,.schema.json,src}` for the tools, `/DATA`
+read-only, `/jobs` ephemeral. A tool is a **virtualenv, not a service** —
+fifteen images would mean fifteen copies of the same CUDA stack, fifteen things
+to schedule, and a network hop between a tool and the file it was just handed.
+
+**Measured, in the built image:** `numpy_old` runs numpy 1.26.4 on Python
+3.12.13 and `numpy_new` runs numpy 2.5.2 on Python 3.13.15, both answering over
+HTTP from one container, while `import numpy` in the API venv is a
+`ModuleNotFoundError`. That is the entire point of the migration, demonstrated
+rather than described.
+
+- **The uv cache is transport, never `UV_CACHE_DIR`.** uv installs by
+  hardlinking out of its cache; `link()` fails with `EXDEV` across filesystems
+  and uv falls back to copying, silently. A BuildKit cache mount *is* a
+  separate filesystem, so pointing `UV_CACHE_DIR` at one breaks exactly what
+  the mount was added to help. It is copied in, synced against, copied back
+  and pruned inside one `RUN`.
+- **Every `uv sync` in ONE layer**, because overlayfs copies a file up when a
+  later layer touches it, and a cache deleted in a later layer frees nothing.
+- **`docker/verify_dedup.py`, and it had to be written twice.** The naive
+  check — same path, different inode — reported 114 failures on a correct
+  image: numpy 1.26 and 2.5 share a few dozen byte-identical test fixtures
+  that come from *different wheels*, which uv could not share if it wanted to.
+  It compares files of the same distribution **at the same version**, from
+  each venv's `RECORD`, minus what an installer writes rather than unpacks
+  (console scripts embed their own venv's interpreter path). Verified in both
+  directions: 0 failures on the real image, 925 duplicated files and 54.4 MB
+  wasted on the same image built with `UV_LINK_MODE=copy` — 610 MB against
+  686 MB, on nothing heavier than numpy.
+- **Manifests are extracted in a stage of their own.** `COPY` cannot glob a
+  directory structure, and that stage's *output* is content-addressed:
+  unchanged lock files mean an identical digest, so editing a tool's source
+  leaves `uv sync` CACHED. Confirmed by rebuilding after a source edit.
+- **The tools arrive through a named build context** (`--build-context
+  tools=<dir>`), because they genuinely live in another repository. A named
+  context overrides the stage of the same name, so omitting it builds a server
+  with no tools rather than failing.
+- **An old pin drags an old interpreter behind it.** numpy 1.26 ships no wheel
+  for 3.13, so the first build tried to compile it from source and failed. uv
+  installs Python 3.12 into the image for that tool alone — one base image
+  still, because `nvidia-*` wheels are `py3-none-manylinux` and deduplicate
+  across Python versions anyway.
+- **`registry.py` no longer requires the `tools/` package to exist**, which is
+  what lets the image ship without the in-process tools — and is the shape
+  phase 4 leaves behind.
+- **`file_utils` imports pandas lazily now.** It was the one module-level
+  heavy import in the server core, and `main.py` imports `file_utils`: the API
+  venv could not have been slim while it stayed. `load_tabular_*` are tool
+  helpers.
+- **The container does not run as root.** Third-party code from fifteen
+  upstreams runs in it, on confidential imaging.
+
+`server/requirements-api.txt` is the API's whole dependency list — fastapi,
+uvicorn, python-multipart, pydantic-settings — and a test asserts it stays that
+way, because an API that quietly regrows numpy is pinned to what the tools can
+agree on all over again.
+
+**Tests:** 427 server tests (+4). The image itself is verified by building it,
+which the suite does not do.
 
 ### 2026-08-12 — A tool can be declared without being imported (phase 2)
 

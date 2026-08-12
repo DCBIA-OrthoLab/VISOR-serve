@@ -32,7 +32,16 @@ import logging
 import os
 import traceback
 
-import tools as tools_package
+try:
+    import tools as tools_package
+except ModuleNotFoundError:
+    # There is no tools/ package at all, which is not a failure: the
+    # deployment image ships the server WITHOUT the in-process tools (its
+    # virtualenv holds fastapi and nothing heavier), and serves everything
+    # from TOOLS_DIR instead. This is also what the end state looks like once
+    # every tool has been repackaged.
+    tools_package = None
+
 from base import Tool
 from config import settings
 from deployment import deployment_config
@@ -117,8 +126,11 @@ def _discover_tool_classes(root: str) -> list:
 
     The folder name is carried along so a failure further down -- during
     instantiation or schema validation -- can still name the tool it came from.
+    Empty when the image ships no in-process tools at all.
     """
     discovered = []
+    if tools_package is None:
+        return discovered
 
     for entry in _tool_folders(root):
         folder_path = os.path.join(root, entry)
@@ -205,7 +217,8 @@ def _build_registry() -> dict:
 
     schema_tools = len(registry)
 
-    for folder, cls in _discover_tool_classes(tools_package.__path__[0]):
+    legacy_root = tools_package.__path__[0] if tools_package is not None else ""
+    for folder, cls in _discover_tool_classes(legacy_root):
         try:
             instance = _instantiate(folder, cls, registry)
         except Exception as exc:

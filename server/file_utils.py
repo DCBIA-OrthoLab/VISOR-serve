@@ -11,9 +11,14 @@ import os
 import tempfile
 import zipfile
 
-import pandas as pd
-
 from config import settings
+
+# NOTE: pandas is imported INSIDE load_tabular_file/load_tabular_directory, not
+# here. Those two are tool helpers -- only a tool that reads tabular data calls
+# them -- while this module is imported by main.py on every start. At module
+# level, pandas would be a hard dependency of the API process itself, which is
+# meant to carry fastapi and nothing heavier (see docker/Dockerfile: the server
+# venv holds no pandas, no numpy and no torch).
 
 
 # Scratch dirs handed out during the request being served, so main.py can
@@ -224,8 +229,10 @@ def compressed_extension(extension: str) -> str:
     return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)
 
 
-def load_tabular_file(file_path: str) -> pd.DataFrame:
-    """Load a single CSV, XLSX, or ODS file into a DataFrame."""
+def load_tabular_file(file_path: str):
+    """Load a single CSV, XLSX, or ODS file into a pandas DataFrame."""
+    import pandas as pd
+
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".csv":
         return pd.read_csv(file_path)
@@ -236,8 +243,10 @@ def load_tabular_file(file_path: str) -> pd.DataFrame:
     raise ValueError(f"Unsupported file extension '{ext}' for tabular file: {file_path}")
 
 
-def load_tabular_directory(directory_path: str) -> pd.DataFrame:
+def load_tabular_directory(directory_path: str):
     """Load and concatenate every CSV/XLSX/ODS file found directly in a directory."""
+    import pandas as pd
+
     extensions = ["*.csv", "*.xlsx", "*.ods"]
     all_files = []
     for ext in extensions:

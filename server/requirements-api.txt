@@ -1,0 +1,15 @@
+# What the API PROCESS needs, and nothing else. This is the whole point of the
+# migration: the server validates requests, moves files and starts processes,
+# so it carries fastapi and stays on the newest Python, while every heavy
+# dependency lives in a tool's own virtualenv one exec() away.
+#
+# Adding anything here that a TOOL needs -- numpy, pandas, torch, SimpleITK --
+# undoes that: the API is pinned to whatever those packages agree on again.
+# There is a test on this file (tests/test_api_requirements.py).
+#
+# The in-process image keeps using requirements.txt, which still carries the
+# whole stack, until every tool has moved (see CLAUDE.md, phase 4).
+fastapi
+uvicorn[standard]
+python-multipart
+pydantic-settings
