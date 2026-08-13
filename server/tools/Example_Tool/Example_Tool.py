@@ -33,7 +33,7 @@ from base import ArgSpec, Tool, ToolArgumentError
 
 
 class ExampleTool(Tool):
-    name = "example_tool"
+    name = "Example_Tool"
     arguments = {
         "label": ArgSpec(type=str, required=True, description="Free-text label for this run"),
         "input": ArgSpec(

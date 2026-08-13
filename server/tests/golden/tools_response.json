@@ -1344,51 +1344,7 @@
     "output_kind": "files"
   },
   {
-    "name": "SurgMovPred",
-    "arguments": {
-      "input": {
-        "type": "zip_file",
-        "types": [
-          "zip_file"
-        ],
-        "required": true,
-        "description": "Input data: a zip archive of a folder containing CSV / XLSX / ODS files; a server-side test file may also be a single such file",
-        "server_selectable": "testfile",
-        "choices": null,
-        "initial": null,
-        "extensions": {
-          "zip_file": [
-            ".zip"
-          ]
-        },
-        "label": null,
-        "section": null,
-        "visible_when": null,
-        "ui": null,
-        "groups": null
-      },
-      "model": {
-        "type": "str",
-        "types": [
-          "str"
-        ],
-        "required": true,
-        "description": "Name of a model hosted on the server (see GET /tools/SurgMovPred/data); a folder (or zip archive) containing one or more stacking_package.pkl files",
-        "server_selectable": "model",
-        "choices": null,
-        "initial": null,
-        "extensions": null,
-        "label": null,
-        "section": null,
-        "visible_when": null,
-        "ui": null,
-        "groups": null
-      }
-    },
-    "output_kind": "file"
-  },
-  {
-    "name": "example_tool",
+    "name": "Example_Tool",
     "arguments": {
       "label": {
         "type": "str",
@@ -1511,7 +1467,51 @@
     "output_kind": "files"
   },
   {
-    "name": "test_tool",
+    "name": "SurgMovPred",
+    "arguments": {
+      "input": {
+        "type": "zip_file",
+        "types": [
+          "zip_file"
+        ],
+        "required": true,
+        "description": "Input data: a zip archive of a folder containing CSV / XLSX / ODS files; a server-side test file may also be a single such file",
+        "server_selectable": "testfile",
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "zip_file": [
+            ".zip"
+          ]
+        },
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      },
+      "model": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "Name of a model hosted on the server (see GET /tools/SurgMovPred/data); a folder (or zip archive) containing one or more stacking_package.pkl files",
+        "server_selectable": "model",
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "file"
+  },
+  {
+    "name": "Test_Tool",
     "arguments": {
       "text_1": {
         "type": "str",

@@ -149,7 +149,7 @@ def one_megabyte_limit(monkeypatch):
     monkeypatch.setattr(
         main,
         "deployment_config",
-        DeploymentConfig({"example_tool": ToolDeployment(max_upload_mb=1)}),
+        DeploymentConfig({"Example_Tool": ToolDeployment(max_upload_mb=1)}),
     )
 
 
@@ -157,7 +157,7 @@ def test_a_multipart_upload_over_the_tool_limit_is_413(one_megabyte_limit):
     payload = b"col\n" + b"1\n" * (1024 * 1024)
 
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers=AUTH,
         data={"label": "x"},
         files={"input": ("big.csv", io.BytesIO(payload), "text/csv")},
@@ -185,7 +185,7 @@ def test_a_chunked_upload_over_the_tool_limit_is_413_before_it_is_claimed(one_me
         )
 
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers=AUTH,
         data={"label": "x", "__uploads__": json.dumps({"input": session["upload_id"]})},
     )
@@ -197,7 +197,7 @@ def test_a_chunked_upload_over_the_tool_limit_is_413_before_it_is_claimed(one_me
 
 def test_under_the_limit_still_runs(one_megabyte_limit):
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers=AUTH,
         data={"label": "x", "threshold": "0.5"},
         files={"input": ("small.csv", io.BytesIO(b"col\n1\n2\n"), "text/csv")},
@@ -207,4 +207,4 @@ def test_under_the_limit_still_runs(one_megabyte_limit):
 
 
 def test_the_global_limit_applies_when_no_tool_declares_one():
-    assert deployment.deployment_config.upload_limit_mb("example_tool") == settings.MAX_UPLOAD_MB
+    assert deployment.deployment_config.upload_limit_mb("Example_Tool") == settings.MAX_UPLOAD_MB

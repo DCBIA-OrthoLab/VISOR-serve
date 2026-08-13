@@ -5,7 +5,7 @@ so run() can always trust its inputs.
 # TODO to add a new tool: create a folder tools/<name>/ with an __init__.py
 # (can be empty) and a tools/<name>/<name>.py file (must match the folder
 # name) subclassing Tool; set `name` and `arguments`, implement `run`.
-# Nothing else needs to change -- see tools/test_tool/ for a minimal example
+# Nothing else needs to change -- see tools/Test_Tool/ for a minimal example
 # and registry.py for how it gets picked up automatically.
 """
 

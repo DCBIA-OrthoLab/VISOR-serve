@@ -67,7 +67,7 @@ def test_a_broken_import_does_not_stop_the_other_tools(caplog):
     assert "zz_broken_probe" in registry.FAILED_TOOLS
     assert "ModuleNotFoundError" in registry.FAILED_TOOLS["zz_broken_probe"]
     # The healthy tools are all still registered.
-    assert {"test_tool", "example_tool"} <= set(rebuilt)
+    assert {"Test_Tool", "Example_Tool"} <= set(rebuilt)
     # And the failure is impossible to miss in the console.
     assert "TOOL FAILED TO LOAD" in caplog.text
     assert "zz_broken_probe" in caplog.text
@@ -80,7 +80,7 @@ def test_a_tool_raising_at_import_is_skipped():
         rebuilt = registry._build_registry()
 
     assert "model weights not found" in registry.FAILED_TOOLS["zz_raising_probe"]
-    assert "test_tool" in rebuilt
+    assert "Test_Tool" in rebuilt
 
 
 def test_an_invalid_schema_is_skipped_not_fatal():
@@ -100,7 +100,7 @@ def test_an_invalid_schema_is_skipped_not_fatal():
 
     assert "ToolSchemaError" in registry.FAILED_TOOLS["zz_bad_schema_probe"]
     assert "zz_bad_schema_probe" not in rebuilt
-    assert "test_tool" in rebuilt
+    assert "Test_Tool" in rebuilt
 
 
 def test_a_folder_without_its_module_is_skipped_not_fatal():
@@ -108,7 +108,7 @@ def test_a_folder_without_its_module_is_skipped_not_fatal():
         rebuilt = registry._build_registry()
 
     assert "is missing its" in registry.FAILED_TOOLS["zz_no_module_probe"]
-    assert "test_tool" in rebuilt
+    assert "Test_Tool" in rebuilt
 
 
 def test_get_tool_distinguishes_a_failed_tool_from_an_unknown_one():
