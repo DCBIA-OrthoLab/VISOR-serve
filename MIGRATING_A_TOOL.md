@@ -71,16 +71,16 @@ What that costs, tool by tool, measured on the current registry:
 
 | tool | args | what it loses without more work |
 |---|---|---|
-| `test_tool` | 2 | nothing |
+| `Test_Tool` | 2 | nothing |
 | `SurgMovPred` | 2 | nothing beyond `extensions` |
-| `example_tool` | 6 | 1 choice, 1 multichoice |
+| `Example_Tool` | 6 | 1 choice, 1 multichoice |
 | `CrownSeg` | 6 | 1 choice |
 | `BatchDentalSeg` | 4 | 4 labels, 4 sections |
 | `AMASSS` | 8 | 2 multichoices (structures, merge) |
 | `ALI` | 6 | 3 multichoices, 3 tabbed layouts, 6 labels, 6 sections |
 | `ASO` | 12 | 3 choices, 4 multichoices, **7 `visible_when`**, 4 layouts, 12 labels |
 
-Read that column as an order of migration, not as a blocker: `test_tool`,
+Read that column as an order of migration, not as a blocker: `Test_Tool`,
 `SurgMovPred` and `BatchDentalSeg` are nearly free, and `ASO` — whose four
 modes only make sense with `visible_when` hiding the inert half — should be
 last, and probably wants the schema to grow before it goes.

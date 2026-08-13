@@ -326,7 +326,7 @@ def run(self, input: str) -> list:
   extracts it first.
 - Only file types can be combined — a scalar type must stand alone.
 
-`tools/example_tool/` is a working example of this.
+`tools/Example_Tool/` is a working example of this.
 
 ### Presentation hints — laying the client's panel out
 
