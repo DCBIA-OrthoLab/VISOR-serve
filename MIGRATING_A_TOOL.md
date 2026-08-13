@@ -102,8 +102,10 @@ Three things a packaged tool declares but a caller never sends:
   its own default (`cuda`) on a CPU server.
 - **the GPU slot** — the per-tool semaphores are gone with the tools that held
   them, so the server serialises card work through `MAX_CONCURRENT_GPU_JOBS`,
-  one counter across all tools. A tool that declares no `device` never queues
-  for it.
+  one counter across all tools. **Every run is assumed to want the card**; the
+  only way out is a `device` argument resolving to a CPU value. A tool that
+  imports torch without declaring `device` would otherwise never queue at all,
+  and two of them would meet on the same device.
 
 ### 3. Move the server-side bits to `deployment.toml`
 
