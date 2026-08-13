@@ -102,6 +102,27 @@ def _tool_folders(root: str) -> list:
     ]
 
 
+def _is_leftover(folder: str) -> bool:
+    """Is this directory the remains of a tool git could not delete?
+
+    Renaming tools/example_tool/ to tools/Example_Tool/ leaves the old path
+    behind on every checkout where the server or the tests have run: git
+    removes the tracked files but cannot remove a directory that still holds an
+    untracked __pycache__/. The result is a folder with no source in it at all,
+    which discovery would otherwise report as a tool that FAILED TO LOAD -- in
+    a full-width banner, at every startup, on a deployment where all the tools
+    are in fact fine and `git status` is clean.
+
+    A folder with Python in it but not its <name>.py is the opposite case and
+    keeps failing loudly: that one is a real tool, misnamed.
+    """
+    try:
+        return not any(entry.endswith(".py") for entry in os.listdir(folder))
+    except OSError:
+        # Unreadable is not empty. Let discovery reach it and report why.
+        return False
+
+
 def _discover_schema_tools(root: str) -> list:
     """(folder name, SchemaTool) for every folder under `root` declaring one.
 
@@ -136,6 +157,8 @@ def _discover_tool_classes(root: str) -> list:
         folder_path = os.path.join(root, entry)
         # A tool that declares a schema is served from it and never imported.
         if is_packaged(folder_path):
+            continue
+        if _is_leftover(folder_path):
             continue
 
         try:

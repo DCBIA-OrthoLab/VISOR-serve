@@ -111,6 +111,27 @@ def test_a_folder_without_its_module_is_skipped_not_fatal():
     assert "Test_Tool" in rebuilt
 
 
+def test_a_folder_git_could_not_delete_is_not_a_tool_that_failed():
+    """The exact state a rename leaves on an existing checkout.
+
+    tools/example_tool/ became tools/Example_Tool/, and git removed the tracked
+    files but not the directory, because pytest had left a __pycache__/ inside
+    it. Reported as a failure, that is a startup banner claiming two tools are
+    unavailable on a deployment where every tool loaded -- and a red suite for
+    anyone who pulls, which the pre-push hook turns into a blocked push.
+    """
+    path = os.path.join(TOOLS_DIR, "zz_leftover_probe")
+    os.makedirs(os.path.join(path, "__pycache__"))
+    try:
+        open(os.path.join(path, "__pycache__", "example_tool.cpython-310.pyc"), "w").close()
+        rebuilt = registry._build_registry()
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+
+    assert "zz_leftover_probe" not in registry.FAILED_TOOLS
+    assert "Test_Tool" in rebuilt
+
+
 def test_get_tool_distinguishes_a_failed_tool_from_an_unknown_one():
     """"Unknown tool" on something that exists in the source tree reads like a
     typo and sends the client developer looking in the wrong place."""
