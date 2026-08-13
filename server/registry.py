@@ -170,6 +170,15 @@ def _instantiate(folder: str, cls, registry: dict):
     return instance
 
 
+def _comparable(name: str) -> str:
+    """One tool's name reduced to what does not vary between spellings.
+
+    `Batch_Dental_Seg` and `BatchDentalSeg` are the same tool written two ways,
+    so neither case nor separators may decide whether they collide.
+    """
+    return "".join(character for character in name.casefold() if character.isalnum())
+
+
 def _reject_duplicate(name: str, registry: dict) -> None:
     if name in registry:
         raise RuntimeError(f"Duplicate tool name detected: '{name}'")
@@ -217,33 +226,28 @@ def _build_registry() -> dict:
 
     schema_tools = len(registry)
 
-    packaged = {name.casefold(): name for name in registry}
+    packaged = {_comparable(name): name for name in registry}
 
     legacy_root = tools_package.__path__[0] if tools_package is not None else ""
     for folder, cls in _discover_tool_classes(legacy_root):
-        try:
-            instance = _instantiate(folder, cls, registry)
-        except Exception as exc:
-            _record_failure(folder, exc)
-            continue
-        # The packaged tool wins over the one this server still imports, and
-        # the comparison is case-insensitive because that is the only thing
-        # separating them: a tool is named after its folder, and packaging it
-        # lowercased the name -- `AMASSS` became `amasss`.
-        #
-        # Without this both are served, they differ by nothing a person reads,
-        # and the imported one fails on any deployment that does not carry the
-        # whole inference stack in the SERVER's environment -- which is the
-        # situation packaging exists to end. The failure is a 500 several
-        # frames deep in the tool ("missing: nnunetv2"), and nothing tells the
-        # caller they picked the superseded one.
-        superseded = packaged.get(instance.name.casefold())
+        # Checked BEFORE instantiating, and that ordering is the point. When the
+        # two names are identical -- which is what the naming convention makes
+        # normal, `AMASSS` on both sides -- _instantiate's duplicate check fires
+        # first and the tool is reported as FAILED TO LOAD, in a banner, at
+        # every startup. It has not failed: it has been replaced.
+        superseded = packaged.get(_comparable(getattr(cls, "name", "") or ""))
         if superseded is not None:
             logger.info(
                 "Not serving imported tool '%s': superseded by the packaged '%s'. "
                 "Delete server/tools/%s once that one is merged.",
-                instance.name, superseded, instance.name,
+                getattr(cls, "name", cls.__name__), superseded, os.path.basename(folder),
             )
+            continue
+
+        try:
+            instance = _instantiate(folder, cls, registry)
+        except Exception as exc:
+            _record_failure(folder, exc)
             continue
         registry[instance.name] = instance
 
