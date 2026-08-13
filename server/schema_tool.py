@@ -287,10 +287,16 @@ def _argument_spec(
             f"as {declared_type!r} rather than 'path'."
         )
 
+    # A deployment decision, not the tool's: which arguments a client renders.
+    # The spec still exists and the tool still applies its own default -- this
+    # only says nobody is asked. See ArgSpec.hidden.
+    hidden = argument_name in deployment.hidden
+
     choices = declaration.get("choices")
     if choices:
         narrowed = _choice_spec(where, declared_type, declaration, choices)
         if narrowed is not None:
+            narrowed.hidden = hidden
             return narrowed
 
     accepts = declaration.get("extensions")
@@ -313,6 +319,7 @@ def _argument_spec(
         # path, where there is a file picker to pre-fill and nothing to put in
         # it; a schema declaring one is not an error.
         initial=None if declared_type == "path" else declaration.get("default"),
+        hidden=hidden,
     )
 
 

@@ -201,6 +201,17 @@ class ArgSpec:
     # validation, which still has to hold for a direct API call.
     visible_when: Optional[dict] = None
 
+    # Not rendered by a client, at all. The value is still the tool's own
+    # default, and the spec still exists here -- dispatch.uses_the_gpu() reads
+    # `device` to decide whether a run takes the card, so removing it from the
+    # schema would silently make every tool look CPU-only.
+    #
+    # For arguments a clinician has no business seeing: which device to run on,
+    # nnUNet's tile step size, whether to resample on the GPU. They change the
+    # result, they are recorded in the run report, and they are set by whoever
+    # deploys the server -- not by the person segmenting a patient.
+    hidden: bool = False
+
     # How a "multichoice" argument's check boxes are laid out (see UI_LAYOUTS).
     ui: Optional[str] = None
 

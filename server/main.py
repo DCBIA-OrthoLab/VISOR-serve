@@ -361,6 +361,10 @@ def list_tools() -> list:
                     "label": spec.label,
                     "section": spec.section,
                     "visible_when": spec.visible_when,
+                    # True: do not render this at all. Still published, because
+                    # a client that hides it must still know it exists rather
+                    # than treat it as an argument the server invented.
+                    "hidden": spec.hidden,
                     "ui": spec.ui,
                     # Listed explicitly so the wire shape does not depend on
                     # whether a tool spelled its catalog as a tuple or a list.

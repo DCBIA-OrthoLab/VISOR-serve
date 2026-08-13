@@ -386,6 +386,10 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         "label": None,
         "section": None,
         "visible_when": None,
+        # False unless deployment.toml names it: an argument a client must not
+        # render at all (a CUDA device, a tile step size). The tool still
+        # declares it and still applies its own default.
+        "hidden": False,
         "ui": None,
         "groups": None,
     }
