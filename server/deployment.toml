@@ -20,7 +20,12 @@
 
 [tools.AMASSS]
 server_selectable = { model = "model", scans = "testfile" }
-hidden = ["device", "tile_step_size", "gpu_resampling", "surface_decimation"]
+hidden = [
+    "device", "tile_step_size", "gpu_resampling",
+    # Surface tuning: iterations and a triangle-reduction percentage. Same
+    # family as the two above -- a deployment choice, not a clinical one.
+    "surface_decimation", "surface_smoothing",
+]
 
 [tools.Batch_Dental_Seg]
 data_dir = "BatchDentalSeg"

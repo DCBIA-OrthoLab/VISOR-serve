@@ -299,6 +299,26 @@ def _argument_spec(
             narrowed.hidden = hidden
             return narrowed
 
+    # A model is chosen from what the server hosts, never uploaded: the weights
+    # do not travel, in either direction. What travels is a NAME, so the
+    # argument is published as a scalar and main.py resolves it to a local path
+    # before run() is called -- which is what the tool's `Path` annotation then
+    # receives, unchanged.
+    #
+    # Published as a path instead, it becomes a file argument: the client gives
+    # every file argument an input row with a local picker (see
+    # formgen.file_input_modes -- "which arguments those are is the schema's
+    # answer, not a module's"), and a clinician is offered to upload a model
+    # bundle from their laptop.
+    if selectable == "model" and declared_type == "path":
+        return ArgSpec(
+            type=str,
+            required=required,
+            description=declaration.get("description", ""),
+            server_selectable=selectable,
+            hidden=hidden,
+        )
+
     accepts = declaration.get("extensions")
     if accepts is not None and declared_type != "path":
         raise SchemaError(
