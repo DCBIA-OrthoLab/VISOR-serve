@@ -4,7 +4,10 @@
     /tools/<name>/.venv/bin/python /opt/sadt/runner.py --job /jobs/<id>/job.json
 
 Read the job file, import the tool, call its run(), write result.json. That is
-the whole job.
+the whole job -- plus one thing: a tool declaring `*, sup` is handed a
+**supervisor**, and can call another tool through it. That call re-enters this
+same file with the sibling's interpreter, so chaining and nesting are one
+recursion rather than a feature.
 
 Three constraints shape this file, and all three are load-bearing:
 
@@ -31,9 +34,12 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import json
 import logging
 import os
+import shutil
+import subprocess
 import sys
 import traceback
 import typing
@@ -46,6 +52,17 @@ SRC_DIR_NAME = "src"
 TOOL_DIR_ENV = "SADT_TOOL_DIR"
 
 RESULT_FILE = "result.json"
+JOB_FILE = "job.json"
+
+# The supervisor: how a tool calls ANOTHER tool. Keyword-only and unannotated,
+# which is what `describe.py` reads to keep it out of the published schema -- a
+# client never sends one, because it is not data.
+SUPERVISOR_ARGUMENT = "sup"
+
+# Guards a tool that names itself, directly or through a cycle. Four is past
+# anything real: the deepest chain today is AREG -> ASO -> ALI.
+SUPERVISOR_DEPTH_ENV = "SADT_SUPERVISOR_DEPTH"
+MAX_SUPERVISOR_DEPTH = 4
 
 # The tool's package under src/, when there is exactly one. sadt-tools names it
 # `sadt_<tool>`, but the rule is the one its own describe.py uses -- the single
@@ -173,9 +190,17 @@ def _coerce(value, annotation):
     (`testkit/src/sadt_testkit/_driver.py`): every tool's integration tests run
     against that one, so a difference here is a suite that passes while
     production fails.
+
+    An empty string is ABSENCE and stays a string. `Path("")` is
+    `PosixPath(".")` -- the current directory, and truthy -- so coercing the
+    "not supplied" default of an optional path hands the tool a real directory
+    to walk. `ASO` read an unset `landmarks=""` as a supplied landmark folder
+    and walked its whole checkout. Calling `run()` directly in Python keeps the
+    `""` the signature declares, so coercing it is also what makes the two call
+    paths disagree.
     """
     if annotation is Path:
-        return Path(value)
+        return Path(value) if value != "" else value
     if typing.get_origin(annotation) is list and typing.get_args(annotation) == (Path,):
         return [Path(item) for item in value]
     return value
@@ -251,6 +276,174 @@ def _configure_logging() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# The supervisor
+# ---------------------------------------------------------------------------
+
+def _takes_supervisor(run) -> bool:
+    """Does this run() ask for a supervisor?
+
+    The same rule `describe.py` uses to keep it out of the schema: a parameter
+    named `sup`, keyword-only, and UNANNOTATED. Unannotated is the marker rather
+    than an accident -- every other parameter must be annotated, so there is
+    nothing else this shape could be, and a tool cannot grow a supervisor by
+    forgetting a type.
+    """
+    try:
+        parameter = inspect.signature(run).parameters.get(SUPERVISOR_ARGUMENT)
+        hints = typing.get_type_hints(run)
+    except Exception:  # noqa: BLE001 - an unresolvable annotation is not fatal
+        return False
+    return (
+        parameter is not None
+        and parameter.kind is parameter.KEYWORD_ONLY
+        and SUPERVISOR_ARGUMENT not in hints
+    )
+
+
+class _Supervisor:
+    """What a tool receives as `sup`: five members, duck-typed, nothing shared.
+
+    A tool never imports this class. It cannot -- the tool's venv holds none of
+    the server -- and that is the point: the same object shape is produced by
+    `sadt-tools`' `scripts/run_tool.py` and faked in its tests, and a tool
+    cannot tell the three apart.
+
+    `run()` re-enters THIS file with the sibling's interpreter, so the callee
+    gets its own venv, its own dependency set and its own supervisor. Nesting
+    (`AREG -> ASO -> ALI`) is that same recursion and needs no special case.
+
+    **It does not go back through the server.** A nested call is a subprocess of
+    the parent, so it never queues for a slot the parent is already holding --
+    which is exactly the deadlock the in-process version had, where four
+    concurrent ASO runs each waited on a fifth slot. The cost is that nested
+    work is invisible to MAX_GPU_JOBS: a supervised chain can put two tools on
+    the card at once. Chains are serial today (ASO waits for ALI before it
+    registers), so the peak is one tool at a time per chain, but a deployment
+    running several supervised jobs concurrently has to size for that.
+    """
+
+    def __init__(self, tools_dir: str, job_dir: str, depth: int):
+        self._tools_dir = tools_dir
+        self._job_dir = job_dir
+        self._depth = depth
+        self._calls = 0
+        self.out = Path(job_dir) / "output"
+        # Removed with the job directory, by whoever owns it. The tool is held
+        # to writing only under `output/`, so its scratch sits beside it rather
+        # than inside what the caller keeps.
+        self.tmp = Path(job_dir) / "tmp"
+        self.tmp.mkdir(parents=True, exist_ok=True)
+
+    # -- the frozen interface ----------------------------------------------
+
+    def run(self, tool: str, **params):
+        """Run another tool, blocking, and return what its run() returned."""
+        if self._depth >= MAX_SUPERVISOR_DEPTH:
+            raise RunnerError(
+                f"Supervised calls nested more than {MAX_SUPERVISOR_DEPTH} deep "
+                f"(asking for '{tool}'). A tool is calling itself, directly or "
+                f"through a cycle."
+            )
+
+        interpreter = self._interpreter(tool)
+        self._calls += 1
+        nested_dir = os.path.join(self._job_dir, "sup", f"{self._calls:02d}_{tool}")
+        os.makedirs(os.path.join(nested_dir, "output"), exist_ok=True)
+
+        job_path = os.path.join(nested_dir, JOB_FILE)
+        with open(job_path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "job_id": f"{os.path.basename(self._job_dir)}.{self._calls}",
+                    "tool": tool,
+                    "job_dir": nested_dir,
+                    "params": params,
+                },
+                handle,
+                default=_jsonable,
+            )
+
+        self.log(f"running '{tool}'")
+        environment = dict(os.environ)
+        environment[SUPERVISOR_DEPTH_ENV] = str(self._depth + 1)
+        # SADT_TOOL_DIR points at the PARENT's folder; the callee derives its
+        # own from its interpreter, and inheriting ours would send it to the
+        # wrong sources.
+        environment.pop(TOOL_DIR_ENV, None)
+
+        completed = subprocess.run(
+            [interpreter, os.path.abspath(__file__), "--job", job_path],
+            # Not captured: a nested tool's log is the only sign of life during
+            # an hour-long run, and it is already on stderr where the server
+            # collects it. Its result never travels on stdout anyway.
+            cwd=nested_dir,
+            env=environment,
+        )
+        if completed.returncode != 0:
+            raise RunnerError(
+                f"Supervised tool '{tool}' failed (exit {completed.returncode}). "
+                f"Its error is above, and in {os.path.join(nested_dir, RESULT_FILE)}."
+            )
+        return self._result(tool, nested_dir)
+
+    def progress(self, fraction: float, message: str) -> None:
+        try:
+            self.log(f"{float(fraction):.0%} {message}")
+        except (TypeError, ValueError):
+            self.log(str(message))
+
+    def log(self, message: str) -> None:
+        # Through logging, not print: the runner owns handlers and the server
+        # reads stderr. The depth prefix is what makes a nested chain readable.
+        logging.getLogger("sadt.supervisor").info("%s%s", "  " * self._depth, message)
+
+    # -- internals ----------------------------------------------------------
+
+    def _interpreter(self, tool: str) -> str:
+        for relative in (os.path.join("bin", "python"), os.path.join("Scripts", "python.exe")):
+            candidate = os.path.join(self._tools_dir, tool, ".venv", relative)
+            if os.path.isfile(candidate):
+                return candidate
+        raise RunnerError(
+            f"Supervised tool '{tool}' has no virtualenv under "
+            f"{os.path.join(self._tools_dir, tool)}. It is not deployed here."
+        )
+
+    def _result(self, tool: str, nested_dir: str):
+        path = os.path.join(nested_dir, RESULT_FILE)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, ValueError) as exc:
+            raise RunnerError(f"Supervised tool '{tool}' wrote no readable result: {exc}")
+        if "error" in payload:
+            error = payload["error"]
+            raise RunnerError(
+                f"Supervised tool '{tool}' failed: "
+                f"{error.get('type', 'Error')}: {error.get('message', '')}"
+            )
+        value = payload.get("result")
+        if isinstance(value, str):
+            return Path(value)
+        if isinstance(value, dict):
+            return {key: Path(item) for key, item in value.items()}
+        return value
+
+
+def _supervisor_for(run, job: dict):
+    """A supervisor for this job, or None when the tool does not ask for one."""
+    if not _takes_supervisor(run):
+        return None
+    tools_dir = os.path.dirname(_tool_dir())
+    depth = 0
+    try:
+        depth = int(os.environ.get(SUPERVISOR_DEPTH_ENV, "0"))
+    except ValueError:
+        pass
+    return _Supervisor(tools_dir=tools_dir, job_dir=job["job_dir"], depth=depth)
+
+
 def _load_job(job_path: str) -> dict:
     try:
         with open(job_path, encoding="utf-8") as handle:
@@ -280,7 +473,13 @@ def main(argv=None) -> int:
         job = _load_job(arguments.job)
         module = _import_tool(job["tool"], os.path.join(_tool_dir(), SRC_DIR_NAME))
         run = _run_function(module, job["tool"])
-        result = run(**_call_arguments(run, job["params"]))
+        arguments = _call_arguments(run, job["params"])
+        supervisor = _supervisor_for(run, job)
+        if supervisor is not None:
+            # Injected, never taken from job.json: it is not data, and a client
+            # that could name one would be naming a process to start.
+            arguments[SUPERVISOR_ARGUMENT] = supervisor
+        result = run(**arguments)
         _write_result(job["job_dir"], result)
     except RunnerError as exc:
         # Ours, and already precise: the traceback would only point back here.

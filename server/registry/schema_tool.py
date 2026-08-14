@@ -119,7 +119,12 @@ _ARGUMENT_KEYS = ("type", "required", "default", "description", "extensions", "c
 # and a file picker for one is the single fastest way to make every run a 422.
 OUTPUT_DIR_ARGUMENT = "output_dir"
 
-_TOP_LEVEL_KEYS = ("name", "description", "arguments", "returns", "source_hash")
+# `supervisor` is a flag, not an argument: the tool calls another tool and the
+# runner injects the object that lets it. Read here only so it is not reported
+# as unknown, and so a deployment can be told which tools need siblings present.
+_TOP_LEVEL_KEYS = (
+    "name", "description", "arguments", "returns", "source_hash", "supervisor",
+)
 
 
 class SchemaError(Exception):
@@ -423,6 +428,10 @@ class SchemaTool(Tool):
         # the server would send something meaningless, and offered nothing
         # would make every run a 422 for a missing required argument.
         self.wants_output_dir = OUTPUT_DIR_ARGUMENT in arguments
+        # The runner builds one when it sees `*, sup` in the signature; this is
+        # the same fact, published, so `/tools` can say a chain is involved and
+        # a deployment check can verify the siblings are actually installed.
+        self.needs_supervisor = bool(schema.get("supervisor"))
         self.arguments = {
             argument_name: _argument_spec(name, argument_name, declaration, deployment)
             for argument_name, declaration in arguments.items()

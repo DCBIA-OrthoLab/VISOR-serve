@@ -38,6 +38,46 @@ interpreter, so it cannot drift from the code.
 | `output_dir: Path` | — | filled in by the server |
 | `*, sup` | — | the supervisor, never published |
 
+## Calling another tool
+
+Declare `*, sup` — keyword-only and **unannotated** — and the runner hands you a
+supervisor. Being unannotated is the marker: every other parameter must be
+annotated, so nothing else has that shape, and a tool cannot grow one by
+forgetting a type.
+
+```python
+def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+    landmarks = sup.run("ALI", input=scans, model=bundle, output_dir=sup.tmp / "ali")
+```
+
+Five members, nothing more: `sup.run(tool, **params)` (blocking, returns what
+that tool's `run()` returned), `sup.out`, `sup.tmp`, `sup.progress(fraction,
+message)`, `sup.log(message)`.
+
+- **Never import a supervisor type.** It is duck-typed on purpose: a tool
+  importing one would need a package shared with this repository, which is what
+  the split removes. The same shape is produced by `sadt-tools`'
+  `scripts/run_tool.py` and faked in its tests.
+- `sup.run("ALI", ...)`, never `sup.ALI(...)`. A typo in a string is greppable;
+  a typo in an attribute is an `AttributeError` an hour into a job.
+- **Give the caller a way in.** Accept the dependency's output as an ordinary
+  argument too (`landmarks: Path = ""`) and skip the call when it is supplied.
+  That is what keeps the tool usable with no supervisor at all — `uv run`, a
+  notebook, a deployment that has not installed the sibling.
+- Default it to `None`. A tool that cannot run without one should say so itself,
+  with a message naming the way forward.
+
+Reach for it only when the ordering forbids plain chaining. Where one tool's
+output is simply another's input, the caller runs both and passes a folder;
+`ASO` needs `ALI` **mid-run**, after it has recentred the scans, which is why it
+takes a supervisor and `ALI` does not.
+
+Nested calls each get their own job directory under `<job>/sup/NN_<tool>/`, and
+are capped at four deep. A nested run is a subprocess of its parent, so it never
+queues behind the slot its parent already holds — but it is invisible to
+`MAX_GPU_JOBS`, so a deployment running several supervised jobs at once has to
+size for more than one tool on the card.
+
 Types are limited to `path`, `str`, `int`, `float`, `bool`, `list[str]`.
 
 ## The conventions, so nothing needs configuring
