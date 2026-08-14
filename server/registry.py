@@ -17,14 +17,16 @@ discovery, though the recognized file is free to import from them.
 Dropping a `.schema.json` into a folder is what moves a tool from the second
 to the first: a folder that has one is never imported.
 
-**Two failure policies, and the difference is deliberate.** A tool that will
-not LOAD -- missing dependency, syntax error, bad schema -- is SKIPPED, not
-fatal: with 15+ tools, one unavailable model must not block all the others.
-The failure is reported as loudly as possible (see _record_failure), kept in
-FAILED_TOOLS, and surfaced again by get_tool(). A tool whose schema no longer
-matches its source is the opposite case and REFUSES TO START the server: it
-would otherwise keep serving, validating requests against a signature that has
-changed under it.
+**A tool that will not load is SKIPPED, never fatal** -- missing dependency,
+syntax error, a schema that cannot be generated. With 15+ tools, one
+unavailable model must not block all the others. The failure is reported as
+loudly as possible (see _record_failure), kept in FAILED_TOOLS, and surfaced
+again by get_tool().
+
+A schema whose `source_hash` no longer matches the source beside it is not a
+failure at all: it is a stale cache, and it is regenerated (see
+schema_tool.resolve_schema). Only a tool that can neither be read nor
+described is skipped.
 """
 
 import importlib
@@ -45,7 +47,7 @@ except ModuleNotFoundError:
 from base import Tool
 from config import settings
 from deployment import deployment_config
-from schema_tool import SchemaTool, SourceHashMismatch, has_schema, load_tool
+from schema_tool import SchemaTool, is_packaged, load_tool
 
 # This module runs at import time, BEFORE main.py reaches its own
 # logging.basicConfig call: without this one, the INFO summary below would be
@@ -100,6 +102,27 @@ def _tool_folders(root: str) -> list:
     ]
 
 
+def _is_leftover(folder: str) -> bool:
+    """Is this directory the remains of a tool git could not delete?
+
+    Renaming tools/example_tool/ to tools/Example_Tool/ leaves the old path
+    behind on every checkout where the server or the tests have run: git
+    removes the tracked files but cannot remove a directory that still holds an
+    untracked __pycache__/. The result is a folder with no source in it at all,
+    which discovery would otherwise report as a tool that FAILED TO LOAD -- in
+    a full-width banner, at every startup, on a deployment where all the tools
+    are in fact fine and `git status` is clean.
+
+    A folder with Python in it but not its <name>.py is the opposite case and
+    keeps failing loudly: that one is a real tool, misnamed.
+    """
+    try:
+        return not any(entry.endswith(".py") for entry in os.listdir(folder))
+    except OSError:
+        # Unreadable is not empty. Let discovery reach it and report why.
+        return False
+
+
 def _discover_schema_tools(root: str) -> list:
     """(folder name, SchemaTool) for every folder under `root` declaring one.
 
@@ -110,12 +133,10 @@ def _discover_schema_tools(root: str) -> list:
     discovered = []
     for entry in _tool_folders(root):
         folder = os.path.join(root, entry)
-        if not has_schema(folder):
+        if not is_packaged(folder):
             continue
         try:
             discovered.append((entry, load_tool(folder, deployment_config)))
-        except SourceHashMismatch:
-            raise
         except Exception as exc:
             _record_failure(entry, exc)
     return discovered
@@ -135,7 +156,9 @@ def _discover_tool_classes(root: str) -> list:
     for entry in _tool_folders(root):
         folder_path = os.path.join(root, entry)
         # A tool that declares a schema is served from it and never imported.
-        if has_schema(folder_path):
+        if is_packaged(folder_path):
+            continue
+        if _is_leftover(folder_path):
             continue
 
         try:
@@ -168,6 +191,15 @@ def _instantiate(folder: str, cls, registry: dict):
     # than on the first request that happens to reach that tool.
     instance.check_schema()
     return instance
+
+
+def _comparable(name: str) -> str:
+    """One tool's name reduced to what does not vary between spellings.
+
+    `Batch_Dental_Seg` and `BatchDentalSeg` are the same tool written two ways,
+    so neither case nor separators may decide whether they collide.
+    """
+    return "".join(character for character in name.casefold() if character.isalnum())
 
 
 def _reject_duplicate(name: str, registry: dict) -> None:
@@ -217,8 +249,24 @@ def _build_registry() -> dict:
 
     schema_tools = len(registry)
 
+    packaged = {_comparable(name): name for name in registry}
+
     legacy_root = tools_package.__path__[0] if tools_package is not None else ""
     for folder, cls in _discover_tool_classes(legacy_root):
+        # Checked BEFORE instantiating, and that ordering is the point. When the
+        # two names are identical -- which is what the naming convention makes
+        # normal, `AMASSS` on both sides -- _instantiate's duplicate check fires
+        # first and the tool is reported as FAILED TO LOAD, in a banner, at
+        # every startup. It has not failed: it has been replaced.
+        superseded = packaged.get(_comparable(getattr(cls, "name", "") or ""))
+        if superseded is not None:
+            logger.info(
+                "Not serving imported tool '%s': superseded by the packaged '%s'. "
+                "Delete server/tools/%s once that one is merged.",
+                getattr(cls, "name", cls.__name__), superseded, os.path.basename(folder),
+            )
+            continue
+
         try:
             instance = _instantiate(folder, cls, registry)
         except Exception as exc:
@@ -250,30 +298,7 @@ def _build_registry() -> dict:
     return registry
 
 
-def _refuse_to_start(exc: SourceHashMismatch) -> None:
-    """A stale schema is the one discovery failure that must not be survivable.
-
-    Logged before it is re-raised, because what follows is a traceback out of
-    an import and the reason has to be readable above it.
-    """
-    logger.error(
-        "\n%s\n"
-        "  THE SERVER WILL NOT START\n"
-        "  %s\n\n"
-        "  A schema that no longer matches its source means every request for that tool is\n"
-        "  validated against a signature that has changed under it.\n"
-        "%s",
-        _BANNER,
-        exc,
-        _BANNER,
-    )
-
-
-try:
-    TOOLS: dict = _build_registry()
-except SourceHashMismatch as exc:
-    _refuse_to_start(exc)
-    raise
+TOOLS: dict = _build_registry()
 
 
 def get_tool(name: str):

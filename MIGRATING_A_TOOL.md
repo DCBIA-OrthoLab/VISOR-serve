@@ -61,8 +61,8 @@ panel shows today has to be declared differently or is lost:
 | `str` / `int` / `float` / `bool` | same | unchanged |
 | `"csv_file"`, `"volume_or_zip_file"`, … | `"path"` + `"extensions": [...]` | declare `extensions` or the file dialog offers everything |
 | `"folder"` | `"path"` | the client still zips it, the server still unpacks it |
-| `"multichoice"` | `"list[str]"` | **check boxes become a free-text list**: the catalog of options is gone |
-| `"choice"` | `"str"` | **the combo box becomes a text field** |
+| `"multichoice"` | `list[Literal[...]]` | check boxes, kept: the generator publishes the options as `choices` |
+| `"choice"` | `Literal[...]` | a combo box, kept, same way |
 | `label`, `section`, `ui`, `groups`, `visible_when` | — | not expressible: the panel falls back to one flat column |
 | `server_selectable` | `deployment.toml` | see step 3 |
 | `initial` | `"default"` | unchanged |
@@ -71,16 +71,16 @@ What that costs, tool by tool, measured on the current registry:
 
 | tool | args | what it loses without more work |
 |---|---|---|
-| `test_tool` | 2 | nothing |
+| `Test_Tool` | 2 | nothing |
 | `SurgMovPred` | 2 | nothing beyond `extensions` |
-| `example_tool` | 6 | 1 choice, 1 multichoice |
+| `Example_Tool` | 6 | 1 choice, 1 multichoice |
 | `CrownSeg` | 6 | 1 choice |
 | `BatchDentalSeg` | 4 | 4 labels, 4 sections |
 | `AMASSS` | 8 | 2 multichoices (structures, merge) |
 | `ALI` | 6 | 3 multichoices, 3 tabbed layouts, 6 labels, 6 sections |
 | `ASO` | 12 | 3 choices, 4 multichoices, **7 `visible_when`**, 4 layouts, 12 labels |
 
-Read that column as an order of migration, not as a blocker: `test_tool`,
+Read that column as an order of migration, not as a blocker: `Test_Tool`,
 `SurgMovPred` and `BatchDentalSeg` are nearly free, and `ASO` — whose four
 modes only make sense with `visible_when` hiding the inert half — should be
 last, and probably wants the schema to grow before it goes.
@@ -90,6 +90,21 @@ last, and probably wants the schema to grow before it goes.
 > even though every test passes. If a tool needs `groups`/`ui`/`visible_when`,
 > say so before porting it rather than after.
 
+### 2b. What the server fills in, so the tool must not
+
+Three things a packaged tool declares but a caller never sends:
+
+- **`output_dir`** — every tool takes it as a required `Path` and writes only
+  there. It is removed from the published schema and filled in with the job's
+  own `output/`.
+- **`device`** — injected from `settings.DEVICE` when the caller picks none,
+  because a tool that no longer reads the environment would otherwise run on
+  its own default (`cuda`) on a CPU server.
+- **the GPU slot** — the per-tool semaphores are gone with the tools that held
+  them, so the server serialises card work through `MAX_CONCURRENT_GPU_JOBS`,
+  one counter across all tools. A tool that declares no `device` never queues
+  for it.
+
 ### 3. Move the server-side bits to `deployment.toml`
 
 Which arguments may be filled from *this* server's `DATA_DIR` is not a property
@@ -97,8 +112,10 @@ of the tool, so it does not travel with it:
 
 ```toml
 [tools.amasss]
-server_selectable = { model = "model", input = "testfile" }
+server_selectable = { model = "model", scans = "testfile" }
 max_upload_mb = 2000
+# The packaged tools are lowercase; the bundles staged under DATA/ are not.
+data_dir = "AMASSS"
 ```
 
 Checked at startup: an argument the tool does not declare, or one that is not

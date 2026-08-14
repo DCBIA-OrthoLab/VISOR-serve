@@ -64,7 +64,7 @@ curl -k https://localhost:8000/health
 curl -k https://localhost:8000/tools
 
 # Run the test tool
-curl -k -X POST https://localhost:8000/run/test_tool \
+curl -k -X POST https://localhost:8000/run/Test_Tool \
   -H "Authorization: Bearer change-me-to-a-long-random-secret" \
   -F "text_1=hello" \
   -F "text_2=world"
@@ -182,8 +182,8 @@ including what `run()` receives (`base.Selection`).
    For a file argument, pick a type from `base.FILE_TYPES` (or add a new one).
 3. That's it — `registry.py` auto-discovers it at startup, `/tools` lists it,
    and `/run/<your_tool>` becomes available immediately. No route to add, no
-   registration list to update. See `tools/test_tool/` for a minimal example,
-   or `tools/example_tool/` for one with a file argument.
+   registration list to update. See `tools/Test_Tool/` for a minimal example,
+   or `tools/Example_Tool/` for one with a file argument.
 
 If your tool needs to unzip an upload, zip its results, and/or load
 CSV/XLSX/ODS files, reuse the shared helpers in `file_utils.py`

@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7-labs
 #
 # One image, one container, N virtualenvs.
 #
@@ -15,10 +15,11 @@
 # Build:
 #     docker buildx build -f docker/Dockerfile --build-context tools=<dir> -t sadt .
 #
-# where <dir> holds one folder per tool, each with pyproject.toml, uv.lock,
-# .schema.json and src/ -- what the sadt-tools repository produces. Without
-# that context the image builds with no tools at all, which is a valid (if
-# empty) server: the `tools` stage below is what gets overridden.
+# where <dir> is the sadt-tools repository: `tools/<name>/` with pyproject.toml,
+# uv.lock and src/, and `scripts/describe.py`, which is what turns a tool's
+# run() signature into the schema this server publishes. Without that context
+# the image builds with no tools at all, which is a valid (if empty) server:
+# the `tools` stage below is what gets overridden.
 
 # ----------------------------------------------------------------------
 # The tools, from another repository
@@ -37,7 +38,7 @@ FROM scratch AS tools
 # or uv.lock changed, the layer digest is identical and the expensive `uv sync`
 # below stays cached.
 FROM busybox:1.36 AS manifests
-COPY --from=tools . /ctx/
+COPY --from=tools tools /ctx/
 RUN mkdir -p /manifests && cd /ctx && \
     for manifest in $(find . -name pyproject.toml -o -name uv.lock); do \
         mkdir -p "/manifests/$(dirname "$manifest")" && cp "$manifest" "/manifests/$manifest"; \
@@ -52,6 +53,17 @@ RUN mkdir -p /manifests && cd /ctx && \
 # tag -- so they deduplicate across virtualenvs even when the tools pin
 # different Pythons. uv installs each tool's interpreter itself.
 FROM python:3.13-slim AS runtime
+
+# The one system library the tools need and no lockfile can provide. libgomp is
+# the GNU OpenMP runtime: lightgbm dlopens it, and so do torch and
+# scikit-learn. A tool's uv.lock pins its PYTHON dependencies exactly and says
+# nothing about the C libraries they load, so without this every SurgMovPred
+# model fails to unpickle -- "None of the 112 model package(s) could be loaded"
+# -- and the cause, `libgomp.so.1: cannot open shared object file`, is three
+# frames deep inside joblib.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /uvx /usr/local/bin/
 
@@ -102,7 +114,35 @@ RUN --mount=type=cache,target=/cache/uv,sharing=locked \
 # and this is the only layer that has to be rebuilt when it does. `--frozen
 # --no-install-project` above is why the venvs could be built without them --
 # a tool's code is not installed as a package, runner.py puts src/ on sys.path.
-COPY --from=tools . /tools/
+# --exclude, and it is not an optimisation: the tools context is a working
+# checkout, where every tool already has a .venv of its own -- 7.2-7.7 GB each
+# at cu128. Copying those in would bury the deduplicated ones this image just
+# built, under a mountain of layers.
+COPY --from=tools --exclude=**/.venv --exclude=**/__pycache__ tools /tools/
+# The schema generator, from the same repository as the tools. It reads the
+# schema out of `run()`'s signature, so the two cannot drift; deployed beside
+# the tools rather than inside the server because it belongs to them.
+COPY --from=tools scripts /tools/scripts/
+
+# ---- the schemas -----------------------------------------------------
+# Generated at build time, each with ITS OWN tool's interpreter: importing a
+# tool needs the tool's dependencies, which is the whole reason the server does
+# not do it. The result is a cache -- `source_hash` is what lets the server
+# notice one has gone stale and regenerate it -- so a failure here is a tool
+# that will be described at startup instead, or reported as not loadable.
+RUN set -eu; \
+    [ -f /tools/scripts/describe.py ] || { echo "no describe.py: tools must ship .schema.json"; exit 0; }; \
+    for tool in /tools/*/; do \
+        name=$(basename "$tool"); \
+        [ -x "$tool/.venv/bin/python" ] || continue; \
+        if "$tool/.venv/bin/python" /tools/scripts/describe.py "$tool" > "$tool/.schema.json.tmp"; then \
+            mv "$tool/.schema.json.tmp" "$tool/.schema.json"; \
+            echo "==> described $name"; \
+        else \
+            rm -f "$tool/.schema.json.tmp"; \
+            echo "!!! $name could not describe itself; it will not be served" >&2; \
+        fi; \
+    done
 
 # ---- the server ------------------------------------------------------
 # server/tools/ is excluded in .dockerignore: this image serves tools from
@@ -118,7 +158,14 @@ COPY docker/verify_dedup.py /opt/sadt/verify_dedup.py
 ENV SADT_DISPATCH_MODE=subprocess \
     TOOLS_DIR=/tools \
     RUNNER_PATH=/opt/sadt/runner.py \
-    DEPLOYMENT_CONFIG=/opt/sadt/deployment.toml \
+    DESCRIBE_PATH=/tools/scripts/describe.py \
+    SCHEMA_CACHE_DIR=/var/cache/sadt \
+    # Next to the server, which is where COPY server/ actually puts it and
+    # what config.py defaults to. Pointed at /opt/sadt/ it named a file that
+    # never existed, so every packaged tool fell back to its own name for
+    # the DATA lookup: `amasss` instead of `AMASSS`, no models, no test
+    # files, and a `model` argument the client could not fill in.
+    DEPLOYMENT_CONFIG=/opt/sadt/server/deployment.toml \
     DATA_DIR=/DATA \
     TEMP_DIR=/jobs \
     PYTHONDONTWRITEBYTECODE=1
@@ -127,7 +174,11 @@ ENV SADT_DISPATCH_MODE=subprocess \
 # confidential imaging. It does not run as root.
 RUN useradd --system --create-home --home-dir /home/sadt sadt && \
     install -d -o sadt -g sadt /jobs && \
-    install -d -o sadt -g sadt /DATA
+    install -d -o sadt -g sadt /DATA && \
+    # Writable, because a schema regenerated at startup is cached here.
+    # /tools stays root-owned and read-only to the server: third-party code
+    # must not be able to rewrite its own virtualenv.
+    install -d -o sadt -g sadt /var/cache/sadt
 
 USER sadt
 WORKDIR /opt/sadt/server

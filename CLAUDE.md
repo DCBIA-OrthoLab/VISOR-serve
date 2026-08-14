@@ -24,7 +24,7 @@ Do **not** add Celery/Redis/async job queues yet.
 
 Every tool is a **class deriving from a common `Tool` base class**. A tool declares:
 
-1. **A unique name** (used to select it over the wire, e.g. `"test_tool"`).
+1. **A unique name** (used to select it over the wire, e.g. `"Test_Tool"`).
 2. **The arguments it expects**, as a typed schema (each argument has a name, a type,
    and whether it is required). This schema is what lets the server **validate**
    incoming arguments *before* running the tool.
@@ -90,11 +90,11 @@ package at startup — e.g. import all modules in `tools/`, collect every subcla
 
 ## The registered tools
 
-(Originally only `test_tool` existed; see the changelog for how the rest arrived.)
+(Originally only `Test_Tool` existed; see the changelog for how the rest arrived.)
 
-- `test_tool` — two required strings in, their concatenation out. Proves the
+- `Test_Tool` — two required strings in, their concatenation out. Proves the
   round trip and serves as the minimal copy-paste template.
-- `example_tool` — the feature showcase: multi-type input (`csv_file` or
+- `Example_Tool` — the feature showcase: multi-type input (`csv_file` or
   `folder`), `choice`/`multichoice` arguments, `output_kind = "files"`.
 - `SurgMovPred` — surgical movement prediction from tabular measurements
   (stacking models, server-side model bundles).
@@ -170,8 +170,8 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 │   ├── config.py            # config from environment variables
 │   ├── tools/               # one folder per tool: tools/<name>/<name>.py (+ src/, test/)
 │   │   ├── _dispatch_probe/ # test fixture, NOT a tool: underscore = never discovered
-│   │   ├── test_tool/
-│   │   ├── example_tool/
+│   │   ├── Test_Tool/
+│   │   ├── Example_Tool/
 │   │   ├── SurgMovPred/
 │   │   ├── AMASSS/
 │   │   ├── ASO/
@@ -246,8 +246,8 @@ model, a reference test dataset) instead of the client uploading it every call.
   deleted), then select it in `build_data_store()` via `settings.DATA_BACKEND`.
   No change needed anywhere else.
 
-### `tools/test_tool.py`
-- Defines `TestTool(Tool)` with `name = "test_tool"`, the two required string args,
+### `tools/Test_Tool/Test_Tool.py`
+- Defines `TestTool(Tool)` with `name = "Test_Tool"`, the two required string args,
   and a `run` returning a str. Serves as the copy-paste template for future tools.
 
 ### Endpoints (`main.py`)
@@ -367,7 +367,7 @@ dependency on when the next request arrives.
 ### `.env.example`, server `README.md`
 - All env vars with dummy values.
 - Install, self-signed cert generation, HTTPS run command, `curl` examples hitting
-  `/tools` and `/run/test_tool` (with token). A short "how to add a tool" section:
+  `/tools` and `/run/Test_Tool` (with token). A short "how to add a tool" section:
   create a file in `tools/`, subclass `Tool`, done.
 
 ---
@@ -410,7 +410,7 @@ Provide a small, generic client mirroring the server:
 
 ## Definition of done
 - Server runs over HTTPS; `/health`, `/tools`, `/run/{tool_name}` all work.
-- `test_tool` round-trips: send `text_1` + `text_2`, get a string back.
+- `Test_Tool` round-trips: send `text_1` + `text_2`, get a string back.
 - Passing wrong/missing/extra args to a tool yields a `422` with a clear message
   (validation happens in the `Tool` base class before `run`).
 - Unknown tool → `404`; no token → `401`; oversized file → `413`.
@@ -426,6 +426,66 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-12 — Read the other repository; seven ways nothing would have worked
+
+`sadt-tools` has six tools packaged, and **not one of them would have loaded**.
+The architecture matched — same reasoning, sometimes the same sentences — and
+every wire between the two was wrong. Found by reading it, and by hashing a
+real tool both ways.
+
+- **`source_hash` was a different algorithm.** They hash the file's raw bytes
+  and sort `Path` objects; this side hashed each file's digest and sorted
+  strings, and `a/b.py` sorts before `a.py` one way and after it the other.
+  Every tool would have looked stale. `schema_hash.py` is now a port of
+  theirs, checked against `amasss` and `surgmovpred` and equal to the digit.
+- **The module is `src/sadt_<tool>/`**, found as "the one package under src/",
+  which is the rule their own generator uses. The runner looked for
+  `src/<tool>.py` and would have imported nothing.
+- **`.schema.json` is not a file they ship.** `scripts/describe.py` emits it
+  from `run()`'s signature, run with THAT TOOL's interpreter, so the schema
+  cannot drift from the code. It is a **cache**, and `source_hash` is what
+  says the cache is behind — so a mismatch now REGENERATES rather than
+  refusing to start, which is what that field is for. The image generates
+  them at build; the server regenerates at startup into `SCHEMA_CACHE_DIR`,
+  because `/tools` is read-only to the user it runs as.
+- **They already publish `choices`**, from `Literal[...]` annotations:
+  `list[Literal[...]]` is several-of, a bare `Literal[...]` exactly-one. The
+  migration cost measured in `MIGRATING_A_TOOL.md` — "AMASSS loses 2
+  multichoices" — does not exist; it was solved on their side while this side
+  was throwing the field away with a warning.
+- **`output_dir` is a required argument of every tool**, and no client can
+  supply a directory on the server. It is taken out of the published schema
+  and filled in at dispatch with the job's own `output/`. Without this every
+  run is a 422 for a missing required argument.
+- **Nothing serialises the GPU any anymore.** Every tool used to hold its own
+  semaphore, which worked only because they shared one process; a packaged
+  tool is its own process, so they have all been removed. New
+  `MAX_CONCURRENT_GPU_JOBS`, and it is one counter ACROSS tools — an AMASSS
+  run and a CrownSeg run want the same card. A run counts as GPU work when
+  the tool declares a `device` argument whose effective value is a CUDA one,
+  so a tabular prediction never queues behind a segmentation.
+- **Errors map by exception class NAME**, there being no shared package to
+  define a base class in: `ToolInputError`/`ValueError`/`FileNotFoundError`
+  answer 422 with the message passed through (they are written to be read by
+  whoever sent the request), `ToolUnavailableError` answers 503, anything else
+  500 with a fixed message. The runner records the name in `result.json` —
+  which reverses the earlier "on failure, write nothing".
+
+Also: `device` is injected from `settings.DEVICE` when the caller picks none
+(a tool that no longer reads the environment would otherwise run on cuda on a
+CPU server); a `.zip` sent for a `path` argument is unpacked by the server,
+cap and single-root strip included, since no tool unpacks archives any more;
+and `deployment.toml` grows `data_dir`, because packaged tools are lowercase
+(`amasss`) while the bundles staged under `DATA/` are not (`AMASSS/`).
+
+**Verified against the real thing**: `amasss`, `batchdentalseg`, `crownseg`
+and `surgmovpred` all load, publish their check boxes, hide their output
+directory, and are correctly classified as GPU or not — `test_tool_contract.py`
+runs their generator with their interpreters and skips where the checkout is
+absent. `ali` and `aso` have no virtualenv yet, which their own document says.
+
+**Tests:** 461 server tests (+27).
 
 ### 2026-08-12 — The gate phase 4 has to pass through: running a tool both ways
 

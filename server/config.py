@@ -60,6 +60,33 @@ class Settings(BaseSettings):
     # argument is upload-only and MAX_UPLOAD_MB applies everywhere.
     DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
 
+    # scripts/describe.py, from the sadt-tools repository, deployed beside the
+    # tools. It turns a tool's run() signature into the schema this server
+    # publishes, and has to run with THAT TOOL's interpreter -- importing a
+    # tool needs the tool's dependencies. Absent, only tools shipping a
+    # pre-generated .schema.json are served.
+    DESCRIBE_PATH: str = os.path.join(_SERVER_DIR, "tools", "scripts", "describe.py")
+
+    # Where regenerated schemas are cached. A .schema.json is a CACHE, not a
+    # declaration -- `source_hash` exists so the server can notice one has gone
+    # stale and generate it again -- and the tool folders are read-only to the
+    # process that serves them, so the cache cannot live next to them.
+    SCHEMA_CACHE_DIR: str = os.path.join(_SERVER_DIR, ".schema-cache")
+
+    # How many tool runs may touch the GPU at once, ACROSS TOOLS.
+    #
+    # This used to be per tool -- AMASSS_MAX_GPU_JOBS, CROWNSEG_MAX_GPU_JOBS,
+    # each a semaphore inside the tool, each defaulting to 1 -- and it worked
+    # because every tool shared the server's process. A packaged tool is its
+    # own process, so an in-process semaphore would cap nothing at all, and the
+    # tools have dropped theirs. Nothing else serialises the card: two AMASSS
+    # runs would both take it, and an AMASSS run and a CrownSeg run compete for
+    # the same device, which is why this is one counter and not one per tool.
+    #
+    # A run counts as GPU work when the tool declares a `device` argument whose
+    # effective value is a CUDA one.
+    MAX_CONCURRENT_GPU_JOBS: int = 1
+
     # Seconds a tool process may run before it is killed. 0 (the default) means
     # no limit, which is what the in-process path does today -- a full cohort
     # segmentation legitimately takes hours.

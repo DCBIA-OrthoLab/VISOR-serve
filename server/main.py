@@ -24,11 +24,13 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+import dispatch
 import file_utils
 import transfer
 from base import (
     FILE_TYPES,
     FOLDER_TYPE,
+    PATH_TYPE,
     ResolvedPath,
     ToolArgumentError,
     ToolUnavailableError,
@@ -84,6 +86,23 @@ class _UploadTooLargeError(Exception):
 
 
 _ACCEPT_ALL_EXTENSIONS = "*"
+
+# A packaged tool's exception class NAME -> the status it means. The tools do
+# not share a base class, so this maps by name, which is the convention
+# sadt-tools documents:
+#
+#   the caller's fault, and every message is written to be read by whoever
+#   sent it -- a bad structure code, a table with no patient column;
+#   ToolUnavailableError -- the tool is installed, its engine is not (crownseg
+#   without its `segmentation` extra), which no request can fix;
+#   anything else is opaque and answers 500 with a fixed message, because a
+#   crash inside a tool can name server-side paths.
+TOOL_ERROR_STATUS = {
+    "ToolInputError": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "ValueError": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "FileNotFoundError": status.HTTP_422_UNPROCESSABLE_CONTENT,
+    "ToolUnavailableError": status.HTTP_503_SERVICE_UNAVAILABLE,
+}
 
 # Form field carrying {argument name: upload id} for inputs that travelled
 # through the chunked-upload endpoints instead of this request's body (see
@@ -342,6 +361,10 @@ def list_tools() -> list:
                     "label": spec.label,
                     "section": spec.section,
                     "visible_when": spec.visible_when,
+                    # True: do not render this at all. Still published, because
+                    # a client that hides it must still know it exists rather
+                    # than treat it as an argument the server invented.
+                    "hidden": spec.hidden,
                     "ui": spec.ui,
                     # Listed explicitly so the wire shape does not depend on
                     # whether a tool spelled its catalog as a tuple or a list.
@@ -369,9 +392,10 @@ def list_tool_data(tool_name: str) -> dict:
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
+    slug = deployment_config.data_slug(tool.name)
     return {
-        "models": data_store.list_models(tool.name),
-        "testfiles": data_store.list_testfiles(tool.name),
+        "models": data_store.list_models(slug),
+        "testfiles": data_store.list_testfiles(slug),
     }
 
 
@@ -402,7 +426,7 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     try:
-        resolved = data_store.resolve_testfile(tool.name, filename)
+        resolved = data_store.resolve_testfile(deployment_config.data_slug(tool.name), filename)
     except DataNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
@@ -650,11 +674,22 @@ def _reject_upload_for_scalar(spec, field_name: str) -> None:
         )
 
 
+def _unpacks_to_a_folder(kind: str, extension: str) -> bool:
+    """Does this input arrive as an archive that must be extracted first?
+
+    Always for a "folder" argument, and for a "path" argument that received a
+    .zip: no packaged tool unpacks archives any more -- each used to carry its
+    own extraction, zip-bomb cap and scratch directory, which is exactly the
+    duplication moving them out removed.
+    """
+    return kind == FOLDER_TYPE or (kind == PATH_TYPE and extension.lower() == ".zip")
+
+
 async def _as_resolved_path(spec, input_path: str, extension: str, work_dir: str, field_name: str):
-    """Tag an input with the declared type it actually is, unpacking a
-    "folder" argument's archive so run() only ever sees a directory."""
+    """Tag an input with the declared type it actually is, unpacking an archive
+    so run() only ever sees a real file or directory."""
     kind = spec.match_type(extension) if spec is not None and spec.is_file else "file"
-    if kind != FOLDER_TYPE:
+    if not _unpacks_to_a_folder(kind, extension):
         return ResolvedPath(input_path, kind)
     extracted = await anyio.to_thread.run_sync(
         functools.partial(_extract_folder_argument, spec, input_path, work_dir, field_name)
@@ -772,7 +807,9 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         spec = tool.arguments[field_name]
         resolver = data_store.resolve_model if spec.server_selectable == "model" else data_store.resolve_testfile
         try:
-            resolved = resolver(tool.name, filename)
+            # Not tool.name: the packaged tools are lowercase while the data
+            # staged under DATA/ is not, so deployment.toml maps the two.
+            resolved = resolver(deployment_config.data_slug(tool.name), filename)
         except DataNotFoundError as exc:
             if work_dir:
                 shutil.rmtree(work_dir, ignore_errors=True)
@@ -785,7 +822,9 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         # the two routes stay indistinguishable from the tool's point of view.
         kind = _resolved_kind(spec, resolved.path)
         path = resolved.path
-        if kind == FOLDER_TYPE and not os.path.isdir(path):
+        if not os.path.isdir(path) and _unpacks_to_a_folder(
+            kind, _extract_extension(os.path.basename(path))
+        ):
             # DATA_DIR is read-only: extract into the request's own work dir.
             if work_dir is None:
                 work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
@@ -815,6 +854,26 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     except ToolArgumentError as exc:
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    except dispatch.ToolFailure as exc:
+        # The tool raised and named its exception class. There is no shared
+        # exception type to isinstance-check -- there is no shared package --
+        # so the NAME decides, and only the names that mean "the caller can fix
+        # this" let their message through.
+        code = TOOL_ERROR_STATUS.get(exc.error_type, 500)
+        logger.warning("endpoint=/run/%s status=%d error=%s", tool_name, code, exc.error_type)
+        if code == 500:
+            # The ONLY place this exists. A 4xx carries its message to the
+            # caller, but a 500 answers "Tool execution failed." and the job
+            # directory holding stderr.log is discarded on the next line, so
+            # without this the tool's traceback is gone -- which is exactly
+            # what makes a failing tool undiagnosable from the outside.
+            # Server-side only, as _stderr_tail intends.
+            logger.error("endpoint=/run/%s failure:\n%s", tool_name, exc.message)
+        _discard(work_dir, scratch_dirs)
+        raise HTTPException(
+            status_code=code,
+            detail=exc.message if code != 500 else "Tool execution failed.",
+        )
     except ToolUnavailableError as exc:
         # The request is fine; this deployment cannot serve it (a dependency the
         # image does not carry). 501 rather than 500: nothing the caller changes

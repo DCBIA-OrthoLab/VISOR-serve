@@ -138,11 +138,11 @@ def test_a_parity_run_leaves_nothing_behind(packaged_probe):
 def test_an_imported_tool_is_loaded_by_path():
     """Both forms share a name, so the registry only ever holds one of them.
     Comparing them means loading the imported one directly."""
-    folder = os.path.join(settings.TOOLS_DIR, "test_tool")
+    folder = os.path.join(settings.TOOLS_DIR, "Test_Tool")
 
     tool = parity.imported_tool(folder)
 
-    assert tool.name == "test_tool"
+    assert tool.name == "Test_Tool"
     assert tool.invoke({"text_1": "hello", "text_2": "world"}) == "hello world"
 
 

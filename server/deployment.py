@@ -41,7 +41,7 @@ logger = logging.getLogger("inference_server")
 # The two kinds data_store.py serves (DATA_DIR/<tool>/{models,testfiles}/).
 SERVER_SELECTABLE_KINDS = ("model", "testfile")
 
-_TOOL_KEYS = ("server_selectable", "max_upload_mb")
+_TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden")
 
 
 class DeploymentConfigError(Exception):
@@ -58,6 +58,19 @@ class ToolDeployment:
     # None falls back to settings.MAX_UPLOAD_MB.
     max_upload_mb: Optional[int] = None
 
+    # The folder under DATA_DIR holding this tool's models and test files, when
+    # it is not named after the tool. Packaged tools are lowercase (`amasss`)
+    # while the data staged by scripts/setup-models.sh is not (`AMASSS/`), and
+    # a case-insensitive lookup would be a guess -- on a case-sensitive
+    # filesystem both can exist.
+    data_dir: Optional[str] = None
+
+    # Argument names a client must not render. The tool still declares them and
+    # still applies its own defaults; this only says a clinician has no
+    # business being asked. A deployment decision, which is why it lives here
+    # and not in the tool: the tool knows nothing about who is looking at it.
+    hidden: tuple = ()
+
 
 _NOTHING_DECLARED = ToolDeployment()
 
@@ -72,6 +85,10 @@ class DeploymentConfig:
     @property
     def configured_tools(self) -> tuple:
         return tuple(sorted(self._tools))
+
+    def data_slug(self, tool_name: str) -> str:
+        """The DATA_DIR folder to look this tool's models up in."""
+        return self.for_tool(tool_name).data_dir or tool_name
 
     def upload_limit_mb(self, tool_name: str) -> int:
         """The upload limit for this tool, in MB. Per-tool config wins; the
@@ -106,11 +123,28 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
                 f"expected one of {list(SERVER_SELECTABLE_KINDS)}."
             )
 
+    data_dir = table.get("data_dir")
+    if data_dir is not None and (not isinstance(data_dir, str) or not data_dir.strip()):
+        raise DeploymentConfigError(f"{where}: 'data_dir' must be a non-empty string.")
+
     limit = table.get("max_upload_mb")
     if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0):
         raise DeploymentConfigError(f"{where}: 'max_upload_mb' must be a positive integer.")
 
-    return ToolDeployment(server_selectable=dict(selectable), max_upload_mb=limit)
+    hidden = table.get("hidden", ())
+    if not isinstance(hidden, (list, tuple)) or not all(
+        isinstance(argument, str) and argument.strip() for argument in hidden
+    ):
+        raise DeploymentConfigError(
+            f"{where}: 'hidden' must be a list of argument names."
+        )
+
+    return ToolDeployment(
+        server_selectable=dict(selectable),
+        max_upload_mb=limit,
+        data_dir=data_dir,
+        hidden=tuple(hidden),
+    )
 
 
 def load(path: Optional[str] = None) -> DeploymentConfig:

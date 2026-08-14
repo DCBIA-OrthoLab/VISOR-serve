@@ -29,6 +29,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import uuid
 from typing import Any, Optional
 
@@ -51,6 +52,56 @@ JOB_SUBDIRS = ("input", "output")
 # How much of the tool's stderr travels with the failure. Enough for a
 # traceback, bounded because a failing tool can print megabytes.
 _STDERR_TAIL_BYTES = 8192
+
+
+# The GPU is one device and the tools no longer arbitrate for it themselves
+# (see settings.MAX_CONCURRENT_GPU_JOBS). Created lazily so the setting can be
+# monkeypatched in a test before the first run.
+_gpu_slots: Optional[threading.BoundedSemaphore] = None
+_gpu_lock = threading.Lock()
+
+# The argument a tool declares when it can run on a card, and the values that
+# mean it will.
+DEVICE_ARGUMENT = "device"
+_GPU_DEVICES = ("cuda", "gpu")
+
+
+def _gpu_semaphore() -> threading.BoundedSemaphore:
+    global _gpu_slots
+    with _gpu_lock:
+        if _gpu_slots is None:
+            _gpu_slots = threading.BoundedSemaphore(settings.MAX_CONCURRENT_GPU_JOBS)
+        return _gpu_slots
+
+
+def uses_the_gpu(tool, params: dict) -> bool:
+    """Will this run take the card?
+
+    A tool that cannot use one does not declare `device` at all, so it never
+    queues behind an inference job -- a tabular prediction has no business
+    waiting for a segmentation.
+    """
+    spec = tool.arguments.get(DEVICE_ARGUMENT)
+    if spec is None:
+        return False
+    value = params.get(DEVICE_ARGUMENT)
+    if value is None:
+        value = spec.default if spec.is_choice else settings.DEVICE
+    return str(value).lower().startswith(_GPU_DEVICES)
+
+
+class ToolFailure(RuntimeError):
+    """The tool itself raised, and said which exception it was.
+
+    There is no shared exception type to catch -- there is no shared package --
+    so the runner records the class NAME and main.py maps it: the caller's
+    fault (422), this deployment's (503), or opaque (500).
+    """
+
+    def __init__(self, error_type: str, message: str):
+        super().__init__(f"{error_type}: {message}")
+        self.error_type = error_type
+        self.message = message
 
 
 class ToolExecutionError(RuntimeError):
@@ -108,6 +159,28 @@ def _create_job_dir(job_id: str) -> str:
     for subdir in JOB_SUBDIRS:
         os.makedirs(os.path.join(job_dir, subdir))
     return file_utils.register_scratch_dir(job_dir)
+
+
+def _server_provided(tool, params: dict, job_dir: str) -> dict:
+    """The arguments the SERVER fills in, not the caller.
+
+    `output_dir` is the job's own output/: every packaged tool takes it as a
+    required argument and writes only there, and a client has no business
+    naming a directory on the server.
+
+    `device` is the deployment's, when the caller did not pick one. It used to
+    be `settings.DEVICE` read inside each tool; a tool that no longer reads the
+    environment would otherwise always run on its own default (cuda), on a
+    server configured for CPU.
+    """
+    filled = dict(params)
+    if getattr(tool, "wants_output_dir", False):
+        output_dir = os.path.join(job_dir, "output")
+        os.makedirs(output_dir, exist_ok=True)
+        filled["output_dir"] = output_dir
+    if DEVICE_ARGUMENT in tool.arguments and DEVICE_ARGUMENT not in filled:
+        filled[DEVICE_ARGUMENT] = settings.DEVICE
+    return filled
 
 
 def _write_job_file(job_dir: str, job_id: str, tool_name: str, params: dict) -> str:
@@ -228,7 +301,16 @@ def _read_result(job_dir: str, tool_name: str) -> Any:
     except (OSError, ValueError) as exc:
         raise ToolExecutionError(f"Tool '{tool_name}' wrote an unreadable {RESULT_FILE}: {exc}")
 
-    if not isinstance(payload, dict) or "result" not in payload:
+    if not isinstance(payload, dict):
+        raise ToolExecutionError(f"Tool '{tool_name}': {RESULT_FILE} must be an object.")
+
+    error = payload.get("error")
+    if isinstance(error, dict):
+        # The tool raised and named its exception class. Which one it was is
+        # the difference between "you sent the wrong thing" and "this broke".
+        raise ToolFailure(str(error.get("type", "")), str(error.get("message", "")))
+
+    if "result" not in payload:
         raise ToolExecutionError(
             f"Tool '{tool_name}': {RESULT_FILE} must be an object with a 'result' field."
         )
@@ -247,11 +329,25 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
     job_dir = _create_job_dir(job_id)
 
     try:
+        params = _server_provided(tool, params, job_dir)
         job_path = _write_job_file(job_dir, job_id, tool.name, params)
-        exit_code = _execute(
-            [interpreter, runner, "--job", job_path], job_dir, _child_environment(job_id, job_dir)
-        )
+        command = [interpreter, runner, "--job", job_path]
+        environment = _child_environment(job_id, job_dir)
+
+        if uses_the_gpu(tool, params):
+            # Held for the whole run, and released by leaving the block on any
+            # path. Blocking on purpose: the request already waits for the tool,
+            # and a queue is what a single card wants.
+            with _gpu_semaphore():
+                exit_code = _execute(command, job_dir, environment)
+        else:
+            exit_code = _execute(command, job_dir, environment)
+
         if exit_code != 0:
+            # A tool that recorded WHICH exception it was gets to say so; the
+            # tail of stderr is the fallback for one that died without writing
+            # anything (a segfault in a CUDA kernel, an OOM kill).
+            _read_result(job_dir, tool.name)
             raise ToolExecutionError(
                 f"Tool '{tool.name}' exited with code {exit_code}:\n{_stderr_tail(job_dir)}"
             )

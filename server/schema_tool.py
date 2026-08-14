@@ -37,9 +37,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 from typing import Any, Optional
 
-from base import LIST_TYPE, ArgSpec, Tool, ToolSchemaError
+from base import (
+    CHOICE_TYPE,
+    LIST_TYPE,
+    MULTICHOICE_TYPE,
+    PATH_TYPE,
+    ArgSpec,
+    Selection,
+    Tool,
+    ToolSchemaError,
+)
 from deployment import ToolDeployment
 from schema_hash import hash_source_tree
 
@@ -53,20 +63,39 @@ SRC_DIR_NAME = "src"
 # extensions are acceptable, so the server falls back to ALLOWED_EXTENSIONS
 # rather than inventing a restriction the tool never asked for.
 ARGUMENT_TYPES = {
-    "path": "file",
+    "path": PATH_TYPE,
     "str": str,
     "int": int,
     "float": float,
     "bool": bool,
+    # Every list the generator can emit. Only list[str] has a widget of its
+    # own; the others are accepted so a tool declaring one loads and runs
+    # rather than being refused for a type the client will simply render as
+    # text.
     "list[str]": LIST_TYPE,
+    "list[int]": LIST_TYPE,
+    "list[float]": LIST_TYPE,
+    "list[bool]": LIST_TYPE,
+    "list[path]": LIST_TYPE,
 }
+
+# A schema type carrying `choices` is a fixed set, and the two widgets fall
+# straight out of whether it is a list: `list[Literal[...]]` is several-of,
+# a bare `Literal[...]` is exactly-one. The generator derives both from the
+# annotation, so there is no second declaration here that could drift.
+CHOICE_BASE_TYPES = ("str",)
+MULTICHOICE_BASE_TYPES = ("list[str]",)
 
 # What `returns` means for main.py's response handling.
 #   "path"  -> one output file, streamed
 #   "paths" -> several, or a directory: zipped into an archive
 #   "text"  -> any JSON-serializable value, returned as JSON
 RETURN_KINDS = {
-    "path": "file",
+    # What sadt-tools' describe.py actually emits: run() returns a Path, or a
+    # dict[str, Path] when it has several named outputs.
+    "path": "files",
+    "dict[str, path]": "files",
+    # Older/other spellings, kept so a schema written by hand still loads.
     "paths": "files",
     "text": "text",
     "json": "text",
@@ -81,7 +110,13 @@ DEFAULT_RETURN_KIND = "text"
 #   extensions   [".nii", ".nii.gz"] for a path argument -- what the client's
 #                file dialog offers. Without it the schema says only "a path"
 #                and the dialog falls back to ALLOWED_EXTENSIONS.
-_ARGUMENT_KEYS = ("type", "required", "default", "description", "extensions")
+_ARGUMENT_KEYS = ("type", "required", "default", "description", "extensions", "choices")
+
+# The output directory every tool takes as a required argument. The SERVER owns
+# it -- it is the job's own output/ -- so it is filled in at dispatch time and
+# never published: a client has no business picking a directory on the server,
+# and a file picker for one is the single fastest way to make every run a 422.
+OUTPUT_DIR_ARGUMENT = "output_dir"
 
 _TOP_LEVEL_KEYS = ("name", "description", "arguments", "returns", "source_hash")
 
@@ -92,12 +127,111 @@ class SchemaError(Exception):
     tool that fails to load is."""
 
 
-class SourceHashMismatch(Exception):
-    """The schema no longer describes the source next to it. Fatal, and
-    deliberately so: every other failure costs one tool, while a stale schema
-    means the server validates requests against a signature that has changed
-    under it -- silently accepting arguments run() no longer takes, and
-    refusing ones it now does."""
+def is_packaged(folder: str) -> bool:
+    """Is this folder a tool the server must NOT import?
+
+    Its own interpreter and its own source is the layout, and either half is
+    enough to say so: a folder with a cached schema is one whose venv has not
+    been built yet, and one with a venv is packaged whether or not its schema
+    has been generated.
+    """
+    return os.path.isdir(os.path.join(folder, SRC_DIR_NAME)) and (
+        os.path.isfile(os.path.join(folder, SCHEMA_FILE))
+        or os.path.isdir(os.path.join(folder, ".venv"))
+    )
+
+
+def generate_schema(folder: str) -> dict:
+    """Ask the tool to describe itself, with its own interpreter.
+
+    `scripts/describe.py` lives in the sadt-tools repository and reads the
+    schema out of `run()`'s signature, so the two cannot drift. It has to run
+    inside the tool's virtualenv: importing a tool needs the tool's
+    dependencies, which is the entire reason this server does not do it.
+
+    A non-zero exit means the tool is not loadable -- describe.py exits 2 on
+    anything it cannot represent rather than emitting a schema that is almost
+    right -- and is reported as such rather than served.
+    """
+    from config import settings
+
+    describe = settings.DESCRIBE_PATH
+    interpreter = os.path.join(folder, ".venv", "bin", "python")
+    if not os.path.isfile(describe) or not os.path.isfile(interpreter):
+        raise SchemaError(
+            f"{os.path.basename(folder)}: no cached {SCHEMA_FILE}, and it cannot be generated "
+            f"(the tool's virtualenv or the schema generator is missing)."
+        )
+
+    completed = subprocess.run(
+        [interpreter, describe, folder], capture_output=True, text=True, check=False
+    )
+    if completed.returncode != 0:
+        raise SchemaError(
+            f"{os.path.basename(folder)}: describe.py exited {completed.returncode}: "
+            f"{completed.stderr.strip()[:500]}"
+        )
+    try:
+        return json.loads(completed.stdout)
+    except ValueError as exc:
+        raise SchemaError(f"{os.path.basename(folder)}: describe.py printed no usable JSON ({exc})")
+
+
+def _cached_path(folder: str) -> str:
+    from config import settings
+
+    return os.path.join(settings.SCHEMA_CACHE_DIR, f"{os.path.basename(folder)}{SCHEMA_FILE}")
+
+
+def _fresh(schema, actual_hash: str) -> bool:
+    return isinstance(schema, dict) and schema.get("source_hash") == actual_hash
+
+
+def resolve_schema(folder: str) -> dict:
+    """The schema for this tool, generated if what is cached has gone stale.
+
+    This is what `source_hash` is FOR: the tool's source is the truth, the
+    schema is a derived artifact, and the hash says whether the derivation is
+    still current. A stale one is regenerated rather than served -- and rather
+    than taken as a reason to refuse to start, which it was when the schema
+    was something a human wrote by hand.
+    """
+    actual = hash_source_tree(os.path.join(folder, SRC_DIR_NAME))
+
+    for path in (os.path.join(folder, SCHEMA_FILE), _cached_path(folder)):
+        if os.path.isfile(path):
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    schema = json.load(handle)
+            except (OSError, ValueError):
+                continue
+            if _fresh(schema, actual):
+                return schema
+            logger.info(
+                "%s: the cached schema describes another source; regenerating.",
+                os.path.basename(folder),
+            )
+
+    schema = generate_schema(folder)
+    if not _fresh(schema, actual):
+        raise SchemaError(
+            f"{os.path.basename(folder)}: describe.py returned a schema whose source_hash does "
+            f"not match its own src/. The two sides compute it differently."
+        )
+    _cache(folder, schema)
+    return schema
+
+
+def _cache(folder: str, schema: dict) -> None:
+    """Keep the generated schema, so the next start does not pay for it again.
+    Failing to write one is not a failure: it costs a subprocess, not a run."""
+    path = _cached_path(folder)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(schema, handle)
+    except OSError as exc:
+        logger.warning("Could not cache the schema for %s: %s", os.path.basename(folder), exc)
 
 
 def read_schema(folder: str) -> dict:
@@ -110,35 +244,6 @@ def read_schema(folder: str) -> dict:
     if not isinstance(schema, dict):
         raise SchemaError(f"{path}: expected a JSON object.")
     return schema
-
-
-def verify_source_hash(folder: str, schema: dict) -> None:
-    """Check the schema against the source tree it claims to describe.
-
-    Raises SourceHashMismatch (fatal) when the two disagree, and SchemaError
-    (skip this tool) when there is nothing to compare -- an unverifiable
-    schema must not serve either, but it endangers only itself.
-    """
-    declared = schema.get("source_hash")
-    if not declared:
-        raise SchemaError(
-            f"{os.path.join(folder, SCHEMA_FILE)}: no 'source_hash'. It cannot be checked "
-            f"against src/, so it cannot be trusted to describe it."
-        )
-
-    src_dir = os.path.join(folder, SRC_DIR_NAME)
-    try:
-        actual = hash_source_tree(src_dir)
-    except FileNotFoundError as exc:
-        raise SchemaError(str(exc))
-
-    if actual != declared:
-        raise SourceHashMismatch(
-            f"Tool '{schema.get('name', os.path.basename(folder))}': {SCHEMA_FILE} was generated "
-            f"from a different {SRC_DIR_NAME}/ than the one installed "
-            f"(schema {declared[:12]}..., source {actual[:12]}...). Regenerate the schema where "
-            f"the tool is packaged, or reinstall the source it was generated from."
-        )
 
 
 def _argument_spec(
@@ -182,6 +287,38 @@ def _argument_spec(
             f"as {declared_type!r} rather than 'path'."
         )
 
+    # A deployment decision, not the tool's: which arguments a client renders.
+    # The spec still exists and the tool still applies its own default -- this
+    # only says nobody is asked. See ArgSpec.hidden.
+    hidden = argument_name in deployment.hidden
+
+    choices = declaration.get("choices")
+    if choices:
+        narrowed = _choice_spec(where, declared_type, declaration, choices)
+        if narrowed is not None:
+            narrowed.hidden = hidden
+            return narrowed
+
+    # A model is chosen from what the server hosts, never uploaded: the weights
+    # do not travel, in either direction. What travels is a NAME, so the
+    # argument is published as a scalar and main.py resolves it to a local path
+    # before run() is called -- which is what the tool's `Path` annotation then
+    # receives, unchanged.
+    #
+    # Published as a path instead, it becomes a file argument: the client gives
+    # every file argument an input row with a local picker (see
+    # formgen.file_input_modes -- "which arguments those are is the schema's
+    # answer, not a module's"), and a clinician is offered to upload a model
+    # bundle from their laptop.
+    if selectable == "model" and declared_type == "path":
+        return ArgSpec(
+            type=str,
+            required=required,
+            description=declaration.get("description", ""),
+            server_selectable=selectable,
+            hidden=hidden,
+        )
+
     accepts = declaration.get("extensions")
     if accepts is not None and declared_type != "path":
         raise SchemaError(
@@ -202,6 +339,46 @@ def _argument_spec(
         # path, where there is a file picker to pre-fill and nothing to put in
         # it; a schema declaring one is not an error.
         initial=None if declared_type == "path" else declaration.get("default"),
+        hidden=hidden,
+    )
+
+
+def _choice_spec(where: str, declared_type: str, declaration: dict, choices: list) -> ArgSpec:
+    """An argument narrowed to a fixed set: a picker rather than a text field.
+
+    The generator derives `choices` from a `Literal[...]` annotation, so the
+    options live in the tool's signature and nowhere else -- which is exactly
+    what the old `ArgSpec.choices` tables failed at, being a second
+    declaration that drifted.
+
+    `ArgSpec` wants {option: on by default} rather than a list plus a default,
+    so the two are folded together here.
+    """
+    if not isinstance(choices, list) or not all(isinstance(option, str) for option in choices):
+        # int options (Literal[1, 2]) are legal in a schema and have no widget
+        # here: published as a plain int, which a client renders as a spin box.
+        logger.warning("%s: options %r are not strings; publishing the plain type.", where, choices)
+        return None
+
+    default = declaration.get("default")
+    if declared_type in MULTICHOICE_BASE_TYPES:
+        selected = default if isinstance(default, list) else []
+        return ArgSpec(
+            type=MULTICHOICE_TYPE,
+            required=declaration.get("required", True),
+            description=declaration.get("description", ""),
+            choices={option: option in selected for option in choices},
+        )
+
+    # Exactly one, and a combo box always shows something: with no declared
+    # default the first option is the one selected, since a schema that offers
+    # options offers them in a meaningful order.
+    chosen = default if default in choices else choices[0]
+    return ArgSpec(
+        type=CHOICE_TYPE,
+        required=declaration.get("required", True),
+        description=declaration.get("description", ""),
+        choices={option: option == chosen for option in choices},
     )
 
 
@@ -239,9 +416,16 @@ class SchemaTool(Tool):
         # description field, and adding one changes the response shape the
         # Slicer client is built against. It waits for a client release.
         self.description = schema.get("description", "")
+        # The output directory is the SERVER's, not the caller's: it is the
+        # job's own output/, filled in by dispatch. Taken out of the published
+        # schema entirely -- a client offered a file picker for a directory on
+        # the server would send something meaningless, and offered nothing
+        # would make every run a 422 for a missing required argument.
+        self.wants_output_dir = OUTPUT_DIR_ARGUMENT in arguments
         self.arguments = {
             argument_name: _argument_spec(name, argument_name, declaration, deployment)
             for argument_name, declaration in arguments.items()
+            if argument_name != OUTPUT_DIR_ARGUMENT
         }
         self.output_kind = RETURN_KINDS.get(schema.get("returns"), DEFAULT_RETURN_KIND)
         self.source_hash = schema.get("source_hash", "")
@@ -256,7 +440,23 @@ class SchemaTool(Tool):
         cleaned = self.validate(args)
         from dispatch import dispatch
 
-        return dispatch(self, cleaned)
+        return dispatch(self, self.for_the_wire(cleaned))
+
+    @staticmethod
+    def for_the_wire(cleaned: dict) -> dict:
+        """What validate() produced, in the shapes run() actually declares.
+
+        A "multichoice" reaches an imported tool as a `Selection` -- every
+        option mapped to true/false -- because that is what its `run()` took.
+        A packaged tool declares `list[Literal[...]]`, so it takes the enabled
+        options and nothing else. Sending the mapping would hand a dict to a
+        parameter annotated as a list, and the tool would fail somewhere deep
+        in its own code.
+        """
+        return {
+            name: list(value.selected) if isinstance(value, Selection) else value
+            for name, value in cleaned.items()
+        }
 
     def run(self, **kwargs):
         raise RuntimeError(
@@ -274,8 +474,7 @@ def load_tool(folder: str, config) -> SchemaTool:
     deployment.toml is keyed by TOOL name, the name the client sends and the
     contract's `[tools.amasss]` uses.
     """
-    schema = read_schema(folder)
-    verify_source_hash(folder, schema)
+    schema = resolve_schema(folder)
 
     name = schema.get("name")
     if isinstance(name, str) and name and name != os.path.basename(folder.rstrip(os.sep)):

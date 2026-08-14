@@ -1,5 +1,5 @@
 {
-  "name": "numpy_twin",
+  "name": "numpy_old",
   "description": "Build fixture: reports the numpy version this tool was installed with.",
   "arguments": {
     "size": {
@@ -10,5 +10,5 @@
     }
   },
   "returns": "text",
-  "source_hash": "f2e1e2ecf4da7912ac1448098f70ca9f06d77c53943f7610c6d743a9f98eb2ca"
+  "source_hash": "dd97b5bbabeb596925b15dee31377cafe7b2b5d61c1043da60f28062f4070508"
 }
