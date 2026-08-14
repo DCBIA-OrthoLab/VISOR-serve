@@ -16,7 +16,7 @@ weights from their laptop. See schema_tool's `selectable == "model"` branch.
 
 from __future__ import annotations
 
-from deployment import ToolDeployment
+from .deployment import ToolDeployment
 
 # Suffixes that mean "the server hosts this, the caller names it".
 MODEL_NAMES = ("model", "reference")

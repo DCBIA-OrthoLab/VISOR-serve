@@ -26,7 +26,7 @@ os.environ.setdefault("API_TOKEN", "test-token")
 
 import config
 import file_utils
-import schema_tool
+from registry import schema_tool
 from base import ArgSpec, Tool
 from config import settings
 

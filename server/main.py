@@ -24,9 +24,9 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-import dispatch
+from execution import dispatch
 import file_utils
-import transfer
+from wire import transfer
 from base import (
     FILE_TYPES,
     FOLDER_TYPE,
@@ -37,9 +37,9 @@ from base import (
 )
 from config import settings
 from data_store import DataNotFoundError, data_store
-from deployment import deployment_config
+from registry.deployment import deployment_config
 from registry import TOOLS, get_tool
-from security import verify_token
+from wire.security import verify_token
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("inference_server")

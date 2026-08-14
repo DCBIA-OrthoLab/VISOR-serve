@@ -42,8 +42,8 @@ from typing import Any, Optional
 import file_utils
 from base import Tool
 from config import settings
-from deployment import deployment_config
-from schema_tool import load_tool
+from registry.deployment import deployment_config
+from registry.schema_tool import load_tool
 
 # Keys whose value differs between two runs of the SAME code and says nothing
 # about the port: how long it took, when it ran, where it ran.

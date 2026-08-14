@@ -19,11 +19,11 @@ os.environ.setdefault("API_TOKEN", "test-token")
 
 from fastapi.testclient import TestClient
 
-import deployment
+from registry import deployment
 import main
-import schema_tool
+from registry import schema_tool
 from config import settings
-from deployment import DeploymentConfig, DeploymentConfigError, ToolDeployment
+from registry.deployment import DeploymentConfig, DeploymentConfigError, ToolDeployment
 
 client = TestClient(main.app)
 AUTH = {"Authorization": "Bearer test-token"}

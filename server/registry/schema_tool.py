@@ -50,9 +50,9 @@ from base import (
     Tool,
     ToolSchemaError,
 )
-import conventions
-from deployment import ToolDeployment
-from schema_hash import hash_source_tree
+from . import conventions
+from .deployment import ToolDeployment
+from .schema_hash import hash_source_tree
 
 logger = logging.getLogger("inference_server")
 
@@ -439,7 +439,7 @@ class SchemaTool(Tool):
         in-process path to fall back to.
         """
         cleaned = self.validate(args)
-        from dispatch import dispatch
+        from execution.dispatch import dispatch
 
         return dispatch(self, self.for_the_wire(cleaned))
 

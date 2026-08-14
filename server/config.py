@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     TOOLS_DIR: str = os.path.join(_SERVER_DIR, "tools")  # <tool>/{.venv,src}
     # Injected by path, never installed into a tool venv, so runner and server
     # are always the same version.
-    RUNNER_PATH: str = os.path.join(_SERVER_DIR, "runner.py")
+    RUNNER_PATH: str = os.path.join(_SERVER_DIR, "execution", "runner.py")
     # Turns a tool's run() signature into its schema, and must run with THAT
     # tool's interpreter. Absent, only tools shipping a .schema.json are served.
     DESCRIBE_PATH: str = os.path.join(_SERVER_DIR, "tools", "scripts", "describe.py")

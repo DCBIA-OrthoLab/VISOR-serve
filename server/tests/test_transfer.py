@@ -15,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
-import transfer
+from wire import transfer
 from config import settings
 from main import app
 

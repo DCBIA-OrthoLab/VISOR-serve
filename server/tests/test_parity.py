@@ -17,7 +17,7 @@ import pytest
 os.environ.setdefault("API_TOKEN", "test-token")
 
 import file_utils
-import parity
+from execution import parity
 from base import ArgSpec, Tool
 from config import settings
 

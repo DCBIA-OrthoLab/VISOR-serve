@@ -5,14 +5,15 @@ this response: every field it reads -- types, extensions, choices, labels,
 sections, visible_when, ui, groups -- comes from here and from nowhere else. A
 change to the shape is a client release, not a server detail.
 
-tests/golden/tools_response.json is the response as the server produced it
-while tools still ran IN-PROCESS. It is the reference the subprocess-dispatch
-work is measured against: the point of that work is that a client cannot tell
-the difference.
+tests/golden/tools_response.json pins the tools STILL RUNNING IN-PROCESS. It
+guarded all eight through the subprocess-dispatch work -- a client had to be
+unable to tell the difference -- and five of them have since been deleted here,
+their packaged equivalents serving in their place. What is left is what has not
+been packaged yet, and it is pinned for the same reason.
 
 IF THIS TEST FAILS, the client breaks. Do not regenerate the fixture to make it
-pass -- report the difference instead. It is regenerated deliberately, and only
-together with a client release:
+pass -- report the difference instead. It is regenerated deliberately: when a
+tool leaves for sadt-tools, or together with a client release.
 
     cd server && API_TOKEN=x python -c "import json, os; \
         os.environ['API_TOKEN']='x'; \

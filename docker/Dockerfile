@@ -2,7 +2,7 @@
 #
 # One image, one container, N virtualenvs.
 #
-#     /opt/sadt/{.venv,server,runner.py}   the API: newest Python, no torch
+#     /opt/sadt/{.venv,server}   the API: newest Python, no torch
 #     /tools/<name>/{.venv,.schema.json,src}
 #     /DATA/<name>/{models,testfiles}      read-only mount, outside the image
 #     /jobs/<uuid>/                        ephemeral
@@ -148,16 +148,15 @@ RUN set -eu; \
 # server/tools/ is excluded in .dockerignore: this image serves tools from
 # /tools, and importing the in-process ones would need the very stack the API
 # venv is built to do without.
-COPY server/ /opt/sadt/server/
-# Beside the server rather than inside it. runner.py is executed BY a tool's
-# interpreter and is handed over by path, so it is never installed into a tool
+# runner.py rides along in server/execution/. It is executed BY a tool's
+# interpreter and handed over by path, so it is never installed into a tool
 # venv -- runner and server are then always the same version.
-COPY server/runner.py /opt/sadt/runner.py
+COPY server/ /opt/sadt/server/
 COPY docker/verify_dedup.py /opt/sadt/verify_dedup.py
 
 ENV SADT_DISPATCH_MODE=subprocess \
     TOOLS_DIR=/tools \
-    RUNNER_PATH=/opt/sadt/runner.py \
+    RUNNER_PATH=/opt/sadt/server/execution/runner.py \
     DESCRIBE_PATH=/tools/scripts/describe.py \
     SCHEMA_CACHE_DIR=/var/cache/sadt \
     # Next to the server, which is where COPY server/ actually puts it and

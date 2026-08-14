@@ -15,7 +15,7 @@ import pytest
 os.environ.setdefault("API_TOKEN", "test-token")
 
 import config
-import dispatch
+from execution import dispatch
 from base import ToolArgumentError, ToolUnavailableError
 from config import settings
 

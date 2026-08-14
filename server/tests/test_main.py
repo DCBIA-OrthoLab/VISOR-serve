@@ -13,12 +13,13 @@ import zipfile
 # regardless of whatever is in the developer's local .env.
 os.environ["API_TOKEN"] = "test-token"
 
+import pytest
 from fastapi.testclient import TestClient
 
 import file_utils
 import main
 import registry
-from base import Tool
+from base import ArgSpec, Tool
 from main import app
 
 client = TestClient(app)
@@ -203,12 +204,27 @@ def test_run_tool_with_two_named_files_missing_one_is_422(monkeypatch):
     assert response.status_code == 422
 
 
-def test_run_rejects_upload_for_scalar_argument():
-    """SurgMovPred's "model" is a server-side-only selection (type str +
-    server_selectable): sending it as a file upload must be rejected outright,
-    not silently passed through as a temp path."""
+@pytest.fixture
+def hosted_model_tool(monkeypatch):
+    """A tool whose `model` is hosted server-side: type str + server_selectable,
+    which is what conventions.py derives for every argument named `model`."""
+
+    class HostedModelTool(Tool):
+        name = "zz_hosted_model"
+        arguments = {"model": ArgSpec(type=str, server_selectable="model")}
+
+        def run(self, model):
+            return str(model)
+
+    monkeypatch.setitem(registry.TOOLS, HostedModelTool.name, HostedModelTool())
+    return HostedModelTool.name
+
+
+def test_run_rejects_upload_for_scalar_argument(hosted_model_tool):
+    """Weights are named, never uploaded: a file sent for such an argument must
+    be refused outright, not passed through as a temp path."""
     response = client.post(
-        "/run/SurgMovPred",
+        f"/run/{hosted_model_tool}",
         headers={"Authorization": f"Bearer {TOKEN}"},
         files={"model": ("model.zip", b"PK\x03\x04fake", "application/zip")},
     )
@@ -217,11 +233,11 @@ def test_run_rejects_upload_for_scalar_argument():
     assert "model" in response.json()["detail"]
 
 
-def test_run_unknown_server_model_name_is_404():
+def test_run_unknown_server_model_name_is_404(hosted_model_tool):
     response = client.post(
-        "/run/SurgMovPred",
+        f"/run/{hosted_model_tool}",
         headers={"Authorization": f"Bearer {TOKEN}"},
-        data={"model": "does_not_exist", "input": "does_not_exist.zip"},
+        data={"model": "does_not_exist"},
     )
 
     assert response.status_code == 404

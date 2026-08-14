@@ -13,8 +13,8 @@ import pytest
 
 os.environ.setdefault("API_TOKEN", "test-token")
 
-import schema_hash
-import schema_tool
+from registry import schema_hash
+from registry import schema_tool
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DOCKER_DIR = os.path.join(REPO_ROOT, "docker")

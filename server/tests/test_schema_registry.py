@@ -15,10 +15,10 @@ import pytest
 
 os.environ.setdefault("API_TOKEN", "test-token")
 
-import deployment
+from registry import deployment
 import registry
-import schema_hash
-import schema_tool
+from registry import schema_hash
+from registry import schema_tool
 from base import LIST_TYPE, ToolArgumentError
 from config import settings
 

@@ -627,7 +627,7 @@ class Tool(ABC):
         from config import DISPATCH_SUBPROCESS, settings
 
         if settings.SADT_DISPATCH_MODE == DISPATCH_SUBPROCESS:
-            from dispatch import dispatch
+            from execution.dispatch import dispatch
 
             return dispatch(self, cleaned)
         return self.run(**cleaned)

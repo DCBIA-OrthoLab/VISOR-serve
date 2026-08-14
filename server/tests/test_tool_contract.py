@@ -16,14 +16,14 @@ import pytest
 
 os.environ.setdefault("API_TOKEN", "test-token")
 
-import deployment
-import dispatch
+from registry import deployment
+from execution import dispatch
 import main
-import schema_hash
-import schema_tool
+from registry import schema_hash
+from registry import schema_tool
 from base import CHOICE_TYPE, MULTICHOICE_TYPE, Selection
 from config import settings
-from deployment import DeploymentConfig, ToolDeployment
+from registry.deployment import DeploymentConfig, ToolDeployment
 
 
 # ----------------------------------------------------------------------

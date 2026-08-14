@@ -46,8 +46,8 @@ except ModuleNotFoundError:
 
 from base import Tool
 from config import settings
-from deployment import deployment_config
-from schema_tool import SchemaTool, is_packaged, load_tool
+from .deployment import deployment_config
+from .schema_tool import SchemaTool, is_packaged, load_tool
 
 # This module runs at import time, BEFORE main.py reaches its own
 # logging.basicConfig call: without this one, the INFO summary below would be
