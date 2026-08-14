@@ -7,9 +7,11 @@ change to the shape is a client release, not a server detail.
 
 tests/golden/tools_response.json pins the tools STILL RUNNING IN-PROCESS. It
 guarded all eight through the subprocess-dispatch work -- a client had to be
-unable to tell the difference -- and five of them have since been deleted here,
-their packaged equivalents serving in their place. What is left is what has not
-been packaged yet, and it is pinned for the same reason.
+unable to tell the difference -- and all six real ones have since been deleted
+here, their packaged equivalents serving in their place. ASO was the last, and
+went once its package was proven end to end: recentre, call ALI through the
+supervisor, register. What is pinned now is `Example_Tool` and `Test_Tool`,
+which are fixtures rather than tools and are not going anywhere.
 
 IF THIS TEST FAILS, the client breaks. Do not regenerate the fixture to make it
 pass -- report the difference instead. It is regenerated deliberately: when a
