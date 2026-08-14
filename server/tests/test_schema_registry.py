@@ -403,3 +403,16 @@ def test_the_registry_holds_both_kinds_at_once():
     will. Nothing here has a schema yet, so all eight are imported ones."""
     assert set(registry.TOOLS) >= {"Test_Tool", "Example_Tool"}
     assert not any(isinstance(tool, schema_tool.SchemaTool) for tool in registry.TOOLS.values())
+
+
+def test_a_packaged_path_argument_accepts_the_tool_s_own_formats(make_tool_folder, monkeypatch):
+    """A schema can only say "a path", so falling back to ALLOWED_EXTENSIONS
+    left every packaged tool accepting .nii alone: Surg_Mov_Pred could not be
+    sent its own .csv, Crown_Seg not a .vtk, and no tool a .zip of a cohort."""
+    import main
+
+    folder = make_tool_folder("anyformat", arguments={"scan": {"type": "path", "required": True}})
+    tool = schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    for filename in ("cohort.zip", "mesh.vtk", "measures.csv", "volume.nii.gz"):
+        assert main._checked_extension(tool, "scan", filename), filename

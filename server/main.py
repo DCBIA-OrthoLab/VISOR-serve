@@ -149,6 +149,13 @@ def _expected_extensions(tool, field_name: str) -> Optional[tuple]:
     spec = tool.arguments.get(field_name)
     if spec is None or not spec.is_file:
         return None
+    # A packaged tool's "path" takes whatever the tool reads -- a .vtk mesh, a
+    # .csv of measurements, a .zip of a whole cohort, which the server unpacks.
+    # Its schema cannot say more than "a path", and falling back to
+    # ALLOWED_EXTENSIONS here would leave every packaged tool accepting .nii
+    # only: Surg_Mov_Pred could not be sent its own .csv.
+    if spec.accepts is None and PATH_TYPE in spec.types:
+        return (_ACCEPT_ALL_EXTENSIONS,)
     return spec.extensions
 
 
