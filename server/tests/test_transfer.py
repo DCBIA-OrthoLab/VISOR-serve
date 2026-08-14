@@ -272,7 +272,7 @@ def test_run_accepts_an_upload_reference_in_place_of_a_multipart_file():
     _put_parts(session["upload_id"], payload, session["chunk_size"])
 
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers=AUTH,
         data={
             "label": "x",
@@ -291,7 +291,7 @@ def test_run_validates_an_uploaded_extension_the_same_way_either_route():
     _put_parts(session["upload_id"], payload, session["chunk_size"])
 
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers=AUTH,
         data={"label": "x", "__uploads__": json.dumps({"input": session["upload_id"]})},
     )
@@ -303,14 +303,14 @@ def test_run_validates_an_uploaded_extension_the_same_way_either_route():
 
 def test_run_rejects_a_malformed_uploads_field():
     response = client.post(
-        "/run/example_tool", headers=AUTH, data={"label": "x", "__uploads__": "{not json"}
+        "/run/Example_Tool", headers=AUTH, data={"label": "x", "__uploads__": "{not json"}
     )
     assert response.status_code == 400
 
 
 def test_run_rejects_an_unknown_upload_id():
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers=AUTH,
         data={"label": "x", "__uploads__": json.dumps({"input": "0123456789abcdefghij"})},
     )
@@ -406,7 +406,7 @@ def test_a_small_result_is_streamed_and_deleted_server_side():
     before = set(os.listdir(os.path.join(settings.TEMP_DIR, "results")))
 
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers={**AUTH, "X-Result-Delivery": "reference"},
         data={"label": "x", "threshold": "0.5", "input": "", "iterations": "1"},
         files={"input": ("input.csv", b"a,b\n1,2\n")},
@@ -422,7 +422,7 @@ def test_a_large_result_takes_the_reference_route():
     main._RESULT_REFERENCE_MIN_BYTES = 0      # every result counts as large
     try:
         response = client.post(
-            "/run/example_tool",
+            "/run/Example_Tool",
             headers={**AUTH, "X-Result-Delivery": "reference"},
             data={"label": "x", "threshold": "0.5"},
             files={"input": ("input.csv", b"a,b\n1,2\n")},
@@ -445,7 +445,7 @@ def test_run_returns_a_reference_when_the_client_asks_for_one():
     unchanged, which is what lets an old client keep working against a new
     server, and a new client against an old one."""
     response = client.post(
-        "/run/test_tool",
+        "/run/Test_Tool",
         headers={**AUTH, "X-Result-Delivery": "reference"},
         data={"text_1": "a", "text_2": "b"},
     )

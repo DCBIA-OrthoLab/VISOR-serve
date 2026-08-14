@@ -54,6 +54,17 @@ RUN mkdir -p /manifests && cd /ctx && \
 # different Pythons. uv installs each tool's interpreter itself.
 FROM python:3.13-slim AS runtime
 
+# The one system library the tools need and no lockfile can provide. libgomp is
+# the GNU OpenMP runtime: lightgbm dlopens it, and so do torch and
+# scikit-learn. A tool's uv.lock pins its PYTHON dependencies exactly and says
+# nothing about the C libraries they load, so without this every SurgMovPred
+# model fails to unpickle -- "None of the 112 model package(s) could be loaded"
+# -- and the cause, `libgomp.so.1: cannot open shared object file`, is three
+# frames deep inside joblib.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
+
 COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /uvx /usr/local/bin/
 
 # UV_CACHE_DIR is on the IMAGE's filesystem, and that is load-bearing: uv
@@ -149,7 +160,12 @@ ENV SADT_DISPATCH_MODE=subprocess \
     RUNNER_PATH=/opt/sadt/runner.py \
     DESCRIBE_PATH=/tools/scripts/describe.py \
     SCHEMA_CACHE_DIR=/var/cache/sadt \
-    DEPLOYMENT_CONFIG=/opt/sadt/deployment.toml \
+    # Next to the server, which is where COPY server/ actually puts it and
+    # what config.py defaults to. Pointed at /opt/sadt/ it named a file that
+    # never existed, so every packaged tool fell back to its own name for
+    # the DATA lookup: `amasss` instead of `AMASSS`, no models, no test
+    # files, and a `model` argument the client could not fill in.
+    DEPLOYMENT_CONFIG=/opt/sadt/server/deployment.toml \
     DATA_DIR=/DATA \
     TEMP_DIR=/jobs \
     PYTHONDONTWRITEBYTECODE=1

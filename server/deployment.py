@@ -41,7 +41,7 @@ logger = logging.getLogger("inference_server")
 # The two kinds data_store.py serves (DATA_DIR/<tool>/{models,testfiles}/).
 SERVER_SELECTABLE_KINDS = ("model", "testfile")
 
-_TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir")
+_TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden")
 
 
 class DeploymentConfigError(Exception):
@@ -64,6 +64,12 @@ class ToolDeployment:
     # a case-insensitive lookup would be a guess -- on a case-sensitive
     # filesystem both can exist.
     data_dir: Optional[str] = None
+
+    # Argument names a client must not render. The tool still declares them and
+    # still applies its own defaults; this only says a clinician has no
+    # business being asked. A deployment decision, which is why it lives here
+    # and not in the tool: the tool knows nothing about who is looking at it.
+    hidden: tuple = ()
 
 
 _NOTHING_DECLARED = ToolDeployment()
@@ -125,8 +131,19 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
     if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0):
         raise DeploymentConfigError(f"{where}: 'max_upload_mb' must be a positive integer.")
 
+    hidden = table.get("hidden", ())
+    if not isinstance(hidden, (list, tuple)) or not all(
+        isinstance(argument, str) and argument.strip() for argument in hidden
+    ):
+        raise DeploymentConfigError(
+            f"{where}: 'hidden' must be a list of argument names."
+        )
+
     return ToolDeployment(
-        server_selectable=dict(selectable), max_upload_mb=limit, data_dir=data_dir
+        server_selectable=dict(selectable),
+        max_upload_mb=limit,
+        data_dir=data_dir,
+        hidden=tuple(hidden),
     )
 
 

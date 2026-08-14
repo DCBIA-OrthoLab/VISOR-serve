@@ -1,0 +1,44 @@
+# Per-tool server-side configuration for the PACKAGED tools in sadt-tools.
+#
+# `data_dir` is load-bearing wherever a tool's name and its DATA folder differ.
+# A packaged tool is named after its folder, and the naming convention spells
+# words out (`Batch_Dental_Seg`) while setup-models.sh staged the data under
+# the run-together spelling (`DATA/BatchDentalSeg/`). Without this the lookup
+# falls back to the tool's own name and finds nothing -- no models, no test
+# files, and a `model` argument published as a bare path the client cannot
+# fill in. AMASSS needs no entry: the two already agree.
+#
+# `server_selectable` says which arguments the client picks from server-side
+# data rather than uploading. Weights never travel, so a `model` argument is
+# ALWAYS "model": the client offers the hosted names and nothing else.
+#
+# `hidden` names arguments a client must not render at all. They are still
+# declared by the tool, still recorded in its run report, and still applied
+# from the tool's own defaults -- the point is only that a clinician is not
+# asked which CUDA device to use or what nnUNet's tile step size should be.
+# Those are the deployment's business, and this file is the deployment.
+
+[tools.AMASSS]
+server_selectable = { model = "model", scans = "testfile" }
+hidden = [
+    "device", "tile_step_size", "gpu_resampling",
+    # Surface tuning: iterations and a triangle-reduction percentage. Same
+    # family as the two above -- a deployment choice, not a clinical one.
+    "surface_decimation", "surface_smoothing",
+]
+
+[tools.Batch_Dental_Seg]
+data_dir = "BatchDentalSeg"
+server_selectable = { model = "model", scans = "testfile" }
+hidden = ["device", "tile_step_size"]
+
+[tools.Crown_Seg]
+data_dir = "CrownSeg"
+server_selectable = { model = "model", meshes = "testfile" }
+# num_workers is Crown_Seg's equivalent of a tile step size: a dataloader
+# tuning knob, not a clinical choice.
+hidden = ["device", "num_workers"]
+
+[tools.Surg_Mov_Pred]
+data_dir = "SurgMovPred"
+server_selectable = { model = "model", measurements = "testfile" }

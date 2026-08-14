@@ -27,3 +27,9 @@ models/
 # DATA
 data/
 DATA/
+
+# Regenerated from each tool's source; source_hash is what keeps it honest.
+.schema-cache/
+
+# run-local.sh writes here.
+local-server.log

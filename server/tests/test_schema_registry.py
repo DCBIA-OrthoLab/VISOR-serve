@@ -339,11 +339,11 @@ def test_a_folder_with_a_schema_is_never_imported(make_tool_folder, monkeypatch)
     import tools as tools_package
 
     package_dir = tools_package.__path__[0]
-    assert "test_tool" in [name for name, _ in registry._discover_tool_classes(package_dir)]
+    assert "Test_Tool" in [name for name, _ in registry._discover_tool_classes(package_dir)]
 
-    monkeypatch.setattr(registry, "is_packaged", lambda folder: folder.endswith("test_tool"))
+    monkeypatch.setattr(registry, "is_packaged", lambda folder: folder.endswith("Test_Tool"))
 
-    assert "test_tool" not in [name for name, _ in registry._discover_tool_classes(package_dir)]
+    assert "Test_Tool" not in [name for name, _ in registry._discover_tool_classes(package_dir)]
 
 
 def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_folder, monkeypatch):
@@ -386,6 +386,10 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         "label": None,
         "section": None,
         "visible_when": None,
+        # False unless deployment.toml names it: an argument a client must not
+        # render at all (a CUDA device, a tile step size). The tool still
+        # declares it and still applies its own default.
+        "hidden": False,
         "ui": None,
         "groups": None,
     }
@@ -396,5 +400,5 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
 def test_the_registry_holds_both_kinds_at_once():
     """The migration state: tools this server imported, next to tools it never
     will. Nothing here has a schema yet, so all eight are imported ones."""
-    assert set(registry.TOOLS) >= {"test_tool", "example_tool"}
+    assert set(registry.TOOLS) >= {"Test_Tool", "Example_Tool"}
     assert not any(isinstance(tool, schema_tool.SchemaTool) for tool in registry.TOOLS.values())

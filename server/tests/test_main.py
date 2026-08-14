@@ -35,11 +35,11 @@ def test_tools_lists_test_tool():
     response = client.get("/tools")
     assert response.status_code == 200
     names = [tool["name"] for tool in response.json()]
-    assert "test_tool" in names
+    assert "Test_Tool" in names
 
 
 def test_run_without_token_is_401():
-    response = client.post("/run/test_tool", data={"text_1": "a", "text_2": "b"})
+    response = client.post("/run/Test_Tool", data={"text_1": "a", "text_2": "b"})
     assert response.status_code == 401
 
 
@@ -54,7 +54,7 @@ def test_run_unknown_tool_is_404():
 
 def test_run_missing_argument_is_422():
     response = client.post(
-        "/run/test_tool",
+        "/run/Test_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"text_1": "a"},
     )
@@ -63,7 +63,7 @@ def test_run_missing_argument_is_422():
 
 def test_run_unexpected_argument_is_422():
     response = client.post(
-        "/run/test_tool",
+        "/run/Test_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"text_1": "a", "text_2": "b", "text_3": "c"},
     )
@@ -72,7 +72,7 @@ def test_run_unexpected_argument_is_422():
 
 def test_run_test_tool_happy_path():
     response = client.post(
-        "/run/test_tool",
+        "/run/Test_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"text_1": "hello", "text_2": "world"},
     )
@@ -88,7 +88,7 @@ def test_run_example_tool_with_single_csv(tmp_path):
 
     with open(csv_file, "rb") as file_obj:
         response = client.post(
-            "/run/example_tool",
+            "/run/Example_Tool",
             headers={"Authorization": f"Bearer {TOKEN}"},
             data={"label": "case_1", "threshold": "0.5"},
             files={"input": ("measures.csv", file_obj, "text/csv")},
@@ -96,7 +96,7 @@ def test_run_example_tool_with_single_csv(tmp_path):
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
-    assert "example_tool_output.zip" in response.headers["content-disposition"]
+    assert "Example_Tool_output.zip" in response.headers["content-disposition"]
 
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
         assert sorted(archive.namelist()) == ["preview.csv", "summary.txt"]
@@ -118,7 +118,7 @@ def test_run_example_tool_with_zipped_folder(tmp_path):
     buffer.seek(0)
 
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"label": "case_2", "threshold": "2.5"},
         files={"input": ("measures.zip", buffer, "application/zip")},
@@ -136,7 +136,7 @@ def test_run_example_tool_with_zipped_folder(tmp_path):
 def test_run_example_tool_rejects_unsupported_extension():
     """type=("csv_file", "folder") accepts .csv and .zip -- nothing else."""
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"label": "case_3", "threshold": "0.5"},
         files={"input": ("volume.nii.gz", b"not tabular", "application/gzip")},
@@ -343,11 +343,11 @@ def test_tools_reports_every_declared_type():
     "types" with the full list, so a client can filter its file picker."""
     tools = {tool["name"]: tool for tool in client.get("/tools").json()}
 
-    example_input = tools["example_tool"]["arguments"]["input"]
+    example_input = tools["Example_Tool"]["arguments"]["input"]
     assert example_input["type"] == "csv_file"
     assert example_input["types"] == ["csv_file", "folder"]
 
-    single_typed = tools["test_tool"]["arguments"]["text_1"]
+    single_typed = tools["Test_Tool"]["arguments"]["text_1"]
     assert single_typed["type"] == "str"
     assert single_typed["types"] == ["str"]
 
@@ -359,13 +359,13 @@ def test_tools_publishes_the_extensions_of_every_file_type():
     keep a copy of that table, and drifts every time it changes here."""
     tools = {tool["name"]: tool for tool in client.get("/tools").json()}
 
-    example_input = tools["example_tool"]["arguments"]["input"]
+    example_input = tools["Example_Tool"]["arguments"]["input"]
     # Keyed by type, not flattened: "folder"'s .zip is what a zipped folder may
     # be uploaded as, not something a file picker should offer.
     assert example_input["extensions"] == {"csv_file": [".csv"], "folder": [".zip"]}
 
     # An argument taking no file at all says so.
-    assert tools["example_tool"]["arguments"]["label"]["extensions"] is None
+    assert tools["Example_Tool"]["arguments"]["label"]["extensions"] is None
 
     for tool in tools.values():
         for argument in tool["arguments"].values():
@@ -675,7 +675,7 @@ def test_server_selectable_folder_argument(monkeypatch, tmp_path):
 
 
 def test_download_testfile_requires_token():
-    response = client.get("/tools/test_tool/testfiles/anything.nii.gz")
+    response = client.get("/tools/Test_Tool/testfiles/anything.nii.gz")
     assert response.status_code == 401
 
 
@@ -689,7 +689,7 @@ def test_download_testfile_unknown_tool_is_404():
 
 def test_download_unknown_testfile_is_404():
     response = client.get(
-        "/tools/test_tool/testfiles/does_not_exist.nii.gz",
+        "/tools/Test_Tool/testfiles/does_not_exist.nii.gz",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
     assert response.status_code == 404
@@ -711,7 +711,7 @@ def test_download_testfile_streams_the_file(monkeypatch, tmp_path):
     )
 
     response = client.get(
-        "/tools/test_tool/testfiles/reference_scan.nii.gz",
+        "/tools/Test_Tool/testfiles/reference_scan.nii.gz",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
 
@@ -743,7 +743,7 @@ def test_download_testfile_folder_arrives_zipped_and_cleans_up(monkeypatch, tmp_
 
     before = set(os.listdir(settings.TEMP_DIR))
     response = client.get(
-        "/tools/test_tool/testfiles/test_cohort",
+        "/tools/Test_Tool/testfiles/test_cohort",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
 
@@ -771,7 +771,7 @@ def test_download_testfile_removes_a_backend_temp_copy(monkeypatch, tmp_path):
     )
 
     response = client.get(
-        "/tools/test_tool/testfiles/materialized.nii.gz",
+        "/tools/Test_Tool/testfiles/materialized.nii.gz",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
 
@@ -812,7 +812,7 @@ def test_tools_exposes_choices():
     """GET /tools ships the options and their initial state, so the client can
     render check boxes / a combo box with no tool-specific code."""
     tools = {tool["name"]: tool for tool in client.get("/tools").json()}
-    arguments = tools["example_tool"]["arguments"]
+    arguments = tools["Example_Tool"]["arguments"]
 
     assert arguments["outputs"]["type"] == "multichoice"
     assert arguments["outputs"]["choices"] == {
@@ -842,17 +842,17 @@ def test_tools_publishes_the_initial_value_of_scalar_arguments():
 
     # None when the tool declares none -- example_tool's `iterations` means
     # "unset", and must not be coerced to 0 client-side.
-    assert tools["example_tool"]["arguments"]["iterations"]["initial"] is None
+    assert tools["Example_Tool"]["arguments"]["iterations"]["initial"] is None
 
 
     # None when the tool declares none -- example_tool's `iterations` means
     # "unset", and must not be coerced to 0 client-side.
-    assert tools["example_tool"]["arguments"]["iterations"]["initial"] is None
+    assert tools["Example_Tool"]["arguments"]["iterations"]["initial"] is None
 
 
 def _run_example(**extra):
     return client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"label": "choices", "threshold": "0", **extra},
         files={"input": ("m.csv", b"a,b\n1,2\n", "text/csv")},
@@ -1026,7 +1026,7 @@ def test_tools_exposes_presentation_hints():
     an existing panel rendering exactly as it did."""
     tools = {tool["name"]: tool for tool in client.get("/tools").json()}
 
-    example = tools["example_tool"]["arguments"]["outputs"]
+    example = tools["Example_Tool"]["arguments"]["outputs"]
     assert example["label"] is None
     assert example["section"] is None
     assert example["visible_when"] is None
@@ -1248,7 +1248,7 @@ def test_served_request_is_logged_with_both_sizes(caplog, tmp_path):
     with caplog.at_level("INFO", logger="inference_server"):
         with open(csv_file, "rb") as file_obj:
             response = client.post(
-                "/run/example_tool",
+                "/run/Example_Tool",
                 headers={"Authorization": f"Bearer {TOKEN}"},
                 data={"label": "case_1", "threshold": "0.5"},
                 files={"input": ("measures.csv", file_obj, "text/csv")},
@@ -1256,7 +1256,7 @@ def test_served_request_is_logged_with_both_sizes(caplog, tmp_path):
 
     assert response.status_code == 200
     line = next(
-        message for message in caplog.messages if message.startswith("endpoint=/run/example_tool")
+        message for message in caplog.messages if message.startswith("endpoint=/run/Example_Tool")
     )
     assert f"received={csv_file.stat().st_size}B" in line
     assert f"sent={len(response.content)}B" in line
@@ -1269,14 +1269,14 @@ def test_text_output_is_logged_without_a_sent_size(caplog):
     measure, so the field is omitted rather than reported as a bogus zero."""
     with caplog.at_level("INFO", logger="inference_server"):
         response = client.post(
-            "/run/test_tool",
+            "/run/Test_Tool",
             headers={"Authorization": f"Bearer {TOKEN}"},
             data={"text_1": "hello", "text_2": "world"},
         )
 
     assert response.status_code == 200
     line = next(
-        message for message in caplog.messages if message.startswith("endpoint=/run/test_tool")
+        message for message in caplog.messages if message.startswith("endpoint=/run/Test_Tool")
     )
     assert "received=0B (0 B)" in line
     assert "sent=" not in line
@@ -1292,7 +1292,7 @@ def test_log_line_carries_no_file_name_or_argument_value(caplog, tmp_path):
     with caplog.at_level("INFO", logger="inference_server"):
         with open(csv_file, "rb") as file_obj:
             response = client.post(
-                "/run/example_tool",
+                "/run/Example_Tool",
                 headers={"Authorization": f"Bearer {TOKEN}"},
                 data={"label": "secret_patient_label", "threshold": "0.5"},
                 files={"input": (csv_file.name, file_obj, "text/csv")},
@@ -1300,7 +1300,7 @@ def test_log_line_carries_no_file_name_or_argument_value(caplog, tmp_path):
 
     assert response.status_code == 200
     line = next(
-        message for message in caplog.messages if message.startswith("endpoint=/run/example_tool")
+        message for message in caplog.messages if message.startswith("endpoint=/run/Example_Tool")
     )
     assert "patient_ident_0042" not in line
     assert "secret_patient_label" not in line

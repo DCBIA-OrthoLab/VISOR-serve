@@ -287,11 +287,37 @@ def _argument_spec(
             f"as {declared_type!r} rather than 'path'."
         )
 
+    # A deployment decision, not the tool's: which arguments a client renders.
+    # The spec still exists and the tool still applies its own default -- this
+    # only says nobody is asked. See ArgSpec.hidden.
+    hidden = argument_name in deployment.hidden
+
     choices = declaration.get("choices")
     if choices:
         narrowed = _choice_spec(where, declared_type, declaration, choices)
         if narrowed is not None:
+            narrowed.hidden = hidden
             return narrowed
+
+    # A model is chosen from what the server hosts, never uploaded: the weights
+    # do not travel, in either direction. What travels is a NAME, so the
+    # argument is published as a scalar and main.py resolves it to a local path
+    # before run() is called -- which is what the tool's `Path` annotation then
+    # receives, unchanged.
+    #
+    # Published as a path instead, it becomes a file argument: the client gives
+    # every file argument an input row with a local picker (see
+    # formgen.file_input_modes -- "which arguments those are is the schema's
+    # answer, not a module's"), and a clinician is offered to upload a model
+    # bundle from their laptop.
+    if selectable == "model" and declared_type == "path":
+        return ArgSpec(
+            type=str,
+            required=required,
+            description=declaration.get("description", ""),
+            server_selectable=selectable,
+            hidden=hidden,
+        )
 
     accepts = declaration.get("extensions")
     if accepts is not None and declared_type != "path":
@@ -313,6 +339,7 @@ def _argument_spec(
         # path, where there is a file picker to pre-fill and nothing to put in
         # it; a schema declaring one is not an error.
         initial=None if declared_type == "path" else declaration.get("default"),
+        hidden=hidden,
     )
 
 

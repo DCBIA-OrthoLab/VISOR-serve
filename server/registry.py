@@ -102,6 +102,27 @@ def _tool_folders(root: str) -> list:
     ]
 
 
+def _is_leftover(folder: str) -> bool:
+    """Is this directory the remains of a tool git could not delete?
+
+    Renaming tools/example_tool/ to tools/Example_Tool/ leaves the old path
+    behind on every checkout where the server or the tests have run: git
+    removes the tracked files but cannot remove a directory that still holds an
+    untracked __pycache__/. The result is a folder with no source in it at all,
+    which discovery would otherwise report as a tool that FAILED TO LOAD -- in
+    a full-width banner, at every startup, on a deployment where all the tools
+    are in fact fine and `git status` is clean.
+
+    A folder with Python in it but not its <name>.py is the opposite case and
+    keeps failing loudly: that one is a real tool, misnamed.
+    """
+    try:
+        return not any(entry.endswith(".py") for entry in os.listdir(folder))
+    except OSError:
+        # Unreadable is not empty. Let discovery reach it and report why.
+        return False
+
+
 def _discover_schema_tools(root: str) -> list:
     """(folder name, SchemaTool) for every folder under `root` declaring one.
 
@@ -137,6 +158,8 @@ def _discover_tool_classes(root: str) -> list:
         # A tool that declares a schema is served from it and never imported.
         if is_packaged(folder_path):
             continue
+        if _is_leftover(folder_path):
+            continue
 
         try:
             expected_file = os.path.join(folder_path, f"{entry}.py")
@@ -168,6 +191,15 @@ def _instantiate(folder: str, cls, registry: dict):
     # than on the first request that happens to reach that tool.
     instance.check_schema()
     return instance
+
+
+def _comparable(name: str) -> str:
+    """One tool's name reduced to what does not vary between spellings.
+
+    `Batch_Dental_Seg` and `BatchDentalSeg` are the same tool written two ways,
+    so neither case nor separators may decide whether they collide.
+    """
+    return "".join(character for character in name.casefold() if character.isalnum())
 
 
 def _reject_duplicate(name: str, registry: dict) -> None:
@@ -217,8 +249,24 @@ def _build_registry() -> dict:
 
     schema_tools = len(registry)
 
+    packaged = {_comparable(name): name for name in registry}
+
     legacy_root = tools_package.__path__[0] if tools_package is not None else ""
     for folder, cls in _discover_tool_classes(legacy_root):
+        # Checked BEFORE instantiating, and that ordering is the point. When the
+        # two names are identical -- which is what the naming convention makes
+        # normal, `AMASSS` on both sides -- _instantiate's duplicate check fires
+        # first and the tool is reported as FAILED TO LOAD, in a banner, at
+        # every startup. It has not failed: it has been replaced.
+        superseded = packaged.get(_comparable(getattr(cls, "name", "") or ""))
+        if superseded is not None:
+            logger.info(
+                "Not serving imported tool '%s': superseded by the packaged '%s'. "
+                "Delete server/tools/%s once that one is merged.",
+                getattr(cls, "name", cls.__name__), superseded, os.path.basename(folder),
+            )
+            continue
+
         try:
             instance = _instantiate(folder, cls, registry)
         except Exception as exc:

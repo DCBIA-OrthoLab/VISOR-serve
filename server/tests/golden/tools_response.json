@@ -32,6 +32,7 @@
         "label": "Scan or Folder",
         "section": "Inputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -49,6 +50,7 @@
         "label": "Model Bundle",
         "section": "Inputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -71,6 +73,7 @@
         "label": "Regions",
         "section": "CBCT landmarks",
         "visible_when": null,
+        "hidden": false,
         "ui": "inline",
         "groups": null
       },
@@ -208,6 +211,7 @@
         "label": "Individual landmarks",
         "section": "CBCT landmarks",
         "visible_when": null,
+        "hidden": false,
         "ui": "tabs",
         "groups": {
           "Cranial base": [
@@ -356,6 +360,7 @@
         "label": "Landmark families",
         "section": "IOS landmarks",
         "visible_when": null,
+        "hidden": false,
         "ui": "inline",
         "groups": null
       },
@@ -373,6 +378,7 @@
         "label": "Prediction ID",
         "section": "Outputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       }
@@ -410,6 +416,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -427,6 +434,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -454,6 +462,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -474,6 +483,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -491,6 +501,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -508,6 +519,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -525,6 +537,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -542,6 +555,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       }
@@ -568,6 +582,7 @@
         "label": "Input Type",
         "section": "Inputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -588,6 +603,7 @@
         "label": "Mode",
         "section": "Inputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -627,6 +643,7 @@
         "label": "Scan / Landmark Folder",
         "section": "Inputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -652,6 +669,7 @@
         "label": "Reference",
         "section": "Inputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -672,6 +690,7 @@
           "modality": "CBCT",
           "automation": "Fully-Automated"
         },
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -807,6 +826,7 @@
         "visible_when": {
           "modality": "CBCT"
         },
+        "hidden": false,
         "ui": "tabs",
         "groups": {
           "Cranial base": [
@@ -981,6 +1001,7 @@
         "visible_when": {
           "modality": "IOS"
         },
+        "hidden": false,
         "ui": "grid",
         "groups": {
           "Upper": [
@@ -1047,6 +1068,7 @@
           "modality": "IOS",
           "automation": "Semi-Automated"
         },
+        "hidden": false,
         "ui": "inline",
         "groups": null
       },
@@ -1069,6 +1091,7 @@
         "visible_when": {
           "modality": "IOS"
         },
+        "hidden": false,
         "ui": "inline",
         "groups": null
       },
@@ -1092,6 +1115,7 @@
         "visible_when": {
           "modality": "IOS"
         },
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1111,6 +1135,7 @@
         "visible_when": {
           "modality": "CBCT"
         },
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1128,6 +1153,7 @@
         "label": "Suffix",
         "section": "Outputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       }
@@ -1165,6 +1191,7 @@
         "label": "Scan or Folder",
         "section": "Inputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1182,6 +1209,7 @@
         "label": "Model",
         "section": "Inputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1199,6 +1227,7 @@
         "label": "Also write one file per segment",
         "section": "Outputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1216,6 +1245,7 @@
         "label": "Prediction ID",
         "section": "Outputs",
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       }
@@ -1249,6 +1279,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1266,6 +1297,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1283,6 +1315,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1303,6 +1336,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1320,6 +1354,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1337,6 +1372,136 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "files"
+  },
+  {
+    "name": "Example_Tool",
+    "arguments": {
+      "label": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "Free-text label for this run",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "input": {
+        "type": "csv_file",
+        "types": [
+          "csv_file",
+          "folder"
+        ],
+        "required": true,
+        "description": "A single .csv file, or a folder of .csv/.xlsx/.ods files sent as a .zip archive",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "csv_file": [
+            ".csv"
+          ],
+          "folder": [
+            ".zip"
+          ]
+        },
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "threshold": {
+        "type": "float",
+        "types": [
+          "float"
+        ],
+        "required": true,
+        "description": "Numeric threshold parameter",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "iterations": {
+        "type": "int",
+        "types": [
+          "int"
+        ],
+        "required": false,
+        "description": "Optional number of iterations",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "outputs": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "Which result files to produce",
+        "server_selectable": null,
+        "choices": {
+          "summary": true,
+          "preview": true,
+          "columns": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "preview_format": {
+        "type": "choice",
+        "types": [
+          "choice"
+        ],
+        "required": false,
+        "description": "Format of the preview file",
+        "server_selectable": null,
+        "choices": {
+          "csv": true,
+          "json": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       }
@@ -1364,6 +1529,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1381,6 +1547,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       }
@@ -1388,130 +1555,7 @@
     "output_kind": "file"
   },
   {
-    "name": "example_tool",
-    "arguments": {
-      "label": {
-        "type": "str",
-        "types": [
-          "str"
-        ],
-        "required": true,
-        "description": "Free-text label for this run",
-        "server_selectable": null,
-        "choices": null,
-        "initial": null,
-        "extensions": null,
-        "label": null,
-        "section": null,
-        "visible_when": null,
-        "ui": null,
-        "groups": null
-      },
-      "input": {
-        "type": "csv_file",
-        "types": [
-          "csv_file",
-          "folder"
-        ],
-        "required": true,
-        "description": "A single .csv file, or a folder of .csv/.xlsx/.ods files sent as a .zip archive",
-        "server_selectable": null,
-        "choices": null,
-        "initial": null,
-        "extensions": {
-          "csv_file": [
-            ".csv"
-          ],
-          "folder": [
-            ".zip"
-          ]
-        },
-        "label": null,
-        "section": null,
-        "visible_when": null,
-        "ui": null,
-        "groups": null
-      },
-      "threshold": {
-        "type": "float",
-        "types": [
-          "float"
-        ],
-        "required": true,
-        "description": "Numeric threshold parameter",
-        "server_selectable": null,
-        "choices": null,
-        "initial": null,
-        "extensions": null,
-        "label": null,
-        "section": null,
-        "visible_when": null,
-        "ui": null,
-        "groups": null
-      },
-      "iterations": {
-        "type": "int",
-        "types": [
-          "int"
-        ],
-        "required": false,
-        "description": "Optional number of iterations",
-        "server_selectable": null,
-        "choices": null,
-        "initial": null,
-        "extensions": null,
-        "label": null,
-        "section": null,
-        "visible_when": null,
-        "ui": null,
-        "groups": null
-      },
-      "outputs": {
-        "type": "multichoice",
-        "types": [
-          "multichoice"
-        ],
-        "required": false,
-        "description": "Which result files to produce",
-        "server_selectable": null,
-        "choices": {
-          "summary": true,
-          "preview": true,
-          "columns": false
-        },
-        "initial": null,
-        "extensions": null,
-        "label": null,
-        "section": null,
-        "visible_when": null,
-        "ui": null,
-        "groups": null
-      },
-      "preview_format": {
-        "type": "choice",
-        "types": [
-          "choice"
-        ],
-        "required": false,
-        "description": "Format of the preview file",
-        "server_selectable": null,
-        "choices": {
-          "csv": true,
-          "json": false
-        },
-        "initial": null,
-        "extensions": null,
-        "label": null,
-        "section": null,
-        "visible_when": null,
-        "ui": null,
-        "groups": null
-      }
-    },
-    "output_kind": "files"
-  },
-  {
-    "name": "test_tool",
+    "name": "Test_Tool",
     "arguments": {
       "text_1": {
         "type": "str",
@@ -1527,6 +1571,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       },
@@ -1544,6 +1589,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "hidden": false,
         "ui": null,
         "groups": null
       }

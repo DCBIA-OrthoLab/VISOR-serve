@@ -5,7 +5,7 @@ so run() can always trust its inputs.
 # TODO to add a new tool: create a folder tools/<name>/ with an __init__.py
 # (can be empty) and a tools/<name>/<name>.py file (must match the folder
 # name) subclassing Tool; set `name` and `arguments`, implement `run`.
-# Nothing else needs to change -- see tools/test_tool/ for a minimal example
+# Nothing else needs to change -- see tools/Test_Tool/ for a minimal example
 # and registry.py for how it gets picked up automatically.
 """
 
@@ -200,6 +200,17 @@ class ArgSpec:
     # default applies. It does NOT replace the tool's own cross-argument
     # validation, which still has to hold for a direct API call.
     visible_when: Optional[dict] = None
+
+    # Not rendered by a client, at all. The value is still the tool's own
+    # default, and the spec still exists here -- dispatch.uses_the_gpu() reads
+    # `device` to decide whether a run takes the card, so removing it from the
+    # schema would silently make every tool look CPU-only.
+    #
+    # For arguments a clinician has no business seeing: which device to run on,
+    # nnUNet's tile step size, whether to resample on the GPU. They change the
+    # result, they are recorded in the run report, and they are set by whoever
+    # deploys the server -- not by the person segmenting a patient.
+    hidden: bool = False
 
     # How a "multichoice" argument's check boxes are laid out (see UI_LAYOUTS).
     ui: Optional[str] = None
