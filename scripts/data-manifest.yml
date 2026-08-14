@@ -321,7 +321,8 @@ tools:
         extract: true
 
   # =========================================================================
-  # ASO -- automated standardized orientation. Ported: server/tools/ASO/.
+  # ASO -- automated standardized orientation. Packaged in sadt-tools;
+  # the data below is still served from DATA/ASO/.
   #
   # Three bundles this block used to fetch have been REMOVED rather than left
   # in place, because nothing on either side of the port reads them:
@@ -342,11 +343,10 @@ tools:
   ASO:
     models:
       # Landmark weights for Fully-Automated CBCT. ASO does not predict
-      # landmarks itself -- it hands this bundle to the ALI tool (see
-      # tools/ASO/src/ali_client.py), which is not deployed yet, so nothing
-      # reads these until it is.
+      # landmarks itself -- it asks the ALI tool for them, mid-run, through
+      # the supervisor the runner injects (`sup.run("ALI", ...)`).
       #
-      # They live under DATA/ASO/ because `landmark_models` is
+      # They live under DATA/ASO/ because `landmark_model` is
       # server_selectable on ASO's schema, and GET /tools/{tool}/data is
       # per tool: the client's dropdown lists DATA/ASO/models/ and main.py
       # resolves the name there before ASO ever runs.

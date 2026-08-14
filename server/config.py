@@ -69,26 +69,6 @@ class Settings(BaseSettings):
     # own extensions. "*" accepts everything.
     ALLOWED_EXTENSIONS: tuple[str, ...] = (".nii", ".nii.gz")
 
-    # --- the in-process tools -----------------------------------------
-    # Read by server/tools/ only. A packaged tool takes these as arguments.
-    AMASSS_MAX_GPU_JOBS: int = 1  # raising it needs a larger shm_size
-    # 195.9s -> 77.0s on five structures. Not numerically free: input resampling
-    # drops to spline order 1 (Dice 0.978 CV to 0.998 MAND). false is bit-identical.
-    AMASSS_GPU_RESAMPLING: bool = True
-    AMASSS_TILE_STEP_SIZE: float = 0.5  # DOES move the segmentation (0.7 -> Dice 0.995)
-    ALI_MAX_GPU_JOBS: int = 4  # a CBCT run peaks at 256 MiB
-    ALI_SEARCH_MAX_SECONDS: Optional[float] = None  # None: 15s on GPU, 60s on CPU
-    BATCHDENTALSEG_MAX_GPU_JOBS: int = 1
-    BATCHDENTALSEG_TILE_STEP_SIZE: float = 0.5
-    CROWNSEG_MAX_GPU_JOBS: int = 1
-    CROWNSEG_NUM_WORKERS: int = 2  # >= 1: shapeaxi sets persistent_workers=True
-    CROWNSEG_MODEL: str = "07-21-22_val-loss0.169.pth"  # staged, never downloaded mid-request
-    # Every ordered triplet is tried below this (7 landmarks is 210), which
-    # beats sampling; above it, a generator seeded with ASO_ICP_SEED. Fixed seed
-    # on purpose: an orientation applied to patient data must be reproducible.
-    ASO_ICP_MAX_TRIPLETS: int = 2500
-    ASO_ICP_SEED: int = 0
-    ASO_LANDMARK_TOOL: str = "ALI"
 
     @field_validator("SADT_DISPATCH_MODE")
     @classmethod
