@@ -111,7 +111,25 @@ DEFAULT_RETURN_KIND = "text"
 #   extensions   [".nii", ".nii.gz"] for a path argument -- what the client's
 #                file dialog offers. Without it the schema says only "a path"
 #                and the dialog falls back to ALLOWED_EXTENSIONS.
-_ARGUMENT_KEYS = ("type", "required", "default", "description", "extensions", "choices")
+#   section      the collapsible box a panel puts the field in.
+#   ui           how to render a choice: "tabs", "inline", "slider".
+#   groups       {tab: [options]} for a multichoice with too many options to
+#                stack in one column -- ALI publishes 119 landmarks.
+#   visible_when {other argument: value} -- the field is shown only then. This
+#                is what keeps a tool with two modalities from asking a CBCT
+#                user about intra-oral meshes.
+#   label        what the field is called, when the argument name is not it.
+#   hidden       never rendered, whatever the panel holds.
+#
+# The five presentation keys were dropped here for a while, and the effect was
+# invisible from both ends: sadt-tools published them, the client read them, and
+# nothing arrived. A key this server does not list is a key that silently does
+# not exist, so adding one is a deliberate act -- which is why they are named
+# and explained rather than passed through wholesale.
+_ARGUMENT_KEYS = (
+    "type", "required", "default", "description", "extensions", "choices",
+    "section", "ui", "groups", "visible_when", "label", "hidden",
+)
 
 # The output directory every tool takes as a required argument. The SERVER owns
 # it -- it is the job's own output/ -- so it is filled in at dispatch time and
@@ -252,6 +270,23 @@ def read_schema(folder: str) -> dict:
     return schema
 
 
+# Presentation, carried straight through from the tool's schema. `base.ArgSpec`
+# has had these fields all along -- what was missing was anyone handing them
+# over, so a tool could publish `section` and `ui`, a client could read them,
+# and nothing arrived. In one function because there are four places an ArgSpec
+# is built and three of them are easy to forget.
+_PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "label")
+
+
+def _presentation(declaration: dict) -> dict:
+    """The layout hints a declaration carries, if any."""
+    return {
+        key: declaration[key]
+        for key in _PRESENTATION_KEYS
+        if declaration.get(key) is not None
+    }
+
+
 def _argument_spec(
     tool_name: str, argument_name: str, declaration, deployment: ToolDeployment
 ) -> ArgSpec:
@@ -318,6 +353,7 @@ def _argument_spec(
     # bundle from their laptop.
     if selectable == "model" and declared_type == "path":
         return ArgSpec(
+        **_presentation(declaration),
             type=str,
             required=required,
             description=declaration.get("description", ""),
@@ -333,6 +369,7 @@ def _argument_spec(
         )
 
     return ArgSpec(
+        **_presentation(declaration),
         type=ARGUMENT_TYPES[declared_type],
         required=required,
         description=declaration.get("description", ""),
@@ -370,6 +407,7 @@ def _choice_spec(where: str, declared_type: str, declaration: dict, choices: lis
     if declared_type in MULTICHOICE_BASE_TYPES:
         selected = default if isinstance(default, list) else []
         return ArgSpec(
+        **_presentation(declaration),
             type=MULTICHOICE_TYPE,
             required=declaration.get("required", True),
             description=declaration.get("description", ""),
@@ -381,6 +419,7 @@ def _choice_spec(where: str, declared_type: str, declaration: dict, choices: lis
     # options offers them in a meaningful order.
     chosen = default if default in choices else choices[0]
     return ArgSpec(
+        **_presentation(declaration),
         type=CHOICE_TYPE,
         required=declaration.get("required", True),
         description=declaration.get("description", ""),
