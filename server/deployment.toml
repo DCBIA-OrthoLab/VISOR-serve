@@ -27,6 +27,14 @@ hidden = [
     "surface_decimation", "surface_smoothing",
 ]
 
+[tools.ALI]
+server_selectable = { model = "model", input = "testfile" }
+# search_seconds is the per-agent time budget of the deep-RL walk: it trades
+# run time against how thoroughly the volume is searched. Same family as a
+# tile step size -- whoever deploys the server decides how long a run may
+# take, and the clinician placing landmarks is not asked to price that.
+hidden = ["device", "search_seconds"]
+
 [tools.Batch_Dental_Seg]
 data_dir = "BatchDentalSeg"
 server_selectable = { model = "model", scans = "testfile" }
