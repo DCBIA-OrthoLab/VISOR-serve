@@ -1,0 +1,32 @@
+# Copy to deployment.toml to configure what THIS server does with a tool.
+# Entirely optional: with no file at all, every tool serves with upload-only
+# inputs and the global MAX_UPLOAD_MB.
+#
+# The split with a tool's .schema.json is deliberate. The schema is generated
+# from the tool's source and is the same wherever that tool is installed; this
+# file is about this machine — which of its arguments may be filled from this
+# server's DATA_DIR, and how much this server accepts as an upload. Put either
+# in the schema and every deployment inherits one server's paths and limits.
+#
+# Keyed by TOOL name — what the client sends to /run/<name>, and what the
+# tool's own .schema.json declares as `name`.
+
+# [tools.amasss]
+#
+# Arguments a caller may satisfy by naming a file already on this server
+# instead of uploading one (see data_store.py). "model" resolves against
+# DATA_DIR/<tool>/models/, "testfile" against DATA_DIR/<tool>/testfiles/.
+# Only `path` arguments can be declared here, and only ones the tool
+# actually has — both are checked at startup, because the failure otherwise
+# is a dropdown that silently never appears.
+# server_selectable = { model = "model", scan = "testfile" }
+#
+# Upload limit for this tool, in MB. Overrides MAX_UPLOAD_MB, up or down: a
+# cohort of CBCTs is not a spreadsheet. Enforced where the tool is known —
+# on the multipart body, and when a chunked upload is claimed by a run.
+# POST /uploads itself does not know which tool the bytes are for and keeps
+# applying the global limit while the transfer runs.
+# max_upload_mb = 2000
+
+# A section naming a tool this server does not serve is a warning at startup,
+# not an error: a deployment file outliving one tool must not stop the others.

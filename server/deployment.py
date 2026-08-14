@@ -1,0 +1,142 @@
+"""Per-tool server-side configuration: `deployment.toml`.
+
+The split with `.schema.json` is deliberate and worth stating once. A tool's
+schema says what its `run()` takes -- the same everywhere the tool is ever
+installed, generated from its source, and hashed. This file says what THIS
+deployment does with it: which arguments may be satisfied by a file already on
+this server, and how large an upload this server accepts for this tool. Move
+either of those into the schema and every deployment inherits one server's
+paths and limits.
+
+    [tools.amasss]
+    server_selectable = { model = "model", scan = "testfile" }
+    max_upload_mb = 500
+
+Absent is the normal case: with no file at all, every `path` argument is
+upload-only and MAX_UPLOAD_MB applies. Nothing here is required for a tool to
+work.
+
+The file is validated at startup rather than on first use: an entry naming an
+argument that does not exist, or a `server_selectable` kind that is neither
+"model" nor "testfile", would otherwise be a dropdown that silently never
+appears.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+try:  # tomllib is standard from 3.11; the server targets the newest Python
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - only on 3.10 and older
+    import tomli as tomllib
+
+from config import settings
+
+logger = logging.getLogger("inference_server")
+
+# The two kinds data_store.py serves (DATA_DIR/<tool>/{models,testfiles}/).
+SERVER_SELECTABLE_KINDS = ("model", "testfile")
+
+_TOOL_KEYS = ("server_selectable", "max_upload_mb")
+
+
+class DeploymentConfigError(Exception):
+    """Raised at startup when deployment.toml cannot be trusted."""
+
+
+@dataclass(frozen=True)
+class ToolDeployment:
+    """What this deployment says about one tool. All-defaults means "nothing
+    said", which is the same as having no entry at all."""
+
+    # {argument name: "model" | "testfile"}
+    server_selectable: dict = field(default_factory=dict)
+    # None falls back to settings.MAX_UPLOAD_MB.
+    max_upload_mb: Optional[int] = None
+
+
+_NOTHING_DECLARED = ToolDeployment()
+
+
+class DeploymentConfig:
+    def __init__(self, tools: dict):
+        self._tools = tools
+
+    def for_tool(self, tool_name: str) -> ToolDeployment:
+        return self._tools.get(tool_name, _NOTHING_DECLARED)
+
+    @property
+    def configured_tools(self) -> tuple:
+        return tuple(sorted(self._tools))
+
+    def upload_limit_mb(self, tool_name: str) -> int:
+        """The upload limit for this tool, in MB. Per-tool config wins; the
+        global MAX_UPLOAD_MB is the default, not a ceiling."""
+        limit = self.for_tool(tool_name).max_upload_mb
+        return settings.MAX_UPLOAD_MB if limit is None else limit
+
+
+def _tool_deployment(tool_name: str, table) -> ToolDeployment:
+    where = f"deployment.toml, [tools.{tool_name}]"
+    if not isinstance(table, dict):
+        raise DeploymentConfigError(f"{where}: expected a table.")
+
+    unknown = sorted(set(table) - set(_TOOL_KEYS))
+    if unknown:
+        # A typo here is silent otherwise: `server_selectible` would simply
+        # leave every argument upload-only, with no dropdown and no error.
+        raise DeploymentConfigError(
+            f"{where}: unknown key(s) {unknown}. Expected any of {list(_TOOL_KEYS)}."
+        )
+
+    selectable = table.get("server_selectable", {})
+    if not isinstance(selectable, dict):
+        raise DeploymentConfigError(
+            f"{where}: 'server_selectable' must be a table of argument name -> "
+            f"{' | '.join(SERVER_SELECTABLE_KINDS)}."
+        )
+    for argument, kind in selectable.items():
+        if kind not in SERVER_SELECTABLE_KINDS:
+            raise DeploymentConfigError(
+                f"{where}: argument '{argument}' is declared server_selectable as {kind!r}; "
+                f"expected one of {list(SERVER_SELECTABLE_KINDS)}."
+            )
+
+    limit = table.get("max_upload_mb")
+    if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0):
+        raise DeploymentConfigError(f"{where}: 'max_upload_mb' must be a positive integer.")
+
+    return ToolDeployment(server_selectable=dict(selectable), max_upload_mb=limit)
+
+
+def load(path: Optional[str] = None) -> DeploymentConfig:
+    path = settings.DEPLOYMENT_CONFIG if path is None else path
+    if not path or not os.path.isfile(path):
+        # The normal case. Explicitly not an error: a server with no
+        # deployment.toml serves every tool with upload-only inputs.
+        return DeploymentConfig({})
+
+    try:
+        with open(path, "rb") as handle:
+            document = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise DeploymentConfigError(f"Cannot read {path}: {exc}")
+
+    unknown = sorted(set(document) - {"tools"})
+    if unknown:
+        raise DeploymentConfigError(f"{path}: unknown top-level table(s) {unknown}. Expected [tools].")
+
+    tools = document.get("tools", {})
+    if not isinstance(tools, dict):
+        raise DeploymentConfigError(f"{path}: [tools] must be a table of tool name -> settings.")
+
+    configured = {name: _tool_deployment(name, table) for name, table in tools.items()}
+    logger.info("Deployment config: %d tool(s) configured (%s)", len(configured), path)
+    return DeploymentConfig(configured)
+
+
+deployment_config: DeploymentConfig = load()

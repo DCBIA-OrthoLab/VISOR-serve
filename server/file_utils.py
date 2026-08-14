@@ -11,9 +11,14 @@ import os
 import tempfile
 import zipfile
 
-import pandas as pd
-
 from config import settings
+
+# NOTE: pandas is imported INSIDE load_tabular_file/load_tabular_directory, not
+# here. Those two are tool helpers -- only a tool that reads tabular data calls
+# them -- while this module is imported by main.py on every start. At module
+# level, pandas would be a hard dependency of the API process itself, which is
+# meant to carry fastapi and nothing heavier (see docker/Dockerfile: the server
+# venv holds no pandas, no numpy and no torch).
 
 
 # Scratch dirs handed out during the request being served, so main.py can
@@ -54,6 +59,32 @@ def make_scratch_dir(prefix: str = "tool_") -> str:
     """
     os.makedirs(settings.TEMP_DIR, exist_ok=True)
     return register_scratch_dir(tempfile.mkdtemp(prefix=prefix, dir=settings.TEMP_DIR))
+
+
+def output_paths(result) -> list:
+    """Normalize what run() returned into a list of output paths. Empty when
+    the returned value isn't path-shaped at all.
+
+    A path, or a list of them, is the canonical form and what every tool here
+    returns. A MAPPING of name -> path is accepted too -- with or without the
+    `{"outputs": {...}}` wrapper -- because that is the shape a tool packaged
+    against the job/result contract may return. The names are not carried into
+    the response: what goes back is one file or one archive, and a tool that
+    needs its outputs named writes a report next to them (AMASSS does).
+    """
+    if isinstance(result, (str, os.PathLike)):
+        return [str(result)]
+    if isinstance(result, (list, tuple)):
+        return [str(path) for path in result]
+    if isinstance(result, dict):
+        outputs = result.get("outputs", result)
+        if (
+            isinstance(outputs, dict)
+            and outputs
+            and all(isinstance(path, (str, os.PathLike)) for path in outputs.values())
+        ):
+            return [str(path) for path in outputs.values()]
+    return []
 
 
 class BadArchiveError(Exception):
@@ -224,8 +255,10 @@ def compressed_extension(extension: str) -> str:
     return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)
 
 
-def load_tabular_file(file_path: str) -> pd.DataFrame:
-    """Load a single CSV, XLSX, or ODS file into a DataFrame."""
+def load_tabular_file(file_path: str):
+    """Load a single CSV, XLSX, or ODS file into a pandas DataFrame."""
+    import pandas as pd
+
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".csv":
         return pd.read_csv(file_path)
@@ -236,8 +269,10 @@ def load_tabular_file(file_path: str) -> pd.DataFrame:
     raise ValueError(f"Unsupported file extension '{ext}' for tabular file: {file_path}")
 
 
-def load_tabular_directory(directory_path: str) -> pd.DataFrame:
+def load_tabular_directory(directory_path: str):
     """Load and concatenate every CSV/XLSX/ODS file found directly in a directory."""
+    import pandas as pd
+
     extensions = ["*.csv", "*.xlsx", "*.ods"]
     all_files = []
     for ext in extensions:

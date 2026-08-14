@@ -15,6 +15,10 @@ os.environ["API_TOKEN"] = "test-token"
 
 from fastapi.testclient import TestClient
 
+import file_utils
+import main
+import registry
+from base import Tool
 from main import app
 
 client = TestClient(app)
@@ -1300,3 +1304,81 @@ def test_log_line_carries_no_file_name_or_argument_value(caplog, tmp_path):
     )
     assert "patient_ident_0042" not in line
     assert "secret_patient_label" not in line
+
+
+# ----------------------------------------------------------------------
+# What run() may return for a file output
+# ----------------------------------------------------------------------
+
+def test_named_outputs_are_the_canonical_return_and_paths_still_work(tmp_path):
+    """`{"outputs": {name: path}}` is the form a packaged tool writes; a bare
+    path or a list of them is accepted too, and is what every imported tool
+    here returns.
+
+    The names stop at this function today -- what travels back is one file or
+    one archive. They exist for `depends_on` sequencing, where the server has
+    to know which output feeds which parameter of the next tool and a list of
+    paths would leave it guessing from an extension.
+    """
+    first = tmp_path / "mand.nii.gz"
+    second = tmp_path / "max.nii.gz"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    assert file_utils.output_paths(str(first)) == [str(first)]
+    assert file_utils.output_paths([str(first), str(second)]) == [str(first), str(second)]
+    assert file_utils.output_paths({"mandible": str(first)}) == [str(first)]
+    assert file_utils.output_paths({"outputs": {"mandible": str(first), "maxilla": str(second)}}) == [
+        str(first),
+        str(second),
+    ]
+
+
+def test_a_result_that_is_not_path_shaped_is_still_refused():
+    assert file_utils.output_paths({"count": 3}) == []
+    assert file_utils.output_paths({"outputs": {}}) == []
+    assert file_utils.output_paths(42) == []
+
+
+def test_a_single_file_tool_returning_several_paths_is_a_failure(monkeypatch, tmp_path):
+    """Streaming the first of several and calling it a success would return
+    part of a result."""
+    produced = [tmp_path / "a.nii.gz", tmp_path / "b.nii.gz"]
+    for path in produced:
+        path.write_bytes(b"x")
+
+    class TwoFiles(Tool):
+        name = "two_files_probe"
+        arguments = {}
+        output_kind = "file"
+
+        def run(self):
+            return {"outputs": {name.name: str(name) for name in produced}}
+
+    monkeypatch.setitem(registry.TOOLS, "two_files_probe", TwoFiles())
+
+    response = client.post("/run/two_files_probe", headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert response.status_code == 500
+
+
+def test_a_single_named_output_is_streamed(monkeypatch, tmp_path):
+    scratch = file_utils.make_scratch_dir(prefix="named_output_")
+    produced = os.path.join(scratch, "result.nii.gz")
+    with open(produced, "wb") as handle:
+        handle.write(b"segmentation")
+
+    class OneFile(Tool):
+        name = "one_file_probe"
+        arguments = {}
+        output_kind = "file"
+
+        def run(self):
+            return {"outputs": {"mandible": produced}}
+
+    monkeypatch.setitem(registry.TOOLS, "one_file_probe", OneFile())
+
+    response = client.post("/run/one_file_probe", headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert response.status_code == 200
+    assert response.content == b"segmentation"

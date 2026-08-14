@@ -135,7 +135,13 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 .
 ├── CLAUDE.md
 ├── ADDING_A_TOOL.md         # the full contract for writing a tool
-├── docker-compose.yml       # inference (GPU) + inference-cpu (profile "cpu") + test services
+├── MIGRATING_A_TOOL.md      # moving one tool out of the server, and proving it
+├── docker-compose.yml       # inference (GPU) + inference-cpu + inference-venvs + test services
+├── docker/                  # the deployment image: one container, N tool virtualenvs
+│   ├── Dockerfile           #   /opt/sadt (API, no torch) + /tools/<name>/.venv
+│   ├── verify_dedup.py      #   are the venvs hardlinked, or silently copied?
+│   ├── fixtures/            #   three tools with incompatible pins, no GPU needed
+│   └── README.md
 ├── .env.example             # the three variables compose interpolates
 ├── .githooks/pre-push       # runs `docker compose run --rm test` before a push
 ├── scripts/                 # stand the server up, and populate DATA/
@@ -149,9 +155,14 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 ├── server/
 │   ├── main.py              # FastAPI app: /run/{tool_name}, /uploads, /results
 │   ├── base.py              # Tool base class, ArgSpec, ToolArgumentError
-│   ├── registry.py          # auto-discovery of Tool subclasses in tools/
+│   ├── registry.py          # discovery: .schema.json tools, and Tool subclasses in tools/
+│   ├── parity.py            # run a tool both ways and compare what a caller receives
 │   ├── dispatch.py          # runs a tool in its own venv, as a subprocess (SADT_DISPATCH_MODE)
 │   ├── runner.py            # the other side of that: stdlib only, executed BY a tool's venv
+│   ├── schema_tool.py       # a tool built from its .schema.json, never imported
+│   ├── schema_hash.py       # source_hash: the reference implementation, executable
+│   ├── deployment.py        # deployment.toml: per-tool server-side config
+│   ├── deployment.toml.example
 │   ├── data_store.py        # DataStore interface + LocalDataStore (server-side models/testfiles)
 │   ├── file_utils.py        # shared helpers: scratch dirs, zip, scan extensions, tabular loading
 │   ├── transfer.py          # chunked resumable uploads, range-served results
@@ -415,6 +426,199 @@ Provide a small, generic client mirroring the server:
   implemented: tool runs execute concurrently in worker threads, see changelog.)
 
 ## Changelog
+
+### 2026-08-12 — The gate phase 4 has to pass through: running a tool both ways
+
+Phase 4 deletes `server/tools/`, and every deletion there is one line and no
+way back. What licenses it is not that the subprocess path *works* — phases 1
+to 3 showed that — but that a given tool produces the same thing on both
+sides. `server/parity.py` runs one tool in both forms and compares **what a
+caller receives**:
+
+- every file produced, keyed by name and hashed. Absolute paths are never
+  compared: one run wrote into a job directory, the other into a scratch
+  directory, and neither name means anything to a client;
+- the returned value, with each path replaced by the artifact it names, so
+  `{"outputs": {"mandible": "/jobs/ab12/output/x.nii.gz"}}` and
+  `/tmp/inference_server/tool_9f/x.nii.gz` compare equal;
+- minus the keys that differ between two runs of the *same* code — duration,
+  timestamp, job id.
+
+**It does not claim a difference is a defect.** The packaged tool runs against
+its own pinned dependencies; a different numpy moves voxels and a newer
+SimpleITK writes a different header. It makes the difference visible, per
+file, so it is read rather than discovered by a clinician. Exit code 1 on any
+difference, and the report says which file and which side.
+
+Tested in both directions on `_dispatch_probe`, which now exists in both forms
+— packaged with its own venv, and an in-process twin in the test: agreement is
+reported as agreement, a twin returning a different total is caught, and a twin
+writing a *different file with the same answer* is caught. That last one is
+the failure a smoke test misses.
+
+`file_utils.output_paths` (moved out of `main.py`) is now what both the
+response builder and the harness use to find what a run produced, so "what
+counts as an output" is written once.
+
+**`MIGRATING_A_TOOL.md`**: the loop, per tool — package, translate the schema,
+move `server_selectable` to `deployment.toml`, build, prove, flip — plus what
+the translation *costs*, measured against the current registry. `test_tool`,
+`SurgMovPred` and `BatchDentalSeg` are nearly free; `ASO` loses 3 choices, 4
+multichoices and **7 `visible_when`** rules, whose whole job is hiding the
+inert half of its four modes, so it should go last. Rolling a tool back is
+deleting its `.schema.json`, which is why the in-process copies stay until the
+very end.
+
+**Tests:** 434 server tests (+7).
+
+### 2026-08-12 — One image, N virtualenvs, and the server imports none of them (phase 3)
+
+`docker/Dockerfile`: `/opt/sadt/{.venv,server,runner.py}` for the API on the
+newest Python, `/tools/<name>/{.venv,.schema.json,src}` for the tools, `/DATA`
+read-only, `/jobs` ephemeral. A tool is a **virtualenv, not a service** —
+fifteen images would mean fifteen copies of the same CUDA stack, fifteen things
+to schedule, and a network hop between a tool and the file it was just handed.
+
+**Measured, in the built image:** `numpy_old` runs numpy 1.26.4 on Python
+3.12.13 and `numpy_new` runs numpy 2.5.2 on Python 3.13.15, both answering over
+HTTP from one container, while `import numpy` in the API venv is a
+`ModuleNotFoundError`. That is the entire point of the migration, demonstrated
+rather than described.
+
+- **The uv cache is transport, never `UV_CACHE_DIR`.** uv installs by
+  hardlinking out of its cache; `link()` fails with `EXDEV` across filesystems
+  and uv falls back to copying, silently. A BuildKit cache mount *is* a
+  separate filesystem, so pointing `UV_CACHE_DIR` at one breaks exactly what
+  the mount was added to help. It is copied in, synced against, copied back
+  and pruned inside one `RUN`.
+- **Every `uv sync` in ONE layer**, because overlayfs copies a file up when a
+  later layer touches it, and a cache deleted in a later layer frees nothing.
+- **`docker/verify_dedup.py`, and it had to be written twice.** The naive
+  check — same path, different inode — reported 114 failures on a correct
+  image: numpy 1.26 and 2.5 share a few dozen byte-identical test fixtures
+  that come from *different wheels*, which uv could not share if it wanted to.
+  It compares files of the same distribution **at the same version**, from
+  each venv's `RECORD`, minus what an installer writes rather than unpacks
+  (console scripts embed their own venv's interpreter path). Verified in both
+  directions: 0 failures on the real image, 925 duplicated files and 54.4 MB
+  wasted on the same image built with `UV_LINK_MODE=copy` — 610 MB against
+  686 MB, on nothing heavier than numpy.
+- **Manifests are extracted in a stage of their own.** `COPY` cannot glob a
+  directory structure, and that stage's *output* is content-addressed:
+  unchanged lock files mean an identical digest, so editing a tool's source
+  leaves `uv sync` CACHED. Confirmed by rebuilding after a source edit.
+- **The tools arrive through a named build context** (`--build-context
+  tools=<dir>`), because they genuinely live in another repository. A named
+  context overrides the stage of the same name, so omitting it builds a server
+  with no tools rather than failing.
+- **An old pin drags an old interpreter behind it.** numpy 1.26 ships no wheel
+  for 3.13, so the first build tried to compile it from source and failed. uv
+  installs Python 3.12 into the image for that tool alone — one base image
+  still, because `nvidia-*` wheels are `py3-none-manylinux` and deduplicate
+  across Python versions anyway.
+- **`registry.py` no longer requires the `tools/` package to exist**, which is
+  what lets the image ship without the in-process tools — and is the shape
+  phase 4 leaves behind.
+- **`file_utils` imports pandas lazily now.** It was the one module-level
+  heavy import in the server core, and `main.py` imports `file_utils`: the API
+  venv could not have been slim while it stayed. `load_tabular_*` are tool
+  helpers.
+- **The container does not run as root.** Third-party code from fifteen
+  upstreams runs in it, on confidential imaging.
+
+`server/requirements-api.txt` is the API's whole dependency list — fastapi,
+uvicorn, python-multipart, pydantic-settings — and a test asserts it stays that
+way, because an API that quietly regrows numpy is pinned to what the tools can
+agree on all over again.
+
+**Tests:** 427 server tests (+4). The image itself is verified by building it,
+which the suite does not do.
+
+### 2026-08-12 — A tool can be declared without being imported (phase 2)
+
+Phase 1 gave a tool its own process. This gives it its own *declaration*: a
+folder holding `.schema.json`, `.venv/` and `src/`, from which the server
+builds a `Tool` without importing a line of it. `registry.py` now discovers
+both kinds, and dropping a `.schema.json` into a folder is what moves a tool
+from one to the other — a folder that has one is never imported.
+
+**Both kinds at once, and that is not a compromise.** The two bullets of the
+phase — "registry reads schemas instead of importing" and "the golden
+`GET /tools` test must still pass" — are only simultaneously satisfiable that
+way: the eight tools here have no schema, and the contract's type vocabulary
+(`path`, `str`, `int`, `float`, `bool`, `list[str]`) *cannot* express what they
+publish — `volume_or_zip_file` and its extensions, a `multichoice` over 119
+landmarks, `visible_when`, `ui`, `groups`. A schema-only registry today means
+either no tools or a different response. The server stops importing tools when
+the tools leave this repo, which is phase 4.
+
+- **`source_hash` is fatal, alone among discovery failures.** Everything else
+  costs one tool (skipped, reported, `FAILED_TOOLS`); a schema that no longer
+  matches the source beside it takes the server down, because it would
+  otherwise keep serving — validating requests against a signature that has
+  changed under it, accepting arguments `run()` no longer takes and refusing
+  ones it now does. A schema with NO hash is unverifiable and skipped instead:
+  it must not serve, but it endangers only itself.
+- **`schema_hash.py` is executable**, `python server/schema_hash.py <src>`.
+  The generator lives in the other repository and the two must agree byte for
+  byte or nothing starts, so this ships a reference implementation to check
+  against rather than a description to reimplement. The rule: sha256 over
+  `<relative posix path>\0<sha256 of contents>\n` per file, sorted,
+  `__pycache__` and `*.pyc` excluded — every clause of which exists to make the
+  hash reproducible on another machine.
+- **The folder must be named after the tool.** Not cosmetic: `dispatch.py`
+  looks the interpreter up at `<TOOLS_DIR>/<tool name>/.venv/bin/python`, so a
+  mismatch registers a tool that cannot be run.
+- **`deployment.toml` is the server's half of the declaration.** A schema is
+  generated from the tool's source and is the same wherever it is installed;
+  which arguments may be filled from *this* machine's `DATA_DIR`, and how much
+  *this* machine accepts as an upload, are not properties of the tool. Absent
+  is the normal case. A `server_selectable` entry naming an argument the tool
+  does not declare, or one that is not a `path`, is a startup error — the
+  failure is otherwise a dropdown that silently never appears.
+- **`max_upload_mb` is enforced where the tool is known**: on the multipart
+  body, and when a chunked upload is *claimed*. `POST /uploads` opens a session
+  for a file, not for a tool, and keeps applying the global `MAX_UPLOAD_MB`
+  while the transfer runs.
+- **An unknown key in a schema is a WARNING, not a refusal.** This is the seam
+  between two repositories: a field one side adds must not stop the other from
+  starting, and must not vanish in silence either. An unknown key in
+  `deployment.toml` is the opposite — that file is ours, and
+  `server_selectible` would just leave every argument upload-only.
+- **`base.LIST_TYPE`** (`"list[str]"`), the one argument shape the schema can
+  declare that nothing here could express. Not `multichoice`, which picks from
+  a catalog the tool declares; this is free text. A type-system addition of the
+  same kind as the choice types, made once.
+
+**Where the two repositories could disagree, this server takes both.** Each of
+these is read if present and costs the generator one optional field; none of
+them changes anything for a tool that omits it:
+
+- **`extensions` on a `path` argument** (`ArgSpec.accepts`, new). The contract's
+  types cannot say more than "a path", so the client's file dialog would fall
+  back to `ALLOWED_EXTENSIONS` where AMASSS today offers exactly
+  `.nii/.nii.gz/.nrrd/...`. This is how a schema tool narrows its own picker
+  without a `FILE_TYPES` entry being invented for it.
+- **`description` per argument.** The client renders it under the field.
+- **`{"outputs": {name: path}}` as a return value, and it is the form to
+  write.** The contract shows `"returns": "path"` next to a `result.json` of
+  `{"result": {"outputs": {...}}}` — a mapping, not a path, which
+  `_output_paths` refused and which answered 500. Both work now, and the
+  mapping is canonical: the names buy nothing over HTTP (the response is one
+  file or one archive either way) but they are what `depends_on` sequencing
+  will wire on. Feeding AMASSS's mandible into AREG means
+  `params["scan"] = result["outputs"]["mandible"]`; with a list of paths the
+  server picks by extension or by position, which is a guess. When that lands,
+  the names have to be declared in `.schema.json` too, so a wiring naming an
+  output no tool produces fails at startup like every other schema mistake.
+- And a single-file tool returning SEVERAL paths is now a failure rather than
+  the first of them streamed as if it were the result.
+
+**Still needing a client release, so left alone:** the schema's tool-level
+`description` is read and kept but not published — `GET /tools` has no field
+for it, and adding one is a shape change.
+
+**Tests:** 423 server tests (+43), no GPU, no weights and no network.
 
 ### 2026-08-12 — A tool can run in its own interpreter (phase 1: the path, no tool on it)
 

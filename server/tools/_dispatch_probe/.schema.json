@@ -1,0 +1,33 @@
+{
+  "name": "_dispatch_probe",
+  "description": "Dispatch-path test fixture: arithmetic, a file, and which interpreter ran it.",
+  "arguments": {
+    "a": {
+      "type": "int",
+      "required": true,
+      "description": "First addend"
+    },
+    "b": {
+      "type": "int",
+      "required": true,
+      "description": "Second addend"
+    },
+    "out_name": {
+      "type": "str",
+      "required": false,
+      "default": "probe.txt"
+    },
+    "fail": {
+      "type": "bool",
+      "required": false,
+      "default": false
+    },
+    "tags": {
+      "type": "list[str]",
+      "required": false,
+      "default": []
+    }
+  },
+  "returns": "text",
+  "source_hash": "def22c532d7462246304e4829e9a418a06ed146723a6f30938ce54e32d6d6721"
+}

@@ -1,0 +1,7 @@
+# The other half: numpy 2, on a newer interpreter, in the same image, at the
+# same time.
+[project]
+name = "numpy-new"
+version = "0.0.0"
+requires-python = ">=3.13"
+dependencies = ["numpy>=2"]

@@ -62,6 +62,14 @@ CHOICE_TYPE = "choice"
 MULTICHOICE_TYPE = "multichoice"
 CHOICE_TYPES = (CHOICE_TYPE, MULTICHOICE_TYPE)
 
+# A list of strings with NO fixed set of options -- the one argument shape a
+# .schema.json can declare that nothing here could express (see schema_tool.py).
+# "multichoice" is not the same thing: it picks from a catalog the tool
+# declares, and a client renders it as check boxes. This is free text, and a
+# client renders it as a list the user adds to. Accepted on the wire as a JSON
+# array or as the comma-separated shorthand, exactly like "multichoice".
+LIST_TYPE = "list[str]"
+
 # How a client lays a "multichoice" argument's options out (ArgSpec.ui). None
 # is the single-column stack.
 #   "tabs"   -> one tab per `groups` entry, for a catalog too long to scroll.
@@ -136,6 +144,14 @@ class ArgSpec:
     # omits the argument, so defaults never live in two places. "choice"
     # declares exactly one True.
     choices: Optional[dict] = None
+
+    # FILE arguments only: the exact extensions this argument accepts, when
+    # they are not the ones its declared type carries. A tool declared by a
+    # .schema.json can only say "path" -- the generic file type, whose fallback
+    # is settings.ALLOWED_EXTENSIONS -- so this is how it narrows its own file
+    # picker to .nii.gz without a FILE_TYPES entry being added for it. None
+    # keeps the declared type's own list, which is every tool in this repo.
+    accepts: Optional[tuple] = None
 
     # SCALAR arguments only: the value a client pre-fills its widget with, so a
     # spin box starts at the tool's default rather than at Qt's 0. Advisory and
@@ -212,6 +228,8 @@ class ArgSpec:
         declaration order. None means "no specific type declared" -- fall back
         to config.ALLOWED_EXTENSIONS.
         """
+        if self.accepts is not None:
+            return tuple(self.accepts)
         accepted: list = []
         for declared in self.types:
             allowed = FILE_TYPES[declared]
@@ -282,10 +300,11 @@ class Tool(ABC):
                     declared not in FILE_TYPES
                     and declared not in SCALAR_TYPES
                     and declared not in CHOICE_TYPES
+                    and declared != LIST_TYPE
                 ):
                     raise ToolSchemaError(
-                        f"{where}: unknown type {declared!r}. Use a scalar type, one of "
-                        f"{sorted(FILE_TYPES)}, or one of {sorted(CHOICE_TYPES)}."
+                        f"{where}: unknown type {declared!r}. Use a scalar type, {LIST_TYPE!r}, "
+                        f"one of {sorted(FILE_TYPES)}, or one of {sorted(CHOICE_TYPES)}."
                     )
             if len(spec.types) > 1 and not spec.is_file:
                 raise ToolSchemaError(
@@ -293,7 +312,26 @@ class Tool(ABC):
                     f"must stand alone (got {spec.types})."
                 )
             self._check_choices(where, spec)
+            self._check_accepts(where, spec)
             self._check_presentation(where, spec)
+
+    @staticmethod
+    def _check_accepts(where: str, spec: ArgSpec) -> None:
+        if spec.accepts is None:
+            return
+        if not spec.is_file:
+            raise ToolSchemaError(f"{where}: 'accepts' only applies to file arguments.")
+        if not isinstance(spec.accepts, (tuple, list)) or not spec.accepts:
+            raise ToolSchemaError(f"{where}: 'accepts' must be a non-empty list of extensions.")
+        wrong = [
+            extension
+            for extension in spec.accepts
+            if not isinstance(extension, str) or not extension.startswith(".")
+        ]
+        if wrong:
+            raise ToolSchemaError(
+                f"{where}: 'accepts' entries must be extensions starting with a dot, got {wrong}."
+            )
 
     def _check_presentation(self, where: str, spec: ArgSpec) -> None:
         """Reject a presentation hint that cannot be honored.
@@ -449,6 +487,8 @@ class Tool(ABC):
             return self._coerce_choice(arg_name, value, spec)
         if declared == MULTICHOICE_TYPE:
             return self._coerce_multichoice(arg_name, value, spec)
+        if declared == LIST_TYPE:
+            return self._coerce_list(arg_name, value)
         if declared is str:
             # A ResolvedPath is a str, so a server-selectable scalar keeps its
             # .kind here instead of being flattened back to a plain string.
@@ -473,6 +513,26 @@ class Tool(ABC):
         if isinstance(value, str) and value.lower() in ("true", "false", "1", "0"):
             return value.lower() in ("true", "1")
         raise ToolArgumentError(f"Argument '{arg_name}' must be a boolean")
+
+    @staticmethod
+    def _coerce_list(arg_name: str, value: Any) -> list:
+        """A list of strings, sent as a JSON array -- ["Mandible", "Maxilla"] --
+        or as the comma-separated shorthand a form field can carry."""
+        if isinstance(value, (list, tuple)):
+            return [str(item) for item in value]
+        if not isinstance(value, str):
+            raise ToolArgumentError(f"Argument '{arg_name}' must be a list of strings")
+
+        text = value.strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ToolArgumentError(f"Argument '{arg_name}': invalid JSON ({exc})")
+            if not isinstance(parsed, list):
+                raise ToolArgumentError(f"Argument '{arg_name}': expected a JSON array of strings")
+            return [str(item) for item in parsed]
+        return [item.strip() for item in text.split(",") if item.strip()]
 
     @staticmethod
     def _coerce_choice(arg_name: str, value: Any, spec: ArgSpec) -> str:

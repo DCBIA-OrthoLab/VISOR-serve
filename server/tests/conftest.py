@@ -13,6 +13,7 @@ which is what these fixtures use -- the layout being exercised is exactly the
 real one.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -25,6 +26,7 @@ os.environ.setdefault("API_TOKEN", "test-token")
 
 import config
 import file_utils
+import schema_tool
 from base import ArgSpec, Tool
 from config import settings
 
@@ -98,6 +100,45 @@ def probe_python(probe_tools_dir, monkeypatch) -> str:
     belongs to."""
     monkeypatch.setattr(settings, "TOOLS_DIR", probe_tools_dir)
     return os.path.join(probe_tools_dir, PROBE_NAME, ".venv", "bin", "python")
+
+
+@pytest.fixture
+def probe_schema() -> dict:
+    """The probe's own .schema.json, as shipped."""
+    with open(os.path.join(PROBE_SOURCE, schema_tool.SCHEMA_FILE), encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+@pytest.fixture
+def make_tool_folder(tmp_path, probe_schema):
+    """Install a tool folder the way the deployment image installs one:
+    <TOOLS_DIR>/<name>/{.schema.json,src/}.
+
+    The source is the probe's, so `source_hash` is a real hash of a real tree
+    and a test that wants a MISMATCH has to actually change something. No
+    virtualenv: discovery never needs one, and building one per test would
+    dominate the suite.
+    """
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir(exist_ok=True)
+
+    def install(folder_name: str, **schema_overrides) -> str:
+        folder = tools_dir / folder_name
+        shutil.copytree(
+            os.path.join(PROBE_SOURCE, schema_tool.SRC_DIR_NAME),
+            folder / schema_tool.SRC_DIR_NAME,
+            # Compiled artifacts are excluded from the hash, so carrying them
+            # into a fresh install would only make the fixture lie about what a
+            # packaged tool contains.
+            ignore=shutil.ignore_patterns("__pycache__"),
+        )
+        schema = dict(probe_schema, name=folder_name)
+        schema.update(schema_overrides)
+        (folder / schema_tool.SCHEMA_FILE).write_text(json.dumps(schema))
+        return str(folder)
+
+    install.root = str(tools_dir)
+    return install
 
 
 @pytest.fixture

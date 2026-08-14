@@ -35,6 +35,7 @@ from base import (
 )
 from config import settings
 from data_store import DataNotFoundError, data_store
+from deployment import deployment_config
 from registry import TOOLS, get_tool
 from security import verify_token
 
@@ -74,7 +75,6 @@ async def _lifespan(_app: FastAPI):
 app = FastAPI(lifespan=_lifespan)
 
 _CHUNK_SIZE_BYTES = 1024 * 1024  # read/write in 1 MB chunks, never load the full file into RAM
-_MAX_UPLOAD_BYTES = settings.MAX_UPLOAD_MB * 1024 * 1024
 _MAX_EXTRACTED_BYTES = settings.MAX_EXTRACTED_MB * 1024 * 1024
 _RESULT_REFERENCE_MIN_BYTES = settings.RESULT_REFERENCE_MIN_MB * 1024 * 1024
 
@@ -152,16 +152,28 @@ def _matched_extension(filename: str, expected: Optional[tuple]) -> Optional[str
     return None
 
 
-async def _stream_to_disk(upload: UploadFile, destination: str) -> int:
+async def _stream_to_disk(upload: UploadFile, destination: str, max_bytes: int) -> int:
     """Write the upload to disk in chunks, never buffering the whole file in RAM."""
     size = 0
     with open(destination, "wb") as out_file:
         while chunk := await upload.read(_CHUNK_SIZE_BYTES):
             size += len(chunk)
-            if size > _MAX_UPLOAD_BYTES:
+            if size > max_bytes:
                 raise _UploadTooLargeError()
             out_file.write(chunk)
     return size
+
+
+def _upload_limit_mb(tool) -> int:
+    """The upload limit for this tool: deployment.toml's `max_upload_mb` when
+    it declares one, MAX_UPLOAD_MB otherwise.
+
+    Applied here rather than in POST /uploads because that endpoint opens a
+    session for a file, not for a tool, and does not know which tool the bytes
+    are for. The chunked path is therefore bounded by the global limit while
+    the transfer runs, and by the tool's own the moment it is claimed below.
+    """
+    return deployment_config.upload_limit_mb(tool.name)
 
 
 def _type_name(arg_type) -> str:
@@ -206,16 +218,6 @@ def _temp_root_of(path: str) -> Optional[str]:
         return None
     relative = os.path.relpath(resolved, temp_dir)
     return os.path.join(temp_dir, relative.split(os.sep)[0])
-
-
-def _output_paths(result) -> list:
-    """Normalize what run() returned into a list of output paths. Empty when
-    the returned value isn't path-shaped at all."""
-    if isinstance(result, (str, os.PathLike)):
-        return [str(result)]
-    if isinstance(result, (list, tuple)):
-        return [str(path) for path in result]
-    return []
 
 
 def _discard(work_dir: Optional[str], scratch_dirs: list) -> None:
@@ -298,7 +300,10 @@ def _extensions_of(spec) -> Optional[dict]:
     for declared in spec.types:
         name = _type_name(declared)
         if name in FILE_TYPES:
-            extensions = FILE_TYPES[name]
+            # ArgSpec.accepts overrides the declared type's own list: it is how
+            # an argument declared as a generic file (a .schema.json can only
+            # say "path") still tells the client what it reads.
+            extensions = FILE_TYPES[name] if spec.accepts is None else spec.accepts
             per_type[name] = list(extensions) if extensions else None
     return per_type or None
 
@@ -699,6 +704,8 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     input_paths = []
     resolved_files = []
     size = 0
+    upload_limit_mb = _upload_limit_mb(tool)
+    upload_limit_bytes = upload_limit_mb * 1024 * 1024
 
     if uploaded_files or upload_references:
         work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
@@ -710,11 +717,11 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             extension = _checked_extension(tool, field_name, upload.filename or "")
             input_path = os.path.join(work_dir, f"{field_name}{extension}")
             try:
-                size += await _stream_to_disk(upload, input_path)
+                size += await _stream_to_disk(upload, input_path, upload_limit_bytes)
             except _UploadTooLargeError:
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"File exceeds the {settings.MAX_UPLOAD_MB} MB limit.",
+                    detail=f"File exceeds the {upload_limit_mb} MB limit.",
                 )
             input_paths.append(input_path)
             # An argument can accept several types (e.g. ("csv_file",
@@ -733,6 +740,14 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             try:
                 session = await anyio.to_thread.run_sync(transfer.get_upload, upload_id)
                 extension = _checked_extension(tool, field_name, session.filename)
+                # The tool is only known here, so this is where a per-tool
+                # limit lower than the global one is enforced -- before the
+                # blob is claimed, never after.
+                if session.size > upload_limit_bytes:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail=f"File exceeds the {upload_limit_mb} MB limit.",
+                    )
                 input_path = os.path.join(work_dir, f"{field_name}{extension}")
                 await anyio.to_thread.run_sync(transfer.claim_upload, upload_id, input_path)
             except transfer.TransferError as exc:
@@ -835,12 +850,24 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         # `scratch_dirs` covers file_utils.make_scratch_dir(); _output_roots
         # also catches a tool that wrote under TEMP_DIR by hand.
         try:
-            outputs = _output_paths(result)
+            outputs = file_utils.output_paths(result)
             if not outputs:
                 raise ValueError(
                     f"Tool '{tool.name}' declares output_kind={tool.output_kind!r} but "
                     f"run() returned {type(result).__name__}, not a path (or a list of paths)."
                 )
+            if tool.output_kind != "files":
+                # One file goes back, so there has to be exactly one. Taking
+                # the first of several silently would return part of a result
+                # and call it a success.
+                if len(outputs) > 1:
+                    raise ValueError(
+                        f"Tool '{tool.name}' declares output_kind={tool.output_kind!r} but "
+                        f"returned {len(outputs)} paths. Declare 'files' to return several."
+                    )
+                # Normalized rather than reused as-is: `result` may have been a
+                # mapping of named outputs, and what is streamed is a path.
+                result = outputs[0]
             output_roots = _output_roots(outputs, work_dir) | set(scratch_dirs)
             if tool.output_kind == "files":
                 # Built inside work_dir, never inside the tool's own scratch
@@ -856,7 +883,10 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                 )
         except Exception:
             logger.exception("endpoint=/run/%s status=500 (packing output)", tool_name)
-            _discard(work_dir, _output_roots(_output_paths(result), work_dir) | set(scratch_dirs))
+            _discard(
+                work_dir,
+                _output_roots(file_utils.output_paths(result), work_dir) | set(scratch_dirs),
+            )
             raise HTTPException(status_code=500, detail="Tool execution failed.")
 
         media_type = _media_type_of(str(result))
