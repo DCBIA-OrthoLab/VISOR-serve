@@ -110,12 +110,25 @@ def test_server_selectable_reaches_the_published_schema(make_tool_folder):
     assert tool.arguments["scan"].server_selectable == "testfile"
 
 
-def test_a_tool_with_no_entry_is_upload_only(make_tool_folder):
-    folder = make_tool_folder("plain", arguments={"scan": {"type": "path", "required": True}})
+def test_a_tool_with_no_entry_gets_the_conventions(make_tool_folder):
+    """Adding a tool must need no edit to this repository, so an empty
+    deployment.toml is the normal case rather than a lapse."""
+    folder = make_tool_folder(
+        "plain",
+        arguments={
+            "scan": {"type": "path", "required": True},
+            "model": {"type": "path", "required": True},
+            "device": {"type": "str", "required": False},
+        },
+    )
 
     tool = schema_tool.load_tool(folder, DeploymentConfig({}))
 
-    assert tool.arguments["scan"].server_selectable is None
+    assert tool.arguments["scan"].server_selectable == "testfile"
+    # A name, never an upload: weights do not travel from a clinician's laptop.
+    assert tool.arguments["model"].server_selectable == "model"
+    assert tool.arguments["model"].type is str
+    assert tool.arguments["device"].hidden is True
 
 
 def test_selecting_an_argument_the_tool_does_not_declare_is_refused(make_tool_folder):

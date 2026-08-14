@@ -1,52 +1,14 @@
-# Per-tool server-side configuration for the PACKAGED tools in sadt-tools.
+# Per-tool overrides. Adding a tool needs NOTHING here: conventions.py derives
+# which arguments are filled from DATA/, which are hidden from a clinician, and
+# which DATA/ folder a tool reads. Every tool currently served is covered by
+# them, which is why this file has no entries.
 #
-# `data_dir` is load-bearing wherever a tool's name and its DATA folder differ.
-# A packaged tool is named after its folder, and the naming convention spells
-# words out (`Batch_Dental_Seg`) while setup-models.sh staged the data under
-# the run-together spelling (`DATA/BatchDentalSeg/`). Without this the lookup
-# falls back to the tool's own name and finds nothing -- no models, no test
-# files, and a `model` argument published as a bare path the client cannot
-# fill in. AMASSS needs no entry: the two already agree.
+# Write a section only for an exception:
 #
-# `server_selectable` says which arguments the client picks from server-side
-# data rather than uploading. Weights never travel, so a `model` argument is
-# ALWAYS "model": the client offers the hosted names and nothing else.
+#   [tools.MyTool]
+#   server_selectable = { atlas = "model" }   # not named *_model, but hosted
+#   hidden = ["iterations"]                   # technical, not in TECHNICAL
+#   data_dir = "MyToolData"                   # DATA/ folder named differently
+#   max_upload_mb = 500                       # this tool alone takes more
 #
-# `hidden` names arguments a client must not render at all. They are still
-# declared by the tool, still recorded in its run report, and still applied
-# from the tool's own defaults -- the point is only that a clinician is not
-# asked which CUDA device to use or what nnUNet's tile step size should be.
-# Those are the deployment's business, and this file is the deployment.
-
-[tools.AMASSS]
-server_selectable = { model = "model", scans = "testfile" }
-hidden = [
-    "device", "tile_step_size", "gpu_resampling",
-    # Surface tuning: iterations and a triangle-reduction percentage. Same
-    # family as the two above -- a deployment choice, not a clinical one.
-    "surface_decimation", "surface_smoothing",
-]
-
-[tools.ALI]
-server_selectable = { model = "model", input = "testfile" }
-# search_seconds is the per-agent time budget of the deep-RL walk: it trades
-# run time against how thoroughly the volume is searched. Same family as a
-# tile step size -- whoever deploys the server decides how long a run may
-# take, and the clinician placing landmarks is not asked to price that.
-hidden = ["device", "search_seconds"]
-
-[tools.Batch_Dental_Seg]
-data_dir = "BatchDentalSeg"
-server_selectable = { model = "model", scans = "testfile" }
-hidden = ["device", "tile_step_size"]
-
-[tools.Crown_Seg]
-data_dir = "CrownSeg"
-server_selectable = { model = "model", meshes = "testfile" }
-# num_workers is Crown_Seg's equivalent of a tile step size: a dataloader
-# tuning knob, not a clinical choice.
-hidden = ["device", "num_workers"]
-
-[tools.Surg_Mov_Pred]
-data_dir = "SurgMovPred"
-server_selectable = { model = "model", measurements = "testfile" }
+# Anything stated here wins, per argument, over the convention.

@@ -50,6 +50,7 @@ from base import (
     Tool,
     ToolSchemaError,
 )
+import conventions
 from deployment import ToolDeployment
 from schema_hash import hash_source_tree
 
@@ -487,7 +488,9 @@ def load_tool(folder: str, config) -> SchemaTool:
             f"tool: its interpreter is looked up by tool name."
         )
 
-    tool = SchemaTool(folder, schema, config.for_tool(name))
+    arguments = schema.get("arguments") or {}
+    deployment = conventions.derive(arguments if isinstance(arguments, dict) else {}, config.for_tool(name))
+    tool = SchemaTool(folder, schema, deployment)
     try:
         tool.check_schema()
     except ToolSchemaError as exc:
@@ -495,5 +498,3 @@ def load_tool(folder: str, config) -> SchemaTool:
     return tool
 
 
-def has_schema(folder: str) -> bool:
-    return os.path.isfile(os.path.join(folder, SCHEMA_FILE))

@@ -377,7 +377,9 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         "types": ["path"],
         "required": True,
         "description": "A CBCT scan",
-        "server_selectable": None,
+        # By convention: a path argument that is not a model may be filled from
+        # DATA/<tool>/testfiles/, and can still be uploaded.
+        "server_selectable": "testfile",
         "choices": None,
         "initial": None,
         # null, so the client falls back to ALLOWED_EXTENSIONS: the schema
@@ -386,9 +388,8 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         "label": None,
         "section": None,
         "visible_when": None,
-        # False unless deployment.toml names it: an argument a client must not
-        # render at all (a CUDA device, a tile step size). The tool still
-        # declares it and still applies its own default.
+        # True for a technical argument (a CUDA device, a tile step size),
+        # which the tool still declares and still defaults for.
         "hidden": False,
         "ui": None,
         "groups": None,

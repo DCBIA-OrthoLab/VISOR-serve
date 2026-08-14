@@ -87,8 +87,19 @@ class DeploymentConfig:
         return tuple(sorted(self._tools))
 
     def data_slug(self, tool_name: str) -> str:
-        """The DATA_DIR folder to look this tool's models up in."""
-        return self.for_tool(tool_name).data_dir or tool_name
+        """The DATA_DIR folder to look this tool's models up in.
+
+        The naming convention spells words out (`Batch_Dental_Seg`) while the
+        data was staged run-together (`DATA/BatchDentalSeg/`). The literal name
+        wins wherever it exists, so a folder that really does carry underscores
+        is never mis-resolved.
+        """
+        declared = self.for_tool(tool_name).data_dir
+        if declared:
+            return declared
+        if os.path.isdir(os.path.join(settings.DATA_DIR, tool_name)):
+            return tool_name
+        return tool_name.replace("_", "")
 
     def upload_limit_mb(self, tool_name: str) -> int:
         """The upload limit for this tool, in MB. Per-tool config wins; the
