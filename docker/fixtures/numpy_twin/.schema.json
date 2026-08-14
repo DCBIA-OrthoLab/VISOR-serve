@@ -1,0 +1,14 @@
+{
+  "name": "numpy_twin",
+  "description": "Build fixture: reports the numpy version this tool was installed with.",
+  "arguments": {
+    "size": {
+      "type": "int",
+      "required": false,
+      "default": 3,
+      "description": "Identity matrix size"
+    }
+  },
+  "returns": "text",
+  "source_hash": "f2e1e2ecf4da7912ac1448098f70ca9f06d77c53943f7610c6d743a9f98eb2ca"
+}

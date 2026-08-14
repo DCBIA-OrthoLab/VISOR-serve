@@ -38,7 +38,7 @@ def test_the_tool_writes_into_its_own_job_directory(
 ):
     result = dispatch.dispatch(probe_tool, {"a": 20, "b": 22})
 
-    output_path = result["output_path"]
+    output_path = result["outputs"]["probe"]
     assert os.path.isfile(output_path)
     with open(output_path) as handle:
         assert handle.read() == "42"

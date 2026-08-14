@@ -65,6 +65,9 @@ x-test-base: &test-base
     # scripts/data-manifest.yml still agree on where a bundle is downloaded.
     # The server itself never reads this file.
     - ./scripts:/workspace/scripts:ro
+    # Likewise: the tests check that the image's build fixtures still describe
+    # their own source, and that the API requirements stay slim.
+    - ./docker:/workspace/docker:ro
   command: >
     sh -c "pip install --no-cache-dir --user -r requirements.txt -r requirements-dev.txt &&
            python -m pytest"
@@ -138,3 +141,39 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # The venvs image (docker/Dockerfile): ONE container, N virtualenvs, and a
+  # server that imports no tool at all. Under a profile, so nothing about the
+  # deployment above changes:
+  #
+  #     docker compose --profile venvs up -d --build inference-venvs
+  #
+  # `tools` is where the packaged tool folders come from -- the sadt-tools
+  # repository's output. It defaults to the build fixtures, which need no GPU
+  # and no model and exist to prove the layout works:
+  #
+  #     TOOLS_CONTEXT=../sadt-tools/dist docker compose --profile venvs build
+  #
+  # No GPU reservation here yet: the fixtures do not need one, and a
+  # reservation is all-or-nothing (it would make this service unstartable on
+  # any machine without a card). A real deployment adds the same `deploy:`
+  # block as `inference`.
+  inference-venvs:
+    profiles: ["venvs"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      additional_contexts:
+        tools: ${TOOLS_CONTEXT:-docker/fixtures}
+    environment:
+      - API_TOKEN=${API_TOKEN:-dev-token}
+      - DEVICE=${DEVICE:-cuda}
+    volumes:
+      # Read-only, and outside the image: an image gets copied around, a mount
+      # does not.
+      - ./DATA:/DATA:ro
+    # Port 8001 by default, so it can run beside the in-process server while
+    # the tools are moved over one at a time.
+    ports:
+      - "${BIND_ADDR:+${BIND_ADDR:-}:}${VENVS_HOST_PORT:-8001}:8000"
+    restart: unless-stopped
