@@ -381,11 +381,27 @@ class _Supervisor:
             env=environment,
         )
         if completed.returncode != 0:
+            # Its own result file is where the useful half is. The child's
+            # traceback goes to stderr, which whatever runs the PARENT may be
+            # capturing and trimming -- so "see above" is a promise this cannot
+            # keep, and the message has to carry the reason itself.
             raise RunnerError(
                 f"Supervised tool '{tool}' failed (exit {completed.returncode}). "
-                f"Its error is above, and in {os.path.join(nested_dir, RESULT_FILE)}."
+                f"{self._failure(tool, nested_dir)}"
             )
         return self._result(tool, nested_dir)
+
+    def _failure(self, tool: str, nested_dir: str) -> str:
+        """What the callee said went wrong, read back from its result file."""
+        path = os.path.join(nested_dir, RESULT_FILE)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                error = json.load(handle).get("error") or {}
+        except (OSError, ValueError):
+            return f"It wrote no readable result; see its output above and {path}."
+        kind = error.get("type", "Error")
+        message = error.get("message", "").strip()
+        return f"{kind}: {message}" if message else f"{kind} (no message)."
 
     def progress(self, fraction: float, message: str) -> None:
         try:

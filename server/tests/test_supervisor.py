@@ -165,14 +165,22 @@ def test_a_failing_nested_tool_names_itself(tools_dir, tmp_path):
     """)
     make_tool(tools_dir, "Caller", CALLER)
 
+    job_dir = tmp_path / "job"
     completed, result = run_job(
-        tools_dir, "Caller", tmp_path / "job",
-        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        tools_dir, "Caller", job_dir,
+        {"scans": str(tmp_path / "in"), "output_dir": str(job_dir / "output")},
     )
 
     assert completed.returncode != 0
     assert "Leaf" in completed.stderr
-    assert "the leaf refused" in completed.stderr
+    # The reason travels in the PARENT's error, not only in the child's output:
+    # whatever runs the parent may be capturing and trimming stderr, so "see
+    # above" is a promise the supervisor cannot keep. This was found by running
+    # a real chain through the server, where the child's traceback vanished.
+    assert "ValueError: the leaf refused" in completed.stderr
+    assert (job_dir / "result.json").is_file()
+    error = json.loads((job_dir / "result.json").read_text())["error"]
+    assert "the leaf refused" in error["message"]
 
 
 def test_an_undeployed_tool_says_it_is_not_installed(tools_dir, tmp_path):
