@@ -83,8 +83,10 @@ class Settings(BaseSettings):
     # runs would both take it, and an AMASSS run and a CrownSeg run compete for
     # the same device, which is why this is one counter and not one per tool.
     #
-    # A run counts as GPU work when the tool declares a `device` argument whose
-    # effective value is a CUDA one.
+    # EVERY run counts as GPU work unless it says otherwise: only a tool that
+    # declares a `device` argument can opt out, and only by resolving it to a
+    # CPU value. A tool that quietly imports torch without declaring `device`
+    # would otherwise never queue at all.
     MAX_CONCURRENT_GPU_JOBS: int = 1
 
     # Seconds a tool process may run before it is killed. 0 (the default) means

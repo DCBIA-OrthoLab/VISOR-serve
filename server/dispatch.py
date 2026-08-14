@@ -60,10 +60,10 @@ _STDERR_TAIL_BYTES = 8192
 _gpu_slots: Optional[threading.BoundedSemaphore] = None
 _gpu_lock = threading.Lock()
 
-# The argument a tool declares when it can run on a card, and the values that
-# mean it will.
+# The argument a tool declares when it can be told where to run, and the values
+# that mean "not on the card".
 DEVICE_ARGUMENT = "device"
-_GPU_DEVICES = ("cuda", "gpu")
+_CPU_DEVICES = ("cpu", "mps")
 
 
 def _gpu_semaphore() -> threading.BoundedSemaphore:
@@ -77,17 +77,25 @@ def _gpu_semaphore() -> threading.BoundedSemaphore:
 def uses_the_gpu(tool, params: dict) -> bool:
     """Will this run take the card?
 
-    A tool that cannot use one does not declare `device` at all, so it never
-    queues behind an inference job -- a tabular prediction has no business
-    waiting for a segmentation.
+    **Assumed yes**, unless the run is explicitly on something else. Only a
+    tool that declares `device` can say otherwise, and only by resolving it to
+    a CPU value.
+
+    The safe default is the strict one. A tool that quietly imports torch
+    without declaring `device` -- and several do; it was `settings.DEVICE`
+    inside them until they were packaged -- would otherwise never queue, and
+    two of them would meet on the card with nothing between them. The cost of
+    being wrong the other way is a CPU-only run waiting for a slot it did not
+    need; the cost of being wrong this way is an out-of-memory in the middle of
+    somebody's cohort.
     """
     spec = tool.arguments.get(DEVICE_ARGUMENT)
     if spec is None:
-        return False
+        return True
     value = params.get(DEVICE_ARGUMENT)
     if value is None:
         value = spec.default if spec.is_choice else settings.DEVICE
-    return str(value).lower().startswith(_GPU_DEVICES)
+    return not str(value).lower().startswith(_CPU_DEVICES)
 
 
 class ToolFailure(RuntimeError):

@@ -197,9 +197,11 @@ def test_a_tool_declaring_a_device_is_gpu_work(make_tool_folder):
     assert dispatch.uses_the_gpu(tool, {"scans": "/x", "device": "cpu"}) is False
 
 
-def test_a_tool_with_no_device_never_queues_for_the_card(probe_tool):
-    """A tabular prediction has no business waiting behind a segmentation."""
-    assert dispatch.uses_the_gpu(probe_tool, {"a": 1}) is False
+def test_a_tool_that_says_nothing_is_assumed_to_use_the_card(probe_tool):
+    """The safe default is the strict one: a tool that imports torch without
+    declaring `device` -- and that was every tool until they were packaged --
+    would otherwise never queue, and two of them would meet on the card."""
+    assert dispatch.uses_the_gpu(probe_tool, {"a": 1}) is True
 
 
 def test_the_deployment_decides_the_device_when_the_caller_does_not(
@@ -214,6 +216,7 @@ def test_the_deployment_decides_the_device_when_the_caller_does_not(
     filled = dispatch._server_provided(tool, {"scans": "/x"}, str(tmp_path))
 
     assert filled["device"] == "cpu"
+    # And THIS is how a run opts out of the queue: by saying where it runs.
     assert dispatch.uses_the_gpu(tool, filled) is False
 
 
