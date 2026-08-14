@@ -531,8 +531,25 @@ class Tool(ABC):
         )
 
     def invoke(self, args: dict):
-        """Validate args, then run the tool. This is what the server calls."""
+        """Validate args, then run the tool. This is what the server calls.
+
+        Validation happens HERE either way: whichever side of
+        SADT_DISPATCH_MODE the run goes to, it gets arguments that already
+        match the declared schema, and a bad request costs no process at all.
+        """
         cleaned = self.validate(args)
+        # Imported here rather than at module level, and this is worth keeping:
+        # base.py is the ONE server module every tool imports, and it depends on
+        # nothing but the standard library. Importing config at the top would
+        # make `import base` require API_TOKEN to be set, dispatch would drag
+        # the rest of the server in behind it, and a tool's own unit tests would
+        # need a configured server to run.
+        from config import DISPATCH_SUBPROCESS, settings
+
+        if settings.SADT_DISPATCH_MODE == DISPATCH_SUBPROCESS:
+            from dispatch import dispatch
+
+            return dispatch(self, cleaned)
         return self.run(**cleaned)
 
     @abstractmethod
