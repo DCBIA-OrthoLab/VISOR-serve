@@ -455,6 +455,19 @@ optional and both always rendered; one is inert on any given run. Emptying the
 selection for the mode that actually ran is a 422 naming the argument to fill
 in — that 422 is how a mode mismatch explains itself.
 
+`ios_networks` offers three: **Occlusal** (the occlusal point and the two
+buccal cusps) and **Cervical** (cervical lingual and buccal), on by default,
+and **Mucogingival** — one point per lower tooth on the gingival margin, off by
+default. Mucogingival is lower-jaw only (that is what it was trained on, so a
+maxilla is skipped rather than reported as a missing model) and it is the
+network AREG's lower-arch registration asks for. Its cameras are aimed per
+tooth along the buccal normal of the arch, and a tooth missing from the
+segmentation still gets its landmark, from a fit of the arch through the teeth
+that are there. A point placed that way — or forced out of the most likely
+pixels when the class won none — carries the reason in its own `description`
+field and in the report's `landmarks_degraded`, because it looks exactly like a
+good one otherwise.
+
 The response is a zip mirroring the input's folder tree, with **one
 `<scan>_lm_<ID>.mrk.json` per scan** holding every landmark found (the two
 original CLIs wrote one file per anatomical region, and disagreed on the
@@ -508,6 +521,104 @@ changes nothing.
 
 **From another server-side tool**: `tools.CrownSeg.src.CrownSegLogic.segment_crowns()`.
 Needs `shapeaxi` + pytorch3d, same image caveat as ALI's IOS engine.
+
+## AREG: registering two timepoints onto each other
+
+```bash
+# Semi-Automated CBCT: you send the T1 masks the registration is confined to
+curl -k -X POST https://localhost:8000/run/AREG \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F "modality=CBCT" -F "automation=Semi-Automated" \
+  -F "cbct_regions=Cranial base,Mandible" \
+  -F "t1=@/path/to/T1.zip" -F "t2=@/path/to/T2.zip" \
+  -F "t1_masks=@/path/to/masks.zip" --output result.zip
+
+# Fully-Automated CBCT: AMASSS produces those masks server-side
+curl -k -X POST https://localhost:8000/run/AREG \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F "modality=CBCT" -F "automation=Fully-Automated" \
+  -F "cbct_regions=Cranial base" \
+  -F "segmentation_model=AMASSS_Models" \
+  -F "t1=@/path/to/T1.zip" -F "t2=@/path/to/T2.zip" --output result.zip
+```
+
+Five modes, two engines:
+
+|          | Semi-Automated                  | Fully-Automated                 | Oriented + Fully-Automated |
+|----------|---------------------------------|---------------------------------|----------------------------|
+| **CBCT** | your T1 masks, masked elastix   | AMASSS segments the T1 masks    | ASO orients the T1 first   |
+| **IOS**  | your segmented, oriented meshes | CrownSeg labels + ASO orients   | —                          |
+
+`modality` and `automation` are explicit arguments, never inferred: a `.zip`
+can hold either kind of data, and guessing wrong registers a patient's
+follow-up against the wrong anatomy and calls it a success. A mode a modality
+does not have (`IOS` + `Oriented`) is a **422** naming what that modality
+offers.
+
+**T1 and T2 are paired by name**, up to the timepoint token and a trailing
+`_scan`/`_Or`/`_Seg`…, so `P1_T1_scan.nii.gz` in one folder pairs with
+`P1_T2.nii.gz` in the other. Subjects present at only one timepoint are listed
+in `AREG_report.json` rather than dropped in silence.
+
+**CBCT: each region is a separate registration.** `cbct_regions` runs one
+masked registration per selected region into its own output folder
+(`CB/`, `MAND/`, `MAX/`) — registering on the cranial base and on the mandible
+answer two different clinical questions. In Semi-Automated mode a mask has to
+say **both** that it is a segmentation (`mask`/`seg`/`pred`) and which
+structure it covers (`cb`/`mand`/`max`), matched as whole tokens of the name:
+`P1_T1_CB_seg.nii.gz`. `segmentation_label` picks one label out of a
+multi-label mask; a label the mask does not hold is refused rather than
+silently falling back to the whole mask.
+
+**The `.tfm` a run returns maps the T1 frame to the T2 frame you sent**, which
+is what `sitk.ResampleImageFilter` consumes — so resampling your own T2 with it
+reproduces the registered volume in the archive. (In the automated IOS modes,
+where the meshes are oriented before registration, the orientation is composed
+in, so the transform still refers to the mesh you sent.)
+
+**IOS registers on a region that does not move**, and which region that is
+depends on the arch — `ios_patch` picks one, and with it the arch:
+
+- **Palate (upper arch)** — a network predicts the patch on each maxilla and the
+  two are aligned by ICP; the mandible is carried by the maxilla's transform, so
+  the occlusion the pair was captured in survives. Needs pytorch3d (same image
+  caveat as ALI's IOS engine) and the `registration_model` checkpoint.
+- **Mucogingival line (lower arch)** — the mandible has no palate, but it has the
+  mucogingival line. The 13 MG landmarks are joined into a spline, every sample
+  is snapped onto the mesh, and a band grows **along the surface** (geodesic, so
+  a buccal patch cannot leak to the lingual side where the ridge is thin);
+  vertices that land on a crown are dropped, because the crowns are what moves.
+  `mgl_patch_height` is the half-height in mm, and **0** registers on the
+  landmarks alone — the control case for measuring what the surface around the
+  line adds.
+
+**The mucogingival band itself needs no model and no GPU** — a spline, a
+shortest-path walk and a label lookup — so a server without pytorch3d registers
+lower arches at full speed while answering **501** for the palate. The landmarks
+it is built from are predicted by `ALI`'s Mucogingival network, in-process:
+send nothing and they are produced for both timepoints. `mgl_landmarks` is
+there only to reuse landmarks you already have, which also skips paying for the
+prediction twice.
+
+```bash
+# The landmarks are predicted server-side; nothing to supply but the scans
+curl -k -X POST https://localhost:8000/run/AREG \
+  -H "Authorization: Bearer $API_TOKEN" \
+  -F "modality=IOS" -F "automation=Semi-Automated" \
+  -F "ios_patch=Mucogingival line (lower arch)" \
+  -F "mgl_patch_height=5.0" \
+  -F "t1=@T1.zip" -F "t2=@T2.zip" \
+  --output result.zip
+```
+
+**Not ported: the IOSCBCT mode** (registering an intra-oral scan onto a CBCT of
+the same patient). It is a genuinely different problem — cross-modality,
+landmark-driven, its own four-folder input contract — and the CLI it would come
+from is the least settled of the three.
+
+`AREG_MAX_GPU_JOBS` (default 1) caps how many IOS patch predictions touch the
+GPU at once. The CBCT engine is elastix on the CPU and needs `itk-elastix`,
+which is in `requirements.txt`.
 
 A tool folder missing its `<name>.py` file, duplicate tool names, or a tool
 missing its `name`, all fail loudly at server
