@@ -38,7 +38,12 @@ FROM scratch AS tools
 # or uv.lock changed, the layer digest is identical and the expensive `uv sync`
 # below stays cached.
 FROM busybox:1.36 AS manifests
-COPY --from=tools tools /ctx/
+# --exclude for the same reason the sources are copied with it: the tools
+# context is a working checkout, where every tool already has a .venv. Without
+# it the find below walks INTO those venvs and copies the pyproject.toml of
+# every installed package, which recreates a `.venv/` directory holding no
+# interpreter -- and `uv sync` then refuses the tool outright.
+COPY --from=tools --exclude=**/.venv --exclude=**/__pycache__ tools /ctx/
 RUN mkdir -p /manifests && cd /ctx && \
     for manifest in $(find . -name pyproject.toml -o -name uv.lock); do \
         mkdir -p "/manifests/$(dirname "$manifest")" && cp "$manifest" "/manifests/$manifest"; \
