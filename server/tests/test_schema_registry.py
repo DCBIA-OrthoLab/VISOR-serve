@@ -388,6 +388,8 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         "label": None,
         "section": None,
         "visible_when": None,
+        # Narrows a choice argument's own options; null on everything else.
+        "options_when": None,
         # True for a technical argument (a CUDA device, a tile step size),
         # which the tool still declares and still defaults for.
         "hidden": False,

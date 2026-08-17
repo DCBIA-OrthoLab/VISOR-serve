@@ -368,6 +368,7 @@ def list_tools() -> list:
                     "label": spec.label,
                     "section": spec.section,
                     "visible_when": spec.visible_when,
+                    "options_when": spec.options_when,
                     # True: do not render this at all. Still published, because
                     # a client that hides it must still know it exists rather
                     # than treat it as an argument the server invented.

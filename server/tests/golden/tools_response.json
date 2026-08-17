@@ -16,6 +16,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "options_when": null,
         "hidden": false,
         "ui": null,
         "groups": null
@@ -42,6 +43,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "options_when": null,
         "hidden": false,
         "ui": null,
         "groups": null
@@ -60,6 +62,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "options_when": null,
         "hidden": false,
         "ui": null,
         "groups": null
@@ -78,6 +81,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "options_when": null,
         "hidden": false,
         "ui": null,
         "groups": null
@@ -100,6 +104,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "options_when": null,
         "hidden": false,
         "ui": null,
         "groups": null
@@ -121,6 +126,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "options_when": null,
         "hidden": false,
         "ui": null,
         "groups": null
@@ -145,6 +151,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "options_when": null,
         "hidden": false,
         "ui": null,
         "groups": null
@@ -163,6 +170,7 @@
         "label": null,
         "section": null,
         "visible_when": null,
+        "options_when": null,
         "hidden": false,
         "ui": null,
         "groups": null

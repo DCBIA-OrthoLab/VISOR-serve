@@ -128,7 +128,7 @@ DEFAULT_RETURN_KIND = "text"
 # and explained rather than passed through wholesale.
 _ARGUMENT_KEYS = (
     "type", "required", "default", "description", "extensions", "choices",
-    "section", "ui", "groups", "visible_when", "label", "hidden",
+    "section", "ui", "groups", "visible_when", "options_when", "label", "hidden",
 )
 
 # The output directory every tool takes as a required argument. The SERVER owns
@@ -275,7 +275,7 @@ def read_schema(folder: str) -> dict:
 # over, so a tool could publish `section` and `ui`, a client could read them,
 # and nothing arrived. In one function because there are four places an ArgSpec
 # is built and three of them are easy to forget.
-_PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "label")
+_PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label")
 
 
 def _presentation(declaration: dict) -> dict:

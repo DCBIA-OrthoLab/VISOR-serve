@@ -201,6 +201,17 @@ class ArgSpec:
     # validation, which still has to hold for a direct API call.
     visible_when: Optional[dict] = None
 
+    # Narrow this argument's own options instead of hiding it:
+    # {other_arg: {its value: [option, ...]}}. `visible_when` can only show or
+    # hide a whole field, and AREG needs neither -- its three automation modes
+    # are all meaningful, but IOS has no "Oriented + Fully-Automated". Without
+    # this the combo box offers it, and choosing it fails at the end of a run.
+    #
+    # Presentation only, exactly like visible_when: validate() still accepts
+    # every option in `choices`, because a direct API call is not a panel and
+    # the tool's own check is what decides.
+    options_when: Optional[dict] = None
+
     # Not rendered by a client, at all. The value is still the tool's own
     # default, and the spec still exists here -- dispatch.uses_the_gpu() reads
     # `device` to decide whether a run takes the card, so removing it from the
@@ -398,6 +409,8 @@ class Tool(ABC):
                 f"{where}: the {spec.ui!r} layout needs 'groups' to say what to group."
             )
 
+        self._check_options_when(where, spec)
+
         if spec.visible_when is None:
             return
         if not isinstance(spec.visible_when, dict) or not spec.visible_when:
@@ -422,6 +435,57 @@ class Tool(ABC):
                     f"{where}: 'visible_when' expects '{other_name}' to be {unknown}, which "
                     f"is not among its choices ({sorted(other.choices)})."
                 )
+
+    def _check_options_when(self, where: str, spec: ArgSpec) -> None:
+        """Reject an options_when that names something nobody declares.
+
+        Every name here is checked because the failure is otherwise a combo box
+        silently missing an option -- indistinguishable, to a clinician, from a
+        mode the tool does not support.
+        """
+        if spec.options_when is None:
+            return
+        if not spec.is_choice:
+            raise ToolSchemaError(
+                f"{where}: 'options_when' narrows an argument's own options, and this "
+                f"one is a {spec.types[0]!r} rather than a choice."
+            )
+        if not isinstance(spec.options_when, dict) or not spec.options_when:
+            raise ToolSchemaError(f"{where}: 'options_when' must be a non-empty dict.")
+        for other_name, by_value in spec.options_when.items():
+            other = self.arguments.get(other_name)
+            if other is None:
+                raise ToolSchemaError(
+                    f"{where}: 'options_when' refers to '{other_name}', which this tool "
+                    f"does not declare."
+                )
+            if other.types[0] != CHOICE_TYPE:
+                raise ToolSchemaError(
+                    f"{where}: 'options_when' can only test a 'choice' argument, and "
+                    f"'{other_name}' is a {other.types[0]!r}."
+                )
+            if not isinstance(by_value, dict) or not by_value:
+                raise ToolSchemaError(
+                    f"{where}: 'options_when[{other_name!r}]' must map each of its values "
+                    f"to the options allowed then."
+                )
+            for value, allowed in by_value.items():
+                if value not in other.choices:
+                    raise ToolSchemaError(
+                        f"{where}: 'options_when' expects '{other_name}' to be {value!r}, "
+                        f"which is not among its choices ({sorted(other.choices)})."
+                    )
+                if not isinstance(allowed, (list, tuple)) or not allowed:
+                    raise ToolSchemaError(
+                        f"{where}: 'options_when[{other_name!r}][{value!r}]' must be a "
+                        f"non-empty list of this argument's own options."
+                    )
+                unknown = [option for option in allowed if option not in spec.choices]
+                if unknown:
+                    raise ToolSchemaError(
+                        f"{where}: 'options_when' allows {unknown}, which are not among "
+                        f"this argument's choices ({sorted(spec.choices)})."
+                    )
 
     @staticmethod
     def _check_choices(where: str, spec: ArgSpec) -> None:
