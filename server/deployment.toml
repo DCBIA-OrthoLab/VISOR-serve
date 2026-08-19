@@ -12,3 +12,20 @@
 #   max_upload_mb = 500                       # this tool alone takes more
 #
 # Anything stated here wins, per argument, over the convention.
+
+# AREG's bundles are staged under DATA/AREG/ -- one folder, shared by the two
+# engines the split produced. Without this, each looks for DATA/<its own name>/
+# and falls back to the run-together spelling (`AREGIOS`), so a hosted model
+# selected by name answers 404 for a folder that was never going to exist.
+[tools.AREG_CBCT]
+data_dir = "AREG"
+
+[tools.AREG_IOS]
+data_dir = "AREG"
+
+# Orchestrates four tools and computes almost nothing itself; see the rule in
+# deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
+# ALI_CBCT ~45s + ASO ~15s = ~157s, plus 20% = ~190s. Left unset here so the
+# global default applies while the chain is still being measured.
+[tools.AREG_IOSCBCT]
+data_dir = "AREG"

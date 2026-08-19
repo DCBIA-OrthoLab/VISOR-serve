@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 import sys
 import textwrap
 from pathlib import Path
@@ -398,3 +399,104 @@ def test_a_nested_tool_can_call_a_tool_outside_its_group(tools_dir, tmp_path):
         capture_output=True, text=True, cwd=str(job_dir),
     )
     assert completed.returncode == 0, completed.stderr
+
+
+# ---------------------------------------------------------------------------
+# Three levels, and the deadline that crosses them
+# ---------------------------------------------------------------------------
+
+def test_a_chain_three_levels_deep_runs_and_carries_its_chain(tools_dir, tmp_path):
+    """A -> B -> C, which is the shape AREG_IOSCBCT -> ASO -> ALI_CBCT has.
+
+    Everything proven before this was two levels. Three is the first time a
+    supervised child is itself a supervisor: the depth and the chain have to
+    survive two hops, and the chain check must NOT fire on a tool that appears
+    twice in the tree on different branches -- which is exactly what
+    AREG_IOSCBCT does, calling ALI_CBCT directly and again through ASO.
+    """
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Middle", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Call the leaf, one level down.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Leaf", scans=scans, output_dir=sup.tmp / "leaf")
+        return output_dir
+    """)
+    make_tool(tools_dir, "Top", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Call the middle tool AND the leaf directly -- two branches.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Leaf", scans=scans, output_dir=sup.tmp / "direct")
+        sup.run("Middle", scans=scans, output_dir=sup.tmp / "middle")
+        return output_dir
+    """)
+
+    job_dir = tmp_path / "job"
+    completed, _ = run_job(
+        tools_dir, "Top", job_dir,
+        {"scans": str(tmp_path / "in"), "output_dir": str(job_dir / "output")},
+    )
+    assert completed.returncode == 0, completed.stderr
+
+    # The grandchild's job file exists, which is what says two hops happened.
+    grandchild = sorted(job_dir.glob("sup/*/sup/*/job.json"))
+    assert grandchild, "no third level was reached"
+    record = json.loads(grandchild[0].read_text(encoding="utf-8"))
+    assert record["tool"] == "Leaf"
+    assert record["root"] == "t"
+
+
+def test_the_deadline_crosses_levels_and_is_not_restarted(tools_dir, tmp_path):
+    """A child gets the time its parent has LEFT, not a fresh budget.
+
+    The deadline travels as an absolute instant on the monotonic clock, whose
+    origin is per-boot rather than per-process. Passing a duration instead would
+    restart the budget at every hop, and a three-deep chain would quietly get
+    three times what the operator granted.
+    """
+    make_tool(tools_dir, "Slow", """
+    import time
+    def run(scans: Path, output_dir: Path) -> Path:
+        \"\"\"Outlive any sensible budget.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        time.sleep(60)
+        return output_dir
+    """)
+    make_tool(tools_dir, "Caller", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Call something slower than the budget allows.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Slow", scans=scans, output_dir=sup.tmp / "slow")
+        return output_dir
+    """)
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "output").mkdir(exist_ok=True)
+    job_path = job_dir / "job.json"
+    job_path.write_text(json.dumps({
+        "job_id": "t", "tool": "Caller", "job_dir": str(job_dir),
+        "params": {"scans": str(tmp_path / "in"),
+                   "output_dir": str(job_dir / "output")},
+    }), encoding="utf-8")
+
+    environment = dict(os.environ)
+    # Three seconds from now, as the server would set it.
+    environment["SADT_SUPERVISOR_DEADLINE"] = repr(time.monotonic() + 3.0)
+
+    started = time.monotonic()
+    completed = subprocess.run(
+        [str(tools_dir / "Caller" / ".venv" / "bin" / "python"), str(RUNNER),
+         "--job", str(job_path)],
+        capture_output=True, text=True, cwd=str(job_dir), env=environment,
+    )
+    elapsed = time.monotonic() - started
+
+    assert completed.returncode != 0
+    assert "ran out of the job's remaining time" in completed.stderr, completed.stderr
+    # Killed on the parent's budget, not given a fresh 60s of its own.
+    assert elapsed < 30, f"took {elapsed:.0f}s, so the budget was not inherited"

@@ -30,3 +30,30 @@
 
 # A section naming a tool this server does not serve is a warning at startup,
 # not an error: a deployment file outliving one tool must not stop the others.
+
+# ---------------------------------------------------------------------------
+# timeout_seconds, and the one case where it is not about compute
+# ---------------------------------------------------------------------------
+#
+# For an ordinary tool the number is its own work: a SurgMovPred prediction is
+# seconds, an AMASSS cohort is hours, and the global TOOL_TIMEOUT_SECONDS has to
+# be set for the slowest or every fast tool that hangs holds a slot until then.
+#
+# An ORCHESTRATING tool inverts that. AREG_IOSCBCT computes for 0.8 s and spends
+# the rest of its wall clock inside four `sup.run()` calls -- Crown_Seg, ALI_IOS,
+# ALI_CBCT, ASO -- each a subprocess in its own virtualenv. Sized on its own
+# compute it would be killed in the middle of its second call, and killed
+# correctly: the timeout sends SIGTERM to the whole process group, so the child
+# holding the GPU dies with it.
+#
+# Rule of thumb, so the number is derived rather than guessed:
+#
+#     timeout_seconds >= (sum of the timeouts of every tool in `calls`) * 1.2
+#
+# The 20 % covers this tool's own work plus process start-up per child, which is
+# seconds each for a venv carrying torch. Read `calls` out of the tool's
+# .schema.json -- it is published exactly so this is mechanical -- and note that
+# a chain is SEQUENTIAL, so the terms add rather than max.
+#
+# That is also why an orchestrator's timeout looks absurd next to its siblings':
+# it is not slower, it is waiting.

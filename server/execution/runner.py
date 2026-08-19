@@ -41,6 +41,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import traceback
 import typing
 from pathlib import Path
@@ -59,10 +60,23 @@ JOB_FILE = "job.json"
 # client never sends one, because it is not data.
 SUPERVISOR_ARGUMENT = "sup"
 
-# Guards a tool that names itself, directly or through a cycle. Five is past
-# anything real: the deepest chain today is AREG_IOSCBCT -> ASO -> ALI_CBCT.
+# A backstop, and only that. The real cycle protection is the CHAIN check below,
+# which refuses a tool already running above the call and names it; this catches
+# the other shape -- a chain that grows without ever repeating -- and nothing
+# else. That is why the number can be generous: the deepest real chain is
+# AREG_IOSCBCT -> ASO -> ALI_CBCT, three levels, and depth costs almost nothing.
+#
+# Measured: an orchestrating tool holds ~12 MB (AREG_IOSCBCT imports no torch),
+# a leaf ~500 MB, and a chain is SEQUENTIAL -- each sup.run() waits for its
+# child -- so one heavy process lives at a time per chain whatever the depth.
+# What multiplies memory is MAX_CONCURRENT_TOOLS, not this.
 SUPERVISOR_DEPTH_ENV = "SADT_SUPERVISOR_DEPTH"
-MAX_SUPERVISOR_DEPTH = 5
+MAX_SUPERVISOR_DEPTH = 10
+
+# When the whole job must be finished by, as a monotonic-clock deadline, passed
+# down so every level can give its child only the time it has left. See
+# _remaining_seconds.
+SUPERVISOR_DEADLINE_ENV = "SADT_SUPERVISOR_DEADLINE"
 
 # The tools already on the stack, innermost last, as one comma-separated value.
 # It travels in the environment rather than in job.json because it belongs to
@@ -357,6 +371,46 @@ class _Supervisor:
     running several supervised jobs concurrently has to size for that.
     """
 
+    @staticmethod
+    def _deadline():
+        """When this whole job must be done, or None when nothing said.
+
+        A monotonic timestamp shared by every level: `time.monotonic()` counts
+        from an arbitrary origin that is constant per BOOT, not per process, so
+        a parent and a child on the same machine read the same clock. Passing an
+        absolute instant rather than a duration is what makes it survive the
+        hop -- a duration would restart at every level and a five-deep chain
+        would get five times the budget.
+        """
+        raw = os.environ.get(SUPERVISOR_DEADLINE_ENV)
+        if not raw:
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return None
+
+    def _remaining_seconds(self):
+        """What is left of the job's budget, or None when there is no deadline.
+
+        Refuses to start a child with no time rather than starting one that will
+        be killed mid-run: a tool that never began is a clean 422-shaped failure
+        naming the chain, where a SIGKILL two levels down is a 500 with nothing
+        in it.
+        """
+        deadline = self._deadline()
+        if deadline is None:
+            return None
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise RunnerError(
+                "The job's time budget is exhausted ({}), so '{}' was not started. "
+                "Raise this tool's timeout_seconds in deployment.toml -- an "
+                "orchestrating tool's budget has to cover its whole chain, not "
+                "its own work.".format(" -> ".join(self._chain), "the next tool")
+            )
+        return left
+
     def __init__(self, tools_dir: str, job_dir: str, depth: int, chain=(), job_id=None, root=None):
         self._tools_dir = tools_dir
         self._job_dir = job_dir
@@ -425,19 +479,41 @@ class _Supervisor:
         environment = dict(os.environ)
         environment[SUPERVISOR_DEPTH_ENV] = str(self._depth + 1)
         environment[SUPERVISOR_CHAIN_ENV] = ",".join(self._chain + (tool,))
+        # Raises when the budget is already spent, before starting anything.
+        remaining = self._remaining_seconds()
         # SADT_TOOL_DIR points at the PARENT's folder; the callee derives its
         # own from its interpreter, and inheriting ours would send it to the
         # wrong sources.
         environment.pop(TOOL_DIR_ENV, None)
 
-        completed = subprocess.run(
-            [interpreter, os.path.abspath(__file__), "--job", job_path],
-            # Not captured: a nested tool's log is the only sign of life during
-            # an hour-long run, and it is already on stderr where the server
-            # collects it. Its result never travels on stdout anyway.
-            cwd=nested_dir,
-            env=environment,
-        )
+        # NO start_new_session here, and that is deliberate. Without it a nested
+        # child inherits its parent's process group, so the SIGTERM the server
+        # sends to the ROOT's group on a timeout reaches every level at once.
+        # Giving each level its own session would look tidier and would detach
+        # the grandchildren from the group the server kills -- exactly the
+        # orphaned-worker-holding-VRAM failure that killpg was added to prevent.
+        #
+        # The timeout below is therefore the polite path, not the only one: it
+        # lets a level fail with a message naming the chain instead of being
+        # killed silently, and the group kill remains the backstop.
+        try:
+            completed = subprocess.run(
+                [interpreter, os.path.abspath(__file__), "--job", job_path],
+                # Not captured: a nested tool's log is the only sign of life
+                # during an hour-long run, and it is already on stderr where the
+                # server collects it. Its result never travels on stdout anyway.
+                cwd=nested_dir,
+                env=environment,
+                timeout=remaining,
+            )
+        except subprocess.TimeoutExpired:
+            raise RunnerError(
+                "Supervised tool '{}' ran out of the job's remaining time after "
+                "{:.0f}s. The chain is {} -> {}; raise the ROOT tool's "
+                "timeout_seconds, which has to cover the whole chain.".format(
+                    tool, remaining or 0, " -> ".join(self._chain), tool
+                )
+            )
         if completed.returncode != 0:
             # Its own result file is where the useful half is. The child's
             # traceback goes to stderr, which whatever runs the PARENT may be

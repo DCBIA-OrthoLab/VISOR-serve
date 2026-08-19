@@ -31,6 +31,7 @@ import shutil
 import signal
 import subprocess
 import threading
+import time
 import uuid
 from typing import Any, Optional
 
@@ -245,7 +246,7 @@ def _jsonable(value):
     )
 
 
-def _child_environment(job_id: str, job_dir: str) -> dict:
+def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = None) -> dict:
     """The environment the tool process runs in.
 
     Inherited rather than rebuilt: tools legitimately need PATH, HOME,
@@ -255,6 +256,16 @@ def _child_environment(job_id: str, job_dir: str) -> dict:
     """
     environment = dict(os.environ)
     environment.pop("API_TOKEN", None)
+    if timeout:
+        # An ABSOLUTE instant on the monotonic clock, not a duration: the clock's
+        # origin is per-boot rather than per-process, so every level of a
+        # supervised chain reads the same one. A duration would restart at each
+        # hop and a five-deep chain would quietly get five times the budget.
+        #
+        # This is what makes an orchestrating tool's timeout mean "the whole
+        # chain": AREG_IOSCBCT computes for a second and spends the rest inside
+        # its children, so the budget it is given has to be theirs too.
+        environment["SADT_SUPERVISOR_DEADLINE"] = repr(time.monotonic() + timeout)
     environment.update(
         {
             "SADT_API": settings.SADT_API,
@@ -415,10 +426,11 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
         params = _server_provided(tool, params, job_dir)
         job_path = _write_job_file(job_dir, job_id, tool.name, params)
         command = [interpreter, runner, "--job", job_path]
-        environment = _child_environment(job_id, job_dir)
         # Per tool, falling back to the global setting. 0 means no limit, which
-        # a cohort legitimately needs.
+        # a cohort legitimately needs. Computed BEFORE the environment, which
+        # carries it down to every supervised level as a deadline.
         timeout = deployment_config.timeout_seconds(tool.name) or None
+        environment = _child_environment(job_id, job_dir, timeout)
 
         if uses_the_gpu(tool, params):
             # Held for the whole run, and released by leaving the block on any
