@@ -8,6 +8,7 @@ conftest.py for how it is laid out.
 
 import contextlib
 import json
+import pathlib
 import os
 import sys
 import signal
@@ -286,4 +287,20 @@ def test_the_timeout_kills_the_whole_process_group_not_just_the_tool(tmp_path):
         os.kill(grandchild, signal.SIGKILL)
     pytest.fail(
         f"grandchild {grandchild} survived the timeout: killpg did not reach the process group"
+    )
+
+
+def test_the_runner_and_the_server_agree_on_the_output_directory_name():
+    """runner.py cannot import the constant, so the agreement is pinned here.
+
+    The runner is stdlib-only by contract and runs under each tool's own
+    interpreter, so it repeats the literal. If the two drift, a tool writes to
+    one directory and the server packs another, and the caller gets an empty
+    archive rather than an error.
+    """
+    runner_source = pathlib.Path(dispatch.settings.RUNNER_PATH).read_text(encoding="utf-8")
+    expected = f'/ "{dispatch.JOB_OUTPUT_DIRNAME}"'
+    assert expected in runner_source, (
+        f"runner.py no longer builds its output directory as "
+        f"{dispatch.JOB_OUTPUT_DIRNAME!r}; dispatch.JOB_OUTPUT_DIRNAME must match."
     )

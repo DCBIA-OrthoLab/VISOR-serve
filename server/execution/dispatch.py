@@ -53,7 +53,16 @@ STDERR_LOG = "stderr.log"
 # Subdirectories every job gets. `input/` is where the server will stage inputs
 # once tools stop being handed paths into the request's own work dir; `output/`
 # is what a tool writes into and what survives long enough to be streamed back.
-JOB_SUBDIRS = ("input", "output")
+# The job directory's output folder. Named here because main.py builds the
+# result archive from it and needs to recognise it: an archive named after this
+# folder would be called "output.zip" for every tool.
+#
+# runner.py repeats the literal rather than importing this. It is stdlib-only by
+# contract, executed by each tool's own interpreter, so it cannot import a server
+# module. The two must agree; a test pins them together.
+JOB_OUTPUT_DIRNAME = "output"
+
+JOB_SUBDIRS = ("input", JOB_OUTPUT_DIRNAME)
 
 # How much of the tool's stderr travels with the failure. Enough for a
 # traceback, bounded because a failing tool can print megabytes.
@@ -211,7 +220,7 @@ def _server_provided(tool, params: dict, job_dir: str) -> dict:
     """
     filled = dict(params)
     if getattr(tool, "wants_output_dir", False):
-        output_dir = os.path.join(job_dir, "output")
+        output_dir = os.path.join(job_dir, JOB_OUTPUT_DIRNAME)
         os.makedirs(output_dir, exist_ok=True)
         filled["output_dir"] = output_dir
     if DEVICE_ARGUMENT in tool.arguments and DEVICE_ARGUMENT not in filled:

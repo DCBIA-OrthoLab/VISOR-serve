@@ -998,11 +998,20 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                 # Built inside work_dir, never inside the tool's own scratch
                 # dir: the archive has to outlive the files it was made from,
                 # right up until the response has finished streaming.
-                archive_name = (
-                    f"{os.path.basename(outputs[0].rstrip(os.sep))}.zip"
-                    if len(outputs) == 1 and os.path.isdir(outputs[0])
-                    else f"{tool.name}_output.zip"
-                )
+                # Always carries the tool's name. Naming the archive after the
+                # single directory a tool produced dates from the in-process
+                # era, when that directory had a name the tool chose; a packaged
+                # tool writes into the job's own `output/`, so the rule was
+                # handing every one of them the same `output.zip`. Nine tools
+                # run from the client landed in the download folder under one
+                # name, each overwriting the last, and the name leaked a
+                # server-side directory rather than saying what produced it.
+                stem = ""
+                if len(outputs) == 1 and os.path.isdir(outputs[0]):
+                    stem = os.path.basename(outputs[0].rstrip(os.sep))
+                if not stem or stem == dispatch.JOB_OUTPUT_DIRNAME:
+                    stem = "output"
+                archive_name = f"{tool.name}_{stem}.zip"
                 result = await anyio.to_thread.run_sync(
                     file_utils.make_zip, outputs, os.path.join(work_dir, archive_name)
                 )
