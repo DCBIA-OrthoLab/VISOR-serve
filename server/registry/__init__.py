@@ -383,7 +383,8 @@ def _refuse_if_nothing_packaged_loaded(registry: dict) -> None:
     Same principle as the stale-schema refusal, one level up: refusing to start
     is the only response that cannot be mistaken for working.
     """
-    on_disk = [name for name, _ in _tool_folders(settings.TOOLS_DIR)]
+    # Walked once: _tool_folders stats every candidate folder, and this runs at
+    # startup on a mount that may be slow.
     packaged = [
         name for name, folder in _tool_folders(settings.TOOLS_DIR) if is_packaged(folder)
     ]

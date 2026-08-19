@@ -17,7 +17,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 import file_utils
-import main
 import registry
 from base import ArgSpec, Tool
 from main import app

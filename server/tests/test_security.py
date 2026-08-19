@@ -21,7 +21,6 @@ import registry
 from base import ArgSpec, Tool
 from config import settings
 from main import app
-from wire import transfer
 
 client = TestClient(app)
 TOKEN = settings.API_TOKEN

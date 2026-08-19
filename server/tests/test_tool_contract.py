@@ -10,7 +10,6 @@ class NAME is the only thing that says which status code to answer.
 
 import json
 import os
-import textwrap
 
 import pytest
 
