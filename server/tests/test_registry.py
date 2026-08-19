@@ -170,3 +170,43 @@ def test_every_tool_in_the_repo_actually_loads():
     assert registry.FAILED_TOOLS == {}, "tool(s) failed to load: " + "; ".join(
         f"{folder} ({reason})" for folder, reason in sorted(registry.FAILED_TOOLS.items())
     )
+
+
+# ---------------------------------------------------------------------------
+# A name written two ways
+
+
+def test_a_tool_is_found_under_a_different_spelling_of_its_name():
+    """`SurgMovPred` became `Surg_Mov_Pred` when the tool was packaged.
+
+    Every Slicer module naming the old spelling got a 404 reading "Unknown
+    tool", which is what a typo returns -- so a cosmetic rename on this side
+    looked, from the panel, like the client asking for something that never
+    existed. CLAUDE.md already described names as compared case- and
+    separator-insensitively; the code did neither, and nothing tested it.
+    """
+    name = next(iter(registry.TOOLS))
+    spelled_differently = name.replace("_", "").lower()
+
+    assert registry.get_tool(spelled_differently) is registry.TOOLS[name]
+
+
+def test_a_name_that_matches_nothing_is_still_unknown():
+    """Forgiving about separators, not about the name."""
+    with pytest.raises(KeyError, match="Unknown tool"):
+        registry.get_tool("Nonexistent_Tool")
+
+
+def test_two_spellings_of_one_name_cannot_both_be_served():
+    """The other half of the same rule, and the reason the lookup is safe: at
+    most one tool can match a canonical key, so there is nothing to
+    disambiguate at request time."""
+    served = {"Batch_Dental_Seg": object()}
+
+    with pytest.raises(RuntimeError, match="same tool written two ways"):
+        registry._reject_duplicate("BatchDentalSeg", served)
+
+
+def test_a_genuinely_different_name_is_not_a_duplicate():
+    served = {"ALI_CBCT": object()}
+    registry._reject_duplicate("ALI_IOS", served)  # must not raise

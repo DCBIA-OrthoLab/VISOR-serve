@@ -285,9 +285,32 @@ def _comparable(name: str) -> str:
     return "".join(character for character in name.casefold() if character.isalnum())
 
 
+def canonical_name(name: str) -> str:
+    """A tool name with case and separators removed.
+
+    `Batch_Dental_Seg` and `BatchDentalSeg` are one tool written two ways: they
+    would land in the same DATA/ folder, answer the same /run path to anyone
+    typing either, and mean the same thing to a reader. Serving both is the
+    ambiguity; refusing the second at startup is the fix.
+
+    The same key makes a lookup forgiving, which is what lets a client survive a
+    cosmetic rename. `SurgMovPred` became `Surg_Mov_Pred` when the tool was
+    packaged, and every Slicer module naming the old spelling got a 404 that
+    reads like a typo.
+    """
+    return "".join(character for character in name.lower() if character.isalnum())
+
+
 def _reject_duplicate(name: str, registry: dict) -> None:
     if name in registry:
         raise RuntimeError(f"Duplicate tool name detected: '{name}'")
+    key = canonical_name(name)
+    clash = next((other for other in registry if canonical_name(other) == key), None)
+    if clash is not None:
+        raise RuntimeError(
+            f"Duplicate tool name detected: '{name}' and '{clash}' differ only in "
+            f"case or separators, so they are the same tool written two ways."
+        )
 
 
 def _check_deployment_config(registry: dict) -> None:
@@ -482,6 +505,13 @@ def get_tool(name: str):
     try:
         return TOOLS[name]
     except KeyError:
+        # Case and separators, before deciding this is unknown. Duplicates that
+        # differ only that way are refused at startup, so at most one tool can
+        # match and there is nothing to disambiguate.
+        key = canonical_name(name)
+        for registered, tool in TOOLS.items():
+            if canonical_name(registered) == key:
+                return tool
         if name in FAILED_TOOLS:
             # The tool exists in the source tree but didn't load. Say so rather
             # than "unknown tool", which reads like a typo. The reason stays in
