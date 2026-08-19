@@ -9,6 +9,7 @@ so run() can always trust its inputs.
 # and registry.py for how it gets picked up automatically.
 """
 
+import os
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -691,9 +692,18 @@ class Tool(ABC):
         from config import DISPATCH_SUBPROCESS, settings
 
         if settings.SADT_DISPATCH_MODE == DISPATCH_SUBPROCESS:
-            from execution.dispatch import dispatch
+            from execution.dispatch import dispatch, tool_interpreter
 
-            return dispatch(self, cleaned)
+            # ...but only when there is an out-of-process to dispatch TO. This
+            # class is a tool the server IMPORTED: its code is right here and it
+            # has no virtualenv of its own unless someone built one beside it,
+            # which is exactly what the parity harness does. The flag used to be
+            # read on its own, so a deployment running with
+            # SADT_DISPATCH_MODE=subprocess answered 501 "not installed on this
+            # server" for a tool sitting in its own process -- which is what the
+            # shipped demos hit the moment they reached a real image.
+            if os.path.isfile(tool_interpreter(self.name)):
+                return dispatch(self, cleaned)
         return self.run(**cleaned)
 
     @abstractmethod

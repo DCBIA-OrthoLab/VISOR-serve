@@ -342,3 +342,29 @@ def test_the_name_search_still_answers_when_the_registry_does_not(tmp_path, monk
     monkeypatch.setattr(dispatch.settings, "TOOLS_DIR", str(tmp_path))
 
     assert dispatch.tool_interpreter("Solo") == str(folder / "python")
+
+
+def test_an_imported_tool_with_no_virtualenv_runs_in_process(monkeypatch, tmp_path):
+    """`SADT_DISPATCH_MODE=subprocess` cannot apply to a tool that has no
+    subprocess to go to.
+
+    The flag decides how a tool the server IMPORTED is executed, and the
+    deployment image sets it because every clinical tool is packaged. Read on
+    its own it also caught the two shipped demos, whose code is in this very
+    process: `Test_Tool` answered 501 "not installed on this server" for two
+    strings and a concatenation.
+    """
+    import base
+
+    class _Imported(base.Tool):
+        name = "Demo_Tool"
+        arguments = {"text": base.ArgSpec(type=str)}
+        output_kind = "text"
+
+        def run(self, text):
+            return text.upper()
+
+    monkeypatch.setattr(dispatch.settings, "SADT_DISPATCH_MODE", "subprocess")
+    monkeypatch.setattr(dispatch.settings, "TOOLS_DIR", str(tmp_path))
+
+    assert _Imported().invoke({"text": "ok"}) == "OK"
