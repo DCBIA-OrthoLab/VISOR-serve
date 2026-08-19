@@ -176,4 +176,21 @@ services:
     # the tools are moved over one at a time.
     ports:
       - "${BIND_ADDR:+${BIND_ADDR:-}:}${VENVS_HOST_PORT:-8001}:8000"
+    # Docker gives a container 64 MB, and nnUNet passes data between its
+    # export workers through shared memory. Without this AMASSS and
+    # Batch_Dental_Seg die with "Background workers died ... your RAM was
+    # full", which names the wrong resource: the host had 100 GB free.
+    shm_size: 8gb
+    # The tools this image carries are the real ones, not the build fixtures
+    # the comment above was written for: AMASSS, ALI and Crown_Seg all
+    # expect a card. A reservation is all-or-nothing, so this service no
+    # longer starts without one, which is correct for an image whose
+    # purpose is running them.
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     restart: unless-stopped
