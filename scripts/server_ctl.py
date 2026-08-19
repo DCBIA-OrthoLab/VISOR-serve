@@ -964,12 +964,20 @@ def cmd_models(args) -> dict:
     if not os.path.isfile(fetch):
         raise ServerCtlError(f"scripts/fetch_data.py not found next to {__file__}.")
 
-    known = {tool["name"] for tool in catalog()["tools"]}
-    unknown = sorted(set(args.tool or []) - known)
-    if unknown:
-        raise ServerCtlError(
-            f"No such tool in the manifest: {', '.join(unknown)}. Known: {', '.join(sorted(known))}"
-        )
+    # Resolved through fetch_data, which is the one place that knows a manifest
+    # key can differ from a served tool name: `Crown_Seg` from GET /tools is
+    # `CrownSeg` here, and `ALI_CBCT` is served by the `ALI` bundle. Checking
+    # names against the catalog keys alone refused every name a client actually
+    # has.
+    if args.tool:
+        fetch_data = _load_fetch_data()
+        try:
+            fetch_data.resolve_tools(
+                fetch_data._parse_manifest(fetch_data._DEFAULT_MANIFEST),
+                args.tool,
+            )
+        except fetch_data.ManifestError as error:
+            raise ServerCtlError(str(error))
 
     command = [sys.executable, fetch, "--data-dir", ensure_data_dir(), "--progress", "always"]
     for kind in args.kind or ["models", "testfiles"]:

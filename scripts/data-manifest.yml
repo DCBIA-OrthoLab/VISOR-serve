@@ -139,6 +139,7 @@ tools:
   #     DATA/ALI/models/ALI_CBCT_Models/Cranial_Base/Ba/1/Ba_Net_1.pth
   # =========================================================================
   ALI:
+    provides: [ALI_CBCT, ALI_IOS]
     models:
       # --- IOS: 5 weight files ---------------------------------------------
       #   Upper/Lower x O(cclusal)/C(ervical), plus Lower_MG (mucogingival).
@@ -251,6 +252,7 @@ tools:
   # every URL is checked and the mode is next in line.
   # =========================================================================
   AREG:
+    provides: [AREG_CBCT, AREG_IOS, AREG_IOSCBCT]
     models:
       # The patch-prediction checkpoint for IOS registration ('registration_model').
       - name: AREG_model.zip
