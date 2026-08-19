@@ -689,12 +689,20 @@ def _safe_stem(filename: str, extension: str) -> str:
     - a result that is empty, or that is all dots (`.`, `..`), returns "" and the
       caller falls back to the field name alone. Traversal cannot survive a
       whitelist that excludes `/`, but `..` is refused explicitly because it is
-      the one leftover that is still a meaningful path.
+      the one leftover that is still a meaningful path;
+    - a run of dots collapses to one, so `..` cannot appear anywhere in the
+      result. `..` between two underscores cannot traverse -- the whitelist
+      already removed every separator -- but a dot run is never part of a real
+      patient name, and leaving it forces anyone auditing this to reason about
+      adjacency instead of reading one flat rule. Found by the URL-encoded
+      payload `..%2f..%2fpasswd`, whose percent signs became underscores and
+      left the dots behind.
     """
     name = os.path.basename(filename or "")
     if extension and name.lower().endswith(extension.lower()):
         name = name[: -len(extension)]
-    cleaned = _SAFE_STEM.sub("_", name).strip("._")
+    cleaned = _SAFE_STEM.sub("_", name)
+    cleaned = re.sub(r"\.{2,}", ".", cleaned).strip("._")
     if not cleaned or set(cleaned) <= {"."}:
         return ""
     return cleaned[:_MAX_STEM]
