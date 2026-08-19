@@ -94,6 +94,13 @@ RUN uv venv --python 3.13 /opt/sadt/.venv && \
 # ---- the tools -------------------------------------------------------
 COPY --from=manifests /manifests/ /tools/
 
+# Two levels, and gated on [tool.sadt], for the same reason the registry is: a
+# tool may live inside a GROUPING folder (tools/ALI/ALI_CBCT), and a folder with
+# a pyproject.toml but no [tool.sadt] is a shared package rather than a tool --
+# tools/ALI/common/ must not get a virtualenv of its own. A one-level loop built
+# six venvs of eleven and the five nested tools were simply absent from the
+# image, which nothing reported until the server tried to run one.
+#
 # EVERY `uv sync` in ONE layer, and this is not stylistic. overlayfs copies a
 # file up when a later layer touches it, which breaks the hardlinks between
 # tools installed in different layers -- eleven torch tools go from ~26 GB to
@@ -106,8 +113,9 @@ RUN --mount=type=cache,target=/cache/uv,sharing=locked \
     set -eu; \
     mkdir -p "$UV_CACHE_DIR"; \
     cp -a /cache/uv/. "$UV_CACHE_DIR"/ 2>/dev/null || true; \
-    for tool in /tools/*/; do \
+    for tool in /tools/*/ /tools/*/*/; do \
         [ -f "$tool/pyproject.toml" ] || continue; \
+        grep -q "^\[tool.sadt\]" "$tool/pyproject.toml" || continue; \
         echo "==> uv sync $(basename "$tool")"; \
         ( cd "$tool" && uv sync --frozen --no-install-project --no-dev ); \
     done; \
@@ -137,7 +145,7 @@ COPY --from=tools scripts /tools/scripts/
 # that will be described at startup instead, or reported as not loadable.
 RUN set -eu; \
     [ -f /tools/scripts/describe.py ] || { echo "no describe.py: tools must ship .schema.json"; exit 0; }; \
-    for tool in /tools/*/; do \
+    for tool in /tools/*/ /tools/*/*/; do \
         name=$(basename "$tool"); \
         [ -x "$tool/.venv/bin/python" ] || continue; \
         if "$tool/.venv/bin/python" /tools/scripts/describe.py "$tool" > "$tool/.schema.json.tmp"; then \
