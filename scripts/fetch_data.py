@@ -122,8 +122,19 @@ def _parse_manifest(path: str) -> dict:
                     tools.setdefault(tool, {})
                 elif indent == 4:  # models: / testfiles:
                     name, value = _split_key(stripped)
+                    # `provides: [A, B]` is a property of the tool, not a kind: the
+                    # served tool names this one bundle covers, for a folder whose
+                    # name stopped being a tool name when ALI and AREG each became
+                    # several. Inline, so it cannot be read as downloadable items.
+                    if name == "provides":
+                        tools[tool]["provides"] = [
+                            part.strip() for part in (value or "").strip("[]").split(",")
+                            if part.strip()
+                        ]
+                        kind, entry = None, None
+                        continue
                     if name not in KINDS:
-                        raise ManifestError(f"Unknown section {name!r}, expected one of {KINDS}")
+                        raise ManifestError(f"Unknown section {name!r}, expected one of {KINDS} or 'provides'")
                     kind, entry = name, None
                     tools[tool].setdefault(kind, [])
                 elif indent == 6 and stripped.startswith("- "):  # first key of an entry
@@ -327,9 +338,63 @@ def _fetch(entry: dict, data_dir: str, force: bool, progress) -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _list_manifest(manifest: dict) -> None:
+def _normalize(name: str) -> str:
+    """Case- and separator-insensitive, the rule the registry already uses.
+
+    `Crown_Seg` and `CrownSeg` are one tool written two ways; the server says so
+    when it refuses duplicates, and a client reading GET /tools has no way to
+    know which spelling this file happens to use.
+    """
+    return "".join(character for character in name.lower()
+                   if character.isalnum())
+
+
+def resolve_tools(manifest: dict, wanted) -> list:
+    """Manifest entries for the tool names a caller asked for.
+
+    A caller reads names from `GET /tools` and gets `Crown_Seg`, `ALI_CBCT`,
+    `AREG_IOSCBCT`. This file predates the splits and still keys on `CrownSeg`,
+    `ALI`, `AREG`, because those are the DATA/ folder names and moving them
+    would break every deployment that already downloaded them. So the names are
+    matched rather than renamed:
+
+    - normalized equality, which resolves every rename that only moved
+      underscores (`Crown_Seg`, `Batch_Dental_Seg`, `Surg_Mov_Pred`);
+    - `provides:`, which an entry uses to name the tools it serves when one
+      bundle feeds several (`ALI` feeds ALI_CBCT and ALI_IOS).
+
+    Returns the manifest keys, in manifest order. Raises ManifestError naming
+    what is unresolvable, because the alternative -- silently downloading
+    something else -- is how a 12 GB bundle arrives for the wrong tool.
+    """
+    if not wanted:
+        return sorted(manifest)
+
+    index = {}
+    for key, entry in manifest.items():
+        index.setdefault(_normalize(key), key)
+        for served in entry.get("provides", ()) or ():
+            index.setdefault(_normalize(served), key)
+
+    resolved, unknown = [], []
+    for name in wanted:
+        key = index.get(_normalize(name))
+        if key is None:
+            unknown.append(name)
+        elif key not in resolved:
+            resolved.append(key)
+    if unknown:
+        served = sorted({served for entry in manifest.values()
+                         for served in (entry.get("provides") or ())} | set(manifest))
+        raise ManifestError(
+            "no such tool in the manifest: {}. Known: {}".format(
+                ", ".join(sorted(unknown)), ", ".join(served)))
+    return resolved
+
+
+def _list_manifest(manifest: dict, wanted=None) -> None:
     grand_total = 0
-    for tool in sorted(manifest):
+    for tool in resolve_tools(manifest, wanted):
         entries = [entry for kind in KINDS for entry in manifest[tool].get(kind, [])]
         total = sum(entry.get("size") or 0 for entry in entries)
         grand_total += total
@@ -375,22 +440,22 @@ def main(argv=None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if args.list:
-        _list_manifest(manifest)
-        return 0
-
-    unknown = sorted(set(args.tool or []) - set(manifest))
-    if unknown:
-        print(
-            f"error: no such tool in the manifest: {', '.join(unknown)}\n"
-            f"       known tools: {', '.join(sorted(manifest))}",
-            file=sys.stderr,
-        )
+    # Resolved BEFORE listing: `--tool X --list` used to print the whole
+    # manifest, so asking about one tool answered with 12 GB of another one's
+    # bundles and no indication the filter had been dropped.
+    try:
+        selected = resolve_tools(manifest, args.tool)
+    except ManifestError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         return 2
+
+    if args.list:
+        _list_manifest(manifest, args.tool)
+        return 0
 
     kinds = args.kind or list(KINDS)
     try:
-        work = [entry for kind in kinds for entry in _entries(manifest, kind, args.tool)]
+        work = [entry for kind in kinds for entry in _entries(manifest, kind, selected)]
     except ManifestError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

@@ -13,8 +13,12 @@ import zipfile
 # regardless of whatever is in the developer's local .env.
 os.environ["API_TOKEN"] = "test-token"
 
+import pytest
 from fastapi.testclient import TestClient
 
+import file_utils
+import registry
+from base import ArgSpec, Tool
 from main import app
 
 client = TestClient(app)
@@ -31,11 +35,11 @@ def test_tools_lists_test_tool():
     response = client.get("/tools")
     assert response.status_code == 200
     names = [tool["name"] for tool in response.json()]
-    assert "test_tool" in names
+    assert "Test_Tool" in names
 
 
 def test_run_without_token_is_401():
-    response = client.post("/run/test_tool", data={"text_1": "a", "text_2": "b"})
+    response = client.post("/run/Test_Tool", data={"text_1": "a", "text_2": "b"})
     assert response.status_code == 401
 
 
@@ -50,7 +54,7 @@ def test_run_unknown_tool_is_404():
 
 def test_run_missing_argument_is_422():
     response = client.post(
-        "/run/test_tool",
+        "/run/Test_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"text_1": "a"},
     )
@@ -59,7 +63,7 @@ def test_run_missing_argument_is_422():
 
 def test_run_unexpected_argument_is_422():
     response = client.post(
-        "/run/test_tool",
+        "/run/Test_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"text_1": "a", "text_2": "b", "text_3": "c"},
     )
@@ -68,7 +72,7 @@ def test_run_unexpected_argument_is_422():
 
 def test_run_test_tool_happy_path():
     response = client.post(
-        "/run/test_tool",
+        "/run/Test_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"text_1": "hello", "text_2": "world"},
     )
@@ -84,7 +88,7 @@ def test_run_example_tool_with_single_csv(tmp_path):
 
     with open(csv_file, "rb") as file_obj:
         response = client.post(
-            "/run/example_tool",
+            "/run/Example_Tool",
             headers={"Authorization": f"Bearer {TOKEN}"},
             data={"label": "case_1", "threshold": "0.5"},
             files={"input": ("measures.csv", file_obj, "text/csv")},
@@ -92,7 +96,7 @@ def test_run_example_tool_with_single_csv(tmp_path):
 
     assert response.status_code == 200
     assert response.headers["content-type"] == "application/zip"
-    assert "example_tool_output.zip" in response.headers["content-disposition"]
+    assert "Example_Tool_output.zip" in response.headers["content-disposition"]
 
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
         assert sorted(archive.namelist()) == ["preview.csv", "summary.txt"]
@@ -114,7 +118,7 @@ def test_run_example_tool_with_zipped_folder(tmp_path):
     buffer.seek(0)
 
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"label": "case_2", "threshold": "2.5"},
         files={"input": ("measures.zip", buffer, "application/zip")},
@@ -132,7 +136,7 @@ def test_run_example_tool_with_zipped_folder(tmp_path):
 def test_run_example_tool_rejects_unsupported_extension():
     """type=("csv_file", "folder") accepts .csv and .zip -- nothing else."""
     response = client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"label": "case_3", "threshold": "0.5"},
         files={"input": ("volume.nii.gz", b"not tabular", "application/gzip")},
@@ -199,12 +203,27 @@ def test_run_tool_with_two_named_files_missing_one_is_422(monkeypatch):
     assert response.status_code == 422
 
 
-def test_run_rejects_upload_for_scalar_argument():
-    """SurgMovPred's "model" is a server-side-only selection (type str +
-    server_selectable): sending it as a file upload must be rejected outright,
-    not silently passed through as a temp path."""
+@pytest.fixture
+def hosted_model_tool(monkeypatch):
+    """A tool whose `model` is hosted server-side: type str + server_selectable,
+    which is what conventions.py derives for every argument named `model`."""
+
+    class HostedModelTool(Tool):
+        name = "zz_hosted_model"
+        arguments = {"model": ArgSpec(type=str, server_selectable="model")}
+
+        def run(self, model):
+            return str(model)
+
+    monkeypatch.setitem(registry.TOOLS, HostedModelTool.name, HostedModelTool())
+    return HostedModelTool.name
+
+
+def test_run_rejects_upload_for_scalar_argument(hosted_model_tool):
+    """Weights are named, never uploaded: a file sent for such an argument must
+    be refused outright, not passed through as a temp path."""
     response = client.post(
-        "/run/SurgMovPred",
+        f"/run/{hosted_model_tool}",
         headers={"Authorization": f"Bearer {TOKEN}"},
         files={"model": ("model.zip", b"PK\x03\x04fake", "application/zip")},
     )
@@ -213,11 +232,11 @@ def test_run_rejects_upload_for_scalar_argument():
     assert "model" in response.json()["detail"]
 
 
-def test_run_unknown_server_model_name_is_404():
+def test_run_unknown_server_model_name_is_404(hosted_model_tool):
     response = client.post(
-        "/run/SurgMovPred",
+        f"/run/{hosted_model_tool}",
         headers={"Authorization": f"Bearer {TOKEN}"},
-        data={"model": "does_not_exist", "input": "does_not_exist.zip"},
+        data={"model": "does_not_exist"},
     )
 
     assert response.status_code == 404
@@ -339,11 +358,11 @@ def test_tools_reports_every_declared_type():
     "types" with the full list, so a client can filter its file picker."""
     tools = {tool["name"]: tool for tool in client.get("/tools").json()}
 
-    example_input = tools["example_tool"]["arguments"]["input"]
+    example_input = tools["Example_Tool"]["arguments"]["input"]
     assert example_input["type"] == "csv_file"
     assert example_input["types"] == ["csv_file", "folder"]
 
-    single_typed = tools["test_tool"]["arguments"]["text_1"]
+    single_typed = tools["Test_Tool"]["arguments"]["text_1"]
     assert single_typed["type"] == "str"
     assert single_typed["types"] == ["str"]
 
@@ -355,13 +374,13 @@ def test_tools_publishes_the_extensions_of_every_file_type():
     keep a copy of that table, and drifts every time it changes here."""
     tools = {tool["name"]: tool for tool in client.get("/tools").json()}
 
-    example_input = tools["example_tool"]["arguments"]["input"]
+    example_input = tools["Example_Tool"]["arguments"]["input"]
     # Keyed by type, not flattened: "folder"'s .zip is what a zipped folder may
     # be uploaded as, not something a file picker should offer.
     assert example_input["extensions"] == {"csv_file": [".csv"], "folder": [".zip"]}
 
     # An argument taking no file at all says so.
-    assert tools["example_tool"]["arguments"]["label"]["extensions"] is None
+    assert tools["Example_Tool"]["arguments"]["label"]["extensions"] is None
 
     for tool in tools.values():
         for argument in tool["arguments"].values():
@@ -396,7 +415,11 @@ def test_surface_file_type_accepts_every_mesh_format_it_advertises(monkeypatch):
             files={"mesh": (f"scan{extension}", io.BytesIO(b"mesh bytes"), "application/octet-stream")},
         )
         assert response.status_code == 200, extension
-        assert response.json() == {"result": f"mesh{extension}"}
+        # `mesh_scan`, not `mesh`: the field name, then the sanitized stem
+        # of what was uploaded. The extension is what this test is about
+        # and is unchanged; the stem is there so a batch's outputs can be
+        # told apart, every tool here naming its outputs after its input.
+        assert response.json() == {"result": f"mesh_scan{extension}"}
 
     response = client.post(
         "/run/surface_test_tool",
@@ -671,7 +694,7 @@ def test_server_selectable_folder_argument(monkeypatch, tmp_path):
 
 
 def test_download_testfile_requires_token():
-    response = client.get("/tools/test_tool/testfiles/anything.nii.gz")
+    response = client.get("/tools/Test_Tool/testfiles/anything.nii.gz")
     assert response.status_code == 401
 
 
@@ -685,7 +708,7 @@ def test_download_testfile_unknown_tool_is_404():
 
 def test_download_unknown_testfile_is_404():
     response = client.get(
-        "/tools/test_tool/testfiles/does_not_exist.nii.gz",
+        "/tools/Test_Tool/testfiles/does_not_exist.nii.gz",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
     assert response.status_code == 404
@@ -693,7 +716,7 @@ def test_download_unknown_testfile_is_404():
 
 def test_download_testfile_streams_the_file(monkeypatch, tmp_path):
     """A plain test file is streamed as-is, named by Content-Disposition and
-    typed from its real extension — the two headers the Slicer client trusts
+    typed from its real extension - the two headers the Slicer client trusts
     to write it to disk under the right name."""
     import main
     from data_store import ResolvedFile
@@ -707,7 +730,7 @@ def test_download_testfile_streams_the_file(monkeypatch, tmp_path):
     )
 
     response = client.get(
-        "/tools/test_tool/testfiles/reference_scan.nii.gz",
+        "/tools/Test_Tool/testfiles/reference_scan.nii.gz",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
 
@@ -739,7 +762,7 @@ def test_download_testfile_folder_arrives_zipped_and_cleans_up(monkeypatch, tmp_
 
     before = set(os.listdir(settings.TEMP_DIR))
     response = client.get(
-        "/tools/test_tool/testfiles/test_cohort",
+        "/tools/Test_Tool/testfiles/test_cohort",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
 
@@ -767,7 +790,7 @@ def test_download_testfile_removes_a_backend_temp_copy(monkeypatch, tmp_path):
     )
 
     response = client.get(
-        "/tools/test_tool/testfiles/materialized.nii.gz",
+        "/tools/Test_Tool/testfiles/materialized.nii.gz",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
 
@@ -808,7 +831,7 @@ def test_tools_exposes_choices():
     """GET /tools ships the options and their initial state, so the client can
     render check boxes / a combo box with no tool-specific code."""
     tools = {tool["name"]: tool for tool in client.get("/tools").json()}
-    arguments = tools["example_tool"]["arguments"]
+    arguments = tools["Example_Tool"]["arguments"]
 
     assert arguments["outputs"]["type"] == "multichoice"
     assert arguments["outputs"]["choices"] == {
@@ -838,17 +861,17 @@ def test_tools_publishes_the_initial_value_of_scalar_arguments():
 
     # None when the tool declares none -- example_tool's `iterations` means
     # "unset", and must not be coerced to 0 client-side.
-    assert tools["example_tool"]["arguments"]["iterations"]["initial"] is None
+    assert tools["Example_Tool"]["arguments"]["iterations"]["initial"] is None
 
 
     # None when the tool declares none -- example_tool's `iterations` means
     # "unset", and must not be coerced to 0 client-side.
-    assert tools["example_tool"]["arguments"]["iterations"]["initial"] is None
+    assert tools["Example_Tool"]["arguments"]["iterations"]["initial"] is None
 
 
 def _run_example(**extra):
     return client.post(
-        "/run/example_tool",
+        "/run/Example_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"label": "choices", "threshold": "0", **extra},
         files={"input": ("m.csv", b"a,b\n1,2\n", "text/csv")},
@@ -1022,7 +1045,7 @@ def test_tools_exposes_presentation_hints():
     an existing panel rendering exactly as it did."""
     tools = {tool["name"]: tool for tool in client.get("/tools").json()}
 
-    example = tools["example_tool"]["arguments"]["outputs"]
+    example = tools["Example_Tool"]["arguments"]["outputs"]
     assert example["label"] is None
     assert example["section"] is None
     assert example["visible_when"] is None
@@ -1244,7 +1267,7 @@ def test_served_request_is_logged_with_both_sizes(caplog, tmp_path):
     with caplog.at_level("INFO", logger="inference_server"):
         with open(csv_file, "rb") as file_obj:
             response = client.post(
-                "/run/example_tool",
+                "/run/Example_Tool",
                 headers={"Authorization": f"Bearer {TOKEN}"},
                 data={"label": "case_1", "threshold": "0.5"},
                 files={"input": ("measures.csv", file_obj, "text/csv")},
@@ -1252,7 +1275,7 @@ def test_served_request_is_logged_with_both_sizes(caplog, tmp_path):
 
     assert response.status_code == 200
     line = next(
-        message for message in caplog.messages if message.startswith("endpoint=/run/example_tool")
+        message for message in caplog.messages if message.startswith("endpoint=/run/Example_Tool")
     )
     assert f"received={csv_file.stat().st_size}B" in line
     assert f"sent={len(response.content)}B" in line
@@ -1265,14 +1288,14 @@ def test_text_output_is_logged_without_a_sent_size(caplog):
     measure, so the field is omitted rather than reported as a bogus zero."""
     with caplog.at_level("INFO", logger="inference_server"):
         response = client.post(
-            "/run/test_tool",
+            "/run/Test_Tool",
             headers={"Authorization": f"Bearer {TOKEN}"},
             data={"text_1": "hello", "text_2": "world"},
         )
 
     assert response.status_code == 200
     line = next(
-        message for message in caplog.messages if message.startswith("endpoint=/run/test_tool")
+        message for message in caplog.messages if message.startswith("endpoint=/run/Test_Tool")
     )
     assert "received=0B (0 B)" in line
     assert "sent=" not in line
@@ -1288,7 +1311,7 @@ def test_log_line_carries_no_file_name_or_argument_value(caplog, tmp_path):
     with caplog.at_level("INFO", logger="inference_server"):
         with open(csv_file, "rb") as file_obj:
             response = client.post(
-                "/run/example_tool",
+                "/run/Example_Tool",
                 headers={"Authorization": f"Bearer {TOKEN}"},
                 data={"label": "secret_patient_label", "threshold": "0.5"},
                 files={"input": (csv_file.name, file_obj, "text/csv")},
@@ -1296,7 +1319,169 @@ def test_log_line_carries_no_file_name_or_argument_value(caplog, tmp_path):
 
     assert response.status_code == 200
     line = next(
-        message for message in caplog.messages if message.startswith("endpoint=/run/example_tool")
+        message for message in caplog.messages if message.startswith("endpoint=/run/Example_Tool")
     )
     assert "patient_ident_0042" not in line
     assert "secret_patient_label" not in line
+
+
+# ----------------------------------------------------------------------
+# What run() may return for a file output
+# ----------------------------------------------------------------------
+
+def test_named_outputs_are_the_canonical_return_and_paths_still_work(tmp_path):
+    """`{"outputs": {name: path}}` is the form a packaged tool writes; a bare
+    path or a list of them is accepted too, and is what every imported tool
+    here returns.
+
+    The names stop at this function today -- what travels back is one file or
+    one archive. They exist for `depends_on` sequencing, where the server has
+    to know which output feeds which parameter of the next tool and a list of
+    paths would leave it guessing from an extension.
+    """
+    first = tmp_path / "mand.nii.gz"
+    second = tmp_path / "max.nii.gz"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+
+    assert file_utils.output_paths(str(first)) == [str(first)]
+    assert file_utils.output_paths([str(first), str(second)]) == [str(first), str(second)]
+    assert file_utils.output_paths({"mandible": str(first)}) == [str(first)]
+    assert file_utils.output_paths({"outputs": {"mandible": str(first), "maxilla": str(second)}}) == [
+        str(first),
+        str(second),
+    ]
+
+
+def test_a_result_that_is_not_path_shaped_is_still_refused():
+    assert file_utils.output_paths({"count": 3}) == []
+    assert file_utils.output_paths({"outputs": {}}) == []
+    assert file_utils.output_paths(42) == []
+
+
+def test_a_single_file_tool_returning_several_paths_is_a_failure(monkeypatch, tmp_path):
+    """Streaming the first of several and calling it a success would return
+    part of a result."""
+    produced = [tmp_path / "a.nii.gz", tmp_path / "b.nii.gz"]
+    for path in produced:
+        path.write_bytes(b"x")
+
+    class TwoFiles(Tool):
+        name = "two_files_probe"
+        arguments = {}
+        output_kind = "file"
+
+        def run(self):
+            return {"outputs": {name.name: str(name) for name in produced}}
+
+    monkeypatch.setitem(registry.TOOLS, "two_files_probe", TwoFiles())
+
+    response = client.post("/run/two_files_probe", headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert response.status_code == 500
+
+
+def test_a_single_named_output_is_streamed(monkeypatch, tmp_path):
+    scratch = file_utils.make_scratch_dir(prefix="named_output_")
+    produced = os.path.join(scratch, "result.nii.gz")
+    with open(produced, "wb") as handle:
+        handle.write(b"segmentation")
+
+    class OneFile(Tool):
+        name = "one_file_probe"
+        arguments = {}
+        output_kind = "file"
+
+        def run(self):
+            return {"outputs": {"mandible": produced}}
+
+    monkeypatch.setitem(registry.TOOLS, "one_file_probe", OneFile())
+
+    response = client.post("/run/one_file_probe", headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert response.status_code == 200
+    assert response.content == b"segmentation"
+
+
+# ---------------------------------------------------------------------------
+# A patient's filename survives into the output
+# ---------------------------------------------------------------------------
+
+def test_an_uploaded_filename_reaches_the_tool_that_names_its_outputs_from_it(
+    tmp_path, monkeypatch
+):
+    """The property that matters clinically: which output belongs to which patient.
+
+    Not "the sanitizer produces string X" -- that is an implementation. The
+    thing a clinician depends on is that a batch of scans comes back as a batch
+    of distinguishable results, and every tool here names its outputs after its
+    input, so this is the one place that can be true or false for all of them.
+
+    Before this, the temp file was named after the FORM FIELD, so every patient
+    arrived as `scans.nii.gz` and every result came back as
+    `scans_Pred_MAND.nii.gz`. Identity survived only in request order. Measured
+    on AMASSS, Batch_Dental_Seg and Crown_Seg -- three unrelated code families,
+    one cause.
+    """
+    seen = {}
+
+    class _Spy(Tool):
+        name = "Spy_Tool"
+        arguments = {"scan": ArgSpec(type="nifti_file", required=True)}
+        output_kind = "text"
+
+        def run(self, scan):
+            # What the tool sees is what it will name its outputs after.
+            seen["path"] = str(scan)
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Spy_Tool", _Spy())
+
+    source = tmp_path / "patient 042 (T1).nii.gz"
+    source.write_bytes(b"not a real volume")
+    with open(source, "rb") as handle:
+        response = client.post(
+            "/run/Spy_Tool",
+            files={"scan": ("patient 042 (T1).nii.gz", handle, "application/gzip")},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert response.status_code == 200, response.text
+    received = os.path.basename(seen["path"])
+    # Recognisable, not identical: the spaces and parentheses are gone because
+    # this string is written to the server's disk.
+    assert "042" in received, received
+    assert "patient" in received, received
+    assert received.endswith(".nii.gz"), received
+    # And the argument it belongs to is still readable.
+    assert received.startswith("scan_"), received
+
+
+def test_a_traversing_filename_cannot_escape_the_work_directory(tmp_path, monkeypatch):
+    """The reason the name is sanitized rather than trusted."""
+    seen = {}
+
+    class _Spy(Tool):
+        name = "Spy_Tool_2"
+        arguments = {"scan": ArgSpec(type="nifti_file", required=True)}
+        output_kind = "text"
+
+        def run(self, scan):
+            seen["path"] = str(scan)
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Spy_Tool_2", _Spy())
+
+    source = tmp_path / "evil.nii.gz"
+    source.write_bytes(b"x")
+    with open(source, "rb") as handle:
+        response = client.post(
+            "/run/Spy_Tool_2",
+            files={"scan": ("../../../etc/passwd.nii.gz", handle, "application/gzip")},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert response.status_code == 200, response.text
+    received = seen["path"]
+    assert ".." not in received, received
+    assert os.path.basename(received).startswith("scan_"), received

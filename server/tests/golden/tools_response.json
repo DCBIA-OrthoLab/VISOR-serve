@@ -1,0 +1,181 @@
+[
+  {
+    "name": "Example_Tool",
+    "arguments": {
+      "label": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "Free-text label for this run",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "options_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "input": {
+        "type": "csv_file",
+        "types": [
+          "csv_file",
+          "folder"
+        ],
+        "required": true,
+        "description": "A single .csv file, or a folder of .csv/.xlsx/.ods files sent as a .zip archive",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": {
+          "csv_file": [
+            ".csv"
+          ],
+          "folder": [
+            ".zip"
+          ]
+        },
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "options_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "threshold": {
+        "type": "float",
+        "types": [
+          "float"
+        ],
+        "required": true,
+        "description": "Numeric threshold parameter",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "options_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "iterations": {
+        "type": "int",
+        "types": [
+          "int"
+        ],
+        "required": false,
+        "description": "Optional number of iterations",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "options_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "outputs": {
+        "type": "multichoice",
+        "types": [
+          "multichoice"
+        ],
+        "required": false,
+        "description": "Which result files to produce",
+        "server_selectable": null,
+        "choices": {
+          "summary": true,
+          "preview": true,
+          "columns": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "options_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "preview_format": {
+        "type": "choice",
+        "types": [
+          "choice"
+        ],
+        "required": false,
+        "description": "Format of the preview file",
+        "server_selectable": null,
+        "choices": {
+          "csv": true,
+          "json": false
+        },
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "options_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "files"
+  },
+  {
+    "name": "Test_Tool",
+    "arguments": {
+      "text_1": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "First string",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "options_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      },
+      "text_2": {
+        "type": "str",
+        "types": [
+          "str"
+        ],
+        "required": true,
+        "description": "Second string",
+        "server_selectable": null,
+        "choices": null,
+        "initial": null,
+        "extensions": null,
+        "label": null,
+        "section": null,
+        "visible_when": null,
+        "options_when": null,
+        "hidden": false,
+        "ui": null,
+        "groups": null
+      }
+    },
+    "output_kind": "text"
+  }
+]

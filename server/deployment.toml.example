@@ -1,0 +1,58 @@
+# Copy to deployment.toml to configure what THIS server does with a tool.
+# Entirely optional: with no file at all, every tool serves with upload-only
+# inputs and the global MAX_UPLOAD_MB.
+#
+# The split with a tool's .schema.json is deliberate. The schema is generated
+# from the tool's source and is the same wherever that tool is installed; this
+# file is about this machine - which of its arguments may be filled from this
+# server's DATA_DIR, and how much this server accepts as an upload. Put either
+# in the schema and every deployment inherits one server's paths and limits.
+#
+# Keyed by TOOL name - what the client sends to /run/<name>, and what the
+# tool's own .schema.json declares as `name`.
+
+# [tools.amasss]
+#
+# Arguments a caller may satisfy by naming a file already on this server
+# instead of uploading one (see data_store.py). "model" resolves against
+# DATA_DIR/<tool>/models/, "testfile" against DATA_DIR/<tool>/testfiles/.
+# Only `path` arguments can be declared here, and only ones the tool
+# actually has - both are checked at startup, because the failure otherwise
+# is a dropdown that silently never appears.
+# server_selectable = { model = "model", scan = "testfile" }
+#
+# Upload limit for this tool, in MB. Overrides MAX_UPLOAD_MB, up or down: a
+# cohort of CBCTs is not a spreadsheet. Enforced where the tool is known - # on the multipart body, and when a chunked upload is claimed by a run.
+# POST /uploads itself does not know which tool the bytes are for and keeps
+# applying the global limit while the transfer runs.
+# max_upload_mb = 2000
+
+# A section naming a tool this server does not serve is a warning at startup,
+# not an error: a deployment file outliving one tool must not stop the others.
+
+# ---------------------------------------------------------------------------
+# timeout_seconds, and the one case where it is not about compute
+# ---------------------------------------------------------------------------
+#
+# For an ordinary tool the number is its own work: a SurgMovPred prediction is
+# seconds, an AMASSS cohort is hours, and the global TOOL_TIMEOUT_SECONDS has to
+# be set for the slowest or every fast tool that hangs holds a slot until then.
+#
+# An ORCHESTRATING tool inverts that. AREG_IOSCBCT computes for 0.8 s and spends
+# the rest of its wall clock inside four `sup.run()` calls -- Crown_Seg, ALI_IOS,
+# ALI_CBCT, ASO -- each a subprocess in its own virtualenv. Sized on its own
+# compute it would be killed in the middle of its second call, and killed
+# correctly: the timeout sends SIGTERM to the whole process group, so the child
+# holding the GPU dies with it.
+#
+# Rule of thumb, so the number is derived rather than guessed:
+#
+#     timeout_seconds >= (sum of the timeouts of every tool in `calls`) * 1.2
+#
+# The 20 % covers this tool's own work plus process start-up per child, which is
+# seconds each for a venv carrying torch. Read `calls` out of the tool's
+# .schema.json -- it is published exactly so this is mechanical -- and note that
+# a chain is SEQUENTIAL, so the terms add rather than max.
+#
+# That is also why an orchestrator's timeout looks absurd next to its siblings':
+# it is not slower, it is waiting.

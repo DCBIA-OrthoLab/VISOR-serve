@@ -1,0 +1,10 @@
+# The same numpy as numpy_new, resolved to the same wheel. This one exists to
+# prove the OTHER half of the layout: two tools asking for the same package
+# must share one copy on disk (see docker/verify_dedup.py). Eleven torch tools
+# are ~26 GB hardlinked and ~63 GB copied, and nothing observable fails in the
+# second case.
+[project]
+name = "numpy-twin"
+version = "0.0.0"
+requires-python = ">=3.13"
+dependencies = ["numpy>=2"]

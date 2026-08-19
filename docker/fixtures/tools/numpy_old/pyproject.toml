@@ -1,0 +1,13 @@
+# One half of the conflict the whole architecture exists for: this tool cannot
+# have numpy 2, and its neighbour cannot do without it. In one interpreter
+# there is no answer; in two virtualenvs there is no question.
+#
+# `requires-python` is capped for a reason worth seeing: numpy 1.26 ships no
+# wheel for 3.13+, so an old pin drags an old interpreter behind it. uv
+# installs that interpreter into the image itself -- which is why there is one
+# base image and not one per Python.
+[project]
+name = "numpy-old"
+version = "0.0.0"
+requires-python = ">=3.11,<3.13"
+dependencies = ["numpy<2"]

@@ -1,9 +1,9 @@
-# `scripts/` — standing the server up, and filling `DATA/`
+# `scripts/` - standing the server up, and filling `DATA/`
 
 Two jobs, one folder. **Deployment**: go from a bare machine to a running
 server, and keep it current. **Data**: fill `DATA/`, which is gitignored (it
 holds confidential data and hundreds of GB of weights), from the public GitHub
-releases the original Slicer modules already used — so nobody hand-copies
+releases the original Slicer modules already used - so nobody hand-copies
 model bundles around.
 
 | File | Role |
@@ -17,7 +17,7 @@ model bundles around.
 | [`data-manifest.yml`](data-manifest.yml) | What exists, where it comes from, where it goes. |
 
 Everything here is **standard library only**, on purpose: it runs on a host
-before any `requirements.txt` is installed, and — for `server_ctl.py` — inside
+before any `requirements.txt` is installed, and - for `server_ctl.py` - inside
 Slicer's own interpreter, where nothing may be pip-installed on a user's behalf.
 
 ## Standing a server up
@@ -36,7 +36,7 @@ the existing token** so clients already configured against this server keep
 working.
 
 Add `--tool NAME` (repeatable) to also download that tool's data. Nothing is
-downloaded by default — the full set is ~29 GB and which tools a site uses is
+downloaded by default - the full set is ~29 GB and which tools a site uses is
 not something to assume.
 
 ### Afterwards, from the clone
@@ -53,7 +53,7 @@ python3 scripts/server_ctl.py token             # the API key, for a client
 `update` **fast-forwards only** and refuses to pull over uncommitted changes.
 When something did change it relaunches with `up -d --force-recreate`, never
 `restart`: the container installs `requirements.txt` as part of its *command*,
-into a writable layer `restart` keeps — so a new dependency that is never
+into a writable layer `restart` keeps - so a new dependency that is never
 re-resolved would be a silent no-op update, which is worse than a failed one.
 
 ### GPU or not
@@ -62,7 +62,7 @@ re-resolved would be a silent no-op update, which is worse than a failed one.
 device reservation) and `inference-cpu` (without). A compose device
 reservation is all-or-nothing and cannot be removed by an override file, so a
 single service asking for a GPU simply cannot start on a laptop. `server_ctl.py`
-picks between them from whether **docker** has an `nvidia` runtime — not from
+picks between them from whether **docker** has an `nvidia` runtime - not from
 whether `nvidia-smi` exists on the host, which says nothing about whether the
 container toolkit is installed. Force it with `--device gpu|cpu`.
 
@@ -70,9 +70,9 @@ container toolkit is installed. Force it with `--device gpu|cpu`.
 
 `server_ctl.py up` publishes the port on **`127.0.0.1`** by default, because
 this deployment speaks plain HTTP. `docker compose up` by hand still binds
-every interface — IPv4 *and* IPv6 — unchanged, for the lab server that sits
+every interface - IPv4 *and* IPv6 - unchanged, for the lab server that sits
 behind a TLS terminator. Putting a plain-HTTP deployment on a network address
-means medical images crossing the network in the clear — see `SECURITY.md`.
+means medical images crossing the network in the clear - see `SECURITY.md`.
 
 `BIND_ADDR` unset is not the same as `BIND_ADDR=0.0.0.0`: with no host address
 docker publishes on both stacks, while an explicit `0.0.0.0` is IPv4 only.
@@ -87,7 +87,7 @@ about a port buried in the output of a button press.
 ### Starting without a network
 
 A start re-runs `pip install -r requirements.txt` inside the container, and
-that install **cannot succeed offline** — `nnunetv2` → `batchgenerators` →
+that install **cannot succeed offline** - `nnunetv2` → `batchgenerators` →
 `unittest2` → `argparse`, and pip never treats `argparse` as satisfied because
 the stdlib module shadows the distribution. It re-downloads that one 23 kB
 wheel every time.
@@ -104,7 +104,7 @@ in one line (`DEPENDENCY-INSTALL-FATAL`): it needs the network once.
 ### `DATA/` has to exist before docker starts
 
 `./DATA:/data:ro` is a bind mount, so a missing host path is created by the
-**docker daemon** — owned by root. Every later download then fails with
+**docker daemon** - owned by root. Every later download then fails with
 "Permission denied" against the very directory the server reads, on a
 brand-new install. `server_ctl.py` creates `DATA/` as the invoking user before
 compose ever runs; if docker already won that race, it says so and gives the
@@ -119,7 +119,7 @@ the server comes up.
 
 ## Filling `DATA/`
 
-On a machine with nothing checked out — run it from the directory that should
+On a machine with nothing checked out - run it from the directory that should
 end up holding `DATA/`:
 
 ```bash
@@ -156,7 +156,7 @@ too, and `REPO`/`REF` point the wrappers at a fork or a branch other than
 
 `--progress always` prints a new download-progress line every few seconds
 instead of redrawing one in place with `\r`. That is for a caller reading whole
-lines out of a pipe — a GUI streaming this into a log pane — where `\r` is
+lines out of a pipe - a GUI streaming this into a log pane - where `\r` is
 invisible and a 12 GB bundle would otherwise print nothing at all for an hour.
 On a terminal the default is unchanged.
 
@@ -169,7 +169,7 @@ python3 scripts/server_ctl.py models --tool AMASSS --tool ALI
 
 `catalog` compares the manifest against what is actually on disk, so a partial
 install is legible: it reports **what a download would really transfer**, not
-the tool's total size. That distinction is the point — "ALI: 12.3 GB" next to
+the tool's total size. That distinction is the point - "ALI: 12.3 GB" next to
 an already-complete ALI is the number that makes someone skip a tool they
 already have.
 
@@ -180,7 +180,7 @@ resume.
 ## What you get
 
 The layout is exactly the one `server/data_store.py` reads, so a file landing
-here is immediately offered by `GET /tools/<tool>/data` — nothing else to
+here is immediately offered by `GET /tools/<tool>/data` - nothing else to
 configure:
 
 ```
@@ -201,7 +201,7 @@ for a finished one.
 
 ## Adding an entry
 
-Append to [`data-manifest.yml`](data-manifest.yml) — the header there documents
+Append to [`data-manifest.yml`](data-manifest.yml) - the header there documents
 every field. The short version:
 
 ```yaml
@@ -226,8 +226,22 @@ every field. The short version:
 
 ## Checksums
 
+**71 of the 77 entries carry no checksum, and that is a gap rather than a
+design.** For almost everything under `DATA/` the only thing verified is the
+byte count, so an upstream artefact replaced in place - or a download truncated
+at exactly the right size - passes. These are model weights and patient test
+data on a server built for confidential imaging. `fetch_data.py` proceeds on a
+missing `sha256` with a log line rather than a refusal, which reads as a check
+that happened.
+
+**Backlog, not blocking:** every entry gets a `sha256`, and `fetch_data.py`
+warns loudly or refuses rather than logging quietly when one is absent. Raised
+2026-08-18, when `IOSCBCT_TestFile` downloaded with `no sha256 in the manifest`
+and nothing stopped.
+
+
 `sha256` is optional and mostly absent today. When present it is verified and
 a mismatch discards the download rather than installing it. To pin an entry,
 run the fetch once, take the hash the script prints, and paste it into the
-manifest — the hashes are not published by GitHub, so inventing them would be
+manifest - the hashes are not published by GitHub, so inventing them would be
 worse than leaving the field out.

@@ -4,8 +4,9 @@ __pycache__/
 *.pyo
 .pytest_cache/
 
-# Virtual environment
+# Virtual environments, the server's own and the per-tool ones
 venv/
+.venv/
 
 # Secrets / local config
 .env
@@ -26,3 +27,12 @@ models/
 # DATA
 data/
 DATA/
+
+# Regenerated from each tool's source; source_hash is what keeps it honest.
+.schema-cache/
+
+# run-local.sh writes here.
+local-server.log
+
+# Scratch from manual validation runs (landmark comparisons, resolve probes).
+.validation/

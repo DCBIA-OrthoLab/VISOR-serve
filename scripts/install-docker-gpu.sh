@@ -71,7 +71,7 @@ sudo -v   # demande le mot de passe une fois, tôt
 # 1) Docker Engine
 # ---------------------------------------------------------------------------
 
-step "1/4 — Docker Engine"
+step "1/4 - Docker Engine"
 
 if command -v docker >/dev/null 2>&1 && sudo docker info >/dev/null 2>&1; then
   ok "Docker est déjà installé et le daemon répond. Étape sautée."
@@ -120,14 +120,14 @@ if id -nG "${REAL_USER}" | grep -qw docker; then
 else
   sudo usermod -aG docker "${REAL_USER}"
   warn "${REAL_USER} ajouté au groupe docker. Une déconnexion/reconnexion (ou 'newgrp docker') est nécessaire pour que ça prenne effet."
-  add_report "Groupe docker : utilisateur ajouté — RECONNEXION NÉCESSAIRE"
+  add_report "Groupe docker : utilisateur ajouté - RECONNEXION NÉCESSAIRE"
 fi
 
 # ---------------------------------------------------------------------------
 # 2) Driver NVIDIA (uniquement si une carte est présente)
 # ---------------------------------------------------------------------------
 
-step "2/4 — Driver NVIDIA"
+step "2/4 - Driver NVIDIA"
 
 HAS_NVIDIA_CARD=false
 if command -v lspci >/dev/null 2>&1 && lspci | grep -qi nvidia; then
@@ -136,7 +136,7 @@ fi
 
 if ! $HAS_NVIDIA_CARD; then
   warn "Aucune carte NVIDIA détectée sur cette machine (lspci). Le serveur tournera en mode CPU."
-  add_report "GPU : aucune carte NVIDIA détectée — installation en mode CPU uniquement"
+  add_report "GPU : aucune carte NVIDIA détectée - installation en mode CPU uniquement"
 else
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
     ok "Driver NVIDIA déjà installé et fonctionnel :"
@@ -155,7 +155,7 @@ else
       sudo ubuntu-drivers autoinstall
     fi
     warn "Driver NVIDIA installé. Un REDÉMARRAGE de la machine est nécessaire avant qu'il soit chargé."
-    add_report "Driver NVIDIA : installé — REDÉMARRAGE NÉCESSAIRE avant de continuer"
+    add_report "Driver NVIDIA : installé - REDÉMARRAGE NÉCESSAIRE avant de continuer"
     add_report "  -> après redémarrage, relance ce script pour finir l'étape 3 (NVIDIA Container Toolkit)"
     echo
     fail "Redémarre la machine maintenant (sudo reboot), puis relance ce script pour continuer."
@@ -177,7 +177,7 @@ fi
 # 3) NVIDIA Container Toolkit (uniquement si une carte GPU est présente)
 # ---------------------------------------------------------------------------
 
-step "3/4 — NVIDIA Container Toolkit"
+step "3/4 - NVIDIA Container Toolkit"
 
 if ! $HAS_NVIDIA_CARD; then
   ok "Pas de carte NVIDIA : étape sautée."
@@ -212,7 +212,7 @@ fi
 # 4) Vérification finale
 # ---------------------------------------------------------------------------
 
-step "4/4 — Vérification"
+step "4/4 - Vérification"
 
 DOCKER_OK=false
 if sudo docker run --rm hello-world >/dev/null 2>&1; then
@@ -220,7 +220,7 @@ if sudo docker run --rm hello-world >/dev/null 2>&1; then
   ok "Docker fonctionne (hello-world)."
   add_report "Test Docker : OK"
 else
-  fail "Docker ne fonctionne pas correctement — 'docker run hello-world' a échoué."
+  fail "Docker ne fonctionne pas correctement - 'docker run hello-world' a échoué."
   add_report "Test Docker : ÉCHEC"
 fi
 
@@ -232,7 +232,7 @@ if $HAS_NVIDIA_CARD; then
     add_report "Test GPU dans un conteneur : OK"
   else
     fail "Le GPU n'est PAS accessible depuis un conteneur (docker run --gpus all a échoué)."
-    add_report "Test GPU dans un conteneur : ÉCHEC — voir la sortie ci-dessus"
+    add_report "Test GPU dans un conteneur : ÉCHEC - voir la sortie ci-dessus"
   fi
 fi
 

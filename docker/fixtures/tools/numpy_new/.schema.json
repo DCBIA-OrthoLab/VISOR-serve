@@ -1,0 +1,14 @@
+{
+  "name": "numpy_new",
+  "description": "Build fixture: reports the numpy version this tool was installed with.",
+  "arguments": {
+    "size": {
+      "type": "int",
+      "required": false,
+      "default": 3,
+      "description": "Identity matrix size"
+    }
+  },
+  "returns": "text",
+  "source_hash": "c53371f2d0dcd5a2ce05eaae1e91ed9147779bedae19cfcac9d3e203cbff0f32"
+}

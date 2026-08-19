@@ -1,0 +1,51 @@
+# Per-tool overrides. Adding a tool needs NOTHING here: conventions.py derives
+# which arguments are filled from DATA/, which are hidden from a clinician, and
+# which DATA/ folder a tool reads. Every tool currently served is covered by
+# them, which is why this file has no entries.
+#
+# Write a section only for an exception:
+#
+#   [tools.MyTool]
+#   server_selectable = { atlas = "model" }   # not named *_model, but hosted
+#   hidden = ["iterations"]                   # technical, not in TECHNICAL
+#   data_dir = "MyToolData"                   # DATA/ folder named differently
+#   max_upload_mb = 500                       # this tool alone takes more
+#
+# Anything stated here wins, per argument, over the convention.
+
+# AREG's bundles are staged under DATA/AREG/ -- one folder, shared by the two
+# engines the split produced. Without this, each looks for DATA/<its own name>/
+# and falls back to the run-together spelling (`AREGIOS`), so a hosted model
+# selected by name answers 404 for a folder that was never going to exist.
+[tools.AREG_CBCT]
+data_dir = "AREG"
+
+[tools.AREG_IOS]
+data_dir = "AREG"
+
+# Orchestrates four tools and computes almost nothing itself; see the rule in
+# deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
+# ALI_CBCT ~45s + ASO ~15s = ~157s, plus 20% = ~190s. Left unset here so the
+# global default applies while the chain is still being measured.
+[tools.AREG_IOSCBCT]
+data_dir = "AREG"
+
+# The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
+# this each looks for DATA/<its own name>/ and falls back to the run-together
+# spelling (ALICBCT), which was never going to exist.
+[tools.ALI_CBCT]
+data_dir = "ALI"
+
+[tools.ALI_IOS]
+data_dir = "ALI"
+
+# AREG became three tools when it was split, one per modality, because the
+# engines cannot share a virtualenv. This publishes the name callers already
+# have -- every Slicer module names `AREG` -- as a choice between them. The
+# schema is composed from the three at startup, so changing one of them changes
+# what this offers, with nothing to keep in sync.
+[tools.AREG]
+dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "CBCT to IOS" = "AREG_IOSCBCT" }
+
+[tools.ALI]
+dispatch = { "CBCT" = "ALI_CBCT", "Intraoral scan" = "ALI_IOS" }

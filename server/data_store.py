@@ -30,12 +30,10 @@ class DataNotFoundError(Exception):
 class ResolvedFile:
     """A server-side data file, ready to be read from `path`.
 
-    `is_temporary` tells the caller whether `path` must be deleted once the
-    request is done. Local files under DATA_DIR are persistent reference
-    data and must never be deleted (`is_temporary=False`, the default). A
-    backend that materializes a remote blob to a local temp copy (e.g.
-    downloaded from a database or object store) sets `is_temporary=True` so
-    main.py cleans it up like any other per-request temp file.
+    `is_temporary` says whether `path` must be deleted once the request is
+    done. Local files under DATA_DIR are persistent reference data and must
+    never be deleted (the default). A backend that materializes a remote blob
+    to a local temp copy sets it True so main.py cleans the copy up.
     """
 
     path: str
@@ -65,12 +63,9 @@ class DataStore(ABC):
 class LocalDataStore(DataStore):
     """Reads models/test files from DATA_DIR/<tool_name>/{models,testfiles}/.
 
-    An entry can be a single file (e.g. a zip archive) or a whole folder
-    (e.g. an unpacked model directory): both are listed and resolved the
-    same way, and the tool receives the resolved path either way.
-
-    DATA_DIR is expected to be mounted read-only (see docker-compose.yml):
-    this store never writes to it.
+    An entry can be a single file or a whole folder; both are listed and
+    resolved the same way. DATA_DIR is mounted read-only (see
+    docker-compose.yml) and this store never writes to it.
     """
 
     # Junk that archive tools and macOS leave behind; never listed as data.

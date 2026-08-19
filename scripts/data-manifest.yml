@@ -139,12 +139,25 @@ tools:
   #     DATA/ALI/models/ALI_CBCT_Models/Cranial_Base/Ba/1/Ba_Net_1.pth
   # =========================================================================
   ALI:
+    provides: [ALI_CBCT, ALI_IOS]
     models:
-      # --- IOS: 4 weight files, Upper/Lower x O(cclusal)/C(ervical) ---------
+      # --- IOS: 5 weight files ---------------------------------------------
+      #   Upper/Lower x O(cclusal)/C(ervical), plus Lower_MG (mucogingival).
+      #
+      # The 2026-08-05 release, "ALI IOS models - Occlusal, Cervical,
+      # Mucogingival". It supersedes baptistebaquero/ALIDDM v1.0.3, which held
+      # the same four crown checkpoints and no MG one; a deployment on the old
+      # bundle answers 422 for the Mucogingival network, and AREG's lower-arch
+      # registration then has to be handed its landmarks instead of predicting
+      # them.
+      #
+      # Naming: the MG checkpoint is `Lower_MG_v6.pth`, which the one naming
+      # rule (a network token and a jaw token, split on `_`) reads without a
+      # special case -- see ALI_IOS/engine.discover_weights.
       - name: Models.zip
         dest: ALI_IOS_Models
-        url: https://github.com/baptistebaquero/ALIDDM/releases/download/v1.0.3/Models.zip
-        size: 189452566
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/ALI_IOS_models/Models.zip
+        size: 236630338
         extract: true
       # --- CBCT: one archive per anatomical region -------------------------
       - name: Cranial_Base.zip
@@ -216,13 +229,60 @@ tools:
         url: https://github.com/baptistebaquero/ALIDDM/releases/download/v1.0.4/T1_01_U_segmented.vtk
 
   # =========================================================================
-  # AREG -- automated registration. NOT PORTED YET.
+  # AREG -- automated registration. Ported: server/tools/AREG/.
+  #
+  # AREG's automated modes are mostly OTHER tools -- AMASSS produces the CBCT
+  # masks, ASO orients, CrownSeg labels the crowns -- and every one of those
+  # is driven through an argument that is `server_selectable` on AREG'S OWN
+  # schema. GET /tools/{tool}/data is per tool, so the bundles have to be
+  # under DATA/AREG/ even though byte-identical copies live under the other
+  # tools' folders.
+  #
+  # A deployment tight on disk should HARD-LINK them (`cp -al`), not symlink
+  # them: data_store._resolve requires the realpath to stay inside
+  # `DATA/<tool>/<kind>/` -- not merely inside DATA_DIR -- so a symlink
+  # pointing at another tool's folder is listed by GET /tools/AREG/data and
+  # then refused with "No such model 'AMASSS_Models' for tool 'AREG'", which
+  # is the traversal guard doing its job. A hard link resolves to its own
+  # path and costs no extra space. (Verified 2026-08-10; the same correction
+  # applies to the ASO block's note below, which this one used to copy.)
+  #
+  # The IOSCBCT test files below are for the one mode that is NOT ported:
+  # cross-modality IOS-to-CBCT registration. Kept rather than dropped because
+  # every URL is checked and the mode is next in line.
   # =========================================================================
   AREG:
+    provides: [AREG_CBCT, AREG_IOS, AREG_IOSCBCT]
     models:
+      # The patch-prediction checkpoint for IOS registration ('registration_model').
       - name: AREG_model.zip
         url: https://github.com/HUTIN1/AREG/releases/download/v1.0.0/AREG_model.zip
         size: 18014117
+        extract: true
+      # 'segmentation_model' -- the T1 masks of the Fully-Automated CBCT modes.
+      # Same archive AMASSS itself uses.
+      - name: AMASSS_Models.zip
+        dest: AMASSS_Models
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AMASSS_CBCT/AMASSS_Models.zip
+        size: 1163164147
+        extract: true
+      # 'cbct_reference' -- the frame the T1 scans are oriented into by the
+      # Oriented + Fully-Automated mode. Two published planes; the landmark
+      # sets they carry are DISJOINT, which is why ASO refuses a selection a
+      # reference cannot support rather than failing every patient separately.
+      - name: Frankfurt_Horizontal_Midsagittal_Plane.zip
+        dest: CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane
+        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Frankfurt_Horizontal_Midsagittal_Plane.zip
+        extract: true
+      - name: Occlusal_Midsagittal_Plane.zip
+        dest: CBCT_Gold_Occlusal_Midsagittal_Plane
+        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Occlusal_Midsagittal_Plane.zip
+        extract: true
+      # 'ios_reference' -- the reference arches the Fully-Automated IOS mode
+      # orients both timepoints onto before predicting the patch.
+      - name: Gold_file.zip
+        dest: IOS_Gold_files
+        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.0/Gold_file.zip
         extract: true
     testfiles:
       - name: AREG_test_scans.zip
@@ -263,7 +323,8 @@ tools:
         extract: true
 
   # =========================================================================
-  # ASO -- automated standardized orientation. Ported: server/tools/ASO/.
+  # ASO -- automated standardized orientation. Packaged in sadt-tools;
+  # the data below is still served from DATA/ASO/.
   #
   # Three bundles this block used to fetch have been REMOVED rather than left
   # in place, because nothing on either side of the port reads them:
@@ -284,19 +345,20 @@ tools:
   ASO:
     models:
       # Landmark weights for Fully-Automated CBCT. ASO does not predict
-      # landmarks itself -- it hands this bundle to the ALI tool (see
-      # tools/ASO/src/ali_client.py), which is not deployed yet, so nothing
-      # reads these until it is.
+      # landmarks itself -- it asks the ALI tool for them, mid-run, through
+      # the supervisor the runner injects (`sup.run("ALI", ...)`).
       #
-      # They live under DATA/ASO/ because `landmark_models` is
+      # They live under DATA/ASO/ because `landmark_model` is
       # server_selectable on ASO's schema, and GET /tools/{tool}/data is
       # per tool: the client's dropdown lists DATA/ASO/models/ and main.py
       # resolves the name there before ASO ever runs.
       #
       # These are the SAME weights DATA/ALI/models/ will hold. A deployment
-      # tight on disk can symlink CBCT_landmark_models/<LM> at ALI's copy
-      # instead of fetching both -- data_store resolves symlinks as long as
-      # they stay inside DATA_DIR.
+      # tight on disk can HARD-LINK CBCT_landmark_models/<LM> at ALI's copy
+      # (`cp -al`) instead of fetching both. NOT a symlink: data_store._resolve
+      # requires the realpath to stay inside `DATA/<tool>/<kind>/`, not merely
+      # inside DATA_DIR, so a symlink across tools is listed and then refused
+      # with "No such model" (verified 2026-08-10).
       #
       # Curated to the seven landmarks the published reference planes are
       # built on (ASO's own defaults), not all 112: that is 758 MB instead of
@@ -405,16 +467,21 @@ tools:
         extract: true
 
   # =========================================================================
-  # BATCHDENTALSEG -- nnUNet dental segmentation. NOT PORTED YET.
+  # BatchDentalSeg -- nnUNet dental segmentation, four models.
   #
   # Every bundle ships three files under the same three names
   # (checkpoint_final.pth / dataset.json / plans.json), so each gets its own
   # folder through `dest` -- without it they would overwrite each other.
+  #
+  # The checkpoint goes under `<bundle>/fold_0/`, NOT beside the two json
+  # files: that is the layout nnUNet's `initialize_from_trained_model_folder`
+  # walks, and it reads the fold from a subdirectory named after it. Flat, the
+  # bundle downloads perfectly and then no model is ever found.
   # =========================================================================
-  BATCHDENTALSEG:
+  BatchDentalSeg:
     models:
       - name: checkpoint_final.pth
-        dest: UniversalLab/checkpoint_final.pth
+        dest: UniversalLab/fold_0/checkpoint_final.pth
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/UNIVERSALLAB_MODEL/checkpoint_final.pth
         size: 819880677
       - name: dataset.json
@@ -426,7 +493,7 @@ tools:
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/UNIVERSALLAB_MODEL/plans.json
         size: 16102
       - name: checkpoint_final.pth
-        dest: PediatricDentalSeg/checkpoint_final.pth
+        dest: PediatricDentalSeg/fold_0/checkpoint_final.pth
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/PEDIATRICDENTALSEG_MODEL/checkpoint_final.pth
         size: 250280254
       - name: dataset.json
@@ -440,7 +507,7 @@ tools:
         sha256: 65c553cfc8da8108dfb73a9e289fe0de209822650ef8fde8c6c9e04766254238
         size: 16053
       - name: checkpoint_final.pth
-        dest: NasoMaxillaDentSeg/checkpoint_final.pth
+        dest: NasoMaxillaDentSeg/fold_0/checkpoint_final.pth
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/NASOMAXILLADENTSEG_MODEL/checkpoint_final.pth
         size: 1132459189
       - name: dataset.json

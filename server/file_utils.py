@@ -1,6 +1,8 @@
-"""Shared helpers for tools that need to unzip an upload and/or load tabular
-data files (CSV/XLSX/ODS). Factored out so multiple tools can reuse the same
-logic instead of each reimplementing zip extraction and tabular loading.
+"""Shared helpers for tools: scratch directories, zip extraction and creation,
+medical scan extensions, and tabular data loading (CSV/XLSX/ODS).
+
+Anything more than one tool needs belongs here rather than being reimplemented
+per tool. Tools never import each other.
 """
 
 import contextvars
@@ -9,17 +11,22 @@ import os
 import tempfile
 import zipfile
 
-import pandas as pd
-
 from config import settings
+
+# pandas is imported INSIDE load_tabular_file/load_tabular_directory, not
+# here. Those two are tool helpers -- only a tool that reads tabular data calls
+# them -- while this module is imported by main.py on every start. At module
+# level, pandas would be a hard dependency of the API process itself, which is
+# meant to carry fastapi and nothing heavier (see docker/Dockerfile: the server
+# venv holds no pandas, no numpy and no torch).
 
 
 # Scratch dirs handed out during the request being served, so main.py can
-# remove them all even when run() raises before returning any path -- a crash
-# mid-inference must not leave patient data behind. A ContextVar (rather than a
-# module global) keeps concurrent requests from seeing each other's list; the
+# remove them all even when run() raises before returning a path -- a crash
+# mid-inference must not leave patient data behind. A ContextVar rather than a
+# module global keeps concurrent requests from seeing each other's list; the
 # list is mutated in place, never reassigned, so the copy anyio hands to the
-# worker thread stays the same object the request handler holds.
+# worker thread stays the object the request handler holds.
 _scratch_dirs: contextvars.ContextVar = contextvars.ContextVar("scratch_dirs", default=None)
 
 
@@ -30,20 +37,54 @@ def track_scratch_dirs() -> list:
     return created
 
 
+def register_scratch_dir(directory: str) -> str:
+    """Record an already-created directory for the same cleanup; returns it.
+
+    For a caller that has to choose the name itself -- dispatch.py names a job
+    directory after its job id, so a directory left behind by a crash can be
+    matched to a log line.
+    """
+    tracked = _scratch_dirs.get()
+    if tracked is not None:  # None when a tool is called outside a request
+        tracked.append(directory)
+    return directory
+
+
 def make_scratch_dir(prefix: str = "tool_") -> str:
     """Fresh writable scratch dir under settings.TEMP_DIR for one request.
 
-    For tools whose inputs all come from the read-only data store: there is
-    no upload work dir to write next to, so extraction/output files go here
-    instead. main.py deletes this directory once the request is over --
-    whether it succeeded or run() raised.
+    For tools whose inputs all come from the read-only data store, which have
+    no upload work dir to write next to. main.py deletes it once the request is
+    over, whether it succeeded or run() raised.
     """
     os.makedirs(settings.TEMP_DIR, exist_ok=True)
-    scratch_dir = tempfile.mkdtemp(prefix=prefix, dir=settings.TEMP_DIR)
-    tracked = _scratch_dirs.get()
-    if tracked is not None:  # None when a tool is called outside a request
-        tracked.append(scratch_dir)
-    return scratch_dir
+    return register_scratch_dir(tempfile.mkdtemp(prefix=prefix, dir=settings.TEMP_DIR))
+
+
+def output_paths(result) -> list:
+    """Normalize what run() returned into a list of output paths. Empty when
+    the returned value isn't path-shaped at all.
+
+    A path, or a list of them, is the canonical form and what every tool here
+    returns. A MAPPING of name -> path is accepted too -- with or without the
+    `{"outputs": {...}}` wrapper -- because that is the shape a tool packaged
+    against the job/result contract may return. The names are not carried into
+    the response: what goes back is one file or one archive, and a tool that
+    needs its outputs named writes a report next to them (AMASSS does).
+    """
+    if isinstance(result, (str, os.PathLike)):
+        return [str(result)]
+    if isinstance(result, (list, tuple)):
+        return [str(path) for path in result]
+    if isinstance(result, dict):
+        outputs = result.get("outputs", result)
+        if (
+            isinstance(outputs, dict)
+            and outputs
+            and all(isinstance(path, (str, os.PathLike)) for path in outputs.values())
+        ):
+            return [str(path) for path in outputs.values()]
+    return []
 
 
 class BadArchiveError(Exception):
@@ -82,7 +123,7 @@ def extract_zip(
       fill the server's disk.
 
     `strip_single_root=True` returns the inner folder when the archive holds
-    exactly one — zipping "patients/" on any OS produces "patients/<files>",
+    exactly one -- zipping "patients/" on any OS produces "patients/<files>",
     and callers almost always want the files, not the wrapper.
     """
     if extract_dir is None:
@@ -124,12 +165,10 @@ def extract_zip(
 
 
 # Extensions whose bytes are already compressed. DEFLATE gains ~0% on them
-# while running at 30-46 MB/s on one core (measured 2026-08-07 on the real
-# 94 MB .nii.gz testfile: 3.3s of CPU to shave 0% off the archive), and the
-# client pays the same tax twice more on arrival -- its integrity pass CRCs
-# every member and its extraction inflates them again, both ~5x faster on a
-# STORED member. `.gz` covers the compound medical extensions (.nii.gz,
-# .nrrd.gz, .gipl.gz); the OOXML formats are zip containers by design.
+# while running at 30-46 MB/s on one core (3.3s of CPU to shave 0% off the
+# 94 MB .nii.gz testfile), and the client pays the same tax twice more on
+# arrival: its integrity pass CRCs every member and its extraction inflates
+# them again, both ~5x faster on a STORED member.
 _STORED_EXTENSIONS = (
     ".gz", ".bz2", ".xz", ".zip", ".7z",
     ".xlsx", ".ods", ".docx", ".pptx",
@@ -192,8 +231,34 @@ def _add_to_zip(zf: zipfile.ZipFile, file_path: str, arcname: str, written: set)
     zf.write(file_path, arcname, compress_type=zipfile.ZIP_STORED if stored else None)
 
 
-def load_tabular_file(file_path: str) -> pd.DataFrame:
-    """Load a single CSV, XLSX, or ODS file into a DataFrame."""
+# Medical volume formats the tools read and write, longest extension first so
+# ".nii.gz" is never cut short by ".nii".
+SCAN_EXTENSIONS = (".nii.gz", ".nrrd.gz", ".gipl.gz", ".nii", ".nrrd", ".gipl")
+
+# The compressed spelling ITK can WRITE for each scan extension. NIfTI and GIPL
+# take an external .gz; NRRD compresses inside the file and ITK has no
+# ".nrrd.gz" writer at all, so that spelling maps back down to ".nrrd".
+_COMPRESSED_EXTENSIONS = {".nii": ".nii.gz", ".gipl": ".gipl.gz", ".nrrd.gz": ".nrrd"}
+
+
+def split_scan_extension(filename: str) -> tuple:
+    """('scan.nii.gz') -> ('scan', '.nii.gz'), compound extensions preserved."""
+    lower = filename.lower()
+    for extension in SCAN_EXTENSIONS:
+        if lower.endswith(extension):
+            return filename[: -len(extension)], filename[-len(extension):]
+    return os.path.splitext(filename)
+
+
+def compressed_extension(extension: str) -> str:
+    """The compressed spelling ITK can write for a scan extension."""
+    return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)
+
+
+def load_tabular_file(file_path: str):
+    """Load a single CSV, XLSX, or ODS file into a pandas DataFrame."""
+    import pandas as pd
+
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".csv":
         return pd.read_csv(file_path)
@@ -204,8 +269,10 @@ def load_tabular_file(file_path: str) -> pd.DataFrame:
     raise ValueError(f"Unsupported file extension '{ext}' for tabular file: {file_path}")
 
 
-def load_tabular_directory(directory_path: str) -> pd.DataFrame:
+def load_tabular_directory(directory_path: str):
     """Load and concatenate every CSV/XLSX/ODS file found directly in a directory."""
+    import pandas as pd
+
     extensions = ["*.csv", "*.xlsx", "*.ods"]
     all_files = []
     for ext in extensions:
