@@ -133,7 +133,12 @@ RUN --mount=type=cache,target=/cache/uv,sharing=locked \
         [ -f "$tool/pyproject.toml" ] || continue; \
         grep -q "^\[tool.sadt\]" "$tool/pyproject.toml" || continue; \
         echo "==> uv sync $(basename "$tool")"; \
-        ( cd "$tool" && uv sync --frozen --no-install-project --no-dev ); \
+        # --all-extras, because an extra is where a tool puts an engine it does
+        # not want CI to build on every PR -- Crown_Seg's shapeaxi, behind
+        # `segmentation`. Skipping them builds a virtualenv that imports and then
+        # answers 503 on the first real request. There is nothing optional about
+        # them in a deployment image: this is the machine that runs the tool.
+        ( cd "$tool" && uv sync --frozen --no-install-project --no-dev --all-extras ); \
     done; \
     cp -a "$UV_CACHE_DIR"/. /cache/uv/ 2>/dev/null || true; \
     uv cache prune --ci >/dev/null 2>&1 || true; \
