@@ -500,3 +500,12 @@ def test_the_deadline_crosses_levels_and_is_not_restarted(tools_dir, tmp_path):
     assert "ran out of the job's remaining time" in completed.stderr, completed.stderr
     # Killed on the parent's budget, not given a fresh 60s of its own.
     assert elapsed < 30, f"took {elapsed:.0f}s, so the budget was not inherited"
+
+
+def test_the_caller_facing_names_match_the_servers_own_table():
+    """runner.py is stdlib-only and cannot import main.py, so the two lists are
+    written twice. If they drift, a child's 422 silently becomes a 500."""
+    import main
+    from execution import runner
+
+    assert set(runner.CALLER_FACING_ERRORS) == set(main.TOOL_ERROR_STATUS)

@@ -90,6 +90,14 @@ SUPERVISOR_CHAIN_ENV = "SADT_SUPERVISOR_CHAIN"
 _FALLBACK_PREFIX = "sadt_"
 
 
+# Exception names a tool raises to answer the CALLER rather than to report a
+# crash. The server maps these to 422 with the message passed through, so a
+# supervised child raising one has to reach it under its own name -- see
+# _supervised. Kept in step with main.TOOL_ERROR_STATUS by a test.
+CALLER_FACING_ERRORS = ("ToolInputError", "ValueError", "FileNotFoundError",
+                        "ToolUnavailableError")
+
+
 class RunnerError(Exception):
     """Anything that stops this script before the tool's run() is reached."""
 
@@ -518,23 +526,36 @@ class _Supervisor:
             # traceback goes to stderr, which whatever runs the PARENT may be
             # capturing and trimming -- so "see above" is a promise this cannot
             # keep, and the message has to carry the reason itself.
+            kind, message = self._failure_parts(tool, nested_dir)
+
+            # A child's answer to the CALLER is re-raised under the child's own
+            # exception name, so the server maps it the way it would have if the
+            # caller had run that tool directly. Wrapping it in RunnerError threw
+            # the classification away: AMASSS saying "No scan found in ...
+            # Supported extensions: .nii.gz, ..." -- a sentence written to be
+            # read by whoever sent the request -- reached the client as "Tool
+            # execution failed", indistinguishable from a crash. The tool name is
+            # prepended because in a chain the caller cannot otherwise tell which
+            # step is talking.
+            if kind in CALLER_FACING_ERRORS:
+                raise type(kind, (Exception,), {})(f"{tool}: {message}")
+
             raise RunnerError(
                 f"Supervised tool '{tool}' failed (exit {completed.returncode}). "
-                f"{self._failure(tool, nested_dir)}"
+                f"{kind}: {message}" if message else
+                f"Supervised tool '{tool}' failed (exit {completed.returncode}). {kind}."
             )
         return self._result(tool, nested_dir)
 
-    def _failure(self, tool: str, nested_dir: str) -> str:
-        """What the callee said went wrong, read back from its result file."""
+    def _failure_parts(self, tool: str, nested_dir: str):
+        """`(exception class name, message)` the callee recorded, read back."""
         path = os.path.join(nested_dir, RESULT_FILE)
         try:
             with open(path, encoding="utf-8") as handle:
                 error = json.load(handle).get("error") or {}
         except (OSError, ValueError):
-            return f"It wrote no readable result; see its output above and {path}."
-        kind = error.get("type", "Error")
-        message = error.get("message", "").strip()
-        return f"{kind}: {message}" if message else f"{kind} (no message)."
+            return ("Error", f"It wrote no readable result; see its output and {path}.")
+        return (error.get("type", "Error"), error.get("message", "").strip())
 
     def progress(self, fraction: float, message: str) -> None:
         try:
