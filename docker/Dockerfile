@@ -47,6 +47,22 @@ COPY --from=tools --exclude=**/.venv --exclude=**/__pycache__ tools /ctx/
 RUN mkdir -p /manifests && cd /ctx && \
     for manifest in $(find . -name pyproject.toml -o -name uv.lock); do \
         mkdir -p "/manifests/$(dirname "$manifest")" && cp "$manifest" "/manifests/$manifest"; \
+    done && \
+    # A SHARED package comes over whole, sources included, not just its
+    # manifest. `uv sync` runs before the tool sources are copied -- which is
+    # what keeps a source edit from rebuilding every virtualenv -- but a path
+    # dependency has to EXIST at that point. tools/ALI/common/ and
+    # tools/AREG/common/ are dependencies of the tools beside them, so a
+    # manifest alone leaves `uv sync` with nothing to install and the tool fails
+    # at import with "No module named sadt_ali_common".
+    #
+    # They are identified the same way the server identifies them: a
+    # pyproject.toml with no [tool.sadt]. Cheap to copy early, being stdlib-only
+    # and a few hundred lines, and they change far less often than tool sources.
+    for manifest in $(find . -name pyproject.toml); do \
+        grep -q "^\[tool.sadt\]" "$manifest" && continue; \
+        package="$(dirname "$manifest")"; \
+        mkdir -p "/manifests/$package" && cp -a "$package/." "/manifests/$package/"; \
     done
 
 # ----------------------------------------------------------------------
