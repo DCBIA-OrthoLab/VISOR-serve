@@ -15,9 +15,19 @@
 # a layer -- an image is copied around, a mount is not.
 DATA
 
-# The tools that still run in-process. This image serves tools from /tools,
-# and importing these would need the very stack the API venv is built without.
-server/tools
+# The in-process tools are SHIPPED, and the exclusion that used to sit here is
+# gone with its reason. It read "importing these would need the very stack the
+# API venv is built without", which was true when server/tools/ held AMASSS,
+# ALI and ASO; what is left is 48 kB importing `base` and `file_utils` and
+# nothing else.
+#
+# They earn their place: `Test_Tool` takes two strings and returns their
+# concatenation, so a fresh deployment can prove its whole round trip -- auth,
+# upload, run, result -- before a single model has been downloaded, which
+# nothing else here can do. `Example_Tool` is the panel showcase the client's
+# ExampleTool module renders.
+#
+# Their virtualenvs and caches are still excluded, by the **/venv rules above.
 
 # Not the server's business.
 server/tests
