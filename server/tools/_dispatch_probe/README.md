@@ -1,8 +1,8 @@
-# `_dispatch_probe` — the dispatch path, without a tool
+# `_dispatch_probe` - the dispatch path, without a tool
 
-A test fixture, not a tool. It exists so the whole subprocess loop — job
+A test fixture, not a tool. It exists so the whole subprocess loop - job
 directory, `job.json`, another interpreter, `runner.py`, `result.json`,
-cleanup — can be proven end to end without a model, a GPU, or a single heavy
+cleanup - can be proven end to end without a model, a GPU, or a single heavy
 dependency in the way.
 
 The leading underscore is load-bearing: `registry/` skips folders starting
@@ -13,7 +13,7 @@ they define themselves.
 ## Its virtualenv
 
 There isn't one here. `tests/conftest.py` copies this folder into a temporary
-directory, builds the venv *there*, and points `TOOLS_DIR` at it — which is
+directory, builds the venv *there*, and points `TOOLS_DIR` at it - which is
 the same knob the deployment image uses to put the tools at `/tools/<name>/`,
 so the layout under test is the real one.
 
@@ -24,7 +24,7 @@ exist there; and a venv is a build artifact that a clone on another machine
 should not inherit.
 
 It is created with `uv venv` when uv is installed and with the standard
-library's `venv` (no pip) otherwise — the probe imports nothing, so there is
+library's `venv` (no pip) otherwise - the probe imports nothing, so there is
 nothing to install and no network to reach.
 
 To build one by hand, the way the deployment image will build every tool's:
@@ -38,13 +38,13 @@ To build one by hand, the way the deployment image will build every tool's:
 the server's `API_TOKEN` leaked into its environment (it must not); and the
 file it wrote into `output/`. `fail=True` makes it raise, which is how the
 failure half of the contract is tested: a non-zero exit, a `result.json`
-carrying `{"error": {"type", "message"}}` — the class NAME is what `main.py`
-maps to a status — and the stderr tail attached to the error.
+carrying `{"error": {"type", "message"}}` - the class NAME is what `main.py`
+maps to a status - and the stderr tail attached to the error.
 
 It also has a packaged twin, which is what `execution/parity.py` is proven
 against: agreement is reported as agreement, a twin returning a different total
 is caught, and a twin writing a *different file with the same answer* is caught
-too — that last one is the failure a smoke test misses.
+too - that last one is the failure a smoke test misses.
 
 The **supervisor** is tested separately (`tests/test_supervisor.py`), against
 one-file tools built on the fly into a temporary `TOOLS_DIR`, because what is

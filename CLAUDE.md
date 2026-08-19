@@ -1,4 +1,4 @@
-# CLAUDE.md — GPU Inference Server (tool-registry architecture) + 3D Slicer client
+# CLAUDE.md - GPU Inference Server (tool-registry architecture) + 3D Slicer client
 
 ## Project context
 
@@ -8,7 +8,7 @@ server runs the selected tool, and returns the result.
 
 The extension will expose **at least 15 tools**, and this number will grow. The
 whole design must therefore be **scalable and low-friction to extend**: adding a new
-tool must require writing one self-contained class and nothing else — no edits to
+tool must require writing one self-contained class and nothing else - no edits to
 the server core, no new route, no manual registration list to keep in sync.
 
 **The data is confidential medical imaging.** Confidentiality and transport security
@@ -23,7 +23,7 @@ Do **not** add Celery/Redis/async job queues yet.
 ## Core design: a `Tool` base class
 
 > **Historical, and still half true.** This section is the original brief, and
-> it is what `base.py` still implements — `ArgSpec`, `validate()` before
+> it is what `base.py` still implements - `ArgSpec`, `validate()` before
 > `run()`, `ToolArgumentError` → 422. What changed is where a tool's
 > declaration comes from: a clinical tool is no longer a subclass here, it is a
 > `.schema.json` generated from a `run()` signature in `sadt-tools`, which the
@@ -89,7 +89,7 @@ validation-before-run + clear error on mismatch.
 ## Scalable tool discovery (the registry)
 
 `server/registry/` discovers **two kinds of tool**, side by side, and
-`GET /tools` publishes them identically — a client cannot tell which is which.
+`GET /tools` publishes them identically - a client cannot tell which is which.
 
 1. **A folder under `TOOLS_DIR` holding a `.schema.json`** (every clinical tool).
    The server reads the JSON, checks it against the hash of the `src/` beside
@@ -123,29 +123,29 @@ and is served from `TOOLS_DIR` without this server importing a line of it.
 Names are what a client sends to `/run/<name>`, and they are the folder names
 on that side:
 
-- `AMASSS` — CBCT skull structure segmentation (nnUNet v2, GPU).
-- `ALI` — automatic landmark identification, on CBCT volumes (deep-RL agents)
+- `AMASSS` - CBCT skull structure segmentation (nnUNet v2, GPU).
+- `ALI` - automatic landmark identification, on CBCT volumes (deep-RL agents)
   or intraoral surface scans (multi-view rendering + 2D UNet). The engine is
   chosen from the data, not from an argument.
-- `ASO` — automated standardized orientation, CBCT and intra-oral scans. Its
+- `ASO` - automated standardized orientation, CBCT and intra-oral scans. Its
   fully-automated CBCT mode calls `ALI` **mid-run**, through the supervisor.
-- `AREG` — registration of two timepoints. Drives `AMASSS`, `ASO`, `Crown_Seg`
+- `AREG` - registration of two timepoints. Drives `AMASSS`, `ASO`, `Crown_Seg`
   and (through ASO) `ALI`, all through the supervisor.
-- `Crown_Seg` — per-tooth labelling of intraoral scans (shapeaxi). Its own tool
+- `Crown_Seg` - per-tooth labelling of intraoral scans (shapeaxi). Its own tool
   rather than a helper inside ALI, because ASO, AREG and FlexReg need it too.
-- `Batch_Dental_Seg` — teeth and jaw structures on dental CT/CBCT, one scan or a
+- `Batch_Dental_Seg` - teeth and jaw structures on dental CT/CBCT, one scan or a
   whole cohort (nnUNet v2, GPU). Four trained models that label different
   things; the hosted bundle name selects the weights and their label table
   together.
-- `Surg_Mov_Pred` — surgical movement prediction from tabular measurements
+- `Surg_Mov_Pred` - surgical movement prediction from tabular measurements
   (stacking models, server-side model bundles).
 
 Two in-process tools stay in this repository, and only these two. They are the
 demonstration of the `Tool`/`ArgSpec` path, not clinical tools:
 
-- `Test_Tool` — two required strings in, their concatenation out. Proves the
+- `Test_Tool` - two required strings in, their concatenation out. Proves the
   round trip end to end with no dependency at all.
-- `Example_Tool` — the feature showcase: multi-type input (`csv_file` or
+- `Example_Tool` - the feature showcase: multi-type input (`csv_file` or
   `folder`), `choice`/`multichoice` arguments, `output_kind = "files"`.
 
 The extension will eventually expose ~15+ tools; the architecture must
@@ -176,7 +176,7 @@ The middle box imports nothing from the right-hand one. It runs it:
 ```
 
 `runner.py` ships with the SERVER and is injected by path, never installed into
-a tool's venv — so runner and server are always the same version and there is
+a tool's venv - so runner and server are always the same version and there is
 no cross-repo skew to negotiate. It reads `job.json`, imports the tool from its
 `src/`, calls `run(**params)`, and writes `result.json`. A tool that declares
 `*, sup` also receives a **supervisor** and can call another tool; that call
@@ -230,7 +230,7 @@ re-enters the same file with the sibling's interpreter, so chaining and nesting
 │   │   └── security.py      #   Bearer token verification
 │   ├── deployment.toml      # per-tool overrides; empty, because the conventions cover them
 │   ├── deployment.toml.example
-│   ├── tools/               # NOT where the tools are any more — see below
+│   ├── tools/               # NOT where the tools are any more - see below
 │   │   ├── _dispatch_probe/ # test fixture: underscore = never discovered
 │   │   ├── _AREG/           # the parked in-process AREG, kept for its history
 │   │   ├── Test_Tool/       # in-process demo: the minimal round trip
@@ -245,21 +245,21 @@ re-enters the same file with the sibling's interpreter, so chaining and nesting
 ```
 
 **The real tools are not in this repository.** They live in `sadt-tools`, one
-isolated project each, and reach this server through `TOOLS_DIR` — a folder of
+isolated project each, and reach this server through `TOOLS_DIR` - a folder of
 `<Tool_Name>/{.schema.json,.venv,src}`. `server/tools/` keeps only the two
 in-process demos, the dispatch fixture, and the parked `_AREG`.
 
 The Slicer client (thin modules + the generic inference client) lives in its
-own repo, `SlicerAutomatedDentalToolsCloud` — not here. Its **Slicer Cloud**
+own repo, `SlicerAutomatedDentalToolsCloud` - not here. Its **Slicer Cloud**
 module is a panel over `scripts/server_ctl.py`: it clones this repository,
 checks Docker, starts the container, reports when the clone has fallen behind
 and relaunches it, and picks which tools' bundles land in `DATA/`. The logic
-stays here on purpose — a deployment fix ships with the server rather than
+stays here on purpose - a deployment fix ships with the server rather than
 needing an extension release.
 
 ---
 
-## PART 1 — Server (`server/` directory)
+## PART 1 - Server (`server/` directory)
 
 ### Required stack
 - **FastAPI** + **Uvicorn**, `python-multipart`.
@@ -273,37 +273,37 @@ needing an extension release.
   `ToolArgumentError` with a precise message otherwise.
 
 ### `registry/`
-- `__init__.py` — discovery (both kinds, see above), `TOOLS`, `FAILED_TOOLS`,
+- `__init__.py` - discovery (both kinds, see above), `TOOLS`, `FAILED_TOOLS`,
   `get_tool(name)`.
-- `schema_tool.py` — a `.schema.json` turned into a `Tool`, plus the schema
+- `schema_tool.py` - a `.schema.json` turned into a `Tool`, plus the schema
   vocabulary the two repositories agree on. An unknown key is a **warning**,
   never a refusal: this is the seam between two repositories, and a field one
   side adds must not stop the other from starting.
-- `schema_hash.py` — `source_hash`, executable as
+- `schema_hash.py` - `source_hash`, executable as
   `python server/registry/schema_hash.py <src>` so the generator on the other
   side can be checked against it byte for byte.
-- `conventions.py` — **what a tool gets with no configuration at all.** An
+- `conventions.py` - **what a tool gets with no configuration at all.** An
   argument named `model`, `*_model` or `*_reference` is published as a name
   picked from `DATA/<tool>/models/` and can never be uploaded; any other `path`
   may also be filled from `DATA/<tool>/testfiles/`; an argument in `TECHNICAL`
   (`device`, `tile_step_size`, `num_workers`, `seed`, …) is not rendered to a
   clinician. Adding a tool needs no edit to this repository.
-- `deployment.py` — `deployment.toml`, the exceptions to those conventions,
+- `deployment.py` - `deployment.toml`, the exceptions to those conventions,
   merged per argument over them.
 
 ### `execution/`
-- `dispatch.py` — the server half of a run: job directory, `job.json`, the GPU
+- `dispatch.py` - the server half of a run: job directory, `job.json`, the GPU
   slot, the timeout, and the mapping from a tool's exception class NAME to a
   status code.
-- `runner.py` — the tool half, executed **by the tool's own interpreter**.
+- `runner.py` - the tool half, executed **by the tool's own interpreter**.
   Standard library only, 3.9 → 3.13, injected by absolute path so runner and
   server are always the same version. It also injects the **supervisor**.
-- `parity.py` — run one tool both ways and compare what a caller receives.
+- `parity.py` - run one tool both ways and compare what a caller receives.
 
-### `data_store.py` — server-side models and test files
+### `data_store.py` - server-side models and test files
 Lets a tool argument be satisfied by a file already present on the server (an AI
 model, a reference test dataset) instead of the client uploading it every call.
-- `ArgSpec.server_selectable: Optional[str]` — `"model"` or `"testfile"` on a
+- `ArgSpec.server_selectable: Optional[str]` - `"model"` or `"testfile"` on a
   file-typed argument opts it into this; `None` (default) means upload-only.
 - Layout on disk: `DATA_DIR/<tool_name>/models/` and
   `DATA_DIR/<tool_name>/testfiles/` (`DATA_DIR` from config, mounted **read-only**).
@@ -311,26 +311,26 @@ model, a reference test dataset) instead of the client uploading it every call.
   in both folders, so a client can present them (e.g. a dropdown) instead of a file
   picker.
 - `GET /tools/{tool_name}/testfiles/{filename}` (Bearer-protected) streams one of
-  the listed **test files** to the client (a folder entry arrives zipped) — backs
+  the listed **test files** to the client (a folder entry arrives zipped) - backs
   the Slicer client's "Test file" button. Models are deliberately not
   downloadable: selected by name, used in place.
 - In `POST /run/{tool_name}`, a `server_selectable` argument sent as a plain form
   value (the file name) instead of an upload is resolved against `data_store`
   rather than streamed to a temp dir.
 - **Backend abstraction (`DataStore`):** `main.py` and every `Tool` only ever call
-  `data_store.list_models/list_testfiles/resolve_model/resolve_testfile` — never
+  `data_store.list_models/list_testfiles/resolve_model/resolve_testfile` - never
   the filesystem directly. `LocalDataStore` is the only implementation today. To
   swap to an external database or object store later: add a new `DataStore`
   subclass in `data_store.py` returning a `ResolvedFile(path, is_temporary)` from
   each `resolve_*` (`is_temporary=True` if the backend had to materialize a temp
-  copy, so `main.py`'s cleanup deletes it — persistent local paths must never be
+  copy, so `main.py`'s cleanup deletes it - persistent local paths must never be
   deleted), then select it in `build_data_store()` via `settings.DATA_BACKEND`.
   No change needed anywhere else.
 
 ### `tools/Test_Tool/Test_Tool.py`
 - Defines `TestTool(Tool)` with `name = "Test_Tool"`, the two required string
   args, and a `run` returning a str. It is the minimal proof that the HTTP
-  round trip works with no dependency in the way — **not** the template for a
+  round trip works with no dependency in the way - **not** the template for a
   new tool any more. A new tool is a package in `sadt-tools`; see
   `ADDING_A_TOOL.md`.
 
@@ -338,10 +338,10 @@ model, a reference test dataset) instead of the client uploading it every call.
 1. `GET /health` → `{"status": "ok"}`, no auth.
 2. `GET /tools` → list of `{name, arguments, output_kind}` from the registry, no
    auth. Lets clients discover tools and their expected arguments.
-3. `POST /run/{tool_name}` — generic, Bearer-token protected:
+3. `POST /run/{tool_name}` - generic, Bearer-token protected:
    - `404` if `tool_name` not in registry.
    - Collect arguments from the request (form fields for scalars; an optional
-     uploaded `file` streamed to a temp dir in chunks — never fully into RAM).
+     uploaded `file` streamed to a temp dir in chunks - never fully into RAM).
    - Call `tool.invoke(args)` → this runs `validate` then `run`.
    - On `ToolArgumentError` → `422` with the message.
    - Return the result: JSON for text/scalar outputs, `FileResponse` for file
@@ -352,7 +352,7 @@ model, a reference test dataset) instead of the client uploading it every call.
 ### Chunked transfer (`transfer.py`)
 
 A file arriving in one request rides one TCP connection, which is bound by its
-congestion window long before it is bound by bandwidth — hence a 100 MB CBCT
+congestion window long before it is bound by bandwidth - hence a 100 MB CBCT
 taking minutes, and a connection dropped at 95% starting again from zero. These
 endpoints let a client use several at once. All Bearer-protected, all optional:
 a client that ignores them still works, and one that uses them against an older
@@ -425,27 +425,27 @@ dependency on when the next request arrives.
 ### `wire/security.py`, `config.py`
 - Bearer token from env (`API_TOKEN`), constant-time compare, `401` on failure.
 - Config from env, grouped as `config.py` groups them:
-  - **core** — `API_TOKEN`, `DEVICE`, `TEMP_DIR`, `DATA_DIR`, `DATA_BACKEND`.
-  - **running a tool** — `SADT_DISPATCH_MODE`, `TOOLS_DIR`, `RUNNER_PATH`,
+  - **core** - `API_TOKEN`, `DEVICE`, `TEMP_DIR`, `DATA_DIR`, `DATA_BACKEND`.
+  - **running a tool** - `SADT_DISPATCH_MODE`, `TOOLS_DIR`, `RUNNER_PATH`,
     `DESCRIBE_PATH`, `SCHEMA_CACHE_DIR`, `DEPLOYMENT_CONFIG`, `SADT_API`,
     `MAX_CONCURRENT_TOOLS`, `MAX_CONCURRENT_GPU_JOBS`, `TOOL_TIMEOUT_SECONDS`.
-  - **uploads and results** — `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
+  - **uploads and results** - `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
     `UPLOAD_CHUNK_MB`, `TRANSFER_TTL_SECONDS`, `TRANSFER_SWEEP_SECONDS`,
     `RESULT_REFERENCE_MIN_MB`, `ZIP_COMPRESSLEVEL`, `ALLOWED_EXTENSIONS`.
 - **`MAX_CONCURRENT_GPU_JOBS` is one counter ACROSS tools.** The per-tool
   semaphores went with the tools that held them: a packaged tool is its own
   process, so an in-process semaphore would cap nothing, and an AMASSS run and
   a `Crown_Seg` run want the same card. A run is **assumed** to want the GPU
-  unless it declares `device` and resolves it to a CPU value — the safe default
+  unless it declares `device` and resolves it to a CPU value - the safe default
   is the strict one, because a tool that quietly imports torch without
   declaring `device` would otherwise never queue at all.
-- **Every setting goes through `config.Settings`** — nothing reads `os.getenv`
+- **Every setting goes through `config.Settings`** - nothing reads `os.getenv`
   directly, so the whole configuration stays discoverable in one file and
   documented in `.env.example`. A *tool* now reads no setting at all: what used
   to be `settings.AMASSS_TILE_STEP_SIZE` is an argument of `run()` with the
   same default, and the server passes it only to override.
 
-### Security / confidentiality — hard requirements
+### Security / confidentiality - hard requirements
 - **TLS mandatory**; README documents HTTPS + self-signed cert for dev, real cert
   for prod, never plain HTTP.
 - Upload size limit (`MAX_UPLOAD_MB` → `413`).
@@ -465,7 +465,7 @@ dependency on when the next request arrives.
 
 ---
 
-## PART 2 — Slicer client (`slicer_client/inference_client.py`)
+## PART 2 - Slicer client (`slicer_client/inference_client.py`)
 
 Runs inside Slicer's Python interpreter. Available: `requests`, `slicer`, `qt`,
 `vtk`, `os`, `tempfile`. No other external deps.
@@ -507,7 +507,7 @@ Provide a small, generic client mirroring the server:
 - Passing wrong/missing/extra args to a tool yields a `422` with a clear message
   (validation happens in the `Tool` base class before `run`).
 - Unknown tool → `404`; no token → `401`; oversized file → `413`.
-- Adding a new tool requires only a new file in `tools/` subclassing `Tool` — no
+- Adding a new tool requires only a new file in `tools/` subclassing `Tool` - no
   core changes, no manual registration.
 - No temp files left behind.
 
@@ -519,7 +519,7 @@ Provide a small, generic client mirroring the server:
   one, and a supervised chain is invisible to it (a nested call is a subprocess
   of its parent, not a new admission). `runner.py` records
   `peak_vram_bytes` per run precisely so a real budget can later be set from
-  measurements rather than guesses — that instrumentation is in, the policy is
+  measurements rather than guesses - that instrumentation is in, the policy is
   not.
 
 Already implemented, despite earlier versions of this list: real GPU inference,
@@ -528,10 +528,10 @@ concurrently in worker threads, capped by `MAX_CONCURRENT_TOOLS`).
 
 ## Changelog
 
-### 2026-08-12 — Read the other repository; seven ways nothing would have worked
+### 2026-08-12 - Read the other repository; seven ways nothing would have worked
 
 `sadt-tools` has six tools packaged, and **not one of them would have loaded**.
-The architecture matched — same reasoning, sometimes the same sentences — and
+The architecture matched - same reasoning, sometimes the same sentences - and
 every wire between the two was wrong. Found by reading it, and by hashing a
 real tool both ways.
 
@@ -546,14 +546,14 @@ real tool both ways.
 - **`.schema.json` is not a file they ship.** `scripts/describe.py` emits it
   from `run()`'s signature, run with THAT TOOL's interpreter, so the schema
   cannot drift from the code. It is a **cache**, and `source_hash` is what
-  says the cache is behind — so a mismatch now REGENERATES rather than
+  says the cache is behind - so a mismatch now REGENERATES rather than
   refusing to start, which is what that field is for. The image generates
   them at build; the server regenerates at startup into `SCHEMA_CACHE_DIR`,
   because `/tools` is read-only to the user it runs as.
 - **They already publish `choices`**, from `Literal[...]` annotations:
   `list[Literal[...]]` is several-of, a bare `Literal[...]` exactly-one. The
-  migration cost measured in `MIGRATING_A_TOOL.md` — "AMASSS loses 2
-  multichoices" — does not exist; it was solved on their side while this side
+  migration cost measured in `MIGRATING_A_TOOL.md` - "AMASSS loses 2
+  multichoices" - does not exist; it was solved on their side while this side
   was throwing the field away with a warning.
 - **`output_dir` is a required argument of every tool**, and no client can
   supply a directory on the server. It is taken out of the published schema
@@ -562,7 +562,7 @@ real tool both ways.
 - **Nothing serialises the GPU any anymore.** Every tool used to hold its own
   semaphore, which worked only because they shared one process; a packaged
   tool is its own process, so they have all been removed. New
-  `MAX_CONCURRENT_GPU_JOBS`, and it is one counter ACROSS tools — an AMASSS
+  `MAX_CONCURRENT_GPU_JOBS`, and it is one counter ACROSS tools - an AMASSS
   run and a CrownSeg run want the same card. A run counts as GPU work when
   the tool declares a `device` argument whose effective value is a CUDA one,
   so a tabular prediction never queues behind a segmentation.
@@ -570,7 +570,7 @@ real tool both ways.
   define a base class in: `ToolInputError`/`ValueError`/`FileNotFoundError`
   answer 422 with the message passed through (they are written to be read by
   whoever sent the request), `ToolUnavailableError` answers 503, anything else
-  500 with a fixed message. The runner records the name in `result.json` —
+  500 with a fixed message. The runner records the name in `result.json` - 
   which reverses the earlier "on failure, write nothing".
 
 Also: `device` is injected from `settings.DEVICE` when the caller picks none
@@ -582,17 +582,17 @@ and `deployment.toml` grows `data_dir`, because packaged tools are lowercase
 
 **Verified against the real thing**: `amasss`, `batchdentalseg`, `crownseg`
 and `surgmovpred` all load, publish their check boxes, hide their output
-directory, and are correctly classified as GPU or not — `test_tool_contract.py`
+directory, and are correctly classified as GPU or not - `test_tool_contract.py`
 runs their generator with their interpreters and skips where the checkout is
 absent. `ali` and `aso` have no virtualenv yet, which their own document says.
 
 **Tests:** 461 server tests (+27).
 
-### 2026-08-12 — The gate phase 4 has to pass through: running a tool both ways
+### 2026-08-12 - The gate phase 4 has to pass through: running a tool both ways
 
 Phase 4 deletes `server/tools/`, and every deletion there is one line and no
-way back. What licenses it is not that the subprocess path *works* — phases 1
-to 3 showed that — but that a given tool produces the same thing on both
+way back. What licenses it is not that the subprocess path *works* - phases 1
+to 3 showed that - but that a given tool produces the same thing on both
 sides. `server/parity.py` runs one tool in both forms and compares **what a
 caller receives**:
 
@@ -602,7 +602,7 @@ caller receives**:
 - the returned value, with each path replaced by the artifact it names, so
   `{"outputs": {"mandible": "/jobs/ab12/output/x.nii.gz"}}` and
   `/tmp/inference_server/tool_9f/x.nii.gz` compare equal;
-- minus the keys that differ between two runs of the *same* code — duration,
+- minus the keys that differ between two runs of the *same* code - duration,
   timestamp, job id.
 
 **It does not claim a difference is a defect.** The packaged tool runs against
@@ -611,8 +611,8 @@ SimpleITK writes a different header. It makes the difference visible, per
 file, so it is read rather than discovered by a clinician. Exit code 1 on any
 difference, and the report says which file and which side.
 
-Tested in both directions on `_dispatch_probe`, which now exists in both forms
-— packaged with its own venv, and an in-process twin in the test: agreement is
+Tested in both directions on `_dispatch_probe`, which now exists in both forms -
+packaged with its own venv, and an in-process twin in the test: agreement is
 reported as agreement, a twin returning a different total is caught, and a twin
 writing a *different file with the same answer* is caught. That last one is
 the failure a smoke test misses.
@@ -621,8 +621,8 @@ the failure a smoke test misses.
 response builder and the harness use to find what a run produced, so "what
 counts as an output" is written once.
 
-**`MIGRATING_A_TOOL.md`**: the loop, per tool — package, translate the schema,
-move `server_selectable` to `deployment.toml`, build, prove, flip — plus what
+**`MIGRATING_A_TOOL.md`**: the loop, per tool - package, translate the schema,
+move `server_selectable` to `deployment.toml`, build, prove, flip - plus what
 the translation *costs*, measured against the current registry. `test_tool`,
 `SurgMovPred` and `BatchDentalSeg` are nearly free; `ASO` loses 3 choices, 4
 multichoices and **7 `visible_when`** rules, whose whole job is hiding the
@@ -632,11 +632,11 @@ very end.
 
 **Tests:** 434 server tests (+7).
 
-### 2026-08-12 — One image, N virtualenvs, and the server imports none of them (phase 3)
+### 2026-08-12 - One image, N virtualenvs, and the server imports none of them (phase 3)
 
 `docker/Dockerfile`: `/opt/sadt/{.venv,server,runner.py}` for the API on the
 newest Python, `/tools/<name>/{.venv,.schema.json,src}` for the tools, `/DATA`
-read-only, `/jobs` ephemeral. A tool is a **virtualenv, not a service** —
+read-only, `/jobs` ephemeral. A tool is a **virtualenv, not a service** - 
 fifteen images would mean fifteen copies of the same CUDA stack, fifteen things
 to schedule, and a network hop between a tool and the file it was just handed.
 
@@ -655,14 +655,14 @@ rather than described.
 - **Every `uv sync` in ONE layer**, because overlayfs copies a file up when a
   later layer touches it, and a cache deleted in a later layer frees nothing.
 - **`docker/verify_dedup.py`, and it had to be written twice.** The naive
-  check — same path, different inode — reported 114 failures on a correct
+  check - same path, different inode - reported 114 failures on a correct
   image: numpy 1.26 and 2.5 share a few dozen byte-identical test fixtures
   that come from *different wheels*, which uv could not share if it wanted to.
   It compares files of the same distribution **at the same version**, from
   each venv's `RECORD`, minus what an installer writes rather than unpacks
   (console scripts embed their own venv's interpreter path). Verified in both
   directions: 0 failures on the real image, 925 duplicated files and 54.4 MB
-  wasted on the same image built with `UV_LINK_MODE=copy` — 610 MB against
+  wasted on the same image built with `UV_LINK_MODE=copy` - 610 MB against
   686 MB, on nothing heavier than numpy.
 - **Manifests are extracted in a stage of their own.** `COPY` cannot glob a
   directory structure, and that stage's *output* is content-addressed:
@@ -674,11 +674,11 @@ rather than described.
   with no tools rather than failing.
 - **An old pin drags an old interpreter behind it.** numpy 1.26 ships no wheel
   for 3.13, so the first build tried to compile it from source and failed. uv
-  installs Python 3.12 into the image for that tool alone — one base image
+  installs Python 3.12 into the image for that tool alone - one base image
   still, because `nvidia-*` wheels are `py3-none-manylinux` and deduplicate
   across Python versions anyway.
 - **`registry.py` no longer requires the `tools/` package to exist**, which is
-  what lets the image ship without the in-process tools — and is the shape
+  what lets the image ship without the in-process tools - and is the shape
   phase 4 leaves behind.
 - **`file_utils` imports pandas lazily now.** It was the one module-level
   heavy import in the server core, and `main.py` imports `file_utils`: the API
@@ -687,28 +687,28 @@ rather than described.
 - **The container does not run as root.** Third-party code from fifteen
   upstreams runs in it, on confidential imaging.
 
-`server/requirements-api.txt` is the API's whole dependency list — fastapi,
-uvicorn, python-multipart, pydantic-settings — and a test asserts it stays that
+`server/requirements-api.txt` is the API's whole dependency list - fastapi,
+uvicorn, python-multipart, pydantic-settings - and a test asserts it stays that
 way, because an API that quietly regrows numpy is pinned to what the tools can
 agree on all over again.
 
 **Tests:** 427 server tests (+4). The image itself is verified by building it,
 which the suite does not do.
 
-### 2026-08-12 — A tool can be declared without being imported (phase 2)
+### 2026-08-12 - A tool can be declared without being imported (phase 2)
 
 Phase 1 gave a tool its own process. This gives it its own *declaration*: a
 folder holding `.schema.json`, `.venv/` and `src/`, from which the server
 builds a `Tool` without importing a line of it. `registry.py` now discovers
 both kinds, and dropping a `.schema.json` into a folder is what moves a tool
-from one to the other — a folder that has one is never imported.
+from one to the other - a folder that has one is never imported.
 
 **Both kinds at once, and that is not a compromise.** The two bullets of the
-phase — "registry reads schemas instead of importing" and "the golden
-`GET /tools` test must still pass" — are only simultaneously satisfiable that
+phase - "registry reads schemas instead of importing" and "the golden
+`GET /tools` test must still pass" - are only simultaneously satisfiable that
 way: the eight tools here have no schema, and the contract's type vocabulary
 (`path`, `str`, `int`, `float`, `bool`, `list[str]`) *cannot* express what they
-publish — `volume_or_zip_file` and its extensions, a `multichoice` over 119
+publish - `volume_or_zip_file` and its extensions, a `multichoice` over 119
 landmarks, `visible_when`, `ui`, `groups`. A schema-only registry today means
 either no tools or a different response. The server stops importing tools when
 the tools leave this repo, which is phase 4.
@@ -716,7 +716,7 @@ the tools leave this repo, which is phase 4.
 - **`source_hash` is fatal, alone among discovery failures.** Everything else
   costs one tool (skipped, reported, `FAILED_TOOLS`); a schema that no longer
   matches the source beside it takes the server down, because it would
-  otherwise keep serving — validating requests against a signature that has
+  otherwise keep serving - validating requests against a signature that has
   changed under it, accepting arguments `run()` no longer takes and refusing
   ones it now does. A schema with NO hash is unverifiable and skipped instead:
   it must not serve, but it endangers only itself.
@@ -725,7 +725,7 @@ the tools leave this repo, which is phase 4.
   byte or nothing starts, so this ships a reference implementation to check
   against rather than a description to reimplement. The rule: sha256 over
   `<relative posix path>\0<sha256 of contents>\n` per file, sorted,
-  `__pycache__` and `*.pyc` excluded — every clause of which exists to make the
+  `__pycache__` and `*.pyc` excluded - every clause of which exists to make the
   hash reproducible on another machine.
 - **The folder must be named after the tool.** Not cosmetic: `dispatch.py`
   looks the interpreter up at `<TOOLS_DIR>/<tool name>/.venv/bin/python`, so a
@@ -735,7 +735,7 @@ the tools leave this repo, which is phase 4.
   which arguments may be filled from *this* machine's `DATA_DIR`, and how much
   *this* machine accepts as an upload, are not properties of the tool. Absent
   is the normal case. A `server_selectable` entry naming an argument the tool
-  does not declare, or one that is not a `path`, is a startup error — the
+  does not declare, or one that is not a `path`, is a startup error - the
   failure is otherwise a dropdown that silently never appears.
 - **`max_upload_mb` is enforced where the tool is known**: on the multipart
   body, and when a chunked upload is *claimed*. `POST /uploads` opens a session
@@ -744,7 +744,7 @@ the tools leave this repo, which is phase 4.
 - **An unknown key in a schema is a WARNING, not a refusal.** This is the seam
   between two repositories: a field one side adds must not stop the other from
   starting, and must not vanish in silence either. An unknown key in
-  `deployment.toml` is the opposite — that file is ours, and
+  `deployment.toml` is the opposite - that file is ours, and
   `server_selectible` would just leave every argument upload-only.
 - **`base.LIST_TYPE`** (`"list[str]"`), the one argument shape the schema can
   declare that nothing here could express. Not `multichoice`, which picks from
@@ -763,7 +763,7 @@ them changes anything for a tool that omits it:
 - **`description` per argument.** The client renders it under the field.
 - **`{"outputs": {name: path}}` as a return value, and it is the form to
   write.** The contract shows `"returns": "path"` next to a `result.json` of
-  `{"result": {"outputs": {...}}}` — a mapping, not a path, which
+  `{"result": {"outputs": {...}}}` - a mapping, not a path, which
   `_output_paths` refused and which answered 500. Both work now, and the
   mapping is canonical: the names buy nothing over HTTP (the response is one
   file or one archive either way) but they are what `depends_on` sequencing
@@ -776,16 +776,16 @@ them changes anything for a tool that omits it:
   the first of them streamed as if it were the result.
 
 **Still needing a client release, so left alone:** the schema's tool-level
-`description` is read and kept but not published — `GET /tools` has no field
+`description` is read and kept but not published - `GET /tools` has no field
 for it, and adding one is a shape change.
 
 **Tests:** 423 server tests (+43), no GPU, no weights and no network.
 
-### 2026-08-12 — A tool can run in its own interpreter (phase 1: the path, no tool on it)
+### 2026-08-12 - A tool can run in its own interpreter (phase 1: the path, no tool on it)
 
 `registry.py` imports every tool INTO the server, which pins the server's
 Python to the lowest common denominator across all of them and makes two
-incompatible pins simply unresolvable — `SurgMovPred` wants `numpy==2.4.0`
+incompatible pins simply unresolvable - `SurgMovPred` wants `numpy==2.4.0`
 while AREG/MedX/CLIC want `numpy<2.0.0`, and two versions of torch cannot
 coexist in one process at all. Holding torch in the API process also keeps a
 CUDA context alive for the life of the server (VRAM is never fully released
@@ -800,7 +800,7 @@ with `SADT_API`, `SADT_JOB_ID`, `SADT_JOB_DIR` in the environment. The server
 writes `job.json` (`job_id`, `tool`, `job_dir`, `params`), the runner imports
 the tool from its `src/`, calls `run(**params)` and writes
 `{"result": ...}` to `result.json`. On failure it writes NOTHING and exits
-non-zero — an absent `result.json` is the failure signal, which is why it is
+non-zero - an absent `result.json` is the failure signal, which is why it is
 serialized in full and `os.replace`d into place rather than streamed.
 
 - **Nothing switches over yet.** `SADT_DISPATCH_MODE` defaults to `inprocess`,
@@ -811,17 +811,17 @@ serialized in full and `os.replace`d into place rather than streamed.
   installed into the tool venvs: runner and server are then always the same
   version and there is no cross-repo skew to negotiate. It is standard-library
   only and has to run on 3.9 through 3.13, since each tool pins its own
-  interpreter. `tools/_dispatch_probe/` proves exactly that — its venv holds no
+  interpreter. `tools/_dispatch_probe/` proves exactly that - its venv holds no
   third-party package at all, not even pip.
 - **The job directory is a tracked scratch dir** (new
   `file_utils.register_scratch_dir`, for a caller that must name its own), so
-  the request handler already removes it — outputs included — once the response
+  the request handler already removes it - outputs included - once the response
   has streamed, and `_discard` takes it on every error path. A failed run is
   deleted immediately instead of waiting: its inputs are confidential and its
   outputs are worthless.
 - **stdout/stderr go to files, not pipes.** nnUNet prints for hours and a pipe
   means holding all of it in the server's memory. Only the last 8 kB of stderr
-  travels with the failure, into the server log — `ToolExecutionError` is
+  travels with the failure, into the server log - `ToolExecutionError` is
   deliberately not one of `base.py`'s typed errors, so it falls through to the
   generic 500 and the client is told only that the run failed, exactly as an
   in-process crash is today. A missing venv is the opposite case and answers
@@ -830,7 +830,7 @@ serialized in full and `os.replace`d into place rather than streamed.
   inherited (PATH, LD_LIBRARY_PATH, CUDA_VISIBLE_DEVICES), but the server's
   bearer token has no business in a venv full of third-party code.
 - **`cwd` is the job directory**, so a tool writing a relative path lands
-  there rather than in the server's source tree — which is what ALI's original
+  there rather than in the server's source tree - which is what ALI's original
   module did, into the extension's own sources.
 
 **The golden fixture comes first.** `tests/golden/tools_response.json` is
@@ -838,11 +838,11 @@ serialized in full and `os.replace`d into place rather than streamed.
 this was written and asserted per tool, per argument, in order. The Slicer
 client builds its entire UI from that response; the point of the whole
 migration is that it cannot tell the difference. If that test fails, the client
-breaks — the fixture is not what gets updated.
+breaks - the fixture is not what gets updated.
 
 **Tests:** 380 server tests (+25), no GPU, no weights and no network.
 
-### 2026-08-11 — BatchDentalSeg ported: four models, and a manifest that could not load
+### 2026-08-11 - BatchDentalSeg ported: four models, and a manifest that could not load
 
 Port `BATCHDENTALSEG` (teeth and jaw structures on dental CT/CBCT, nnUNet v2).
 Upstream is a 2940-line Qt widget, and most of it is not this pipeline: a queue
@@ -858,7 +858,7 @@ PediatricDentalSeg label 5 segments with the maxilla inside Upper Skull;
 NasoMaxillaDentSeg separates the maxilla, which shifts every later value;
 UniversalLab labels all 32 permanent teeth, 20 deciduous ones and 3 structures.
 The values are what the networks emit, so a wrong table does not fail, it
-renames anatomy — `AMASSS_report.json`'s counterpart publishes `labels` with
+renames anatomy - `AMASSS_report.json`'s counterpart publishes `labels` with
 every run for that reason.
 
 **The hosted bundle name IS the model.** `model` is a scalar
@@ -874,7 +874,7 @@ flat beside `dataset.json` and `plans.json`. nnUNet reads its fold from a
 subdirectory named after it, so every bundle would have downloaded perfectly
 (2.3 GB) and then no model would ever have been found. `dest` now puts the
 checkpoint under `<bundle>/fold_0/`, and `find_model_folder` confirms all three
-files before accepting a candidate — a half-downloaded bundle reports "not
+files before accepting a candidate - a half-downloaded bundle reports "not
 installed" rather than failing inside nnUNet's loader. A test pins the code and
 the manifest to the same folder names, which is why `docker-compose.yml`'s test
 services now mount `scripts/` read-only.
@@ -897,24 +897,24 @@ obvious next addition.
 `nnunet_runner.py` is deliberately a second copy of AMASSS's rather than an
 import: `registry.py` imports every tool at startup, so importing another
 tool's module would make one tool's missing dependency take both out of the
-registry — the same reason ASO and AREG each carry their own dicom.py. It does
+registry - the same reason ASO and AREG each carry their own dicom.py. It does
 NOT carry AMASSS's GPU-resampling swap: that drops the input resampling from
 spline order 3 to order 1, and nothing has measured what that costs *these*
 models.
 
 **Core changes, both sanctioned:** two `config.Settings` fields
 (`BATCHDENTALSEG_MAX_GPU_JOBS`, `BATCHDENTALSEG_TILE_STEP_SIZE`). `main.py`,
-`registry.py` and `base.py` untouched, and no new dependency — the image
+`registry.py` and `base.py` untouched, and no new dependency - the image
 already carries nnUNet v2 for AMASSS.
 
 **Tests:** 354 server tests (+26), no GPU, no weights and no network: inference
 is stubbed, everything around it runs for real. Not yet verified against the
-real bundles — they are 2.3 GB and have not been fetched on this machine.
+real bundles - they are 2.3 GB and have not been fetched on this machine.
 
-### 2026-08-07 — `scripts/` stands the server up, not just fills `DATA/`
+### 2026-08-07 - `scripts/` stands the server up, not just fills `DATA/`
 
 `scripts/server_ctl.py`: `status` / `up` / `update` / `down` / `logs` /
-`catalog` / `models` / `token`, standard library only — it also runs inside
+`catalog` / `models` / `token`, standard library only - it also runs inside
 Slicer's interpreter, where nothing may be pip-installed on a user's behalf.
 Two conventions carry the GUI integration: progress goes to **stderr** and
 machine-readable output to **stdout**, so `--json` prints exactly one object;
@@ -925,7 +925,7 @@ dump lands in log panes and bug reports.
 the user to the `docker` group, saying loudly that group membership only
 applies to a **new login session**. `--nvidia` adds the container toolkit, not
 a GPU driver. `setup-server.sh` is the curl-pipeable one-liner: clone, check
-docker, optionally fetch tools, start, print the URL and token — re-running
+docker, optionally fetch tools, start, print the URL and token - re-running
 **keeps the existing token**, so configured clients keep working.
 
 Decisions worth keeping:
@@ -935,7 +935,7 @@ Decisions worth keeping:
   file cannot rescue it: compose **merges** the `devices` list rather than
   replacing it, so `devices: []` in a second `-f` leaves the reservation in
   place (measured). Which one runs is decided by whether docker has an `nvidia`
-  runtime, not by whether `nvidia-smi` exists — the container toolkit is a
+  runtime, not by whether `nvidia-smi` exists - the container toolkit is a
   separate install.
 - **`BIND_ADDR` unset by default**, written as `127.0.0.1` by `server_ctl.py
   up`: a local deployment speaks plain HTTP, which must not leave the machine.
@@ -945,7 +945,7 @@ Decisions worth keeping:
   stops compose warning on every command. `docker compose config` for
   `inference` is byte-identical to before.
 - **`HOST_PORT`**, with a preflight that refuses to start when anything is
-  listening — checked by connecting, not by `compose ps`, since a second clone
+  listening - checked by connecting, not by `compose ps`, since a second clone
   is its own compose project and `ps` reports nothing while it holds the port.
 - **`--branch` on `status` and `update`.** `clone()` runs only on an empty
   directory, so a deployment repointed at another branch kept following the old
@@ -966,7 +966,7 @@ Decisions worth keeping:
   restart loop.
 - **`wait_for_health` treats `restarting` as a failure.** `restart:
   unless-stopped` turns a boot failure into a loop, and a loop never becomes
-  healthy — the caller used to sit out the full 30-minute timeout.
+  healthy - the caller used to sit out the full 30-minute timeout.
 - **`DATA/` is created before docker can.** `./DATA:/data:ro` is a bind mount,
   so a missing host path is created by the daemon, owned by root, and every
   later download died on `Permission denied` on a brand-new install.
@@ -984,7 +984,7 @@ Also: a root `.env.example` for the three variables compose interpolates
 (distinct from `server/.env.example`, which documents what the application
 reads), and `scripts/README.md` rewritten around the folder's two jobs.
 
-### 2026-08-06 — ALI can be asked for named landmarks, which is what ASO needs
+### 2026-08-06 - ALI can be asked for named landmarks, which is what ASO needs
 
 ASO's fully-automated CBCT mode calls ALI in-process and checks that its schema
 exposes `("input", "model", "landmarks")`. ALI declared `cbct_regions` and
@@ -992,12 +992,12 @@ exposes `("input", "model", "landmarks")`. ALI declared `cbct_regions` and
 
 The name was the smaller half. ASO registers on seven points (Ba, S, N, RPo,
 LPo, ROr, LOr) straddling the Cranial base and Upper regions, so asking by
-region runs **58 agents to use 7** — and one agent is a full two-scale walk of
+region runs **58 agents to use 7** - and one agent is a full two-scale walk of
 the volume. The engine always worked at landmark granularity internally; only
 the schema was coarser.
 
 - `landmarks` is a multichoice over all 119 catalog labels, **every option off
-  by default** — unlike `cbct_regions`, whose options are all on. "All off" is
+  by default** - unlike `cbct_regions`, whose options are all on. "All off" is
   what an omitted multichoice arrives as, so the default state means "nothing
   said here, the regions decide", which is what every earlier request keeps
   meaning.
@@ -1006,7 +1006,7 @@ the schema was coarser.
   would silently drop landmarks for a caller that set both. The run report says
   which drove the run: `regions` is empty when `landmarks_selected` is not.
 - The 119 options are readable because the schema says how to group them:
-  `ui="tabs"` with `groups=LANDMARK_GROUPS`, which is `GROUP_LABELS` — the same
+  `ui="tabs"` with `groups=LANDMARK_GROUPS`, which is `GROUP_LABELS` - the same
   table the engine names its output files by, published rather than restated,
   so a landmark added to it gets its tab with no client release. ALI also
   gained sections and a `label` on every argument.
@@ -1014,7 +1014,7 @@ the schema was coarser.
 **Tests:** 197 server tests (+3), including ASO's exact argument dict surviving
 `tool.validate` with `input` as a resolved directory. Client-side, 34 ALI tests.
 
-### 2026-08-06 — Presentation hints: the schema says how to lay a panel out
+### 2026-08-06 - Presentation hints: the schema says how to lay a panel out
 
 ASO's panel was unusable: four modes share one schema, so a generic client
 rendered 130 CBCT landmarks, 32 teeth, 8 landmark types and 2 jaws as a single
@@ -1022,7 +1022,7 @@ column of ~180 check boxes with CBCT and IOS options interleaved, while any run
 uses one half or the other. ALI has the same shape for a different reason: 119
 landmark options and no `mode` field to hide the inert selection behind. The
 old Slicer modules solved this with hand-written QStackedWidgets and ~700 lines
-of checkbox plumbing, with the anatomy written inside the widget — exactly what
+of checkbox plumbing, with the anatomy written inside the widget - exactly what
 the ports removed.
 
 **Five optional `ArgSpec` fields, published by `GET /tools`, ignored by
@@ -1045,18 +1045,18 @@ one is `null` on a tool that declares none, so existing panels render unchanged.
 - `check_schema` rejects them at startup, and that matters more here than for a
   real type: a wrong `visible_when` hides a field for good, and a client cannot
   tell that from a field the tool never declared. An option no group mentions
-  is *not* an error — the client renders the leftovers.
+  is *not* an error - the client renders the leftovers.
 - `visible_when` is presentation, not validation: a hidden argument is not
   sent, so its declared default applies, and cross-argument checks still run
-  for a direct API call. What it fixes is a real wire problem — a multichoice
+  for a direct API call. What it fixes is a real wire problem - a multichoice
   is read back as the complete `{option: checked}` dict, so a panel was sending
   the inert mode's selection, frozen at whatever the invisible widget held.
 
-### 2026-07-31 — ALI's model bundle is matched to the detected mode; a wrong bundle is a 422
+### 2026-07-31 - ALI's model bundle is matched to the detected mode; a wrong bundle is a 422
 
 Found by running ALI IOS from Slicer with the dropdown left on
 `ALI_CBCT_Models`: the IOS engine listed all 119 CBCT files as unrecognized and
-Slicer showed `500 — The tool failed on the server`, the one message written
+Slicer showed `500 - The tool failed on the server`, the one message written
 for the user buried in the log.
 
 - **`model` is now optional and the mode picks it** (`ALILogic.select_bundle`).
@@ -1064,7 +1064,7 @@ for the user buried in the log.
   (`<landmark>/<scale>/*.pth` folders vs flat jaw/network-token checkpoints;
   mutually exclusive, file-name parsing only, so probing costs a directory walk
   and never a model load). No match is a 422 naming `setup-models.sh`; several
-  matches is a 422 naming the candidates rather than a silent pick — which
+  matches is a 422 naming the candidates rather than a silent pick - which
   model vintage ran must never be a surprise. The report gains `model_bundle`.
   A temp copy materialized for a probe (`ResolvedFile.is_temporary`) is deleted
   whether or not it was picked.
@@ -1081,14 +1081,14 @@ selection sends no `model` at all. Generic in `base_widget`/`formgen`.
 Verified live: an IOS request with no `model` returned 200 in 17s with
 `model_bundle: ALI_IOS_Models`.
 
-### 2026-07-31 — 501 for "this server cannot do that", instead of a blank 500
+### 2026-07-31 - 501 for "this server cannot do that", instead of a blank 500
 
 Found by running ALI in IOS mode: the preflight raised immediately with a
 message naming pytorch3d, and that message went to the server log while the
-Slicer user got `500 — The tool failed on the server.`
+Slicer user got `500 - The tool failed on the server.`
 
 500 hides its detail rightly: a crash inside a tool can name server-side paths.
-A missing optional dependency is the opposite — the request was valid, nothing
+A missing optional dependency is the opposite - the request was valid, nothing
 the caller changes will help, and the reason names a package.
 
 `base.ToolUnavailableError` plus a `501 Not Implemented` mapping in `main.py`.
@@ -1097,7 +1097,7 @@ Every dependency-import failure across `ALI`, `CrownSeg` and `AMASSS` raises it
 another is worse than either. **No client release needed:** `error_for_status`
 shows the server's `detail` verbatim for any unmapped status.
 
-### 2026-07-31 — Test files are downloadable: `GET /tools/{tool}/testfiles/{filename}`
+### 2026-07-31 - Test files are downloadable: `GET /tools/{tool}/testfiles/{filename}`
 
 The Slicer client grows a per-input "Test file" button filling a file input
 with reference data. The hosted-name route runs a tool on a test file without
@@ -1107,7 +1107,7 @@ One Bearer-protected endpoint streams a test file by name, resolved through
 `data_store.resolve_testfile` (so the backend abstraction and its traversal
 checks apply; unknown name → 404). A folder entry is zipped on the fly into a
 staging dir under `TEMP_DIR` and removed by background task once streamed; a
-backend temp copy is likewise removed. **Test files only** — models are
+backend temp copy is likewise removed. **Test files only** - models are
 selected by name and used in place. The log line carries tool, status, duration
 and size, never the file name.
 
@@ -1119,11 +1119,11 @@ its button off the actual `GET /tools/{tool}/data` listing, so an empty
 with the right headers, a folder zipped with `TEMP_DIR` clean afterward, and an
 `is_temporary` copy removed after streaming.
 
-### 2026-07-31 — `monai` pinned: an unpinned entry was replacing the image's torch
+### 2026-07-31 - `monai` pinned: an unpinned entry was replacing the image's torch
 
 Caught by reading a `pip install` log, not by a failing test. Adding `monai`
 unpinned made every container start resolve `monai 1.6.0`, which requires
-`torch>=2.8.0` — so pip downloaded `torch 2.13.0` plus the whole CUDA 13 stack
+`torch>=2.8.0` - so pip downloaded `torch 2.13.0` plus the whole CUDA 13 stack
 **over the image's `2.5.1+cu124`**, on every start. Three consequences, none of
 which fail a test: ~3 GB per container start, `torchaudio 2.5.1+cu124` left
 unsatisfiable, and the image's purpose-built CUDA torch shadowed by a wheel
@@ -1138,7 +1138,7 @@ When adding one, check its torch requirement against the image.
 
 **And an operational one.** The `inference` service installs requirements as
 part of its *command*, so a container up for days runs whatever
-`requirements.txt` said when it last started — uvicorn's `--reload` picks up
+`requirements.txt` said when it last started - uvicorn's `--reload` picks up
 new Python code but never re-runs pip. Worse, `pip --user` writes into the
 container's writable layer, which `docker compose restart` keeps. After
 changing `requirements.txt`:
@@ -1152,14 +1152,14 @@ identically, each only after a complete histogram correction, and the run ended
 on "ALI produced no landmarks for any scan". Both engines now import their
 whole lazy stack once, before the loop.
 
-### 2026-07-31 — Real-data tests are opt-in; `test-gpu` service; ALI's GPU cap off 1
+### 2026-07-31 - Real-data tests are opt-in; `test-gpu` service; ALI's GPU cap off 1
 
 `inference` already runs on the GPU and every tool reads `settings.DEVICE`.
 Nothing hardcodes a device; the one service deliberately on CPU was `test`.
 
 - **`test-gpu`.** The unit tests stub every model and gain nothing from a card,
   but `tests/test_data_integration.py` runs each tool end to end against the
-  real bundles — minutes on a GPU, hours on a CPU. A compose device reservation
+  real bundles - minutes on a GPU, hours on a CPU. A compose device reservation
   is all-or-nothing, so putting it on `test` would make the pre-push hook fail
   on any clone without a card. A second service instead, sharing everything
   through a YAML anchor. The hook keeps pointing at `test`.
@@ -1175,9 +1175,9 @@ Nothing hardcodes a device; the one service deliberately on CPU was `test`.
   `AMASSS_MAX_GPU_JOBS` stays at 1: a 3d_fullres nnUNet is a different order of
   magnitude and nothing here measured it.
 
-### 2026-07-31 — ALI (both engines) + CrownSeg
+### 2026-07-31 - ALI (both engines) + CrownSeg
 
-Port `ALI` — automatic landmark identification — from a pair of Slicer CLI
+Port `ALI` - automatic landmark identification - from a pair of Slicer CLI
 modules. The first tool with *two* engines sharing nothing but their output
 format, and the first whose IOS half depends on a library the image lacks.
 
@@ -1197,22 +1197,22 @@ that actually ran is a 422 naming the argument to fill in.
 
 **`CrownSeg` is a tool, not a helper.** ALI's IOS engine needs a mesh carrying
 per-tooth labels. The Slicer module got them by running the `dentalmodelseg`
-executable out of Slicer's bin — which is only the console-script entry point
+executable out of Slicer's bin - which is only the console-script entry point
 of the `shapeaxi` PyPI package, so nothing needed porting: `tools/CrownSeg/src/`
 calls `shapeaxi.dental_model_seg.main()` directly. It lives in its own tool
 because ASO, AREG and FlexReg call it too, and because ALI's IOS half needs
-pytorch3d — inside ALI, one absent dependency would take four tools out of the
+pytorch3d - inside ALI, one absent dependency would take four tools out of the
 registry instead of one. `model` is optional there and falls back to
 `settings.CROWNSEG_MODEL`; the library's own fallback downloads the checkpoint
 from GitHub mid-request, and a server holding patient data does not make
-outbound calls. shapeaxi's stdout is swallowed — it prints the patient's own
+outbound calls. shapeaxi's stdout is swallowed - it prints the patient's own
 file name.
 
 **Defects fixed by construction**, all of which lost results silently:
 
 - **One unknown landmark cost the whole patient.** `LABEL_GROUPS[landmark]` was
   indexed with no guard inside the save loop, and its `KeyError` was caught far
-  above — so nothing at all was written for that scan. The two spellings that
+  above - so nothing at all was written for that scan. The two spellings that
   triggered it (`UR3OI…` in the UI, `UR3OIP…` in the CLI) are aliases of one
   vocabulary now, and `group_of()` cannot raise.
 - **Homonyms overwrote each other in batch.** The patient key was `file.name`,
@@ -1228,18 +1228,18 @@ file name.
   scratch dir, as does the segmentation CSV the module wrote into the
   extension's own source tree.
 - **`.stl` was accepted then ignored**: the UI counted them, the CLI globbed
-  for `.vtk` only. `surface_or_zip_file` (new `FILE_TYPES` entry — the only
+  for `.vtk` only. `surface_or_zip_file` (new `FILE_TYPES` entry - the only
   core edit) advertises exactly what discovery walks.
 - **`R`, `RIP`, `OIP`** were selectable and predicted by nothing. Not offered.
 - **`SaveId` was read by nothing**; `prediction_ID` is a real argument.
 - **Output extensions disagreed** (`.mrk.json` vs `.json` for identical
   content, only the first of which Slicer recognises). Uniform, and one file
-  per scan instead of one per region — the split forced every downstream tool
+  per scan instead of one per region - the split forced every downstream tool
   to recombine them by hand.
 - **`display.visibility: false`**, in both CLIs. It switches the markups
   *display* node off, so Slicer loads the file, builds the node and draws
   nothing. Invisible inside the old module, fatal the moment anyone opens a
-  result file — which is what a returned archive is for. Two tests pin it.
+  result file - which is what a returned archive is for. Two tests pin it.
 - Two latent search bugs: `new_pos.all() > 0` reduced the array to one boolean
   *before* comparing, letting negative coordinates through; and `Focus`'s
   convergence loop had no bound, which in a worker thread is a request that
@@ -1248,13 +1248,13 @@ file name.
 
 **Sequencing:** the CBCT engine runs today on `monai` + `itk`. The IOS engine
 and CrownSeg are written and tested but cannot execute until the base image is
-rebuilt on torch ≥ 2.8 with pytorch3d compiled in — pytorch3d has no PyPI
+rebuilt on torch ≥ 2.8 with pytorch3d compiled in - pytorch3d has no PyPI
 distribution at all. Both are imported lazily, so ALI loads, publishes its
 schema, and fails only an IOS *run*.
 
 **Tests:** 37 for ALI, 20 for CrownSeg, no GPU, weights or network.
 
-### 2026-07-31 — ASO ported: four modes, one tool, and the defects it inherited
+### 2026-07-31 - ASO ported: four modes, one tool, and the defects it inherited
 
 Port ASO (Automated Standardized Orientation) from a 2587-line Slicer widget
 plus four CLI modules. ASO is the step every longitudinal study runs before
@@ -1302,12 +1302,12 @@ report entry and the rest of the batch is processed.
   `patient1.vtk` was registered against the mandibular reference and returned
   as a success. A file whose name does not say its jaw is refused.
 - **`Files_vtk_json.organise` paired with `vtk_name in json_name`**, so patient
-  `1` matched patient `10` — and padded its list with a literal
+  `1` matched patient `10` - and padded its list with a literal
   `"Upper_nioegfjhdfjkdffdhjmndfhnmdfhj"` sentinel. Exact stem, per directory.
 - **Both jaws wrote the same `.tfm`.** Named per jaw now.
 - **The published IOS reference was rejected outright.** Refusing a mesh whose
   name does not say its jaw is right, but the first version also required an
-  identifier *before* the jaw token — and the published `Gold_file.zip` is
+  identifier *before* the jaw token - and the published `Gold_file.zip` is
   `Upper_gold.vtk` / `Lower_gold.vtk`, jaw first. Found by reading the real
   archive rather than assuming its shape.
 
@@ -1315,14 +1315,14 @@ report entry and the rest of the batch is processed.
 
 - `InitIcp` wrote `source.npy`/`target.npy` into **its own installed package
   directory** and re-`np.load`ed one on every iteration of a 2500-iteration
-  search — a write into the install tree, thousands of round trips per patient,
+  search - a write into the install tree, thousands of round trips per patient,
   and two concurrent requests overwriting each other's landmarks. The search is
   pure and in memory (`src/geometry.py`, shared by both engines, which had
   carried two drifted copies).
 - The triplet search drew from the **global** numpy generator, so the same
   request gave a different orientation every time. Every ordered triplet is now
   enumerated when there are at most `ASO_ICP_MAX_TRIPLETS` of them (7 landmarks
-  is 210) — deterministic, faster *and* better than sampling; above that a
+  is 210) - deterministic, faster *and* better than sampling; above that a
   local generator seeded with `ASO_ICP_SEED` is used.
 
 **Latent bugs found while reading, each now a test:** `np.arccos` of a dot
@@ -1339,7 +1339,7 @@ always had it right, which makes it a transcription slip.
 and `temp_folder` arguments (read, never used), the `<filter-progress>` prints,
 `sys.exit()`, `tqdm`, the `time.sleep(0.2)` progress theatre, the `*Error.txt`
 files written into the output folder, the skip-if-exists guards, and the
-reference *scan* the CBCT ICP read and never used — which it nonetheless
+reference *scan* the CBCT ICP read and never used - which it nonetheless
 required, so a reference bundle holding only landmarks died on an `IndexError`.
 
 **Core changes, both sanctioned:** one `FILE_TYPES` entry (`surface_file`) and
@@ -1358,14 +1358,14 @@ read.
 **Tests:** 201 server tests, 71 new. Two of them cover the outputs a clinician
 relies on, and both hold to the float: the written landmarks land exactly where
 the resampling put the voxels (volume and markups move by two different code
-paths — if they disagree the markups file opens floating beside its scan), and
+paths - if they disagree the markups file opens floating beside its scan), and
 the `.tfm` maps ORIENTED → ORIGINAL, recentring included. That direction is
 asserted rather than assumed because getting it backwards is silent.
 
-### 2026-07-30 — AMASSS surfaces: binary, and decimated by default
+### 2026-07-30 - AMASSS surfaces: binary, and decimated by default
 
 A five-structure run with surfaces returned a 41.9 MB archive Slicer could not
-open — the client froze on the main thread and the user read it as "the server
+open - the client froze on the main thread and the user read it as "the server
 never sent the .vtk". It had: `curl` pulled all 41,889,544 bytes and every mesh
 re-read cleanly. The geometry was the problem.
 
@@ -1375,7 +1375,7 @@ re-read cleanly. The geometry was the problem.
   only accurate to about half a voxel, so that is resolution nobody asked for.
 - **`vtkPolyDataWriter` was writing ASCII** (its default): 848.5 MB for the
   merged surface against 6.4 MB for every segmentation in the same run. Binary
-  is the same geometry and the *more* accurate of the two — it round-trips the
+  is the same geometry and the *more* accurate of the two - it round-trips the
   float32 vertices exactly, while ASCII prints ~6 significant digits and moved
   points by up to 5e-05 mm on read-back. It is also 133x faster to parse (a
   1.6M triangle cranial base: 2.67s ASCII, 0.02s binary).
@@ -1401,7 +1401,7 @@ triangles 3,519,420 → **351,938** (10x), client-side mesh parsing 2.7s+ →
 **A caveat worth keeping:** binary alone did NOT shrink the download. DEFLATE
 was already squeezing ASCII at 6.2:1 and binary only compresses 2.7:1, so the
 archive went 223.4 MB → 227.8 MB on a nine-structure run. Binary pays off in
-disk, RAM, write time, zip time and parse time — not on the wire. Only removing
+disk, RAM, write time, zip time and parse time - not on the wire. Only removing
 geometry moved the download.
 
 **Still on the table, in the client repo:** `AMASSS.py`'s
@@ -1409,7 +1409,7 @@ geometry moved the download.
 
 **Tests:** 119 server tests (+4).
 
-### 2026-07-30 — AMASSS: the GPU was idle seven eighths of the run
+### 2026-07-30 - AMASSS: the GPU was idle seven eighths of the run
 
 Profiling one structure on a 512x512x365 CBCT at 0.33 mm: **14.6s** resampling
 the input to the model's 0.4 mm grid, **4.5s** of inference, **6.9s** resampling
@@ -1418,17 +1418,17 @@ the logits back. Both resamplings are scipy splines pinned to a single core.
 **The tempting fix was measured and discarded.** At a 128³ patch the network
 already saturates the SMs at batch 1: throughput is flat from batch 1 through
 12. Cutting the GPU's work 5x (`tile_step_size` 0.5 → 1.0) moved the total from
-37.3s to 34.5s and dropped utilisation from 36% to 11% — direct evidence the
+37.3s to 34.5s and dropped utilisation from 36% to 11% - direct evidence the
 GPU was never the constraint. **Free VRAM is not convertible into speed here;
 idle time is.**
 
 - **GPU resampling** (`nnunet_runner._enable_gpu_resampling`, new setting
   `AMASSS_GPU_RESAMPLING`, default on). nnUNet already ships torch versions of
-  both resamplers, so nothing is reimplemented — only selected, and selected by
+  both resamplers, so nothing is reimplemented - only selected, and selected by
   NAME: nnUNet resolves them out of the configuration dict via
   `recursive_find_resampling_fn_by_name`. Two things make that mutation safe:
   `PlansManager` hands out a `deepcopy`, so it touches neither the shared plans
-  nor a concurrent request — and consequently the `torch.device` never reaches
+  nor a concurrent request - and consequently the `torch.device` never reaches
   the `plans.json` nnUNet writes, which `json.dump` could not serialize. Both
   properties are `@property @lru_cache`, so the swap clears them.
 - The GPU path uses `predict_from_files_sequential`: `predict_from_files` fans
@@ -1442,7 +1442,7 @@ idle time is.**
 **Not numerically free.** torch has no 3D cubic interpolation, so the input
 resampling drops from spline order 3 to order 1. Dice against the scipy
 pipeline: MAND 0.998, UAW 0.997, MAX 0.995, CB 0.991, **CV 0.978**. The
-cervical vertebra is consistently the outlier — thinnest structure, closest to
+cervical vertebra is consistently the outlier - thinnest structure, closest to
 the edge of the field of view. `AMASSS_GPU_RESAMPLING=false` restores
 bit-identical output, and a bundle whose plans pin a non-default resampler opts
 itself out. `AMASSS_report.json` records `gpu_resampling` and `tile_step_size`.
@@ -1462,7 +1462,7 @@ removed after use.
 
 **Tests:** 115 server tests (+5).
 
-### 2026-07-30 — Dead-code and duplication cleanup
+### 2026-07-30 - Dead-code and duplication cleanup
 
 - `base.py` had an entire block (`FOLDER_TYPE`, `SCALAR_TYPES`, `CHOICE_TYPES`,
   `Selection`, `ResolvedPath`) declared TWICE, plus the remnants of the retired
@@ -1481,10 +1481,10 @@ removed after use.
   `choice`/`multichoice`, `ADDING_A_TOOL.md` §7 now describes the real
   requirements layout.
 
-### 2026-07-28 — AMASSS tool + grouped selection arguments
+### 2026-07-28 - AMASSS tool + grouped selection arguments
 
 Port `AMASSS_CLI.py` (CBCT skull structure segmentation, nnUNet v2). The first
-tool that is genuinely an *API* — AREG already calls it programmatically — the
+tool that is genuinely an *API* - AREG already calls it programmatically - the
 first to need an argument the schema could not express, and the first with a
 GPU deep-learning stack.
 
@@ -1496,7 +1496,7 @@ GPU deep-learning stack.
   widget straight from `GET /tools` and the defaults are written down once.
   Accepted on the wire as `"MAND,MAX"` or `{"MAND": true}`; an invalid option
   is a 422 naming what is allowed. This is a change to the *type system*, made
-  once — the same category as adding a `FILE_TYPES` entry.
+  once - the same category as adding a `FILE_TYPES` entry.
 - `FILE_TYPES["volume_or_zip_file"]`: one argument accepting either a single
   volume or a zip of a folder of them, since the schema cannot express "exactly
   one of these two arguments".
@@ -1531,11 +1531,11 @@ tool at startup and a missing heavy stack must not stop the server booting.
 **Tests:** 35 with `nnunet_runner.predict_folder` stubbed, so no GPU and no
 real models are needed.
 
-### 2026-07-27 — Parallel request handling (threadpool execution of tools)
+### 2026-07-27 - Parallel request handling (threadpool execution of tools)
 
 `run_tool` called `tool.invoke(args)` synchronously inside an `async def`
 endpoint, i.e. directly on the uvicorn event loop. Any inference in progress
-froze the entire server — a second `/run`, or even `/health`, could not be
+froze the entire server - a second `/run`, or even `/health`, could not be
 answered until it finished.
 
 `tool.invoke` now runs via `anyio.to_thread.run_sync(...)` in a worker thread,
@@ -1548,18 +1548,18 @@ The HTTP contract is unchanged.
 
 **Test:** a probe tool whose `run()` blocks on a 2-party `threading.Barrier`,
 fired from two requests through ONE shared event loop (`TestClient` as a
-context manager — two bare `client.post` calls from separate threads would each
+context manager - two bare `client.post` calls from separate threads would each
 get their own loop and pass even against a serial server).
 
-### 2026-07-27 — SurgMovPred: the model is server-side only, selected by name
+### 2026-07-27 - SurgMovPred: the model is server-side only, selected by name
 
 The model should live exclusively in the server's data store: the client asks
 for the list (`GET /tools/SurgMovPred/data`) and sends only the *name*.
 
 The `model` argument changed from `ArgSpec(type="zip_file",
 server_selectable="model")` to `ArgSpec(type=str, server_selectable="model")`.
-The resolution path is unchanged — `main.py` already resolves any
-`server_selectable` argument sent as a form value — but the contract is: a
+The resolution path is unchanged - `main.py` already resolves any
+`server_selectable` argument sent as a form value - but the contract is: a
 scalar type means "name only". To enforce it, `main.py` rejects with a 400 any
 file *upload* targeting a non-file-typed argument, which previously would have
 passed the temp path through as the argument's string value.
@@ -1567,7 +1567,7 @@ passed the temp path through as the argument's string value.
 **Tests:** an upload for `model` is a 400; an unknown model name is a 404; a
 synthetic str-typed `server_selectable` argument resolves through `data_store`.
 
-### 2026-07-27 — Pre-push test gate + real-data integration tests
+### 2026-07-27 - Pre-push test gate + real-data integration tests
 
 The suite only ran on synthetic fixtures and only when someone remembered to
 invoke it. A new `docker-compose.yml` service, `test`, runs the same image as
@@ -1580,7 +1580,7 @@ every tool whose required arguments are all `server_selectable`, it looks up
 real files via `data_store` and runs the tool end to end. `DATA/` is gitignored,
 so a tool with no matching file is **skipped**, never failed.
 
-### 2026-07-24 — Server-side data store: models and test files without re-upload
+### 2026-07-24 - Server-side data store: models and test files without re-upload
 
 Tools like `SurgMovPred` required the client to re-upload the same model on
 every call, and there was no way to say "run this against the server's
@@ -1604,13 +1604,13 @@ contained entirely to `data_store.py`.
 Also: `docker-compose.yml` now mounts a single `./DATA:/data:ro` (previously two
 inconsistent mounts), and `.gitignore` excludes `DATA/`.
 
-### 2026-07-24 — Correct `Content-Type` for file-kind tool outputs
+### 2026-07-24 - Correct `Content-Type` for file-kind tool outputs
 
 `POST /run/{tool_name}` responses with `output_kind in ("file", "segmentation")`
 always sent `application/octet-stream` (or `application/gzip`), regardless of
 the real format. An `.xlsx` is internally a zip container, so a client deciding
-whether to unzip by sniffing magic bytes could not tell it from a real archive
-— it silently extracted the Excel file's internal XML parts.
+whether to unzip by sniffing magic bytes could not tell it from a real archive -
+it silently extracted the Excel file's internal XML parts.
 
 The `FileResponse` now derives `media_type` from the extension via
 `mimetypes.guess_type()`, falling back to the previous logic only when the type
@@ -1619,5 +1619,5 @@ also fixes `.zip`, `.csv` and `.ods`.
 
 **Client-side follow-up (not in this repo):** a client deciding whether to unzip
 by sniffing magic bytes must trust `Content-Type`/`Content-Disposition`
-instead — sniffing can never distinguish a real `.xlsx`/`.docx`/`.pptx` from an
+instead - sniffing can never distinguish a real `.xlsx`/`.docx`/`.pptx` from an
 actual zip archive, those formats being zip containers by design.

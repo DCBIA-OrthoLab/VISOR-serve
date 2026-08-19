@@ -1,4 +1,4 @@
-# The deployment image — one container, N virtualenvs
+# The deployment image - one container, N virtualenvs
 
 ```
 /opt/sadt/{.venv,server,runner.py}   the API: newest Python, fastapi, no torch
@@ -30,7 +30,7 @@ between a tool and the file it was just handed. One image, one container, and
 docker buildx build -f docker/Dockerfile --build-context tools=<dir> -t sadt .
 ```
 
-`<dir>` holds one folder per tool — `pyproject.toml`, `uv.lock`, `src/` — which
+`<dir>` holds one folder per tool - `pyproject.toml`, `uv.lock`, `src/` - which
 is what the `sadt-tools` repository holds. `.schema.json` is **generated during
 the build**, by running `describe.py` with that tool's own freshly-synced
 interpreter, because a schema read from a tool's source can only be produced by
@@ -40,7 +40,7 @@ It is a **named build context** rather than a path inside this repo because the
 tools genuinely live in another one; a named context overrides the stage of the
 same name, so omitting it builds a server with no tools, which is valid.
 
-The context may be a working checkout, `.venv/` directories and all — those are
+The context may be a working checkout, `.venv/` directories and all - those are
 excluded rather than copied, so pointing this at `~/code/sadt-tools/tools`
 works without a `dist/` staging step. A tool nested one level deeper (a
 grouping folder holding several related tools) is **not** discovered by the
@@ -62,7 +62,7 @@ docker run --rm sadt /opt/sadt/.venv/bin/python /opt/sadt/verify_dedup.py
 
 uv installs a package by **hardlinking** it out of its cache, so the same wheel
 in eleven virtualenvs costs the disk once. When that falls back to copying,
-nothing observable fails — every tool still runs, every test still passes — and
+nothing observable fails - every tool still runs, every test still passes - and
 the image is tens of gigabytes larger. Measured on the current tool set: one
 isolated torch 2.2 CUDA stack is 4.9 GB; eleven torch tools are ~63 GB with
 deduplication broken, ~26 GB with it working, ~17 GB if the pins are aligned
@@ -83,7 +83,7 @@ A link count of 1 everywhere means deduplication is broken.
    copy, silently. A BuildKit `--mount=type=cache` pointed straight at
    `UV_CACHE_DIR` breaks exactly this, because the mount *is* a separate
    filesystem. The cache mount is therefore transport only: copy in, sync,
-   copy back out, prune — all in one `RUN`.
+   copy back out, prune - all in one `RUN`.
 2. **Every `uv sync` in a single `RUN` layer.** overlayfs copies a file up when
    a later layer touches it, which breaks hardlinks between tools installed in
    different layers; and a cache deleted in a later layer frees nothing, it
@@ -96,7 +96,7 @@ A link count of 1 everywhere means deduplication is broken.
    dependencies.
 
 One more, which is why there is a single base image: `nvidia-*` wheels are
-`py3-none-manylinux` — no Python ABI tag — so they deduplicate across
+`py3-none-manylinux` - no Python ABI tag - so they deduplicate across
 virtualenvs **even when the tools pin different Pythons**. A torch wheel
 bundles its own CUDA runtime and the driver lives on the host, so a CUDA base
 image per torch version buys nothing.
@@ -105,8 +105,8 @@ image per torch version buys nothing.
 
 The image builds each tool's virtualenv **in place**, at the path it will be
 used from, which is why none of what follows applies to it. It applies to every
-other arrangement — a dev server pointed at a checkout, a CI job, anything that
-mounts `sadt-tools` rather than baking it — and both constraints were found by
+other arrangement - a dev server pointed at a checkout, a CI job, anything that
+mounts `sadt-tools` rather than baking it - and both constraints were found by
 hitting them.
 
 **Mount paths must match host paths exactly.** A virtualenv is not relocatable:
@@ -144,9 +144,9 @@ run succeeded directly on the host, whose `/dev/shm` is half of RAM.
 a committed file. Without `DESCRIBE_PATH` pointing at `sadt-tools/scripts/describe.py`
 and a writable `SCHEMA_CACHE_DIR`, every packaged tool fails to load. The server
 now refuses to start in that case rather than serving only its in-process
-fixtures — a registry of two reads as a small deployment, not a broken one.
+fixtures - a registry of two reads as a small deployment, not a broken one.
 
-## `docker/fixtures/` — what the image is proven with
+## `docker/fixtures/` - what the image is proven with
 
 Three tools that need no GPU, no model and no network:
 
@@ -156,8 +156,8 @@ Three tools that need no GPU, no model and no network:
 | `numpy_new` | `numpy>=2`, Python `>=3.13` | numpy 2.5.2 on 3.13 |
 | `numpy_twin` | `numpy>=2`, Python `>=3.13` | numpy 2.5.2 on 3.13 |
 
-The first two are the conflict the whole architecture exists for, in miniature
-— `SurgMovPred` wants `numpy==2.4.0` while AREG/MedX/CLIC want `numpy<2.0.0`,
+The first two are the conflict the whole architecture exists for, in miniature -
+`SurgMovPred` wants `numpy==2.4.0` while AREG/MedX/CLIC want `numpy<2.0.0`,
 and no single interpreter can hold both. Note that the old pin drags an old
 interpreter behind it: numpy 1.26 ships no wheel for 3.13, so uv installs
 Python 3.12 into the image for that tool alone.

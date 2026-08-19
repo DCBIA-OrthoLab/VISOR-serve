@@ -35,12 +35,12 @@ interpreter, so it cannot drift from the code.
 | `merge: bool = False` | `bool` | check box |
 | `mode: Literal["A", "B"]` | `choice` | combo box |
 | `parts: list[Literal["a", "b"]]` | `multichoice` | check boxes |
-| `output_dir: Path` | — | filled in by the server |
-| `*, sup` | — | the supervisor, never published |
+| `output_dir: Path` | - | filled in by the server |
+| `*, sup` | - | the supervisor, never published |
 
 ## Calling another tool
 
-Declare `*, sup` — keyword-only and **unannotated** — and the runner hands you a
+Declare `*, sup` - keyword-only and **unannotated** - and the runner hands you a
 supervisor. Being unannotated is the marker: every other parameter must be
 annotated, so nothing else has that shape, and a tool cannot grow one by
 forgetting a type.
@@ -62,7 +62,7 @@ message)`, `sup.log(message)`.
   a typo in an attribute is an `AttributeError` an hour into a job.
 - **Give the caller a way in.** Accept the dependency's output as an ordinary
   argument too (`landmarks: Path = ""`) and skip the call when it is supplied.
-  That is what keeps the tool usable with no supervisor at all — `uv run`, a
+  That is what keeps the tool usable with no supervisor at all - `uv run`, a
   notebook, a deployment that has not installed the sibling.
 - Default it to `None`. A tool that cannot run without one should say so itself,
   with a message naming the way forward.
@@ -74,7 +74,7 @@ takes a supervisor and `ALI` does not.
 
 Nested calls each get their own job directory under `<job>/sup/NN_<tool>/`, and
 are capped at four deep. A nested run is a subprocess of its parent, so it never
-queues behind the slot its parent already holds — but it is invisible to
+queues behind the slot its parent already holds - but it is invisible to
 `MAX_GPU_JOBS`, so a deployment running several supervised jobs at once has to
 size for more than one tool on the card.
 
@@ -104,14 +104,14 @@ wiring will use, so give them meaning.
 
 ## Failing
 
-Raise `ValueError` or `FileNotFoundError` for something the caller can fix —
+Raise `ValueError` or `FileNotFoundError` for something the caller can fix - 
 the message reaches them as a `422`. Anything else is a `500` with a fixed
 message, and the traceback stays in the server log.
 
 ## The exceptions
 
 Only if a convention is wrong for you, add a section to
-`server/deployment.toml` — the one file here a tool may ever need:
+`server/deployment.toml` - the one file here a tool may ever need:
 
 ```toml
 [tools.MyTool]
@@ -125,4 +125,4 @@ max_upload_mb = 500
 
 The tools still living in `server/tools/` are the old, in-process kind: a
 `Tool` subclass the server imports. They are being repackaged, and nothing new
-should be written that way — see `MIGRATING_A_TOOL.md`.
+should be written that way - see `MIGRATING_A_TOOL.md`.

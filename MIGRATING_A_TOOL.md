@@ -7,7 +7,7 @@ virtualenv.
 
 **One tool at a time, and reversible.** Nothing here is a big-bang cutover: the
 registry serves both kinds side by side, so a tool can move while the other
-fourteen carry on exactly as before. Deleting `server/tools/` happens once —
+fourteen carry on exactly as before. Deleting `server/tools/` happens once - 
 after the last tool has made this trip.
 
 ---
@@ -46,8 +46,8 @@ The folder name is not cosmetic: `dispatch.py` looks the interpreter up at
 `<TOOLS_DIR>/<tool name>/.venv/bin/python`, so a folder named anything else
 registers a tool that cannot be run. The server refuses it at startup.
 
-`run()` returns named outputs — `{"outputs": {"mandible": "/jobs/…/x.nii.gz"}}`
-— or a path, or a list of paths. All three work; the first is the one to write
+`run()` returns named outputs - `{"outputs": {"mandible": "/jobs/…/x.nii.gz"}}` -
+or a path, or a list of paths. All three work; the first is the one to write
 (see `server/README.md`).
 
 ### 2. Translate the schema, and know what it costs
@@ -63,7 +63,7 @@ panel shows today has to be declared differently or is lost:
 | `"folder"` | `"path"` | the client still zips it, the server still unpacks it |
 | `"multichoice"` | `list[Literal[...]]` | check boxes, kept: the generator publishes the options as `choices` |
 | `"choice"` | `Literal[...]` | a combo box, kept, same way |
-| `label`, `section`, `ui`, `groups`, `visible_when` | — | not expressible: the panel falls back to one flat column |
+| `label`, `section`, `ui`, `groups`, `visible_when` | - | not expressible: the panel falls back to one flat column |
 | `server_selectable` | `deployment.toml` | see step 3 |
 | `initial` | `"default"` | unchanged |
 
@@ -81,8 +81,8 @@ What that costs, tool by tool, measured on the current registry:
 | `ASO` | 12 | 3 choices, 4 multichoices, **7 `visible_when`**, 4 layouts, 12 labels |
 
 Read that column as an order of migration, not as a blocker: `Test_Tool`,
-`SurgMovPred` and `BatchDentalSeg` are nearly free, and `ASO` — whose four
-modes only make sense with `visible_when` hiding the inert half — should be
+`SurgMovPred` and `BatchDentalSeg` are nearly free, and `ASO` - whose four
+modes only make sense with `visible_when` hiding the inert half - should be
 last, and probably wants the schema to grow before it goes.
 
 > **The panel is the deliverable, not the schema.** A tool whose 119 landmarks
@@ -94,13 +94,13 @@ last, and probably wants the schema to grow before it goes.
 
 Three things a packaged tool declares but a caller never sends:
 
-- **`output_dir`** — every tool takes it as a required `Path` and writes only
+- **`output_dir`** - every tool takes it as a required `Path` and writes only
   there. It is removed from the published schema and filled in with the job's
   own `output/`.
-- **`device`** — injected from `settings.DEVICE` when the caller picks none,
+- **`device`** - injected from `settings.DEVICE` when the caller picks none,
   because a tool that no longer reads the environment would otherwise run on
   its own default (`cuda`) on a CPU server.
-- **the GPU slot** — the per-tool semaphores are gone with the tools that held
+- **the GPU slot** - the per-tool semaphores are gone with the tools that held
   them, so the server serialises card work through `MAX_CONCURRENT_GPU_JOBS`,
   one counter across all tools. **Every run is assumed to want the card**; the
   only way out is a `device` argument resolving to a CPU value. A tool that
@@ -133,7 +133,7 @@ docker run --rm <image> /opt/sadt/.venv/bin/python /opt/sadt/verify_dedup.py
 
 See [`docker/README.md`](docker/README.md).
 
-### 5. Prove it — this is the step that is not optional
+### 5. Prove it - this is the step that is not optional
 
 ```bash
 cd server
@@ -143,7 +143,7 @@ python parity.py --imported AMASSS --args case.json
 It runs both forms on the same arguments and compares **what a caller
 receives**: every file produced, by name and by hash, and the returned value
 with paths resolved to the artifacts they name. Absolute paths are never
-compared — one run wrote into a job directory, the other into a scratch
+compared - one run wrote into a job directory, the other into a scratch
 directory, and neither name means anything to a client.
 
 Where the two schemas differ (a `multichoice` became a `list[str]`), pass the
@@ -162,7 +162,7 @@ looked at. Run it on a real case, on real data, and read every line it prints.
 
 Drop the packaged folder into `TOOLS_DIR`. A folder with a `.schema.json` is
 **never imported**, so the in-process copy stops being used the moment the
-packaged one is present — under the same name, so no client changes.
+packaged one is present - under the same name, so no client changes.
 
 **Rolling back is deleting the `.schema.json`.** The folder is imported again
 on the next start. Which is why the in-process copy stays in `server/tools/`
@@ -187,9 +187,9 @@ Not before. Each of those is one line of deletion and no way back.
 ## Checklist
 
 - [ ] folder name == `.schema.json` `name` == what the client sends to `/run/<name>`
-- [ ] `source_hash` regenerated — `python server/schema_hash.py <tool>/src`
+- [ ] `source_hash` regenerated - `python server/schema_hash.py <tool>/src`
 - [ ] `uv.lock` committed, and `requires-python` matches what the pins actually
-      support (numpy 1.26 has no wheel for 3.13 — an old pin drags an old
+      support (numpy 1.26 has no wheel for 3.13 - an old pin drags an old
       interpreter behind it)
 - [ ] `extensions` declared on every `path` argument that is not "any file"
 - [ ] `description` on every argument (the client shows it under the field)
