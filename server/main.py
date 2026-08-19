@@ -26,6 +26,8 @@ from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
 from execution import dispatch
+from registry import facade
+from registry.facade import FacadeTool
 import file_utils
 from wire import transfer
 from base import (
@@ -784,6 +786,42 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     # session here instead of carrying their bytes in this request. Popped
     # before `args` is looked at, so it can never reach a tool as an argument.
     upload_references = _upload_references(args.pop(_UPLOADS_FIELD, None))
+
+    # A facade is a name standing for a choice between tools. Resolved HERE,
+    # before anything else looks at `tool`: from this line on the request is an
+    # ordinary run of an ordinary tool, with its own validation, timeout, GPU
+    # slot and job directory. Nothing downstream knows a facade was involved,
+    # which is what keeps this from being a second execution path.
+    if isinstance(tool, FacadeTool):
+        chosen = args.pop(facade.MODE_ARGUMENT, None)
+        if not chosen:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Missing required argument '{}' for '{}'. Choose one of: {}.".format(
+                    facade.MODE_ARGUMENT, tool.name, ", ".join(sorted(tool.targets))),
+            )
+        try:
+            target_name = tool.target_for(str(chosen))
+        except ToolArgumentError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        logger.info("facade=%s mode=%s -> tool=%s", tool.name, chosen, target_name)
+        # The name follows the tool: every later lookup -- this deployment's
+        # server_selectable entries, its upload limit, the log line -- is about
+        # what actually runs.
+        tool_name = target_name
+        tool = get_tool(target_name)
+
+        # Arguments the chosen mode does not declare. The facade publishes the
+        # union of its targets', so a panel that was switched from one mode to
+        # another legitimately still holds the other's fields; forwarding them
+        # would be an "unexpected argument" 422 for something the caller never
+        # typed. Dropped rather than refused, and only ever the ones the FACADE
+        # published: anything else is still an unexpected argument.
+        for extra in [name for name in args if name not in tool.arguments]:
+            args.pop(extra)
+        for extra in [name for name in uploaded_files if name not in tool.arguments]:
+            uploaded_files.pop(extra)
 
     # An argument declared with ArgSpec(server_selectable=...) can be sent as a
     # plain form value (the file name) instead of an upload, resolved below

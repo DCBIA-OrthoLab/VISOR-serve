@@ -41,7 +41,8 @@ logger = logging.getLogger("inference_server")
 # The two kinds data_store.py serves (DATA_DIR/<tool>/{models,testfiles}/).
 SERVER_SELECTABLE_KINDS = ("model", "testfile")
 
-_TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden", "timeout_seconds")
+_TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden",
+              "timeout_seconds", "dispatch")
 
 
 class DeploymentConfigError(Exception):
@@ -64,6 +65,18 @@ class ToolDeployment:
     # a case-insensitive lookup would be a guess -- on a case-sensitive
     # filesystem both can exist.
     data_dir: Optional[str] = None
+
+    # {mode label shown to a clinician: the tool that mode runs}. Declaring one
+    # publishes a FACADE: a tool of this name whose schema is composed from its
+    # targets' and which forwards a run to whichever the caller picked.
+    #
+    # Here rather than in a package of its own, because the facade holds no copy
+    # of anything. A packaged dispatcher would have to restate its targets'
+    # arguments in its own run() signature, and the day one of them gains an
+    # argument the dispatcher stops forwarding it -- silently, which is the
+    # failure this repository keeps finding. Composed at startup, there is
+    # nothing to keep in sync: the published schema IS the targets'.
+    dispatch: dict = field(default_factory=dict)
 
     # Argument names a client must not render. The tool still declares them and
     # still applies its own defaults; this only says a clinician has no
@@ -154,6 +167,17 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
                 f"expected one of {list(SERVER_SELECTABLE_KINDS)}."
             )
 
+    dispatch = table.get("dispatch", {})
+    if dispatch and not isinstance(dispatch, dict):
+        raise DeploymentConfigError(
+            f"{where}: 'dispatch' must be a table of {{mode = \"tool name\"}}."
+        )
+    for mode, target in (dispatch or {}).items():
+        if not isinstance(target, str) or not target:
+            raise DeploymentConfigError(
+                f"{where}: dispatch mode '{mode}' must name a tool, got {target!r}."
+            )
+
     data_dir = table.get("data_dir")
     if data_dir is not None and (not isinstance(data_dir, str) or not data_dir.strip()):
         raise DeploymentConfigError(f"{where}: 'data_dir' must be a non-empty string.")
@@ -182,6 +206,7 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
         server_selectable=dict(selectable),
         max_upload_mb=limit,
         data_dir=data_dir,
+        dispatch=dict(dispatch or {}),
         hidden=tuple(hidden),
         timeout_seconds=float(timeout) if timeout is not None else None,
     )

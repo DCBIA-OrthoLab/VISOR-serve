@@ -52,6 +52,7 @@ except ModuleNotFoundError:
 from base import Tool
 from config import settings
 from .deployment import deployment_config
+from .facade import build_facades
 from .schema_tool import SchemaTool, is_packaged, load_tool
 
 # This module runs at import time, BEFORE main.py reaches its own
@@ -319,7 +320,12 @@ def _check_deployment_config(registry: dict) -> None:
     A typo'd or leftover section is otherwise dead config that looks live: the
     dropdown it was meant to add simply never appears, and nothing says why.
     """
-    unknown = [name for name in deployment_config.configured_tools if name not in registry]
+    # A `dispatch` entry names the facade this file is asking to CREATE, so it
+    # is legitimately absent from the registry at this point.
+    unknown = [
+        name for name in deployment_config.configured_tools
+        if name not in registry and not deployment_config.for_tool(name).dispatch
+    ]
     if unknown:
         logger.warning(
             "deployment.toml configures %s, which this server does not serve. "
@@ -472,6 +478,14 @@ def _build_registry() -> dict:
         registry[instance.name] = instance
 
     _check_deployment_config(registry)
+
+    # After the real tools and before the supervised-call check, so a facade's
+    # targets are already registered and a `sup.run()` naming a facade is
+    # checked like any other name.
+    registry.update(build_facades(
+        registry, deployment_config.configured_tools, deployment_config.for_tool,
+        on_failure=_record_failure))
+
     _check_supervised_calls(registry)
 
     logger.info(
