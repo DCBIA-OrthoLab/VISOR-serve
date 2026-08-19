@@ -13,7 +13,7 @@ import zipfile
 
 from config import settings
 
-# NOTE: pandas is imported INSIDE load_tabular_file/load_tabular_directory, not
+# pandas is imported INSIDE load_tabular_file/load_tabular_directory, not
 # here. Those two are tool helpers -- only a tool that reads tabular data calls
 # them -- while this module is imported by main.py on every start. At module
 # level, pandas would be a hard dependency of the API process itself, which is

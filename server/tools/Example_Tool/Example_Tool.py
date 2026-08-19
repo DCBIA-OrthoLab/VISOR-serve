@@ -19,7 +19,7 @@ Three things worth copying from here:
    them and streams the archive back; no zip code lives in the tool. Returning
    the output directory itself works too -- see the end of run().
 
-# NOTE: to accept a file kind that doesn't exist yet (e.g. ".vtk"), add one
+# To accept a file kind that doesn't exist yet (e.g. ".vtk"), add one
 # entry to base.FILE_TYPES -- that is the only core edit a new tool should
 # ever need. Use the generic "file" type to fall back to
 # config.ALLOWED_EXTENSIONS instead.

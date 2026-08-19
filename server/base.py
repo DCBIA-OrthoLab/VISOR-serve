@@ -283,7 +283,7 @@ class ArgSpec:
                 return declared
         return self.types[0]
 
-    # NOTE: do not declare a `default` FIELD here. `default` is the @property
+    # Do not declare a `default` FIELD here. `default` is the @property
     # above, which derives the value from `choices`; a field of the same name
     # silently shadows it, and every optional choice argument then reaches
     # run() as None instead of its declared default.
