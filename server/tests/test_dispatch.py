@@ -304,3 +304,41 @@ def test_the_runner_and_the_server_agree_on_the_output_directory_name():
         f"runner.py no longer builds its output directory as "
         f"{dispatch.JOB_OUTPUT_DIRNAME!r}; dispatch.JOB_OUTPUT_DIRNAME must match."
     )
+
+
+def test_a_tools_interpreter_is_found_under_a_folder_that_is_not_its_name(tmp_path, monkeypatch):
+    """`[tool.sadt] name` is only real if the run path honours it.
+
+    Discovery lets a tool declare an API name that differs from its directory,
+    and refuses to descend into a folder that is already a tool. A dispatcher
+    served as `AREG` therefore cannot live in `tools/AREG/`, which is the
+    grouping folder holding the three real ones -- it needs a directory of its
+    own. That only works if the interpreter is looked up by the folder discovery
+    recorded, not by re-deriving it from the name.
+    """
+    import registry
+
+    tool_folder = tmp_path / "AREG_dispatch"
+    (tool_folder / ".venv" / "bin").mkdir(parents=True)
+    interpreter = tool_folder / ".venv" / "bin" / "python"
+    interpreter.write_text("")
+
+    class _Recorded:
+        name = "AREG"
+        folder = str(tool_folder)
+
+    monkeypatch.setitem(registry.TOOLS, "AREG", _Recorded())
+    monkeypatch.setattr(dispatch.settings, "TOOLS_DIR", str(tmp_path))
+
+    assert dispatch.tool_interpreter("AREG") == str(interpreter)
+
+
+def test_the_name_search_still_answers_when_the_registry_does_not(tmp_path, monkeypatch):
+    """Unit tests exercise dispatch with an empty registry, and an in-process
+    tool has no folder at all."""
+    folder = tmp_path / "Solo" / ".venv" / "bin"
+    folder.mkdir(parents=True)
+    (folder / "python").write_text("")
+    monkeypatch.setattr(dispatch.settings, "TOOLS_DIR", str(tmp_path))
+
+    assert dispatch.tool_interpreter("Solo") == str(folder / "python")

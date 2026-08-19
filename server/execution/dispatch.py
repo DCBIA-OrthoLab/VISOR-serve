@@ -139,6 +139,20 @@ class ToolExecutionError(RuntimeError):
     """
 
 
+def _registered_folder(tool_name: str):
+    """The folder discovery recorded for this tool, or None.
+
+    Imported inside the function: registry imports this module, so a module-level
+    import would be a cycle.
+    """
+    try:
+        import registry
+    except ImportError:
+        return None
+    tool = registry.TOOLS.get(tool_name)
+    return getattr(tool, "folder", None)
+
+
 def tool_interpreter(tool_name: str) -> str:
     """Path to the interpreter of this tool's virtualenv.
 
@@ -147,9 +161,25 @@ def tool_interpreter(tool_name: str) -> str:
     in tools/ALI/, which is not a tool itself. The folder is still named after
     the tool -- only its depth varies -- so this stays a lookup.
 
+    The registry is asked FIRST, because it already resolved this at startup and
+    a name-based search cannot answer for a tool whose `[tool.sadt] name` differs
+    from its directory. That key exists to make the API identity a decision
+    rather than an accident of directory casing, and it could not deliver while
+    the run path re-derived the folder from the name -- one rule in two places,
+    which is the shape of nearly every defect found in this repository.
+
+    The search below it stays as a fallback: registry.TOOLS is empty in unit
+    tests that exercise dispatch alone, and an in-process tool has no folder.
+
     The direct path is returned when nothing matches, so the caller's error
     names where it looked first.
     """
+    folder = _registered_folder(tool_name)
+    if folder:
+        registered = os.path.join(folder, ".venv", "bin", "python")
+        if os.path.isfile(registered):
+            return registered
+
     direct = os.path.join(settings.TOOLS_DIR, tool_name, ".venv", "bin", "python")
     if os.path.isfile(direct):
         return direct
