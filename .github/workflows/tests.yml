@@ -47,6 +47,19 @@ jobs:
       # RUN_REAL_DATA_TESTS is not set, so tests/test_data_integration.py
       # skips at collection: it runs real inference against whatever is staged
       # under DATA/, which is empty here and hours long on a CPU anyway.
+      # The image runs as uid 1000, which is a developer's login and NOT a
+      # runner's (1001), so the checkout it mounts was read-only to it. The
+      # suite writes probe tool folders under server/tools/ -- discovery imports
+      # by module name, so the folder has to really be there -- and every
+      # discovery test failed on EACCES: green on every laptop, red here for
+      # three pushes.
+      #
+      # The checkout is handed to the image's user rather than the image being
+      # run as the runner's: an arbitrary uid has no home in it, and pip's
+      # `--user` install then fails on /.local before a test runs.
+      - name: Let the image's user write to the checkout
+        run: sudo chown -R 1000:1000 server DATA
+
       - name: Run the server suite
         run: docker compose run --rm test
 
