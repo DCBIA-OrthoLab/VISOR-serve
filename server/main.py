@@ -408,7 +408,7 @@ def list_tool_data(tool_name: str) -> dict:
 
 
 def _remove_path(path: str) -> None:
-    """Remove a file or a whole directory tree — for backend-materialized temp
+    """Remove a file or a whole directory tree -- for backend-materialized temp
     copies (ResolvedFile.is_temporary), which can be either."""
     if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
@@ -444,7 +444,7 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
     path = resolved.path
     if os.path.isdir(path):
         # DATA_DIR is read-only: the archive is built in its own staging dir
-        # under TEMP_DIR, which must outlive the response stream — hence the
+        # under TEMP_DIR, which must outlive the response stream -- hence the
         # background task, and the inline cleanup on the one path where no
         # response (and so no background task) will ever run.
         staging_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
@@ -459,7 +459,7 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
             raise HTTPException(status_code=500, detail="Could not package the test folder.")
         background_tasks.add_task(shutil.rmtree, staging_dir, ignore_errors=True)
 
-    # Same log shape as /run: tool, status, duration, size — never the file
+    # Same log shape as /run: tool, status, duration, size -- never the file
     # name (see the confidentiality note at the top of this module).
     size = os.path.getsize(path)
     logger.info(

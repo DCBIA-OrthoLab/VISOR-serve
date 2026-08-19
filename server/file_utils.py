@@ -123,7 +123,7 @@ def extract_zip(
       fill the server's disk.
 
     `strip_single_root=True` returns the inner folder when the archive holds
-    exactly one — zipping "patients/" on any OS produces "patients/<files>",
+    exactly one -- zipping "patients/" on any OS produces "patients/<files>",
     and callers almost always want the files, not the wrapper.
     """
     if extract_dir is None:

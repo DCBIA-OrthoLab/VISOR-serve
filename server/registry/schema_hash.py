@@ -18,7 +18,7 @@ if they do not, every tool refuses to start.
 **This is a port of `scripts/describe.py::source_hash` in the sadt-tools
 repository, and it has to stay byte-for-byte equivalent to it.** That side
 generates the hash; this side only checks it. The two disagreeing by one
-separator means every tool looks stale and nothing loads — which is exactly
+separator means every tool looks stale and nothing loads -- which is exactly
 what happened the first time, before the two were compared on a real tool.
 
 The rule: sha256 over `<relative posix path>\\0<the file's bytes>\\0`, for
