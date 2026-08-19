@@ -29,3 +29,12 @@ data_dir = "AREG"
 # global default applies while the chain is still being measured.
 [tools.AREG_IOSCBCT]
 data_dir = "AREG"
+
+# The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
+# this each looks for DATA/<its own name>/ and falls back to the run-together
+# spelling (ALICBCT), which was never going to exist.
+[tools.ALI_CBCT]
+data_dir = "ALI"
+
+[tools.ALI_IOS]
+data_dir = "ALI"

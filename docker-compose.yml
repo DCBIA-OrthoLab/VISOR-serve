@@ -152,7 +152,10 @@ services:
   # repository's output. It defaults to the build fixtures, which need no GPU
   # and no model and exist to prove the layout works:
   #
-  #     TOOLS_CONTEXT=../sadt-tools/dist docker compose --profile venvs build
+  #     TOOLS_CONTEXT=../sadt-tools docker compose --profile venvs build
+  #
+  # The ROOT of the checkout, not a dist/ subdirectory: the build copies
+  # `tools` and `scripts` out of that context, and both sit at the top.
   #
   # No GPU reservation here yet: the fixtures do not need one, and a
   # reservation is all-or-nothing (it would make this service unstartable on
@@ -172,6 +175,12 @@ services:
       # Read-only, and outside the image: an image gets copied around, a mount
       # does not.
       - ./DATA:/DATA:ro
+      # deployment.toml is per-INSTALLATION config: which tool reads which DATA
+      # folder, what each may upload, how long each may run. Baked into the
+      # image, changing one line costs a 22 GB rebuild, and a published image
+      # could not be configured at all. Mounted over the image's own copy, which
+      # stays the default for a deployment that mounts nothing here.
+      - ./server/deployment.toml:/opt/sadt/server/deployment.toml:ro
     # Port 8001 by default, so it can run beside the in-process server while
     # the tools are moved over one at a time.
     ports:
