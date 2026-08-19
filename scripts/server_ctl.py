@@ -3,7 +3,7 @@
 
 This is the engine behind scripts/setup-server.sh, and it is what the Slicer
 "Slicer Cloud" module drives: every button in that panel is one subcommand
-here. It manages the clone it lives in — `scripts/server_ctl.py` sitting one
+here. It manages the clone it lives in - `scripts/server_ctl.py` sitting one
 directory below the repository root is how it finds everything else.
 
     python3 scripts/server_ctl.py status --json
@@ -78,7 +78,7 @@ def _which(name: str):
 
 def _capture(cmd, cwd=None, timeout=60):
     """Run `cmd`, returning (returncode, stdout, stderr) and never raising for
-    a non-zero exit — callers here decide what a failure means."""
+    a non-zero exit - callers here decide what a failure means."""
     try:
         completed = subprocess.run(
             cmd, cwd=cwd, timeout=timeout, check=False,
@@ -272,14 +272,14 @@ def compose_base(service: str):
 
 
 # ---------------------------------------------------------------------------
-# .env — the only place the deployment's secret lives
+# .env - the only place the deployment's secret lives
 # ---------------------------------------------------------------------------
 
 ENV_PATH = os.path.join(REPO_ROOT, ".env")
 
 # Keys docker-compose.yml interpolates. Anything else in the file is left alone.
 _ENV_KEYS = ("API_TOKEN", "DEVICE", "BIND_ADDR", "HOST_PORT")
-_ENV_BANNER = "# Written by scripts/server_ctl.py. This file is gitignored — keep it that way."
+_ENV_BANNER = "# Written by scripts/server_ctl.py. This file is gitignored - keep it that way."
 
 
 def read_env(path=ENV_PATH) -> dict:
@@ -300,7 +300,7 @@ def write_env(updates: dict, path=ENV_PATH) -> None:
     """Merge `updates` into the .env, preserving every other line verbatim.
 
     Rewriting the file wholesale would drop whatever the operator added by
-    hand — DEVICE overrides, an extra setting read by server/config.py — and
+    hand - DEVICE overrides, an extra setting read by server/config.py - and
     doing that silently on an "Update" click is exactly the kind of surprise
     this file must not spring.
     """
@@ -341,7 +341,7 @@ def effective_port() -> int:
     """The host port this deployment publishes on.
 
     Read from the same `.env` compose interpolates, so `status` and `up` cannot
-    disagree about where the server is — the environment wins for a one-off
+    disagree about where the server is - the environment wins for a one-off
     override, exactly as it does for compose itself.
     """
     raw = os.environ.get("HOST_PORT") or read_env().get("HOST_PORT")
@@ -500,7 +500,7 @@ def clone_status(check_remote: bool = False, want_branch=None) -> dict:
         if len(parts) == 2:
             info["ahead"], info["behind"] = int(parts[0]), int(parts[1])
     elif not check_remote:
-        # No local copy of the upstream ref yet — a fetch will produce one.
+        # No local copy of the upstream ref yet - a fetch will produce one.
         info["error"] = f"no local record of {upstream}; run 'update' to fetch it"
     return info
 
@@ -551,7 +551,7 @@ def port_in_use(port: int = DEFAULT_PORT, host: str = "127.0.0.1") -> bool:
 
 
 def health(url=None, timeout: float = 5.0) -> bool:
-    """GET /health. Never raises — an unreachable server just means "not up"."""
+    """GET /health. Never raises - an unreachable server just means "not up"."""
     url = url or url_for()
     try:
         with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as response:
@@ -582,7 +582,7 @@ def wait_for_health(url: str, timeout: int, service: str) -> bool:
         state = container_status(service)
         # "restarting" belongs here with the dead states: `restart:
         # unless-stopped` turns a container that fails at boot into a loop, and
-        # a loop never becomes healthy — without this the caller waited out the
+        # a loop never becomes healthy - without this the caller waited out the
         # full 30-minute timeout on a failure visible in three seconds.
         if state["exists"] and state["state"] in ("exited", "dead", "restarting"):
             log(f"The '{service}' container is not running ({state['state']}).")
@@ -610,8 +610,8 @@ _DEPS_FATAL_MARKER = "DEPENDENCY-INSTALL-FATAL"
 def warn_if_deps_skipped(service: str) -> bool:
     """Say so when the container started without re-running its dependency install.
 
-    Harmless in the offline case it exists for — everything was already
-    installed — but it is the one state where a change to requirements.txt has
+    Harmless in the offline case it exists for - everything was already
+    installed - but it is the one state where a change to requirements.txt has
     NOT taken effect while the server looks perfectly healthy. That has to be
     visible rather than buried in `docker compose logs`.
     """
@@ -623,7 +623,7 @@ def warn_if_deps_skipped(service: str) -> bool:
     log(
         "NOTE: the dependency install did not run this start (no network?). The server is up "
         "on the packages already in its container. If you just changed requirements.txt, it "
-        "has NOT taken effect — re-run 'update' with the network available."
+        "has NOT taken effect - re-run 'update' with the network available."
     )
     return True
 
@@ -634,7 +634,7 @@ def cmd_logs_tail(service: str, lines: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# DATA/ — what the manifest offers against what is on disk
+# DATA/ - what the manifest offers against what is on disk
 # ---------------------------------------------------------------------------
 
 def _load_fetch_data():
@@ -656,7 +656,7 @@ def ensure_data_dir() -> str:
     """Create DATA/ as the invoking user, BEFORE docker can create it as root.
 
     `./DATA:/data:ro` is a bind mount with `create_host_path: true`, so a
-    missing host path is created by the docker DAEMON — owned by root. Every
+    missing host path is created by the docker DAEMON - owned by root. Every
     later `models` download then dies on "Permission denied" against the very
     directory the server reads, on a brand-new install, for a reason nothing
     on screen explains. Creating it first is the entire fix; the check below is
@@ -669,7 +669,7 @@ def ensure_data_dir() -> str:
         raise ServerCtlError(f"Could not create {root}: {exc}") from None
     if not os.access(root, os.W_OK):
         raise ServerCtlError(
-            f"{root} exists but this user cannot write to it — docker created it as root "
+            f"{root} exists but this user cannot write to it - docker created it as root "
             f"before anything else did. Fix it once with:\n\n"
             f"    sudo chown -R $(id -u):$(id -g) {root}"
         )
@@ -680,7 +680,7 @@ def catalog() -> dict:
     """Per tool: what the manifest offers, and how much of it is already here.
 
     This is what makes a partial install legible. `missing_size` is the honest
-    figure — what a download would actually transfer — and it is what the
+    figure - what a download would actually transfer - and it is what the
     client shows, because "AMASSS: 1.5 GB" next to an already-complete AMASSS
     is the number that makes someone skip a tool they could have for free.
     """
@@ -764,7 +764,7 @@ def cmd_token(_args) -> dict:
     token = read_env().get("API_TOKEN")
     if not token:
         raise ServerCtlError(
-            f"No API_TOKEN in {ENV_PATH}. Run 'server_ctl.py up' — it generates one."
+            f"No API_TOKEN in {ENV_PATH}. Run 'server_ctl.py up' - it generates one."
         )
     return {"token": token}
 
@@ -877,7 +877,7 @@ def cmd_update(args) -> dict:
     # --- the code half: pure git ------------------------------------------
     # Deliberately BEFORE the docker preflight. Updating the clone needs
     # neither a working docker nor a free port, and those are exactly the
-    # things a user may be updating in order to fix — refusing to fetch new
+    # things a user may be updating in order to fix - refusing to fetch new
     # code because port 8000 is busy is the tool getting in its own way.
     if args.branch:
         # Before the drift check, not after: "behind" is meaningless while the
@@ -890,7 +890,7 @@ def cmd_update(args) -> dict:
         if clone["dirty"] and clone["behind"]:
             raise ServerCtlError(
                 f"This clone has uncommitted changes and is {clone['behind']} commit(s) behind "
-                f"{_upstream()}. Refusing to pull over local edits — commit or discard them first."
+                f"{_upstream()}. Refusing to pull over local edits - commit or discard them first."
             )
         if clone["behind"]:
             log(f"{clone['behind']} new commit(s) on {_upstream()}. Fast-forwarding...")
@@ -915,7 +915,7 @@ def cmd_update(args) -> dict:
         return result
 
     # The image tag is pinned in docker-compose.yml, so this is a no-op unless
-    # the pull above moved it — but it is what makes a tag bump take effect.
+    # the pull above moved it - but it is what makes a tag bump take effect.
     _stream(compose_base(service) + ["pull", service], cwd=REPO_ROOT)
     result["pulled_image"] = True
 
@@ -1094,7 +1094,7 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument(
         "--bind", default=None,
         help="Host address the port is published on. Omitted, it keeps whatever the "
-             "deployment already uses, and 127.0.0.1 on a first install — this deployment "
+             "deployment already uses, and 127.0.0.1 on a first install - this deployment "
              "speaks plain HTTP, so it stays on loopback unless someone says otherwise. "
              "Pass an empty string to publish on every interface (IPv4 and IPv6), which is "
              "only acceptable behind a TLS terminator; '0.0.0.0' does the same for IPv4 "

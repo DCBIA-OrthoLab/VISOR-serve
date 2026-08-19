@@ -717,7 +717,7 @@ def test_download_unknown_testfile_is_404():
 
 def test_download_testfile_streams_the_file(monkeypatch, tmp_path):
     """A plain test file is streamed as-is, named by Content-Disposition and
-    typed from its real extension — the two headers the Slicer client trusts
+    typed from its real extension - the two headers the Slicer client trusts
     to write it to disk under the right name."""
     import main
     from data_store import ResolvedFile
