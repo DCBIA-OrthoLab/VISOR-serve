@@ -240,6 +240,11 @@ class ArgSpec:
     # which is what the client's pad reads.
     x_range: Optional[tuple] = None
     y_range: Optional[tuple] = None
+    # Names for the two ends of each axis, paired with the range by index.
+    # Presentation, unlike the ranges above: "0.8" says nothing about where that
+    # is in a mouth, and "mid"/"out" does.
+    x_labels: Optional[list] = None
+    y_labels: Optional[list] = None
 
     hidden: bool = False
 
