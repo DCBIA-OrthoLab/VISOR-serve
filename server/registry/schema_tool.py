@@ -45,6 +45,7 @@ from base import (
     LIST_TYPE,
     MULTICHOICE_TYPE,
     PATH_TYPE,
+    VEC2_TYPE,
     ArgSpec,
     Selection,
     Tool,
@@ -78,6 +79,10 @@ ARGUMENT_TYPES = {
     "list[float]": LIST_TYPE,
     "list[bool]": LIST_TYPE,
     "list[path]": LIST_TYPE,
+    # Two numbers set together. The client renders a 2D pad for it when the
+    # schema also says `ui: "joystick"`; without that hint it is two spin
+    # boxes, which is the same value either way.
+    "vec2": VEC2_TYPE,
 }
 
 # A schema type carrying `choices` is a fixed set, and the two widgets fall
@@ -129,6 +134,9 @@ DEFAULT_RETURN_KIND = "text"
 _ARGUMENT_KEYS = (
     "type", "required", "default", "description", "extensions", "choices",
     "section", "ui", "groups", "visible_when", "options_when", "label", "hidden",
+    # A "vec2"'s two axes. Alone among the keys here they reach validate():
+    # a value outside them is refused, not merely left un-rendered.
+    "x_range", "y_range",
 )
 
 # The output directory every tool takes as a required argument. The SERVER owns
@@ -280,12 +288,31 @@ _PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "options_when",
 
 
 def _presentation(declaration: dict) -> dict:
-    """The layout hints a declaration carries, if any."""
-    return {
+    """The layout hints a declaration carries, if any.
+
+    `x_range`/`y_range` ride along because they are declared the same way, but
+    they are not presentation: validate() refuses a value outside them. Kept as
+    tuples so an ArgSpec cannot be edited in place by whoever reads it.
+    """
+    hints = {
         key: declaration[key]
         for key in _PRESENTATION_KEYS
         if declaration.get(key) is not None
     }
+    for axis in ("x_range", "y_range"):
+        bounds = declaration.get(axis)
+        if bounds is None:
+            continue
+        if not isinstance(bounds, (list, tuple)) or len(bounds) != 2:
+            raise SchemaError(
+                "{!r} must be two numbers, low end first (or high end first for "
+                "a mirrored axis).".format(axis)
+            )
+        try:
+            hints[axis] = tuple(float(bound) for bound in bounds)
+        except (TypeError, ValueError):
+            raise SchemaError("{!r} must be two numbers.".format(axis))
+    return hints
 
 
 def _argument_spec(
