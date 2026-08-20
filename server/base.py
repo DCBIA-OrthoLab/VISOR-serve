@@ -99,6 +99,11 @@ VEC2_TYPE = "vec2"
 #   "inline" -> a single horizontal row, for a handful of short options.
 UI_LAYOUTS = ("tabs", "grid", "inline")
 
+# How a "vec2" is offered. Without it the argument is two spin boxes, which is
+# the same value; with it the client adds a 2D pad that writes into them, so a
+# drag sets both at once and the knob sits where the point sits.
+VEC2_LAYOUTS = ("joystick",)
+
 # The layouts that are meaningless without ArgSpec.groups.
 _GROUPED_LAYOUTS = ("tabs", "grid")
 
@@ -405,15 +410,22 @@ class Tool(ABC):
             )
 
         if spec.ui is not None:
-            if spec.types[0] != MULTICHOICE_TYPE:
+            # Two kinds of argument offer a choice of layout, and they do not
+            # share a vocabulary: a multichoice arranges check boxes, a vec2
+            # decides whether its two numbers also get a pad.
+            if spec.types[0] == VEC2_TYPE:
+                allowed = VEC2_LAYOUTS
+            elif spec.types[0] == MULTICHOICE_TYPE:
+                allowed = UI_LAYOUTS
+            else:
                 raise ToolSchemaError(
-                    f"{where}: 'ui' lays a multichoice argument's check boxes out, and this "
-                    f"argument is a {spec.types[0]!r}."
+                    f"{where}: 'ui' lays out a multichoice's check boxes or a vec2's "
+                    f"pad, and this argument is a {spec.types[0]!r}."
                 )
-            if spec.ui not in UI_LAYOUTS:
+            if spec.ui not in allowed:
                 raise ToolSchemaError(
-                    f"{where}: unknown ui layout {spec.ui!r}. Expected one of "
-                    f"{sorted(UI_LAYOUTS)}."
+                    f"{where}: unknown ui layout {spec.ui!r} for a "
+                    f"{spec.types[0]!r}. Expected one of {sorted(allowed)}."
                 )
 
         if spec.groups is not None:
