@@ -80,6 +80,17 @@ CHOICE_TYPES = (CHOICE_TYPE, MULTICHOICE_TYPE)
 # array or as the comma-separated shorthand, exactly like "multichoice".
 LIST_TYPE = "list[str]"
 
+# Two numbers set together, because they are one position rather than two
+# settings. FlexReg's butterfly corners are the case it exists for: each has a
+# medio-lateral ratio and an antero-posterior adjust in millimetres, and the
+# client's pad reads both axes SPATIALLY -- the knob sits where the point sits
+# on the arch. Two separate number fields state two numbers and cannot state
+# that.
+#
+# Accepted on the wire as a JSON array or the comma-separated shorthand, like
+# the list and multichoice types.
+VEC2_TYPE = "vec2"
+
 # How a client lays a "multichoice" argument's options out (ArgSpec.ui). None
 # is the single-column stack.
 #   "tabs"   -> one tab per `groups` entry, for a catalog too long to scroll.
@@ -222,6 +233,14 @@ class ArgSpec:
     # nnUNet's tile step size, whether to resample on the GPU. They change the
     # result, they are recorded in the run report, and they are set by whoever
     # deploys the server -- not by the person segmenting a patient.
+    # The two axes of a "vec2", low end first. Unlike every other field in this
+    # block these are NOT presentation only: validate() refuses a value outside
+    # them, because a request that skips the panel would otherwise place a patch
+    # corner off the arch. A mirrored axis is written by inverting the range,
+    # which is what the client's pad reads.
+    x_range: Optional[tuple] = None
+    y_range: Optional[tuple] = None
+
     hidden: bool = False
 
     # How a "multichoice" argument's check boxes are laid out (see UI_LAYOUTS).
@@ -574,6 +593,8 @@ class Tool(ABC):
             return self._coerce_multichoice(arg_name, value, spec)
         if declared == LIST_TYPE:
             return self._coerce_list(arg_name, value)
+        if declared == VEC2_TYPE:
+            return self._coerce_vec2(arg_name, value, spec)
         if declared is str:
             # A ResolvedPath is a str, so a server-selectable scalar keeps its
             # .kind here instead of being flattened back to a plain string.
@@ -590,6 +611,45 @@ class Tool(ABC):
                     f"Argument '{arg_name}' must be a {declared.__name__}"
                 )
         return value
+
+    @staticmethod
+    def _coerce_vec2(arg_name: str, value: Any, spec: "ArgSpec") -> tuple:
+        """Exactly two numbers, inside the ranges the schema declared.
+
+        Shape and bounds are both checked because both can be wrong
+        independently: one number is a bug in the caller, and a ratio of 1.4 on
+        a 0-to-1 axis is a request that would place a patch corner off the arch
+        and be answered with a success.
+        """
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.strip("[]() ").split(",") if part.strip()]
+        elif isinstance(value, (list, tuple)):
+            parts = list(value)
+        else:
+            raise ToolArgumentError(
+                f"Argument '{arg_name}' must be two numbers, got {type(value).__name__}"
+            )
+
+        if len(parts) != 2:
+            raise ToolArgumentError(
+                f"Argument '{arg_name}' must be exactly two numbers, got {len(parts)}"
+            )
+        try:
+            numbers = tuple(float(part) for part in parts)
+        except (TypeError, ValueError):
+            raise ToolArgumentError(f"Argument '{arg_name}' must be two numbers")
+
+        for number, bounds, axis in zip(numbers, (spec.x_range, spec.y_range), ("x", "y")):
+            if bounds is None:
+                continue
+            # Declared low-to-high or high-to-low: a mirrored axis is written by
+            # inverting the range, which the client's pad already relies on.
+            if not min(bounds) <= number <= max(bounds):
+                raise ToolArgumentError(
+                    f"Argument '{arg_name}': {axis} is {number}, outside the "
+                    f"declared range [{bounds[0]}, {bounds[1]}]"
+                )
+        return numbers
 
     @staticmethod
     def _coerce_bool(arg_name: str, value: Any) -> bool:
