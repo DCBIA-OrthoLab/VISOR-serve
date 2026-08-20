@@ -20,7 +20,7 @@ from registry import deployment
 import registry
 from registry import schema_hash
 from registry import schema_tool
-from base import LIST_TYPE, Tool, ToolArgumentError
+from base import ArgSpec, LIST_TYPE, Tool, ToolArgumentError
 from config import settings
 import config
 from execution import dispatch
@@ -649,3 +649,25 @@ def test_a_mirrored_axis_is_written_by_inverting_the_range():
             return corner
 
     assert _Probe().invoke({"corner": "-10,0"}) == (-10.0, 0.0)
+
+
+def test_a_tool_declaring_a_vec2_passes_its_own_schema_check():
+    """The whole load path, not just _argument_spec.
+
+    `check_schema` keeps a second list of accepted types, and vec2 was added to
+    the registry's and not to that one: every unit test here went through
+    `_argument_spec` directly and passed, while a real tool declaring a pad
+    failed to load with "unknown type 'vec2'". Found by starting a server, which
+    is the only thing that walks both.
+    """
+    from base import VEC2_TYPE
+
+    class _Probe(Tool):
+        name = "Probe"
+        output_kind = "text"
+        arguments = {"corner": ArgSpec(type=VEC2_TYPE, x_range=(0.0, 1.0))}
+
+        def run(self, corner=None):
+            return corner
+
+    _Probe().check_schema()  # must not raise
