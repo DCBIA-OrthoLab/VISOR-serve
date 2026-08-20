@@ -49,3 +49,12 @@ dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "CBCT to IOS" = "AREG_IOS
 
 [tools.ALI]
 dispatch = { "CBCT" = "ALI_CBCT", "Intraoral scan" = "ALI_IOS" }
+
+# FlexReg's `reference` is the patient's OWN other timepoint, uploaded with the
+# rest, not a hosted bundle. The convention reads any argument named `reference`
+# as a model picked from DATA/<tool>/models/, which left the panel offering an
+# empty dropdown and reporting "no model available on the server" for a tool
+# that has none and needs none. `surfaces` is likewise always uploaded: there
+# are no reference arches to run against.
+[tools.FlexReg]
+server_selectable = { surfaces = "none", reference = "none" }
