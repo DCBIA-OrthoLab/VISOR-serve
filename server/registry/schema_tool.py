@@ -364,7 +364,12 @@ def _argument_spec(
     # A deployment decision, not the tool's: which arguments a client renders.
     # The spec still exists and the tool still applies its own default -- this
     # only says nobody is asked. See ArgSpec.hidden.
-    hidden = argument_name in deployment.hidden
+    # Either side may hide it, and neither overrides the other: a TOOL knows an
+    # argument is not for a clinician (FlexReg's four teeth bound the patch and
+    # nobody changes them), a DEPLOYMENT knows what this server does not want
+    # asked. The schema's own key was accepted and then silently dropped, which
+    # is worse than refusing it.
+    hidden = argument_name in deployment.hidden or bool(declaration.get("hidden"))
 
     choices = declaration.get("choices")
     if choices:

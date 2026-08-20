@@ -596,3 +596,19 @@ def test_a_tool_declaring_a_vec2_passes_its_own_schema_check():
             return corner
 
     _Probe().check_schema()  # must not raise
+
+
+def test_a_tool_can_hide_its_own_argument():
+    """The key was accepted and then dropped.
+
+    `hidden` was read only from deployment.toml, so a tool declaring it in its
+    own layout got no warning and no effect -- FlexReg's four tooth numbers kept
+    rendering. A deployment can still hide more; neither side overrides the
+    other.
+    """
+    spec = schema_tool._argument_spec(
+        "T", "tooth", {"type": "int", "required": False, "hidden": True},
+        deployment.ToolDeployment(),
+    )
+
+    assert spec.hidden is True
