@@ -388,6 +388,8 @@ def list_tools() -> list:
                     "x_labels": list(spec.x_labels) if spec.x_labels else None,
                     # How many columns this argument's section is laid out in.
                     "section_columns": spec.section_columns,
+                    # Arguments naming one cell are drawn together in it.
+                    "cell": spec.cell,
                     "y_labels": list(spec.y_labels) if spec.y_labels else None,
                     # Listed explicitly so the wire shape does not depend on
                     # whether a tool spelled its catalog as a tuple or a list.
