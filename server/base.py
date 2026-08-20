@@ -357,9 +357,11 @@ class Tool(ABC):
                     and declared not in SCALAR_TYPES
                     and declared not in CHOICE_TYPES
                     and declared != LIST_TYPE
+                    and declared != VEC2_TYPE
                 ):
                     raise ToolSchemaError(
                         f"{where}: unknown type {declared!r}. Use a scalar type, {LIST_TYPE!r}, "
+                        f"{VEC2_TYPE!r}, "
                         f"one of {sorted(FILE_TYPES)}, or one of {sorted(CHOICE_TYPES)}."
                     )
             if len(spec.types) > 1 and not spec.is_file:
