@@ -251,6 +251,14 @@ class ArgSpec:
     x_labels: Optional[list] = None
     y_labels: Optional[list] = None
 
+    # How many columns this argument's SECTION is laid out in. Declared per
+    # argument because that is where the schema hangs its hints, read back per
+    # section by the client. FlexReg's four patch corners are a 2x2 mirroring
+    # the arch -- left column one side, top row anterior -- so where a pad sits
+    # on screen is where that corner sits in the mouth. Stacked one per row that
+    # meaning is gone.
+    section_columns: Optional[int] = None
+
     hidden: bool = False
 
     # How a "multichoice" argument's check boxes are laid out (see UI_LAYOUTS).
