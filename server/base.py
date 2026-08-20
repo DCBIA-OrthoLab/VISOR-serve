@@ -259,6 +259,12 @@ class ArgSpec:
     # meaning is gone.
     section_columns: Optional[int] = None
 
+    # Which grid cell this argument shares. Several arguments describing one
+    # thing belong in one cell: FlexReg's anterior right corner is a tooth
+    # number and a position along it, drawn together. Absent, an argument has a
+    # cell of its own.
+    cell: Optional[str] = None
+
     hidden: bool = False
 
     # How a "multichoice" argument's check boxes are laid out (see UI_LAYOUTS).

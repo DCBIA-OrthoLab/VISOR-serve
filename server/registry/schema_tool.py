@@ -138,7 +138,7 @@ _ARGUMENT_KEYS = (
     # a value outside them is refused, not merely left un-rendered.
     "x_range", "y_range",
     # Names for the two ends of each axis: presentation, unlike the ranges.
-    "x_labels", "y_labels", "section_columns",
+    "x_labels", "y_labels", "section_columns", "cell",
 )
 
 # The output directory every tool takes as a required argument. The SERVER owns
@@ -287,7 +287,7 @@ def read_schema(folder: str) -> dict:
 # and nothing arrived. In one function because there are four places an ArgSpec
 # is built and three of them are easy to forget.
 _PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label",
-                      "x_labels", "y_labels", "section_columns")
+                      "x_labels", "y_labels", "section_columns", "cell")
 
 
 def _presentation(declaration: dict) -> dict:
