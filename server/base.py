@@ -250,6 +250,11 @@ class ArgSpec:
     # is in a mouth, and "mid"/"out" does.
     x_labels: Optional[list] = None
     y_labels: Optional[list] = None
+    # What each of a vec2's two numbers IS. The client writes them beside the
+    # boxes, so "Ratio (R-L)" and "Adjust (A-P)" read as measurements rather
+    # than as the "X" and "Y" it falls back to.
+    x_label: Optional[str] = None
+    y_label: Optional[str] = None
 
     # How many columns this argument's SECTION is laid out in. Declared per
     # argument because that is where the schema hangs its hints, read back per

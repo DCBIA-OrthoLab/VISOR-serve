@@ -406,6 +406,8 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         "y_labels": None,
         "section_columns": None,
         "cell": None,
+        "x_label": None,
+        "y_label": None,
     }
     structures = entry["arguments"]["structures"]
     assert structures["type"] == LIST_TYPE and structures["initial"] == ["Mandible"]
