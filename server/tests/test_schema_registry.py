@@ -398,6 +398,12 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         "hidden": False,
         "ui": None,
         "groups": None,
+        # A vec2's two axes and their end labels. Null on every other type,
+        # which is what lets a client that ignores them render unchanged.
+        "x_range": None,
+        "y_range": None,
+        "x_labels": None,
+        "y_labels": None,
     }
     structures = entry["arguments"]["structures"]
     assert structures["type"] == LIST_TYPE and structures["initial"] == ["Mandible"]
