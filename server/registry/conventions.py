@@ -16,6 +16,7 @@ weights from their laptop. See schema_tool's `selectable == "model"` branch.
 
 from __future__ import annotations
 
+from . import deployment as deployment_module
 from .deployment import ToolDeployment
 
 # Suffixes that mean "the server hosts this, the caller names it".
@@ -58,6 +59,11 @@ def derive(arguments: dict, declared: ToolDeployment) -> ToolDeployment:
             continue
         selectable[name] = "model" if is_model(name) else "testfile"
     selectable.update(declared.server_selectable)
+    # "none" is a removal, not a kind: it is how a deployment opts an argument
+    # out of a convention its NAME would otherwise put it in.
+    for name, kind in list(selectable.items()):
+        if kind == deployment_module.SERVER_SELECTABLE_NONE:
+            del selectable[name]
 
     hidden = {name for name in arguments if name in TECHNICAL}
     hidden.update(declared.hidden)

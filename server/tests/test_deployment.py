@@ -19,6 +19,7 @@ os.environ.setdefault("API_TOKEN", "test-token")
 
 from fastapi.testclient import TestClient
 
+from registry import conventions
 from registry import deployment
 import main
 from registry import schema_tool
@@ -221,3 +222,27 @@ def test_under_the_limit_still_runs(one_megabyte_limit):
 
 def test_the_global_limit_applies_when_no_tool_declares_one():
     assert deployment.deployment_config.upload_limit_mb("Example_Tool") == settings.MAX_UPLOAD_MB
+
+
+def test_a_deployment_can_opt_an_argument_out_of_a_naming_convention():
+    """`none` is a removal, not a kind.
+
+    The conventions read any `path` named `reference` as a hosted bundle, which
+    is right for ASO and AREG and wrong for FlexReg, whose `reference` is the
+    patient's own other timepoint. Without a way to say no, the panel offered an
+    empty dropdown and reported "no model available on the server" for a tool
+    that has none and needs none.
+    """
+    arguments = {
+        "reference": {"type": "path"},
+        "scans": {"type": "path"},
+    }
+    declared = deployment.ToolDeployment(
+        server_selectable={"reference": deployment.SERVER_SELECTABLE_NONE}
+    )
+
+    merged = conventions.derive(arguments, declared)
+
+    assert "reference" not in merged.server_selectable
+    # Untouched: an exception costs one line rather than restating the rest.
+    assert merged.server_selectable["scans"] == "testfile"
