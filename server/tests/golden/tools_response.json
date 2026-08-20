@@ -19,6 +19,10 @@
         "options_when": null,
         "hidden": false,
         "ui": null,
+        "x_range": null,
+        "y_range": null,
+        "x_labels": null,
+        "y_labels": null,
         "groups": null
       },
       "input": {
@@ -46,6 +50,10 @@
         "options_when": null,
         "hidden": false,
         "ui": null,
+        "x_range": null,
+        "y_range": null,
+        "x_labels": null,
+        "y_labels": null,
         "groups": null
       },
       "threshold": {
@@ -65,6 +73,10 @@
         "options_when": null,
         "hidden": false,
         "ui": null,
+        "x_range": null,
+        "y_range": null,
+        "x_labels": null,
+        "y_labels": null,
         "groups": null
       },
       "iterations": {
@@ -84,6 +96,10 @@
         "options_when": null,
         "hidden": false,
         "ui": null,
+        "x_range": null,
+        "y_range": null,
+        "x_labels": null,
+        "y_labels": null,
         "groups": null
       },
       "outputs": {
@@ -107,6 +123,10 @@
         "options_when": null,
         "hidden": false,
         "ui": null,
+        "x_range": null,
+        "y_range": null,
+        "x_labels": null,
+        "y_labels": null,
         "groups": null
       },
       "preview_format": {
@@ -129,6 +149,10 @@
         "options_when": null,
         "hidden": false,
         "ui": null,
+        "x_range": null,
+        "y_range": null,
+        "x_labels": null,
+        "y_labels": null,
         "groups": null
       }
     },
@@ -154,6 +178,10 @@
         "options_when": null,
         "hidden": false,
         "ui": null,
+        "x_range": null,
+        "y_range": null,
+        "x_labels": null,
+        "y_labels": null,
         "groups": null
       },
       "text_2": {
@@ -173,6 +201,10 @@
         "options_when": null,
         "hidden": false,
         "ui": null,
+        "x_range": null,
+        "y_range": null,
+        "x_labels": null,
+        "y_labels": null,
         "groups": null
       }
     },
