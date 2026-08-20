@@ -22,6 +22,7 @@
         "x_range": null,
         "y_range": null,
         "x_labels": null,
+        "section_columns": null,
         "y_labels": null,
         "groups": null
       },
@@ -53,6 +54,7 @@
         "x_range": null,
         "y_range": null,
         "x_labels": null,
+        "section_columns": null,
         "y_labels": null,
         "groups": null
       },
@@ -76,6 +78,7 @@
         "x_range": null,
         "y_range": null,
         "x_labels": null,
+        "section_columns": null,
         "y_labels": null,
         "groups": null
       },
@@ -99,6 +102,7 @@
         "x_range": null,
         "y_range": null,
         "x_labels": null,
+        "section_columns": null,
         "y_labels": null,
         "groups": null
       },
@@ -126,6 +130,7 @@
         "x_range": null,
         "y_range": null,
         "x_labels": null,
+        "section_columns": null,
         "y_labels": null,
         "groups": null
       },
@@ -152,6 +157,7 @@
         "x_range": null,
         "y_range": null,
         "x_labels": null,
+        "section_columns": null,
         "y_labels": null,
         "groups": null
       }
@@ -181,6 +187,7 @@
         "x_range": null,
         "y_range": null,
         "x_labels": null,
+        "section_columns": null,
         "y_labels": null,
         "groups": null
       },
@@ -204,6 +211,7 @@
         "x_range": null,
         "y_range": null,
         "x_labels": null,
+        "section_columns": null,
         "y_labels": null,
         "groups": null
       }
