@@ -20,7 +20,7 @@ from registry import deployment
 import registry
 from registry import schema_hash
 from registry import schema_tool
-from base import LIST_TYPE, ToolArgumentError
+from base import LIST_TYPE, Tool, ToolArgumentError
 from config import settings
 import config
 from execution import dispatch
@@ -575,3 +575,77 @@ def test_the_interpreter_is_found_in_a_later_catalogue(tmp_path, monkeypatch):
     )
 
     assert dispatch.tool_interpreter("Elsewhere") == str(interpreter)
+# ---------------------------------------------------------------------------
+# vec2: two numbers, and the ranges are not presentation
+
+
+def _vec2_declaration(**extra):
+    declaration = {
+        "type": "vec2",
+        "required": False,
+        "description": "Ratio and adjust of one corner.",
+        "x_range": [0.0, 1.0],
+        "y_range": [-5.0, 5.0],
+        "ui": "joystick",
+    }
+    declaration.update(extra)
+    return declaration
+
+
+def test_a_vec2_carries_its_axis_ranges_into_the_spec():
+    spec = schema_tool._argument_spec("T", "corner", _vec2_declaration(), deployment.ToolDeployment())
+
+    assert spec.types[0] == "vec2"
+    assert spec.x_range == (0.0, 1.0)
+    assert spec.y_range == (-5.0, 5.0)
+
+
+def test_the_ranges_are_tuples_so_a_reader_cannot_edit_them():
+    """An ArgSpec is shared by every request for that tool."""
+    spec = schema_tool._argument_spec("T", "corner", _vec2_declaration(), deployment.ToolDeployment())
+
+    assert isinstance(spec.x_range, tuple)
+
+
+def test_a_range_that_is_not_two_numbers_is_refused_at_startup():
+    with pytest.raises(schema_tool.SchemaError, match="two numbers"):
+        schema_tool._argument_spec(
+            "T", "corner", _vec2_declaration(x_range=[0.0]), deployment.ToolDeployment()
+        )
+
+
+def test_a_value_outside_the_declared_range_is_refused_by_validate():
+    """The one layout key that reaches validate(). A request that skips the
+    panel would otherwise place a patch corner off the arch and be answered with
+    a success."""
+    spec = schema_tool._argument_spec("T", "corner", _vec2_declaration(), deployment.ToolDeployment())
+
+    class _Probe(Tool):
+        name = "Probe"
+        output_kind = "text"
+        arguments = {"corner": spec}
+
+        def run(self, corner=None):
+            return corner
+
+    assert _Probe().invoke({"corner": "0.8,-3"}) == (0.8, -3.0)
+    with pytest.raises(ToolArgumentError, match="outside the declared range"):
+        _Probe().invoke({"corner": "0.8,9"})
+
+
+def test_a_mirrored_axis_is_written_by_inverting_the_range():
+    """`x_range: [15, -15]` puts 15 at the left end, which is how the client's
+    pad declares a mirrored axis."""
+    spec = schema_tool._argument_spec(
+        "T", "corner", _vec2_declaration(x_range=[15.0, -15.0]), deployment.ToolDeployment()
+    )
+
+    class _Probe(Tool):
+        name = "Probe"
+        output_kind = "text"
+        arguments = {"corner": spec}
+
+        def run(self, corner=None):
+            return corner
+
+    assert _Probe().invoke({"corner": "-10,0"}) == (-10.0, 0.0)
