@@ -57,4 +57,8 @@ dispatch = { "CBCT" = "ALI_CBCT", "Intraoral scan" = "ALI_IOS" }
 # that has none and needs none. `surfaces` is likewise always uploaded: there
 # are no reference arches to run against.
 [tools.FlexReg]
-server_selectable = { surfaces = "none", reference = "none" }
+# Both take a hosted arch now: DATA/FlexReg/testfiles/Arches holds one upper and
+# one lower, each carrying per-tooth labels. `reference` stays out of the model
+# convention -- it is the patient's own other timepoint, not a bundle -- but it
+# is a surface a caller may well want to pick from the server.
+server_selectable = { surfaces = "testfile", reference = "testfile" }
