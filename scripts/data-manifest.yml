@@ -460,6 +460,11 @@ tools:
         url: https://github.com/DCBIA-OrthoLab/Fly-by-CNN/releases/download/3.0/07-21-22_val-loss0.169.pth
         size: 6612456
     testfiles:
+      - name: RegTestFiles.zip
+        dest: Arches
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AREG_IOSCBCT/RegTestFiles.zip
+        size: 222374572
+        extract: true
       - name: TestFiles.zip
         url: https://github.com/GaelleLeroux/SlicerAutomatedDentalTools/releases/download/testfileFlexReg/TestFiles.zip
         sha256: 494b58bc73ec2e1162ac9e483fe11afb8160905a6f679ffce6f3b7117e3d69a8
