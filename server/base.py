@@ -80,6 +80,17 @@ CHOICE_TYPES = (CHOICE_TYPE, MULTICHOICE_TYPE)
 # array or as the comma-separated shorthand, exactly like "multichoice".
 LIST_TYPE = "list[str]"
 
+# Two numbers set together, because they are one position rather than two
+# settings. FlexReg's butterfly corners are the case it exists for: each has a
+# medio-lateral ratio and an antero-posterior adjust in millimetres, and the
+# client's pad reads both axes SPATIALLY -- the knob sits where the point sits
+# on the arch. Two separate number fields state two numbers and cannot state
+# that.
+#
+# Accepted on the wire as a JSON array or the comma-separated shorthand, like
+# the list and multichoice types.
+VEC2_TYPE = "vec2"
+
 # How a client lays a "multichoice" argument's options out (ArgSpec.ui). None
 # is the single-column stack.
 #   "tabs"   -> one tab per `groups` entry, for a catalog too long to scroll.
@@ -87,6 +98,11 @@ LIST_TYPE = "list[str]"
 #               meaning (ASO's 32 teeth, upper arch above lower arch).
 #   "inline" -> a single horizontal row, for a handful of short options.
 UI_LAYOUTS = ("tabs", "grid", "inline")
+
+# How a "vec2" is offered. Without it the argument is two spin boxes, which is
+# the same value; with it the client adds a 2D pad that writes into them, so a
+# drag sets both at once and the knob sits where the point sits.
+VEC2_LAYOUTS = ("joystick",)
 
 # The layouts that are meaningless without ArgSpec.groups.
 _GROUPED_LAYOUTS = ("tabs", "grid")
@@ -222,6 +238,38 @@ class ArgSpec:
     # nnUNet's tile step size, whether to resample on the GPU. They change the
     # result, they are recorded in the run report, and they are set by whoever
     # deploys the server -- not by the person segmenting a patient.
+    # The two axes of a "vec2", low end first. Unlike every other field in this
+    # block these are NOT presentation only: validate() refuses a value outside
+    # them, because a request that skips the panel would otherwise place a patch
+    # corner off the arch. A mirrored axis is written by inverting the range,
+    # which is what the client's pad reads.
+    x_range: Optional[tuple] = None
+    y_range: Optional[tuple] = None
+    # Names for the two ends of each axis, paired with the range by index.
+    # Presentation, unlike the ranges above: "0.8" says nothing about where that
+    # is in a mouth, and "mid"/"out" does.
+    x_labels: Optional[list] = None
+    y_labels: Optional[list] = None
+    # What each of a vec2's two numbers IS. The client writes them beside the
+    # boxes, so "Ratio (R-L)" and "Adjust (A-P)" read as measurements rather
+    # than as the "X" and "Y" it falls back to.
+    x_label: Optional[str] = None
+    y_label: Optional[str] = None
+
+    # How many columns this argument's SECTION is laid out in. Declared per
+    # argument because that is where the schema hangs its hints, read back per
+    # section by the client. FlexReg's four patch corners are a 2x2 mirroring
+    # the arch -- left column one side, top row anterior -- so where a pad sits
+    # on screen is where that corner sits in the mouth. Stacked one per row that
+    # meaning is gone.
+    section_columns: Optional[int] = None
+
+    # Which grid cell this argument shares. Several arguments describing one
+    # thing belong in one cell: FlexReg's anterior right corner is a tooth
+    # number and a position along it, drawn together. Absent, an argument has a
+    # cell of its own.
+    cell: Optional[str] = None
+
     hidden: bool = False
 
     # How a "multichoice" argument's check boxes are laid out (see UI_LAYOUTS).
@@ -333,9 +381,11 @@ class Tool(ABC):
                     and declared not in SCALAR_TYPES
                     and declared not in CHOICE_TYPES
                     and declared != LIST_TYPE
+                    and declared != VEC2_TYPE
                 ):
                     raise ToolSchemaError(
                         f"{where}: unknown type {declared!r}. Use a scalar type, {LIST_TYPE!r}, "
+                        f"{VEC2_TYPE!r}, "
                         f"one of {sorted(FILE_TYPES)}, or one of {sorted(CHOICE_TYPES)}."
                     )
             if len(spec.types) > 1 and not spec.is_file:
@@ -379,15 +429,22 @@ class Tool(ABC):
             )
 
         if spec.ui is not None:
-            if spec.types[0] != MULTICHOICE_TYPE:
+            # Two kinds of argument offer a choice of layout, and they do not
+            # share a vocabulary: a multichoice arranges check boxes, a vec2
+            # decides whether its two numbers also get a pad.
+            if spec.types[0] == VEC2_TYPE:
+                allowed = VEC2_LAYOUTS
+            elif spec.types[0] == MULTICHOICE_TYPE:
+                allowed = UI_LAYOUTS
+            else:
                 raise ToolSchemaError(
-                    f"{where}: 'ui' lays a multichoice argument's check boxes out, and this "
-                    f"argument is a {spec.types[0]!r}."
+                    f"{where}: 'ui' lays out a multichoice's check boxes or a vec2's "
+                    f"pad, and this argument is a {spec.types[0]!r}."
                 )
-            if spec.ui not in UI_LAYOUTS:
+            if spec.ui not in allowed:
                 raise ToolSchemaError(
-                    f"{where}: unknown ui layout {spec.ui!r}. Expected one of "
-                    f"{sorted(UI_LAYOUTS)}."
+                    f"{where}: unknown ui layout {spec.ui!r} for a "
+                    f"{spec.types[0]!r}. Expected one of {sorted(allowed)}."
                 )
 
         if spec.groups is not None:
@@ -574,6 +631,8 @@ class Tool(ABC):
             return self._coerce_multichoice(arg_name, value, spec)
         if declared == LIST_TYPE:
             return self._coerce_list(arg_name, value)
+        if declared == VEC2_TYPE:
+            return self._coerce_vec2(arg_name, value, spec)
         if declared is str:
             # A ResolvedPath is a str, so a server-selectable scalar keeps its
             # .kind here instead of being flattened back to a plain string.
@@ -590,6 +649,45 @@ class Tool(ABC):
                     f"Argument '{arg_name}' must be a {declared.__name__}"
                 )
         return value
+
+    @staticmethod
+    def _coerce_vec2(arg_name: str, value: Any, spec: "ArgSpec") -> tuple:
+        """Exactly two numbers, inside the ranges the schema declared.
+
+        Shape and bounds are both checked because both can be wrong
+        independently: one number is a bug in the caller, and a ratio of 1.4 on
+        a 0-to-1 axis is a request that would place a patch corner off the arch
+        and be answered with a success.
+        """
+        if isinstance(value, str):
+            parts = [part.strip() for part in value.strip("[]() ").split(",") if part.strip()]
+        elif isinstance(value, (list, tuple)):
+            parts = list(value)
+        else:
+            raise ToolArgumentError(
+                f"Argument '{arg_name}' must be two numbers, got {type(value).__name__}"
+            )
+
+        if len(parts) != 2:
+            raise ToolArgumentError(
+                f"Argument '{arg_name}' must be exactly two numbers, got {len(parts)}"
+            )
+        try:
+            numbers = tuple(float(part) for part in parts)
+        except (TypeError, ValueError):
+            raise ToolArgumentError(f"Argument '{arg_name}' must be two numbers")
+
+        for number, bounds, axis in zip(numbers, (spec.x_range, spec.y_range), ("x", "y")):
+            if bounds is None:
+                continue
+            # Declared low-to-high or high-to-low: a mirrored axis is written by
+            # inverting the range, which the client's pad already relies on.
+            if not min(bounds) <= number <= max(bounds):
+                raise ToolArgumentError(
+                    f"Argument '{arg_name}': {axis} is {number}, outside the "
+                    f"declared range [{bounds[0]}, {bounds[1]}]"
+                )
+        return numbers
 
     @staticmethod
     def _coerce_bool(arg_name: str, value: Any) -> bool:

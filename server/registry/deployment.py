@@ -39,7 +39,14 @@ from config import settings
 logger = logging.getLogger("inference_server")
 
 # The two kinds data_store.py serves (DATA_DIR/<tool>/{models,testfiles}/).
-SERVER_SELECTABLE_KINDS = ("model", "testfile")
+# "none" is how a deployment says an argument is upload-only DESPITE its name.
+# The conventions read any `path` called `reference` as a hosted bundle, which
+# is right for ASO and AREG and wrong for FlexReg, whose `reference` is the
+# patient's own other timepoint. Without a way to say no, the panel offers an
+# empty dropdown and reports "no model available on the server" for a tool that
+# needs none.
+SERVER_SELECTABLE_NONE = "none"
+SERVER_SELECTABLE_KINDS = ("model", "testfile", SERVER_SELECTABLE_NONE)
 
 _TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden",
               "timeout_seconds", "dispatch")
