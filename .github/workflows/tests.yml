@@ -63,6 +63,15 @@ jobs:
       - name: Run the server suite
         run: docker compose run --rm test
 
+      # The server serves dental tools and knows nothing about them. That is a
+      # claim the README makes and a paper reports, so it is asserted here
+      # rather than believed: the budget is the two illustrative examples in
+      # base.py's error messages, and a third occurrence has to be argued for
+      # in review instead of arriving unnoticed. Standard library only, so it
+      # runs on the bare runner without the image.
+      - name: Assert the server stays domain-independent
+        run: python3 scripts/domain_coupling.py --max 2
+
   deployment-image:
     name: deployment image builds
     runs-on: ubuntu-latest

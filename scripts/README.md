@@ -15,6 +15,7 @@ model bundles around.
 | [`setup-testfiles.sh`](setup-testfiles.sh) | Fetch reference test files. Runnable straight from GitHub. |
 | [`fetch_data.py`](fetch_data.py) | The download engine the wrappers call. Standard library only. |
 | [`data-manifest.yml`](data-manifest.yml) | What exists, where it comes from, where it goes. |
+| [`domain_coupling.py`](domain_coupling.py) | Counts application-domain words in the server's own code. Publishes the word list it counts. Standard library only. |
 
 Everything here is **standard library only**, on purpose: it runs on a host
 before any `requirements.txt` is installed, and - for `server_ctl.py` - inside
@@ -245,3 +246,26 @@ a mismatch discards the download rather than installing it. To pin an entry,
 run the fetch once, take the hash the script prints, and paste it into the
 manifest - the hashes are not published by GitHub, so inventing them would be
 worse than leaving the field out.
+
+
+## Measuring that the server stays domain-independent
+
+This server serves dental and craniofacial tools and knows nothing about
+either. `domain_coupling.py` is that claim's measurement rather than its
+restatement: the word list is in the script, and the count comes from the
+parsed syntax tree, so comments and docstrings are excluded by construction
+instead of by a filter someone chose.
+
+```bash
+python3 scripts/domain_coupling.py           # per-module table
+python3 scripts/domain_coupling.py --json    # one JSON object on stdout
+```
+
+CI runs it with `--max 2`. The budget is the two illustrative examples in
+`base.py`'s error messages (`choices={'mandible': True, 'skull': False}`); a
+third occurrence fails the build, so it has to be argued for in review rather
+than arrive unnoticed.
+
+Read the number as an upper bound on coupling, not as proof of its absence: a
+server could branch on a tool name without spelling a dental word. What this
+measures is vocabulary, which is where coupling shows first.
