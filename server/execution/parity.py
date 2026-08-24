@@ -275,9 +275,31 @@ def _packaged_folder(name: str) -> str:
     return direct
 
 
+def imported_folder(name: str) -> str:
+    """`server/tools/<name>`, or `name` itself when it is a path.
+
+    Two things were wrong with computing this inline. It was resolved against
+    this file's own directory, which stopped being `server/` the day parity.py
+    moved into `execution/` -- so every lookup landed in `server/execution/
+    tools/` and found nothing. And a bare name is no longer enough on its own:
+    the in-process tools were deleted once their packages replaced them, so the
+    side this compares against now comes out of `git show` into a directory of
+    its own. A path is taken as given.
+    """
+    if os.sep in name or os.path.isdir(name):
+        return name
+    server_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(server_dir, "tools", name)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--imported", required=True, help="Folder name under server/tools/")
+    parser.add_argument(
+        "--imported",
+        required=True,
+        help="Folder name under server/tools/, or a path to a folder holding "
+        "<name>.py -- which is where a tool restored from git history lands",
+    )
     parser.add_argument(
         "--packaged",
         help="Folder name under TOOLS_DIR. Defaults to the imported name, lowercased.",
@@ -296,10 +318,11 @@ def main(argv=None) -> int:
     )
     arguments = parser.parse_args(argv)
 
-    imported_folder = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "tools", arguments.imported
-    )
-    packaged_folder = _packaged_folder(arguments.packaged or arguments.imported.lower())
+    imported = imported_folder(arguments.imported)
+    packaged_name = arguments.packaged or os.path.basename(
+        arguments.imported.rstrip(os.sep)
+    ).lower()
+    packaged_folder = _packaged_folder(packaged_name)
     ignored = tuple(DEFAULT_IGNORED_KEYS) + tuple(arguments.ignore)
 
     with open(arguments.args) as handle:
@@ -310,16 +333,16 @@ def main(argv=None) -> int:
     else:
         packaged_args = imported_args
 
-    print(f"imported: {imported_folder}")
+    print(f"imported: {imported}")
     print(f"packaged: {packaged_folder}")
 
     print("\nrunning the imported tool ...")
-    imported = run_once(imported_tool(imported_folder), imported_args, ignored)
+    before = run_once(imported_tool(imported), imported_args, ignored)
     print("running the packaged tool ...")
-    packaged = run_once(packaged_tool(packaged_folder), packaged_args, ignored)
+    after = run_once(packaged_tool(packaged_folder), packaged_args, ignored)
 
-    report = compare(imported, packaged)
-    _print_report(report, imported, packaged)
+    report = compare(before, after)
+    _print_report(report, before, after)
     return 0 if report.ok else 1
 
 

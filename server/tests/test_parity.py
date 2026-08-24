@@ -156,3 +156,28 @@ def test_noisy_keys_are_left_out_of_the_comparison():
     )
 
     assert normalized == {"kept": 1}
+
+
+# ---------------------------------------------------------------------------
+# Finding the side to compare against
+
+
+def test_a_bare_name_resolves_under_server_tools():
+    """It was resolved against parity.py's own directory, which stopped being
+    `server/` the day this module moved into `execution/`: every lookup landed
+    in `server/execution/tools/` and found nothing."""
+    resolved = parity.imported_folder("Test_Tool")
+
+    assert os.path.isdir(resolved), resolved
+    assert os.path.isfile(os.path.join(resolved, "Test_Tool.py"))
+
+
+def test_a_path_is_taken_as_given(tmp_path):
+    """The in-process tools were deleted once their packages replaced them, so
+    the side this compares against now comes out of `git show` into a directory
+    of its own. A bare name cannot reach it."""
+    restored = tmp_path / "ASO"
+    restored.mkdir()
+    (restored / "ASO.py").write_text("")
+
+    assert parity.imported_folder(str(restored)) == str(restored)
