@@ -119,6 +119,43 @@ Useful flags:
 | `--skip-disk-check` | run anyway when the projection does not fit. Say why in your notes. |
 | `--no-summary` | do not regenerate the summary afterwards |
 
+### The transfer-only probe, beside B2
+
+```bash
+python -m benchmarks.transfer_probe --reps 21 --warmup 1
+python -m benchmarks.transfer_probe --tools AMASSS --parallelism 4,1 --reps 30
+```
+
+B2 measures whole calls, so its `upload` phase is five repetitions sitting beside
+a 60-second tool run -- the right shape for "where does the time go", the wrong
+one for "does four-way parallelism buy anything", because the effect is a few
+tenths of a second. `transfer_probe.py` runs the **same** `POST /uploads` and
+part `PUT`s with no tool behind them, so twenty repetitions cost seconds.
+
+Two things to know before quoting it. It **forces the chunked path for every
+payload**, including one the real client sends inline, which is the only way to
+get a parallelism number at a small size. And its absolute rates are lower than
+a campaign's, because it pushes repetitions back to back into one server while a
+real call uploads once and then waits for a segmentation. **Quote the campaign
+for rates and the probe for ratios.** Records go to
+`results/raw/b2probe-<timestamp>.jsonl`; there is no summariser for them, the
+probe prints its own table.
+
+### After every campaign: diff the server's log against your records
+
+**Do this. It is one command and it has already caught a wrong number.**
+
+```bash
+docker logs -t <container> | grep 'endpoint=/run/'
+```
+
+Every `/run` the server served must correspond to a `loopback` record in
+`results/raw/`. Anything left over is another client on your server, and with
+`MAX_CONCURRENT_GPU_JOBS=1` its jobs do not slow yours down -- they **queue in
+front of them**, invisibly, inside `server_exec`. On 2026-08-25 that turned a
+368-second call into a 752-second one and it was read as a warm-up effect for
+several hours. Section 9 has the rest.
+
 ### How long, and how much disk
 
 From `--dry-run` against the shipped config, on the hardware in section 6:
@@ -348,6 +385,7 @@ benchmarks/
   artifacts.py            B5's file-by-file comparison
   _imaging_diff.py        run BY A TOOL's interpreter, for the numeric distance
   summarize.py            raw -> CSV + markdown
+  transfer_probe.py       B2's transfer-only probe: the chunked upload alone
   execution/
     local.py              the no-HTTP path (container or host mode)
     remote.py             the HTTP client, as the real Slicer client speaks it
@@ -368,6 +406,16 @@ benchmarks/
   (the server holds one; there is no server process in that arm), so a local run
   overlapping any other GPU work produces two wrong numbers. Plan items run
   sequentially within a campaign; keeping campaigns apart is the operator's job.
+- **"One campaign at a time" is not enough, because it assumes you are the only
+  client.** Nothing here can see another process calling the same server. With
+  `MAX_CONCURRENT_GPU_JOBS=1` a foreign job does not slow yours down, it queues
+  in front of it, and the wait lands inside `server_exec` where it is
+  indistinguishable from execution. On 2026-08-25 an unidentified second client
+  ran a full B1-shaped sequence against this deployment for an hour and turned
+  `ALI_CBCT`'s 368 s loopback call into 623 s and 752 s. **Diff the server's
+  access log against `results/raw/` after every campaign** (section 3), and read
+  a tool's own report -- `run_report.json` carries `duration_seconds` from
+  inside the tool -- when a total and a phase disagree.
 - **`local` in container mode pays a `docker exec` tax** of about 69 ms per exec
   on this machine. It is measured once per invocation and written into every
   local record as `extra.exec_overhead` so it can be subtracted. Report it
