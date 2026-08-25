@@ -113,6 +113,7 @@ Useful flags:
 | `--paths local,loopback` | B1 only: run only these execution paths |
 | `--reps N` | override the repetition count |
 | `--config PATH` (or `$BENCHMARKS_CONFIG`) | point at your own config file |
+| `--local-mode container\|host` | override `local.mode` for this run. The two are not interchangeable -- see [`NOTES-local-path.md`](NOTES-local-path.md) -- and the mode is written into every record as `extra.local_mode` |
 | `--keep-artifacts` | keep job directories and downloads (fills a disk fast) |
 | `--skip-disk-check` | run anyway when the projection does not fit. Say why in your notes. |
 | `--no-summary` | do not regenerate the summary afterwards |
@@ -250,6 +251,30 @@ keys, which text lines, and -- for an imaging output -- a numeric distance: max,
 mean and RMS of the voxelwise difference, how many voxels moved, and whether the
 geometry (size, spacing, origin, direction) is identical. Nothing is softened
 into "essentially identical".
+
+**Two comparisons, both reported, neither replacing the other.** The first is
+strict and by NAME. That matters, because a file that travels does not keep its
+name: `server/main.py` stages an uploaded input under the argument it arrived
+as -- `<argument>_<stem><ext>` for a small multipart input,
+`<argument><ext>` for a chunked one -- and every tool here names its outputs
+after its input. So the remote side's artifacts are spelled differently from the
+local side's, and the strict pass reports that as `only_left` / `only_right`,
+which is what it should do: a differently-named artifact is a difference.
+
+The second pass then asks the other question -- are the CONTENTS the same? -- by
+pairing those leftovers through the server's own staging rule, reconstructed
+from the argument names in `config.yaml` and the harness's own record of which
+arguments were chunked. It is a rule, not fuzzy matching: nothing is paired that
+the rule does not name. The record carries `parity_ok` (strict) and
+`content_parity_ok` (after the renaming), and the summary prints both.
+
+**The determinism control.** `campaigns.b5.local_control: true` runs the local
+path a second time and compares it against itself, recorded as
+`side: "local_control"` and `path: "local+local"`. Without it, "local and remote
+differ" cannot be attributed to the path at all: a tool that does not reproduce
+itself on one path differs from itself, and calling that a protocol difference
+would be wrong. It is off by default because it doubles the local side of the
+campaign; run it with `--tools` for whichever tools actually differ.
 
 The numeric distance is computed by a **tool's own interpreter**
 (`campaigns.b5.imaging_interpreter` in `config.yaml`), because the tools carry

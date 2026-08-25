@@ -126,3 +126,53 @@ def test_describe_difference_asks_for_a_numeric_distance_on_an_image(tmp_path):
     detail = artifacts.describe_difference("seg.nii.gz", str(left), str(right))
     assert "numeric" in detail
     assert detail["numeric"]["available"] is False  # no interpreter given
+
+
+def test_rename_substitutions_follow_the_servers_two_staging_rules(tmp_path):
+    folder = tmp_path / "cases"
+    folder.mkdir()
+    files = {
+        "meshes": str(tmp_path / "T1_01_U_segmented.vtk"),
+        "scans": str(tmp_path / "MG_test_scan.nii.gz"),
+        "ios": str(folder),
+    }
+    substitutions = artifacts.rename_substitutions(files, chunked_arguments=["scans"])
+    # multipart: the argument becomes a prefix and the stem survives
+    assert substitutions["T1_01_U_segmented"] == "meshes_T1_01_U_segmented"
+    # chunked: the stem does not survive at all
+    assert substitutions["MG_test_scan"] == "scans"
+    # a directory travels as a zip the server unpacks, so its members keep names
+    assert "cases" not in substitutions
+
+
+def test_pair_renamed_finds_the_same_artifact_under_two_names(tmp_path):
+    left, right = tmp_path / "l", tmp_path / "r"
+    _write(str(left), "out/T1_01_U_segmented_Seg.vtk", b"same bytes")
+    _write(str(right), "out/meshes_T1_01_U_segmented_Seg.vtk", b"same bytes")
+    report = artifacts.compare(artifacts.snapshot(str(left)), artifacts.snapshot(str(right)))
+    # the strict pass still reports it as a difference, and must go on doing so
+    assert report.ok is False
+    assert report.only_left and report.only_right
+
+    renamed = artifacts.pair_renamed(
+        report,
+        {"T1_01_U_segmented": "meshes_T1_01_U_segmented"},
+        str(left),
+        str(right),
+    )
+    assert len(renamed["pairs"]) == 1
+    assert renamed["pairs"][0]["identical"] is True
+    assert renamed["unpaired_left"] == [] and renamed["unpaired_right"] == []
+    assert renamed["content_ok"] is True
+
+
+def test_pair_renamed_does_not_hide_a_content_difference(tmp_path):
+    left, right = tmp_path / "l", tmp_path / "r"
+    _write(str(left), "scan_Or.nii.gz", b"\x1f\x8b one")
+    _write(str(right), "input_Or.nii.gz", b"\x1f\x8b two")
+    report = artifacts.compare(artifacts.snapshot(str(left)), artifacts.snapshot(str(right)))
+    renamed = artifacts.pair_renamed(report, {"scan": "input"}, str(left), str(right))
+    assert len(renamed["pairs"]) == 1
+    assert renamed["pairs"][0]["identical"] is False
+    assert "detail" in renamed["pairs"][0]
+    assert renamed["content_ok"] is False

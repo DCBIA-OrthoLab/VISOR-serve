@@ -265,12 +265,120 @@ def numeric_distance(left_path: str, right_path: str, interpreter: Optional[str]
         return {"available": False, "reason": f"unreadable output: {completed.stdout[:300]}"}
 
 
+def rename_substitutions(files: dict, chunked_arguments) -> dict:
+    """`{local stem: remote stem}`, from the SERVER's own staging rule.
+
+    A file that travels does not keep its name. `server/main.py` stages an
+    uploaded input under the ARGUMENT it was sent as, and by two different
+    rules depending on how it travelled:
+
+        multipart (small, inline)   ->  "<argument>_<stem><extension>"
+        chunked (>= min_chunked)    ->  "<argument><extension>"
+
+    Every tool here names its outputs after its input, so the remote side's
+    artifacts are spelled differently from the local side's for reasons that
+    have nothing to do with what the tool computed. This function reconstructs
+    exactly that substitution -- from the argument names in `config.yaml` and
+    the harness's own record of which arguments were chunked -- so the pairing
+    below is a rule, not a guess. A DIRECTORY input is excluded: it travels as a
+    zip and the server unpacks it, so the members keep their names.
+    """
+    chunked = set(chunked_arguments or ())
+    substitutions = {}
+    for argument, path in (files or {}).items():
+        if os.path.isdir(path):
+            continue
+        local_stem = _stem(os.path.basename(path.rstrip(os.sep)))
+        remote_stem = argument if argument in chunked else f"{argument}_{local_stem}"
+        if remote_stem != local_stem:
+            substitutions[local_stem] = remote_stem
+    return substitutions
+
+
+def _stem(name: str) -> str:
+    """`scan.nii.gz` -> `scan`. Compound extensions are not split twice."""
+    lowered = name.lower()
+    for extension in (".nii.gz", ".nrrd.gz", ".gipl.gz", ".tar.gz"):
+        if lowered.endswith(extension):
+            return name[: -len(extension)]
+    return os.path.splitext(name)[0]
+
+
+def pair_renamed(
+    report: "ParityReport",
+    substitutions: dict,
+    left_root: str,
+    right_root: str,
+    imaging_interpreter: Optional[str] = None,
+) -> dict:
+    """Compare the files that exist on both sides under DIFFERENT names.
+
+    The strict comparison above stays strict: a file whose name differs is
+    reported as `only_left` / `only_right` and stays reported that way, because
+    a differently-named artifact IS a difference and the paper has to say so.
+    This is a SECOND, separately labelled pass answering the other question a
+    reviewer asks immediately afterwards -- are the CONTENTS the same? -- and it
+    pairs names only by the server's own documented staging rule.
+    """
+    outcome = {
+        "substitutions": dict(substitutions),
+        "pairs": [],
+        "unpaired_left": [],
+        "unpaired_right": list(report.only_right),
+    }
+    if not substitutions:
+        outcome["unpaired_left"] = list(report.only_left)
+        outcome["content_ok"] = not (
+            report.differing or report.only_left or report.only_right
+        )
+        return outcome
+
+    remaining_right = set(report.only_right)
+    for name in report.only_left:
+        candidate = name
+        for local_stem, remote_stem in substitutions.items():
+            candidate = candidate.replace(local_stem, remote_stem)
+        if candidate == name or candidate not in remaining_right:
+            outcome["unpaired_left"].append(name)
+            continue
+        remaining_right.discard(candidate)
+        left_path = os.path.join(left_root, name)
+        right_path = os.path.join(right_root, candidate)
+        identical = digest(left_path) == digest(right_path)
+        pair = {"local": name, "remote": candidate, "identical": identical}
+        if not identical:
+            pair["detail"] = describe_difference_paths(
+                left_path, right_path, name, imaging_interpreter
+            )
+        outcome["pairs"].append(pair)
+    outcome["unpaired_right"] = sorted(remaining_right)
+    outcome["content_ok"] = (
+        not report.differing
+        and not outcome["unpaired_left"]
+        and not outcome["unpaired_right"]
+        and all(pair["identical"] for pair in outcome["pairs"])
+    )
+    return outcome
+
+
 def describe_difference(
     name: str, left_root: str, right_root: str, imaging_interpreter: Optional[str] = None
 ) -> dict:
     """Everything that can be said about ONE differing artifact."""
-    left_path = os.path.join(left_root, name)
-    right_path = os.path.join(right_root, name)
+    return describe_difference_paths(
+        os.path.join(left_root, name),
+        os.path.join(right_root, name),
+        name,
+        imaging_interpreter,
+    )
+
+
+def describe_difference_paths(
+    left_path: str, right_path: str, name: str, imaging_interpreter: Optional[str] = None
+) -> dict:
+    """The same, for two files that do not share a name. `name` chooses the
+    reader: it is the artifact's own spelling, and the two sides' extensions
+    agree even when their stems do not."""
     lowered = name.lower()
     detail = {"bytes": byte_difference(left_path, right_path)}
     if lowered.endswith(JSON_EXTENSIONS):

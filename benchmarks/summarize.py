@@ -229,19 +229,49 @@ def table_b5(records: list) -> list:
     rows = []
     for record in records:
         extra = record.get("extra") or {}
+        if extra.get("side") == "local_control":
+            # The determinism baseline, kept in its own row shape so it can
+            # never be misread as a local-versus-remote result.
+            parity = extra.get("parity") or {}
+            rows.append(
+                {
+                    "tool": record.get("tool"),
+                    "pair": extra.get("pair"),
+                    "status": record.get("status"),
+                    "local_mode": extra.get("local_mode", ""),
+                    "parity_ok": extra.get("deterministic"),
+                    "content_parity_ok": extra.get("deterministic"),
+                    "identical": parity.get("identical_count"),
+                    "differing": parity.get("differing_count"),
+                    "only_local": len(parity.get("only_left") or []),
+                    "only_remote": len(parity.get("only_right") or []),
+                    "renamed_pairs": 0,
+                    "renamed_identical": 0,
+                    "differing_files": "LOCAL-VS-LOCAL CONTROL: "
+                    + "; ".join(parity.get("differing") or [])[:380],
+                    "error": (record.get("error_message") or "")[:200],
+                }
+            )
+            continue
         if extra.get("side") != "comparison":
             continue
         parity = extra.get("parity") or {}
+        renamed = parity.get("renamed") or {}
+        pairs = renamed.get("pairs") or []
         rows.append(
             {
                 "tool": record.get("tool"),
                 "pair": extra.get("pair"),
                 "status": record.get("status"),
+                "local_mode": extra.get("local_mode", ""),
                 "parity_ok": extra.get("parity_ok"),
+                "content_parity_ok": extra.get("content_parity_ok"),
                 "identical": parity.get("identical_count"),
                 "differing": parity.get("differing_count"),
                 "only_local": len(parity.get("only_left") or []),
                 "only_remote": len(parity.get("only_right") or []),
+                "renamed_pairs": len(pairs),
+                "renamed_identical": sum(1 for p in pairs if p.get("identical")),
                 "differing_files": "; ".join(parity.get("differing") or [])[:400],
                 "error": (record.get("error_message") or "")[:200],
             }
@@ -290,11 +320,37 @@ def parity_details(records: list) -> str:
         parity = extra.get("parity") or {}
         if parity.get("ok"):
             continue
-        blocks.append(f"### {record.get('tool')} (pair {extra.get('pair')})\n")
+        blocks.append(
+            f"### {record.get('tool')} (pair {extra.get('pair')}, "
+            f"local mode {extra.get('local_mode', 'unknown')})\n"
+        )
+        renamed = parity.get("renamed") or {}
+        paired_left = {pair["local"] for pair in (renamed.get("pairs") or [])}
+        paired_right = {pair["remote"] for pair in (renamed.get("pairs") or [])}
         for name in parity.get("only_left") or []:
+            if name in paired_left:
+                continue
             blocks.append(f"- `{name}` -- produced by the local path only.")
         for name in parity.get("only_right") or []:
+            if name in paired_right:
+                continue
             blocks.append(f"- `{name}` -- produced by the remote path only.")
+        for pair in renamed.get("pairs") or []:
+            verdict = (
+                "byte-identical" if pair.get("identical") else "and the bytes differ too"
+            )
+            blocks.append(
+                f"- `{pair['local']}` vs `{pair['remote']}` -- the same artifact under "
+                f"two names (the server stages an uploaded input under its argument "
+                f"name); {verdict}."
+            )
+            detail = pair.get("detail") or {}
+            if detail:
+                byte_detail = detail.get("bytes") or {}
+                blocks.append(
+                    f"  - sizes {byte_detail.get('left_size')} vs "
+                    f"{byte_detail.get('right_size')} bytes"
+                )
         for name in parity.get("differing") or []:
             detail = (parity.get("details") or {}).get(name, {})
             blocks.append(f"- `{name}` -- bytes differ.")

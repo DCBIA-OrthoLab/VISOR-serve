@@ -79,6 +79,8 @@ def execute(item: dict, context: _common.Context) -> Iterator[RunRecord]:
     section = context.config.campaign(NAME)
     imaging_interpreter = _imaging_interpreter(context, tool, section)
 
+    control = bool(section.get("local_control"))
+
     for repetition in range(1, int(item["runs"]) + 1):
         workspace = context.workspace(f"parity_{tool.name}")
         local_dir = os.path.join(workspace, "local")
@@ -90,12 +92,34 @@ def execute(item: dict, context: _common.Context) -> Iterator[RunRecord]:
             )
             yield local_record
 
+            # The control the parity claim needs before it can name a cause.
+            # "local and remote differ" says nothing about the PATH unless the
+            # tool reproduces itself on one path first: a network that is not
+            # deterministic differs from itself, and attributing that to the
+            # protocol would be wrong. Off by default because it doubles the
+            # local side; turned on for whichever tools actually differ.
+            control_record = None
+            control_dir = os.path.join(workspace, "local_control")
+            if control:
+                control_record = _common.execute(
+                    context, NAME, tool, PATH_LOCAL, repetition,
+                    collect_to=control_dir,
+                    extra={"side": "local_control", "pair": repetition},
+                )
+                yield control_record
+
             remote_record = _common.execute(
                 context, NAME, tool, remote, repetition,
                 keep_workspace=True,
                 extra={"side": "remote", "pair": repetition},
             )
             yield remote_record
+
+            if control_record is not None:
+                yield _control_record(
+                    context, tool, repetition, local_record, control_record,
+                    local_dir, control_dir, imaging_interpreter,
+                )
 
             yield _comparison_record(
                 context, tool, repetition, remote, local_record, remote_record,
@@ -106,6 +130,77 @@ def execute(item: dict, context: _common.Context) -> Iterator[RunRecord]:
                 from ..execution.remote import clear_workspace
 
                 clear_workspace(workspace)
+
+
+def _control_record(
+    context: _common.Context,
+    tool,
+    repetition: int,
+    first: RunRecord,
+    second: RunRecord,
+    first_dir: str,
+    second_dir: str,
+    imaging_interpreter,
+) -> RunRecord:
+    """The same tool, the same path, twice. The determinism baseline.
+
+    Recorded with `side: "local_control"` and `path: "local+local"` so it can
+    never be read as a local-versus-remote row. Nothing is renamed here: both
+    sides took the same path and gave their artifacts the same names, so a
+    difference is the tool's own run-to-run variation and nothing else.
+    """
+    timer = PhaseTimer()
+    started_wall = utc_now()
+    extra = {
+        "side": "local_control",
+        "pair": repetition,
+        "local_mode": context.config.local.mode,
+        "first_status": first.status,
+        "second_status": second.status,
+        "imaging_interpreter": imaging_interpreter,
+    }
+    status = STATUS_OK
+    error_type = error_message = None
+
+    if first.status != STATUS_OK or second.status != STATUS_OK:
+        status = STATUS_FAILED
+        error_type = "IncompleteControlPair"
+        error_message = (
+            f"first={first.status} ({first.error_type}); "
+            f"second={second.status} ({second.error_type})"
+        )
+    else:
+        try:
+            report = artifacts.compare(
+                artifacts.snapshot(first_dir), artifacts.snapshot(second_dir)
+            )
+            for name in report.differing:
+                report.details[name] = artifacts.describe_difference(
+                    name, first_dir, second_dir, imaging_interpreter
+                )
+            extra["parity"] = report.as_dict()
+            extra["deterministic"] = report.ok
+        except Exception as error:  # noqa: BLE001 - recorded, never dropped
+            status = STATUS_FAILED
+            error_type = type(error).__name__
+            error_message = str(error)[:4000]
+
+    total = timer.total
+    return RunRecord(
+        campaign=NAME,
+        tool=tool.name,
+        path=f"{PATH_LOCAL}+{PATH_LOCAL}",
+        repetition=repetition,
+        started_at=started_wall,
+        finished_at=utc_now(),
+        total_seconds=total,
+        status=status,
+        phases=timer.finalize(total),
+        error_type=error_type,
+        error_message=error_message,
+        extra=extra,
+        provenance=context.provenance,
+    )
 
 
 def _remote_artifact_root(record: RunRecord) -> str:
@@ -168,25 +263,40 @@ def _comparison_record(
             report.details[name] = artifacts.describe_difference(
                 name, local_dir, remote_root, imaging_interpreter
             )
+        # The second question. The strict comparison above is by NAME, and a
+        # travelling input does not keep its name: the server stages it under
+        # the argument it arrived as. So a tool that names its outputs after its
+        # input produces differently-SPELLED artifacts remotely, which the
+        # strict pass reports as only_left/only_right and must go on reporting.
+        # This pairs those leftovers by the server's own staging rule and asks
+        # whether the CONTENTS match. Both answers are recorded; neither
+        # replaces the other.
+        renamed = artifacts.pair_renamed(
+            report,
+            artifacts.rename_substitutions(
+                tool.files, remote_record.extra.get("chunked_arguments")
+            ),
+            local_dir,
+            remote_root,
+            imaging_interpreter,
+        )
         extra.update(
             {
                 "local_root": local_dir,
                 "remote_root": remote_root,
                 "local_artifacts": left,
                 "remote_artifacts": right,
-                "parity": report.as_dict(),
+                "parity": dict(report.as_dict(), renamed=renamed),
                 "local_result": local_record.extra.get("result"),
                 "remote_result": remote_record.extra.get("result"),
             }
         )
-        if not report.ok:
-            # A difference is a RESULT, not an error: the run succeeded and the
-            # answer is "they differ". `parity.ok` is false and the summary
-            # reports it; the status stays "ok" so it is not counted as a
-            # harness failure.
-            extra["parity_ok"] = False
-        else:
-            extra["parity_ok"] = True
+        # A difference is a RESULT, not an error: the run succeeded and the
+        # answer is "they differ". `parity_ok` is false and the summary reports
+        # it; the status stays "ok" so it is not counted as a harness failure.
+        extra["parity_ok"] = report.ok
+        # Same bytes under whatever name each path gave them.
+        extra["content_parity_ok"] = renamed.get("content_ok")
     except Exception as error:  # noqa: BLE001 - recorded, never dropped
         status = STATUS_FAILED
         error_type = type(error).__name__
