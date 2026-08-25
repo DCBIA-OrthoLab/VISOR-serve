@@ -137,6 +137,11 @@ tools:
   Crown_Seg:
     args:
       device: cuda
+      # NOT the tool's default (true), and the difference is the whole
+      # measurement: the shipped test mesh already carries a `PredictedID`
+      # point array, so with the default this tool COPIES it through and the
+      # network never runs. The row would have measured a file copy.
+      skip_segmented: false
     files:
       meshes: DATA/CrownSeg/testfiles/T1_01_U_segmented.vtk
     server_files:
@@ -183,19 +188,37 @@ tools:
     notes: torch 2.8, monai, landmark output
 
   ASO:
-    args: {}
+    args:
+      modality: CBCT
+      # Semi-Automated is the signature default and it registers on landmark
+      # files that travel BESIDE the scan. There are none beside
+      # MG_test_scan.nii.gz, and there is no CBCT landmark set in DATA/ASO at
+      # all, so the only mode this deployment can take standalone is the one
+      # that predicts them -- through the supervisor, with ALI_CBCT.
+      automation: Fully-Automated
     files:
       input: DATA/AMASSS/testfiles/MG_test_scan.nii.gz
     server_files:
-      reference: {kind: model, name: CBCT_Gold_Occlusal_Midsagittal_Plane}
+      # NOT the Occlusal reference: it defines ANS, IF, PNS, UL6O, UR1O, UR6O,
+      # and ASO's default `cbct_landmarks` are Ba, S, N, RPo, LPo, ROr, LOr.
+      # Zero of the seven exist in it and the server answers 422. The Frankfurt
+      # reference defines exactly those seven.
+      reference: {kind: model, name: CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane}
+      # Required by Fully-Automated CBCT: the bundle ALI_CBCT predicts with.
+      # This one holds exactly the seven landmarks the reference is built on.
+      landmark_model: {kind: model, name: CBCT_landmark_models}
     data_slug: ASO
     local:
       folder: ASO
       package: sadt_aso
-    estimated_seconds: 40
+    estimated_seconds: 120
     estimated_output_mb: 100
     payload_label: 99MB_CBCT    # 98 611 496 B = 94.0 MiB
-    notes: NO torch -- this is what isolates the GPU stack from everything else
+    notes: >-
+      NO torch in ITS OWN process -- which is what isolates the GPU stack from
+      the rest. Fully-Automated CBCT reaches ALI_CBCT (torch 2.8) through the
+      supervisor, so the row is a two-level chain rather than a leaf, and that
+      is exactly the ASO -> ALI_CBCT hop the paper claims.
 
   Surg_Mov_Pred:
     args: {}
@@ -231,13 +254,24 @@ tools:
     args:
       automation: Registration
     files:
-      cbct: DATA/AREG/testfiles/IOSCBCT_TestFile/T2/P_0001_T2.nii.gz
-      ios: DATA/AREG/testfiles/IOSCBCT_TestFile/T1
+      # A FOLDER, not the file inside it: `pipeline.discover` walks both
+      # arguments, so a single file yields nothing and the tool answers
+      # "No patient has both an intraoral scan and a CBCT".
+      cbct: DATA/AREG/testfiles/IOSCBCT_RegTestFiles/T2
+      ios: DATA/AREG/testfiles/IOSCBCT_RegTestFiles/T1
+      # Registration mode PREDICTS NOTHING: it registers on the landmarks the
+      # caller sends, and refuses when either set is missing. Upstream ships
+      # both sets for this case, in the same folder as the scans.
+      ios_landmarks: DATA/AREG/testfiles/IOSCBCT_RegTestFiles/IOS Landmarks
+      cbct_landmarks: DATA/AREG/testfiles/IOSCBCT_RegTestFiles/CBCT Landmarks
     server_files:
       crown_model: {kind: model, name: "07-21-22_val-loss0.169.pth"}
       landmark_model: {kind: model, name: ALI_CBCT_Models}
       ios_landmark_model: {kind: model, name: ALI_IOS_Models}
-      cbct_reference: {kind: model, name: CBCT_Gold_Occlusal_Midsagittal_Plane}
+      # Frankfurt, not Occlusal, for the same reason as ASO's: Fully-Automated
+      # hands this reference to ASO, which registers on its own default seven
+      # landmarks, and the Occlusal reference holds none of them.
+      cbct_reference: {kind: model, name: CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane}
     data_slug: AREG
     local:
       folder: AREG/AREG_IOSCBCT
@@ -293,8 +327,24 @@ campaigns:
       Registration: 60
       Semi-Automated: 150
       Fully-Automated: 260
+    # The three modes do NOT take the same arguments, and pretending they do
+    # would measure the wrong thing. `Registration` registers on landmarks the
+    # caller supplies; the two automated modes PREDICT them -- and skip the
+    # prediction entirely when they are supplied (dispatch.py: `if not ios_lm:`).
+    # Left alone, Semi-Automated and Fully-Automated would run one child instead
+    # of three and four, and the "chain cost" would be a third of itself.
+    #
+    # A `null` removes an input the base tool declares; anything else overrides.
+    per_mode:
+      Semi-Automated:
+        files: {ios_landmarks: null, cbct_landmarks: null}
+      Fully-Automated:
+        files: {ios_landmarks: null, cbct_landmarks: null}
     # Per child: interpreter start and stack import, with no compute in either.
-    children: [Crown_Seg, ALI_IOS, ALI_CBCT, ASO]
+    # The orchestrator is in the list too: `Registration` starts no child at all,
+    # so its own interpreter start and import are the whole isolation cost of that
+    # mode, and without them there is nothing to subtract the chain from.
+    children: [AREG_IOSCBCT, Crown_Seg, ALI_IOS, ALI_CBCT, ASO]
     startup_reps: 5
 
   b4:
@@ -311,6 +361,12 @@ campaigns:
   b5:
     remote_path: loopback
     reps: 1
+    # Run the LOCAL path twice as well, and compare it against itself. This is
+    # the control the parity claim needs before it can name a cause: "local and
+    # remote differ" says nothing about the protocol until the tool is shown to
+    # reproduce itself on ONE path. Off by default because it doubles the local
+    # side of the campaign; turn it on with --tools for whichever tools differ.
+    local_control: false
     tools:
       - Crown_Seg
       - AMASSS
