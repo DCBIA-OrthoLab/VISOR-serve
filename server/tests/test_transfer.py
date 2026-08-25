@@ -15,6 +15,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+import registry
+from base import ArgSpec, Tool
 from wire import transfer
 from config import settings
 from main import app
@@ -315,6 +317,155 @@ def test_run_rejects_an_unknown_upload_id():
         data={"label": "x", "__uploads__": json.dumps({"input": "0123456789abcdefghij"})},
     )
     assert response.status_code == 404
+
+
+# ----------------------------------------------------------------------
+# A patient's name survives a chunked upload
+# ----------------------------------------------------------------------
+#
+# The multipart half of this property is tested in test_main.py
+# (test_an_uploaded_filename_reaches_the_tool_that_names_its_outputs_from_it).
+# It lives here as well because the two routes stage their input in two
+# different places in main.py, and for a while only one of them was right: the
+# chunked branch named the staged file after the FORM FIELD, so every scan in a
+# batch arrived as `scans.nii.gz` and every tool that names its outputs after
+# its input handed back `scans_Pred_MAND.nii.gz` for every patient. That was
+# the branch a client takes for anything large enough to be worth splitting,
+# which is every CBCT, so in production it was the only branch that ran.
+
+
+def _spy_tool(monkeypatch, tool_name: str) -> dict:
+    """Register a tool that records the path it was handed, and return the
+    dict it records into. What the tool sees is what it names its outputs
+    after, which is the property these tests are about -- not the particular
+    string the sanitizer produces."""
+    seen = {}
+
+    class _Spy(Tool):
+        name = tool_name
+        arguments = {"scan": ArgSpec(type="nifti_file", required=True)}
+        output_kind = "text"
+
+        def run(self, scan):
+            seen["path"] = str(scan)
+            return os.path.basename(str(scan))
+
+    monkeypatch.setitem(registry.TOOLS, tool_name, _Spy())
+    return seen
+
+
+def _run_chunked(tool_name: str, filename: str, payload: bytes = b"not a real volume"):
+    """Upload `payload` through a session, then run `tool_name` against it."""
+    session = _open_session(payload, filename=filename)
+    _put_parts(session["upload_id"], payload, session["chunk_size"])
+    return client.post(
+        f"/run/{tool_name}",
+        headers=AUTH,
+        data={"__uploads__": json.dumps({"scan": session["upload_id"]})},
+    )
+
+
+def test_a_chunked_upload_keeps_the_patient_in_the_staged_name(monkeypatch):
+    """The clinical property: a batch of scans comes back as a batch of
+    distinguishable results, whichever route the bytes took."""
+    seen = _spy_tool(monkeypatch, "Chunked_Spy")
+
+    response = _run_chunked("Chunked_Spy", "MG_test_scan.nii.gz")
+
+    assert response.status_code == 200, response.text
+    received = os.path.basename(seen["path"])
+    assert "MG_test" in received, received
+    assert received.endswith(".nii.gz"), received
+    # And the argument it belongs to is still readable in front of it.
+    assert received.startswith("scan_"), received
+
+
+def test_both_upload_routes_stage_an_input_under_the_same_name(monkeypatch):
+    """The two routes are an implementation detail of how the bytes travelled.
+    A tool must not be able to tell them apart, because its outputs are named
+    from what it is handed -- so a 15 MB scan and a 200 MB scan of the same
+    patient must not come back under different names."""
+    seen_multipart = _spy_tool(monkeypatch, "Multipart_Spy")
+    seen_chunked = _spy_tool(monkeypatch, "Chunked_Spy_2")
+
+    multipart = client.post(
+        "/run/Multipart_Spy",
+        headers=AUTH,
+        files={"scan": ("MG_test_scan.nii.gz", b"not a real volume", "application/gzip")},
+    )
+    assert multipart.status_code == 200, multipart.text
+
+    chunked = _run_chunked("Chunked_Spy_2", "MG_test_scan.nii.gz")
+    assert chunked.status_code == 200, chunked.text
+
+    assert os.path.basename(seen_chunked["path"]) == os.path.basename(seen_multipart["path"])
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "../../../etc/passwd.nii.gz",
+        "/etc/passwd.nii.gz",
+        "..\\..\\windows\\system32\\config.nii.gz",
+        "..%2f..%2fpasswd.nii.gz",
+        "MG\x00test.nii.gz",
+    ],
+)
+def test_a_traversing_chunked_filename_cannot_escape_the_work_directory(monkeypatch, filename):
+    """The reason the name is sanitized rather than trusted. A session's
+    filename is a client string that now decides a path component, so every
+    shape that has ever been used to leave a directory is refused here rather
+    than reasoned about."""
+    seen = _spy_tool(monkeypatch, "Chunked_Spy_3")
+
+    response = _run_chunked("Chunked_Spy_3", filename)
+
+    assert response.status_code == 200, response.text
+    received = seen["path"]
+    assert ".." not in received, received
+    assert "\x00" not in received, received
+    assert os.path.basename(received).startswith("scan"), received
+    # Still inside the request's own work dir, which is under TEMP_DIR.
+    temp_dir = os.path.realpath(settings.TEMP_DIR)
+    assert os.path.realpath(received).startswith(temp_dir + os.sep), received
+
+
+def test_a_chunked_upload_with_no_usable_stem_falls_back_to_the_field_name(monkeypatch):
+    """A name that sanitizes down to nothing -- all dots, or pure punctuation --
+    must give the OLD behaviour (the field name alone) rather than an empty
+    stem, a hidden file, or a 500."""
+    seen = _spy_tool(monkeypatch, "Chunked_Spy_4")
+
+    response = _run_chunked("Chunked_Spy_4", "....nii.gz")
+
+    assert response.status_code == 200, response.text
+    assert os.path.basename(seen["path"]) == "scan.nii.gz"
+
+
+def test_a_chunked_filename_of_pure_punctuation_also_falls_back(monkeypatch):
+    seen = _spy_tool(monkeypatch, "Chunked_Spy_5")
+
+    response = _run_chunked("Chunked_Spy_5", "%%%.nii.gz")
+
+    assert response.status_code == 200, response.text
+    received = os.path.basename(seen["path"])
+    # "%%%" is not in the whitelist; whatever survives, it is still a plain
+    # name under the field it belongs to and it still has its extension.
+    assert received.startswith("scan"), received
+    assert received.endswith(".nii.gz"), received
+
+
+def test_an_over_long_chunked_filename_is_truncated_not_refused(monkeypatch):
+    """A 300-character name must not push the staged path past a filesystem
+    limit, and must not cost the caller its run either."""
+    seen = _spy_tool(monkeypatch, "Chunked_Spy_6")
+
+    response = _run_chunked("Chunked_Spy_6", "P" * 300 + ".nii.gz")
+
+    assert response.status_code == 200, response.text
+    received = os.path.basename(seen["path"])
+    assert received.startswith("scan_PPP"), received
+    assert len(received) < 128, len(received)
 
 
 # ----------------------------------------------------------------------

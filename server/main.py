@@ -887,7 +887,16 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=f"File exceeds the {upload_limit_mb} MB limit.",
                     )
-                input_path = os.path.join(work_dir, f"{field_name}{extension}")
+                # Named exactly as the multipart branch above names it, and
+                # for the same clinical reason -- see _safe_stem. Staging this
+                # one as `<argument><extension>` was never a cosmetic
+                # difference: the chunked route is the one a client takes for
+                # any file large enough to be worth splitting, which is every
+                # CBCT, so in production it was the ONLY route that mattered
+                # and it dropped the patient's name from every input it staged.
+                stem = _safe_stem(session.filename, extension)
+                base = f"{field_name}_{stem}" if stem else field_name
+                input_path = os.path.join(work_dir, f"{base}{extension}")
                 await anyio.to_thread.run_sync(transfer.claim_upload, upload_id, input_path)
             except transfer.TransferError as exc:
                 raise _transfer_error(exc)
