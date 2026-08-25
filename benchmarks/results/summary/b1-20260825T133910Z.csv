@@ -1,0 +1,3 @@
+tool,path,runs,warmup_discarded,failed,n,median_s,min_s,max_s,first_error
+Example_Tool,loopback,6,1,6,0,,,,"POST /run/Example_Tool -> 500: {""detail"":""Tool execution failed.""}"
+Test_Tool,loopback,6,1,0,5,0.0021,0.0017,0.0023,

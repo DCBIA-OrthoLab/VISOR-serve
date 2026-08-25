@@ -1,0 +1,326 @@
+# ---------------------------------------------------------------------------
+# The benchmark harness reads this file and nothing else.
+#
+# Adding a tool to a campaign is an edit HERE. No Python changes, no new module,
+# no registration step. If you find yourself editing Python to run a tool, that
+# is a defect in the harness -- please report it.
+#
+# Paths that are not absolute resolve against the SERVER REPOSITORY ROOT (the
+# directory holding this `benchmarks/` folder), so the same file works whatever
+# directory you run from.
+#
+# The API token is NEVER in this file. It comes from $API_TOKEN, or from the
+# server repository's .env, which .gitignore excludes. See README.md.
+# ---------------------------------------------------------------------------
+
+server:
+  # The deployment under test. `loopback` uses this URL.
+  base_url: http://localhost:8000
+  # The same server, as a DIFFERENT machine reaches it. Required only for the
+  # `lan` path; leave it null and any plan item using `lan` is refused with a
+  # message saying so rather than silently measuring loopback twice.
+  lan_base_url: null
+  # Generous on purpose: an AMASSS cohort legitimately runs for an hour, and a
+  # client timeout in the middle of one is a lost measurement, not a result.
+  request_timeout_seconds: 7200
+  verify_tls: true
+
+# The wire protocol, as the real Slicer client speaks it. These are that
+# client's own constants (ServerToolsCoreLib/config.py and transfer.py) and
+# should not be changed to make a number look better -- a benchmark of a client
+# nobody runs measures nothing.
+transfer:
+  chunk_bytes: 8388608        # 8 MB parts
+  parallelism: 4              # concurrent PUTs and concurrent ranged GETs
+  connection_pool: 16         # must exceed parallelism or the pool serialises
+  gzip_parts: true            # only for inputs that are not already compressed
+  result_delivery_reference: true   # X-Result-Delivery: reference
+  min_chunked_bytes: 16777216 # under this, an input travels inside POST /run
+
+# How the `local` path invokes a tool without HTTP. Read NOTES-local-path.md
+# before changing `mode`: the two modes are not interchangeable and the notes
+# quantify how they differ.
+local:
+  # container -- the virtualenvs inside the deployment image, reached with
+  #              `docker exec`. Identical to what the server dispatches to.
+  # host      -- the virtualenvs in the sadt-tools working checkout. Models a
+  #              scientist who installed the tools on their own machine.
+  mode: container
+
+  container: slicer-remote-tool-server-inference-venvs-1
+  container_user: sadt
+  container_tools_dir: /tools
+  container_runner: /opt/sadt/server/execution/runner.py
+  container_jobs_dir: /jobs
+  container_data_dir: /DATA
+
+  host_tools_dir: ../sadt-tools/tools
+  host_runner: server/execution/runner.py
+  host_jobs_dir: /tmp/sadt-benchmarks/jobs
+  host_data_dir: DATA
+
+# Disk safety. This machine has ~59 GB free and the campaigns write CBCT
+# volumes; a campaign that fills the disk takes the server down with it, because
+# the server's own job directories are on the same filesystem.
+guards:
+  min_free_gb: 12       # refuse to start below this, whatever the projection
+  margin_gb: 8          # and refuse if the projected output would leave less
+  scratch_dir: benchmarks/results/scratch
+
+# Recorded in every result record, so a number can be traced to the code that
+# produced it.
+repos:
+  server: .
+  tools: ../sadt-tools
+  client: ../SlicerAutomatedDentalToolsCloud
+
+# ---------------------------------------------------------------------------
+# The tools
+#
+#   args          scalar arguments, sent as form values / written into job.json
+#   files         inputs that TRAVEL (uploaded remotely, staged locally)
+#   server_files  inputs the server already holds; named, never uploaded.
+#                 `kind` is 'model' or 'testfile' and is required: the local
+#                 path has no server to ask which folder a name lives in.
+#   data_slug     the DATA/ folder this tool reads. Not always its own name --
+#                 deployment.toml maps AREG_CBCT/AREG_IOS/AREG_IOSCBCT all onto
+#                 DATA/AREG, and the convention strips underscores elsewhere.
+#   local         folder (under the tools dir) and importable package, or
+#                 `false` with a `local_reason` when there is no local path.
+#   estimated_*   used ONLY by --dry-run and the disk guard. Wrong estimates
+#                 cost a refused campaign, never a wrong measurement.
+# ---------------------------------------------------------------------------
+tools:
+
+  # --- the two trivial tools, for proving the harness works ----------------
+  Test_Tool:
+    args:
+      text_1: hello
+      text_2: benchmark
+    output_kind: text
+    wants_output_dir: false
+    # An IN-PROCESS tool: it is a `Tool` subclass the API imports, with no
+    # virtualenv of its own, so there is no separate interpreter to invoke and
+    # no `local` path to take. That is a fact about this tool, not a limitation
+    # of the harness -- see NOTES-local-path.md.
+    local: false
+    local_reason: >-
+      in-process tool (server/tools/Test_Tool), no per-tool virtualenv, so the
+      no-HTTP path would be an import in the API process rather than a
+      separate interpreter
+    estimated_seconds: 0.1
+    estimated_output_mb: 0
+    payload_label: none
+
+  Example_Tool:
+    args:
+      label: benchmark
+      threshold: 1.0
+    files:
+      input: benchmarks/fixtures/example_tool_input.csv
+    output_kind: files
+    wants_output_dir: false
+    local: false
+    local_reason: >-
+      in-process tool (server/tools/Example_Tool), no per-tool virtualenv
+    estimated_seconds: 0.5
+    estimated_output_mb: 0.1
+    payload_label: none
+    notes: >-
+      On the venvs deployment image this tool FAILS: it calls
+      file_utils.load_tabular_file, which imports pandas, and the API
+      virtualenv deliberately carries no pandas. Kept in the config because a
+      deterministic failure is what proves the harness records failures instead
+      of dropping them.
+
+  # --- the B1 tool spread -------------------------------------------------
+  Crown_Seg:
+    args:
+      device: cuda
+    files:
+      meshes: DATA/CrownSeg/testfiles/T1_01_U_segmented.vtk
+    server_files:
+      model: {kind: model, name: "07-21-22_val-loss0.169.pth"}
+    data_slug: CrownSeg
+    local:
+      folder: Crown_Seg
+      package: sadt_crownseg
+    estimated_seconds: 60
+    estimated_output_mb: 40
+    payload_label: 16MB_mesh    # 15 885 605 B = 15.1 MiB
+    notes: torch 2.11, mesh input, the small payload
+
+  AMASSS:
+    args:
+      device: cuda
+    files:
+      scans: DATA/AMASSS/testfiles/MG_test_scan.nii.gz
+    server_files:
+      model: {kind: model, name: AMASSS_Models}
+    data_slug: AMASSS
+    local:
+      folder: AMASSS
+      package: sadt_amasss
+    estimated_seconds: 180
+    estimated_output_mb: 200
+    payload_label: 99MB_CBCT    # 98 611 496 B = 94.0 MiB
+    notes: torch 2.8, nnU-Net, large payload, GPU-heavy
+
+  ALI_CBCT:
+    args:
+      device: cuda
+    files:
+      input: DATA/AMASSS/testfiles/MG_test_scan.nii.gz
+    server_files:
+      model: {kind: model, name: ALI_CBCT_Models}
+    data_slug: ALI
+    local:
+      folder: ALI/ALI_CBCT
+      package: sadt_ali_cbct
+    estimated_seconds: 180
+    estimated_output_mb: 5
+    payload_label: 99MB_CBCT    # 98 611 496 B = 94.0 MiB
+    notes: torch 2.8, monai, landmark output
+
+  ASO:
+    args: {}
+    files:
+      input: DATA/AMASSS/testfiles/MG_test_scan.nii.gz
+    server_files:
+      reference: {kind: model, name: CBCT_Gold_Occlusal_Midsagittal_Plane}
+    data_slug: ASO
+    local:
+      folder: ASO
+      package: sadt_aso
+    estimated_seconds: 40
+    estimated_output_mb: 100
+    payload_label: 99MB_CBCT    # 98 611 496 B = 94.0 MiB
+    notes: NO torch -- this is what isolates the GPU stack from everything else
+
+  Surg_Mov_Pred:
+    args: {}
+    server_files:
+      measurements: {kind: testfile, name: TestFiles}
+      model: {kind: model, name: all_models}
+    data_slug: SurgMovPred
+    local:
+      folder: Surg_Mov_Pred
+      package: sadt_surgmovpred
+    estimated_seconds: 30
+    estimated_output_mb: 1
+    payload_label: none
+    notes: Python 3.12 and no torch -- the other interpreter generation
+
+  ALI_IOS:
+    args:
+      device: cuda
+    files:
+      input: DATA/CrownSeg/testfiles/T1_01_U_segmented.vtk
+    server_files:
+      model: {kind: model, name: ALI_IOS_Models}
+    data_slug: ALI
+    local:
+      folder: ALI/ALI_IOS
+      package: sadt_ali_ios
+    estimated_seconds: 60
+    estimated_output_mb: 5
+    payload_label: 16MB_mesh    # 15 885 605 B = 15.1 MiB
+    notes: a child of the AREG_IOSCBCT chain
+
+  AREG_IOSCBCT:
+    args:
+      automation: Registration
+    files:
+      cbct: DATA/AREG/testfiles/IOSCBCT_TestFile/T2/P_0001_T2.nii.gz
+      ios: DATA/AREG/testfiles/IOSCBCT_TestFile/T1
+    server_files:
+      crown_model: {kind: model, name: "07-21-22_val-loss0.169.pth"}
+      landmark_model: {kind: model, name: ALI_CBCT_Models}
+      ios_landmark_model: {kind: model, name: ALI_IOS_Models}
+      cbct_reference: {kind: model, name: CBCT_Gold_Occlusal_Midsagittal_Plane}
+    data_slug: AREG
+    local:
+      folder: AREG/AREG_IOSCBCT
+      package: sadt_areg_ioscbct
+    estimated_seconds: 200
+    estimated_output_mb: 250
+    payload_label: 233MB_CBCT_and_IOS  # 217 MB CBCT + 16 MB IOS folder
+    notes: >-
+      the orchestrator: 233 MB of input (217 MB CBCT + a 16 MB IOS folder),
+      and the deepest real chain
+      (AREG_IOSCBCT -> ASO -> ALI_CBCT). Feeds B3.
+
+# ---------------------------------------------------------------------------
+# The campaigns
+# ---------------------------------------------------------------------------
+campaigns:
+
+  b1:
+    reps: 6            # >= 6; the first is discarded
+    warmup: 1
+    paths: [local, loopback]      # add `lan` once server.lan_base_url is set
+    tools:
+      - Test_Tool
+      - Example_Tool
+      - Crown_Seg
+      - AMASSS
+      - ALI_CBCT
+      - ASO
+      - Surg_Mov_Pred
+      - AREG_IOSCBCT
+
+  b2:
+    reps: 4
+    path: loopback
+    # 4 = the client's own default, 1 = the same protocol with one worker. The
+    # difference between the two rows is what parallelism buys, and nothing else
+    # changes between them.
+    parallelism: [4, 1]
+    # One tool per payload size, so the three rows are a size trend.
+    tools:
+      - Crown_Seg        # 16 MB (15.9 MB mesh)
+      - AMASSS           # 99 MB (98.6 MB CBCT)
+      - AREG_IOSCBCT     # 233 MB (217 MB CBCT + 16 MB IOS folder)
+
+  b3:
+    tool: AREG_IOSCBCT
+    path: local
+    reps: 3
+    # The modes differ EXACTLY by how many children the supervisor starts, so
+    # the difference between two rows is the chain cost.
+    modes: [Registration, Semi-Automated, Fully-Automated]
+    seconds_by_mode:
+      Registration: 60
+      Semi-Automated: 150
+      Fully-Automated: 260
+    # Per child: interpreter start and stack import, with no compute in either.
+    children: [Crown_Seg, ALI_IOS, ALI_CBCT, ASO]
+    startup_reps: 5
+
+  b4:
+    path: loopback
+    concurrency: [1, 2, 4, 8]
+    jobs_per_client: 2
+    vram_sample_seconds: 0.5
+    tools:
+      - Crown_Seg
+    notes: >-
+      the server's own MAX_CONCURRENT_TOOLS (4) and MAX_CONCURRENT_GPU_JOBS (1)
+      are what this is testing against; report them next to the numbers.
+
+  b5:
+    remote_path: loopback
+    reps: 1
+    tools:
+      - Crown_Seg
+      - AMASSS
+      - ALI_CBCT
+      - ASO
+      - Surg_Mov_Pred
+      - AREG_IOSCBCT
+    # Which interpreter reads NIfTI/NRRD for the numeric distance. It must be a
+    # path on the machine RUNNING THE HARNESS -- the comparison happens here,
+    # not in the container -- and it must carry SimpleITK and numpy. A tool's
+    # own virtualenv in the sadt-tools checkout is the right answer, because it
+    # is the stack that wrote the file.
+    imaging_interpreter: ../sadt-tools/tools/AMASSS/.venv/bin/python
