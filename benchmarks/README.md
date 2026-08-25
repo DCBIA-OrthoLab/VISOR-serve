@@ -114,6 +114,7 @@ Useful flags:
 | `--reps N` | override the repetition count |
 | `--config PATH` (or `$BENCHMARKS_CONFIG`) | point at your own config file |
 | `--local-mode container\|host` | override `local.mode` for this run. The two are not interchangeable -- see [`NOTES-local-path.md`](NOTES-local-path.md) -- and the mode is written into every record as `extra.local_mode` |
+| `--local-control` | B5 only: run the local path twice and compare it against itself -- the determinism baseline a parity claim needs before it can blame the protocol |
 | `--keep-artifacts` | keep job directories and downloads (fills a disk fast) |
 | `--skip-disk-check` | run anyway when the projection does not fit. Say why in your notes. |
 | `--no-summary` | do not regenerate the summary afterwards |

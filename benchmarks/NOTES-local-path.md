@@ -244,15 +244,17 @@ measurement.
 
 ## 5. Ambiguities that remain
 
-- **Which mode should the published B1 numbers use?** `container` is the
-  faithful one -- it is byte-for-byte the execution the server dispatches, so the
-  local-to-loopback delta is attributable to the protocol and nothing else. `host`
-  is the *realistic* one for the paper's argument, because a scientist running
-  locally runs a checkout on their own OS, not a container. They will not give the
-  same number: different glibc, an un-deduplicated venv with a different page-cache
-  profile, and no `docker exec` tax. **The default is `container`; this is a
-  decision to confirm before the heavy campaigns run.** Running both is affordable
-  for the cheap tools and would settle it with data.
+- **Which mode should the published numbers use?** Settled 2026-08-25, and the
+  two campaigns take different answers because they ask different questions.
+  **B1 takes `container`**: it is byte-for-byte the execution the server
+  dispatches, so the local-to-loopback delta is attributable to the protocol and
+  nothing else. **B5 takes `host` as its primary and `container` as its
+  control**: the host checkout is Ubuntu 22.04 / glibc 2.35 and the image is
+  Debian 13 / glibc 2.41, so byte-identical artifacts *across that gap* is a
+  reproducibility result, where byte-identical inside one image is nearly
+  tautological; running `container` as well is what separates an OS difference
+  from a protocol one. Neither is a default any more: `--local-mode` names the
+  mode on the command line and every record carries `extra.local_mode`.
 
 - **Cold versus warm start is not separated inside the local path.** Repetition 1
   is discarded as warm-up, which is the protocol, but the harness does not drop

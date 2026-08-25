@@ -75,6 +75,14 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--local-control", action="store_true",
+        help=(
+            "B5 only: run the local path TWICE and compare it against itself, as the "
+            "determinism baseline a parity claim needs before it can blame the protocol "
+            "for a difference. Doubles the local side of the campaign."
+        ),
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="validate the config, print the plan, and do nothing else",
     )
@@ -173,6 +181,14 @@ def main(argv=None) -> int:
                 raise ConfigError(
                     "--local-mode container, but local.container names no container"
                 )
+        if arguments.local_control:
+            section = config.campaigns.get(b5_parity.NAME)
+            if not isinstance(section, dict):
+                raise ConfigError(
+                    f"--local-control applies to campaign '{b5_parity.NAME}', which this "
+                    f"config does not define."
+                )
+            section["local_control"] = True
         plan = module.build_plan(config, options_from(arguments))
     except ConfigError as error:
         print(f"config error: {error}", file=sys.stderr)
