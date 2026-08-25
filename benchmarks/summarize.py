@@ -231,7 +231,11 @@ def table_b5(records: list) -> list:
         extra = record.get("extra") or {}
         if extra.get("side") == "local_control":
             # The determinism baseline, kept in its own row shape so it can
-            # never be misread as a local-versus-remote result.
+            # never be misread as a local-versus-remote result. The second RUN
+            # carries the same side marker and no comparison, so it is skipped
+            # here rather than printed as an empty row.
+            if "parity" not in extra and record.get("status") != STATUS_FAILED:
+                continue
             parity = extra.get("parity") or {}
             rows.append(
                 {

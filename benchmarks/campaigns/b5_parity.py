@@ -237,6 +237,10 @@ def _comparison_record(
         "side": "comparison",
         "pair": repetition,
         "remote_path": remote,
+        # Which local mode this pair compared. Without it a summary built from
+        # a host run and a container run cannot tell the two arms apart, and
+        # those two arms are the whole point of running B5 twice.
+        "local_mode": context.config.local.mode,
         "local_status": local_record.status,
         "remote_status": remote_record.status,
         "imaging_interpreter": imaging_interpreter,
