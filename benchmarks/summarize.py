@@ -156,6 +156,10 @@ def table_b3(records: list) -> list:
                     "measurement": "startup",
                     "tool": record.get("tool"),
                     "mode": "",
+                    # Which local mode the probe ran in. The image's virtualenvs
+                    # are hardlink-deduplicated and the host checkout's are not,
+                    # so two rows for one tool are two different measurements.
+                    "local_mode": extra.get("local_mode", ""),
                     "runs": 1,
                     "failed": 1 if record.get("status") == STATUS_FAILED else 0,
                     "n": 1 if record.get("status") == STATUS_OK else 0,
@@ -176,6 +180,9 @@ def table_b3(records: list) -> list:
                 "measurement": "chain",
                 "tool": tool,
                 "mode": mode,
+                "local_mode": (
+                    (measured[0].get("extra") or {}).get("local_mode", "") if measured else ""
+                ),
                 "runs": len(group),
                 "failed": sum(1 for r in group if r.get("status") == STATUS_FAILED),
                 "n": stats["n"],
