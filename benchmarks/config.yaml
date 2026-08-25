@@ -310,11 +310,20 @@ campaigns:
     # difference between the two rows is what parallelism buys, and nothing else
     # changes between them.
     parallelism: [4, 1]
-    # One tool per payload size, so the three rows are a size trend.
+    # One tool per payload size, so the first three rows are a size trend.
+    # Sizes are DECIMAL MB (10^6 bytes), verified with `stat -c %s`.
     tools:
-      - Crown_Seg        # 16 MB (15.9 MB mesh)
-      - AMASSS           # 99 MB (98.6 MB CBCT)
-      - AREG_IOSCBCT     # 233 MB (217 MB CBCT + 16 MB IOS folder)
+      - Crown_Seg        # 15.9 MB mesh -- BELOW transfer.min_chunked_bytes
+                         # (16 MiB), so it travels inside POST /run and has no
+                         # upload phase and no parts to parallelise at all.
+                         # That is the protocol, not a gap in the measurement.
+      - AMASSS           # 98.6 MB CBCT, 12 parts
+      - AREG_IOSCBCT     # 233.0 MB on disk -> 223.3 MB packed, 26 parts
+      - ASO              # the only tool here whose RESULT is large (105.7 MB
+                         # oriented volume). Without it the download column is
+                         # 1-9 MB everywhere and the ranged GET's parallelism
+                         # is never exercised, so "transfers run in parallel"
+                         # would rest on the upload side alone.
 
   b3:
     tool: AREG_IOSCBCT
@@ -352,8 +361,24 @@ campaigns:
     concurrency: [1, 2, 4, 8]
     jobs_per_client: 2
     vram_sample_seconds: 0.5
+    # Two arms, because the two server limits are not the same limit and one
+    # tool cannot exercise both.
+    #
+    #   Crown_Seg  -- a packaged GPU tool. dispatch.uses_the_gpu() answers yes
+    #                 for it, so every job takes the MAX_CONCURRENT_GPU_JOBS
+    #                 semaphore and N clients queue on one card. Mid-weight on
+    #                 purpose: ~58 s a call against ALI_CBCT's ~380 s, so
+    #                 8 x 2 jobs is half an hour rather than three.
+    #   Test_Tool  -- an IN-PROCESS tool. It never reaches dispatch(), so it
+    #                 takes no GPU slot and is bounded only by
+    #                 MAX_CONCURRENT_TOOLS. Without it, a flat throughput curve
+    #                 could not be attributed to the card rather than to the
+    #                 request path. Run it with a large --reps: a 2 ms job needs
+    #                 hundreds of repetitions before the window is long enough
+    #                 to divide by.
     tools:
       - Crown_Seg
+      - Test_Tool
     notes: >-
       the server's own MAX_CONCURRENT_TOOLS (4) and MAX_CONCURRENT_GPU_JOBS (1)
       are what this is testing against; report them next to the numbers.
