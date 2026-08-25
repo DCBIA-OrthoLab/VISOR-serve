@@ -32,7 +32,7 @@ from . import __version__, guards, summarize
 from .campaigns import _common, b1_latency, b2_network, b3_supervisor, b4_concurrency, b5_parity
 from .provenance import collect
 from .recording import Recorder
-from .settings import BENCHMARKS_ROOT, ConfigError, load, read_token
+from .settings import BENCHMARKS_ROOT, LOCAL_MODES, ConfigError, load, read_token
 
 CAMPAIGNS = {
     module.NAME: module
@@ -64,6 +64,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config", default=None,
         help="path to config.yaml (default: the shipped one; $BENCHMARKS_CONFIG also works)",
+    )
+    parser.add_argument(
+        "--local-mode", default=None, choices=sorted(LOCAL_MODES),
+        help=(
+            "override local.mode for this run. 'container' is the execution the server "
+            "dispatches; 'host' is the sadt-tools checkout on this OS. They are not "
+            "interchangeable -- read NOTES-local-path.md. Recorded in every record as "
+            "extra.local_mode either way."
+        ),
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -158,6 +167,12 @@ def main(argv=None) -> int:
 
     try:
         config = load(arguments.config)
+        if arguments.local_mode:
+            config.local.mode = arguments.local_mode
+            if arguments.local_mode == "container" and not config.local.container:
+                raise ConfigError(
+                    "--local-mode container, but local.container names no container"
+                )
         plan = module.build_plan(config, options_from(arguments))
     except ConfigError as error:
         print(f"config error: {error}", file=sys.stderr)
@@ -233,9 +248,15 @@ def main(argv=None) -> int:
               f"{_duration(elapsed)} elapsed")
         print(f"raw: {recorder.path}")
 
-    removed = guards.clear_scratch(config.guards.scratch_dir)
-    if removed:
-        print(f"cleaned {removed} scratch entr{'y' if removed == 1 else 'ies'}")
+    if arguments.keep_artifacts:
+        # --keep-artifacts means keep them. Sweeping the scratch root here would
+        # delete the very job directories and downloads the flag was asked for,
+        # and the flag would silently do nothing.
+        print(f"scratch kept at {config.guards.scratch_dir} (--keep-artifacts)")
+    else:
+        removed = guards.clear_scratch(config.guards.scratch_dir)
+        if removed:
+            print(f"cleaned {removed} scratch entr{'y' if removed == 1 else 'ies'}")
 
     if not arguments.no_summary:
         outcome = summarize.summarize(campaign, arguments.root)

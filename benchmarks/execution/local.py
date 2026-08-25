@@ -50,6 +50,9 @@ STDERR_LOG = "stderr.log"
 
 _DOCKER_TIMEOUT_SECONDS = 120.0
 
+# How much of a tool's stderr is kept. See LocalRunner.execute.
+_STDERR_TAIL_CHARS = 400_000
+
 
 class LocalPathError(RuntimeError):
     """The local path could not be taken. Distinct from a tool that ran and
@@ -320,7 +323,11 @@ class LocalRunner:
             )
 
         run.exit_code = completed.returncode
-        run.stderr_tail = completed.stderr.decode("utf-8", "replace")[-8192:]
+        # Generous, because a SUPERVISED run interleaves its own supervisor lines
+        # with every child's logging: 8 kB of an AREG_IOSCBCT chain is the tail of
+        # ALI_CBCT's landmark progress and none of the "running 'X'" lines that
+        # say which children fired. Callers trim to what they store.
+        run.stderr_tail = completed.stderr.decode("utf-8", "replace")[-_STDERR_TAIL_CHARS:]
 
         payload = self._read_result(run)
         if payload is None:

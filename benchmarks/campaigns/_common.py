@@ -129,12 +129,29 @@ def local_params(context: Context, tool: ToolSpec, job: local_path.LocalRun) -> 
     return params
 
 
+SUPERVISOR_LOGGER = "sadt.supervisor"
+
+
+def supervisor_log(stderr: str) -> list:
+    """The supervisor's own lines out of a chain's stderr, timestamps kept.
+
+    This is what says WHICH children a supervised run actually started, in what
+    order, and when -- read off the run itself rather than off the call graph
+    documentation, which is a different claim. Kept as a short list rather than
+    the whole stream so it can live in every record.
+    """
+    return [
+        line for line in (stderr or "").splitlines() if f" {SUPERVISOR_LOGGER}: " in line
+    ]
+
+
 def run_local(
     context: Context,
     tool: ToolSpec,
     timer: PhaseTimer,
     collect_to: Optional[str] = None,
     timeout: Optional[float] = None,
+    capture_stderr: bool = False,
 ) -> dict:
     """One `local` run. Returns the campaign-facing `extra` fields.
 
@@ -142,6 +159,9 @@ def run_local(
     means the job directory is taken down without reading it, which is what the
     latency campaign wants (copying 200 MB out of a container is not part of
     running a tool).
+
+    `capture_stderr` adds the supervisor's log lines to the record. Off by
+    default: it is evidence B3 needs and noise everywhere else.
     """
     runner = context.local_runner()
     job = None
@@ -156,14 +176,19 @@ def run_local(
         with timer.phase("collect"):
             if collect_to:
                 collected = runner.fetch_outputs(job.job_dir, collect_to)
-        return {
+        fields = {
             "job_id": job.job_id,
+            "job_dir": job.job_dir,
             "result": job.result,
             "peak_vram_bytes": job.peak_vram_bytes,
             "collected_dir": collected,
             "command": job.command,
             "local_mode": context.config.local.mode,
         }
+        if capture_stderr:
+            fields["supervisor_log"] = supervisor_log(job.stderr_tail)
+            fields["stderr_tail"] = job.stderr_tail[-8000:]
+        return fields
     finally:
         if job is not None and not context.keep_artifacts:
             runner.remove_job(job.job_dir)
@@ -214,6 +239,7 @@ def execute(
     collect_to: Optional[str] = None,
     keep_workspace: bool = False,
     timeout: Optional[float] = None,
+    capture_stderr: bool = False,
 ) -> RunRecord:
     """One run, through one path, recorded whether it worked or not.
 
@@ -237,7 +263,12 @@ def execute(
             # was taken in and what the wrapper costs there.
             fields["local_mode"] = context.config.local.mode
             fields["exec_overhead"] = context.local_overhead()
-            fields.update(run_local(context, tool, timer, collect_to=collect_to, timeout=timeout))
+            fields.update(
+                run_local(
+                    context, tool, timer, collect_to=collect_to, timeout=timeout,
+                    capture_stderr=capture_stderr,
+                )
+            )
         else:
             fields.update(
                 run_remote(
@@ -252,6 +283,8 @@ def execute(
         if isinstance(error, local_path.ToolRunFailure):
             fields["tool_error_type"] = error.error_type
             fields["stderr_tail"] = error.stderr_tail[-2000:]
+            if capture_stderr:
+                fields["supervisor_log"] = supervisor_log(error.stderr_tail)
         if isinstance(error, remote_path.RemoteError):
             fields["status_code"] = error.status_code
     except Exception as error:  # noqa: BLE001 - recorded, never dropped

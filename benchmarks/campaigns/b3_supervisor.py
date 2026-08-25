@@ -58,9 +58,15 @@ def build_plan(config: Config, options: dict) -> list:
     children = list(section.get("children", []))
     startup_repetitions = int(section.get("startup_reps", DEFAULT_STARTUP_REPETITIONS))
 
+    # `--tools` selects a subset here as it does everywhere else: the startup
+    # probes are cheap and the chains are not, so "just the isolation cost, in
+    # the other local mode" has to be expressible without re-running three
+    # chains to get it.
+    wanted = options.get("tools")
+
     tool = config.tool(orchestrator)
     plan = []
-    for mode in modes:
+    for mode in (modes if (not wanted or orchestrator in wanted) else []):
         plan.append(
             _common.plan_item(
                 NAME, tool, path, repetitions,
@@ -75,6 +81,8 @@ def build_plan(config: Config, options: dict) -> list:
             )
         )
     for child in children:
+        if wanted and child not in wanted:
+            continue
         child_tool = config.tool(child)
         if not child_tool.supports_local:
             plan.append(
@@ -108,10 +116,11 @@ def execute(item: dict, context: _common.Context) -> Iterator[RunRecord]:
         return
 
     mode = item["mode"]
+    section = context.config.campaign(NAME)
     # The mode is an ARGUMENT of the orchestrator, so it is applied to a copy of
     # the tool spec rather than mutating the shared one -- three plan items
     # otherwise end up all running the last mode.
-    variant = _with_mode(tool, mode)
+    variant = _with_mode(tool, mode, section)
     for repetition in range(1, int(item["runs"]) + 1):
         yield _common.execute(
             context,
@@ -121,13 +130,44 @@ def execute(item: dict, context: _common.Context) -> Iterator[RunRecord]:
             repetition,
             warmup=repetition == 1,
             extra={"measurement": "chain", "mode": mode},
+            capture_stderr=True,
         )
 
 
-def _with_mode(tool, mode: str):
+def _with_mode(tool, mode: str, section: dict = None):
+    """The tool as this mode runs it: the mode itself, plus what it changes.
+
+    The modes do not take the same arguments. AREG_IOSCBCT's Registration mode
+    registers on landmarks the caller supplies; the automated modes predict
+    them, and SKIP the prediction when they are supplied -- so handing all three
+    the same inputs would silently collapse a four-child chain to one child and
+    report the difference as the chain cost. `campaigns.b3.per_mode` carries
+    that difference as data, with `null` meaning "this mode does not take that
+    input at all".
+    """
     from dataclasses import replace
 
-    return replace(tool, args=dict(tool.args, **{MODE_ARGUMENT: mode}))
+    from ..settings import resolve_path
+
+    overrides = ((section or {}).get("per_mode") or {}).get(mode) or {}
+    args = dict(tool.args, **{MODE_ARGUMENT: mode})
+    args.update(overrides.get("args") or {})
+
+    files = dict(tool.files)
+    for argument, path in (overrides.get("files") or {}).items():
+        if path is None:
+            files.pop(argument, None)
+        else:
+            files[argument] = resolve_path(str(path))
+
+    server_files = dict(tool.server_files)
+    for argument, hosted in (overrides.get("server_files") or {}).items():
+        if hosted is None:
+            server_files.pop(argument, None)
+        else:
+            server_files[argument] = hosted
+
+    return replace(tool, args=args, files=files, server_files=server_files)
 
 
 def _startup_record(item: dict, context: _common.Context, tool) -> RunRecord:
@@ -137,7 +177,10 @@ def _startup_record(item: dict, context: _common.Context, tool) -> RunRecord:
     runner = context.local_runner()
     status = STATUS_OK
     error_type = error_message = None
-    extra = {"measurement": "startup"}
+    # The mode belongs in the record: the image's virtualenvs are
+    # hardlink-deduplicated and the host checkout's are not, and whether that
+    # changes first-import time is exactly what two runs of these probes answer.
+    extra = {"measurement": "startup", "local_mode": context.config.local.mode}
     try:
         measured = runner.measure_startup(tool, int(item.get("startup_reps",
                                                              DEFAULT_STARTUP_REPETITIONS)))
