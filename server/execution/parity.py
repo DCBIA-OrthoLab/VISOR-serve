@@ -261,17 +261,20 @@ def _packaged_folder(name: str) -> str:
     `--packaged` already lets a caller name the folder outright -- but leaving
     one site behind is how the assumption survived three rounds of fixing it.
     """
-    direct = os.path.join(settings.TOOLS_DIR, name)
-    if os.path.isdir(direct):
-        return direct
-    try:
-        groups = sorted(os.listdir(settings.TOOLS_DIR))
-    except OSError:
-        return direct
-    for group in groups:
-        nested = os.path.join(settings.TOOLS_DIR, group, name)
-        if os.path.isdir(nested):
-            return nested
+    roots = settings.tool_roots()
+    direct = os.path.join(roots[0], name)
+    for root in roots:
+        here = os.path.join(root, name)
+        if os.path.isdir(here):
+            return here
+        try:
+            groups = sorted(os.listdir(root))
+        except OSError:
+            continue
+        for group in groups:
+            nested = os.path.join(root, group, name)
+            if os.path.isdir(nested):
+                return nested
     return direct
 
 

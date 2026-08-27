@@ -156,7 +156,8 @@ def _registered_folder(tool_name: str):
 def tool_interpreter(tool_name: str) -> str:
     """Path to the interpreter of this tool's virtualenv.
 
-    Searched one level below TOOLS_DIR as well as directly under it, because a
+    Searched one level below each catalogue as well as directly under it,
+    because a
     tool may live inside a GROUPING folder: ALI_CBCT and ALI_IOS are two tools
     in tools/ALI/, which is not a tool itself. The folder is still named after
     the tool -- only its depth varies -- so this stays a lookup.
@@ -180,19 +181,23 @@ def tool_interpreter(tool_name: str) -> str:
         if os.path.isfile(registered):
             return registered
 
-    direct = os.path.join(settings.TOOLS_DIR, tool_name, ".venv", "bin", "python")
-    if os.path.isfile(direct):
-        return direct
-    try:
-        groups = sorted(os.listdir(settings.TOOLS_DIR))
-    except OSError:
-        return direct
-    for group in groups:
-        if group == tool_name:
+    # Every catalogue TOOLS_DIR names, in order, and the server's own last.
+    roots = settings.tool_roots()
+    direct = os.path.join(roots[0], tool_name, ".venv", "bin", "python")
+    for root in roots:
+        here = os.path.join(root, tool_name, ".venv", "bin", "python")
+        if os.path.isfile(here):
+            return here
+        try:
+            groups = sorted(os.listdir(root))
+        except OSError:
             continue
-        nested = os.path.join(settings.TOOLS_DIR, group, tool_name, ".venv", "bin", "python")
-        if os.path.isfile(nested):
-            return nested
+        for group in groups:
+            if group == tool_name:
+                continue
+            nested = os.path.join(root, group, tool_name, ".venv", "bin", "python")
+            if os.path.isfile(nested):
+                return nested
     return direct
 
 

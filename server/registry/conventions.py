@@ -1,7 +1,7 @@
 """What a tool gets without anyone configuring it.
 
-A new tool should be servable by dropping it in `TOOLS_DIR`, with no edit to
-this repository. These rules derive from the schema what `deployment.toml`
+A new tool should be servable by dropping it in one of the directories
+`TOOLS_DIR` names, with no edit to this repository. These rules derive from the schema what `deployment.toml`
 used to have to state; that file remains, as an override for the exceptions.
 
     argument named `model`, `*_model`, `*_reference`   picked from DATA/<tool>/models/
