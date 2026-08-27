@@ -623,12 +623,29 @@ class _Supervisor:
 
     @property
     def _roots(self):
-        """The tools directory, and its parent when we are a nested tool."""
+        """The tool's own catalogue, its parent when nested, and every other
+        catalogue TOOLS_DIR names.
+
+        The first two are derived from where this tool lives, which is the one
+        thing the invocation already fixes. That was enough while there was one
+        catalogue. It is not enough with several: a tool in the second whose
+        child lives in the first would look for it beside itself, not find it,
+        and fail a chain the server's boot check had just declared complete.
+        """
         roots = [self._tools_dir]
         parent = os.path.dirname(self._tools_dir)
         if parent and parent != self._tools_dir:
             roots.append(parent)
-        return roots
+        for entry in os.environ.get("TOOLS_DIR", "").split(os.pathsep):
+            entry = entry.strip()
+            if entry:
+                roots.append(os.path.abspath(entry))
+        seen, ordered = set(), []
+        for root in roots:
+            if root not in seen:
+                seen.add(root)
+                ordered.append(root)
+        return ordered
 
     def _result(self, tool: str, nested_dir: str):
         path = os.path.join(nested_dir, RESULT_FILE)
