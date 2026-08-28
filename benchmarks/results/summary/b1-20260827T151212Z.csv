@@ -1,0 +1,15 @@
+tool,path,runs,warmup_discarded,failed,n,median_s,min_s,max_s,first_error
+ALI_CBCT,local,6,1,0,5,414.8655,410.9571,423.9952,
+ALI_CBCT,loopback,13,3,0,10,404.6225,368.1009,759.2401,
+AMASSS,local,6,1,0,5,77.3117,77.1153,79.6327,
+AMASSS,loopback,8,2,0,6,78.7572,76.8913,87.4463,
+AREG_IOSCBCT,local,12,2,0,10,0.8152,0.6103,1.0225,
+AREG_IOSCBCT,loopback,10,3,2,6,1.7669,1.7171,1.7942,"POST /run/AREG_IOSCBCT -> 422: {""detail"":""The Registration mode takes the landmarks already computed: send both 'ios_landmarks' and 'cbct_landmarks', or use a m"
+ASO,local,12,2,0,10,51.8587,49.0165,55.5914,
+ASO,loopback,10,3,2,6,54.2088,53.4777,54.9504,"POST /run/ASO -> 422: {""detail"":""Only 0 of the selected landmarks exist in this reference, and 3 are needed. The reference defines: ANS, IF, PNS, UL6O, UR1O, UR"
+Crown_Seg,local,12,2,0,10,54.7957,50.3753,60.3675,
+Crown_Seg,loopback,10,3,0,7,58.9099,13.2516,59.3648,
+Example_Tool,loopback,18,3,18,0,,,,"POST /run/Example_Tool -> 500: {""detail"":""Tool execution failed.""}"
+Surg_Mov_Pred,local,18,3,0,15,11.0795,7.8445,13.7647,
+Surg_Mov_Pred,loopback,14,3,0,11,10.9955,9.775,12.649,
+Test_Tool,loopback,18,3,0,15,0.0021,0.0014,0.0039,
