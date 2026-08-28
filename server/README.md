@@ -1,7 +1,7 @@
 # Inference server (tool-registry architecture)
 
 FastAPI server exposing a generic `/run/{tool_name}` endpoint. **It knows no
-dental tool.** The tools live in [`sadt-tools`](https://github.com/Jules-GP/sadt-tools),
+dental tool.** The tools live in [`sadt-tools`](https://github.com/DCBIA-OrthoLab/SADT-VISOR),
 one isolated project each - its own interpreter, its own lockfile, its own
 torch - and this server discovers them from `TOOLS_DIR`, publishes them, and
 runs them **without importing a line of them**:

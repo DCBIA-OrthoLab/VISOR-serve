@@ -3,7 +3,7 @@
 #
 # From a machine with nothing checked out:
 #
-#   curl -fsSL https://raw.githubusercontent.com/Jules-GP/slicer-remote-tool-server/main/scripts/setup-server.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-server.sh | sh
 #
 # Options reach this script through `sh -s --` when piping:
 #
@@ -32,7 +32,7 @@
 
 set -eu
 
-REPO="${REPO:-Jules-GP/slicer-remote-tool-server}"
+REPO="${REPO:-DCBIA-OrthoLab/VISOR-serve}"
 REF="${REF:-main}"
 REPO_URL="${REPO_URL:-https://github.com/${REPO}.git}"
 INSTALL_DIR="${INSTALL_DIR:-./slicer-remote-tool-server}"

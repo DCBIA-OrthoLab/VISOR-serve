@@ -26,7 +26,7 @@ Slicer's own interpreter, where nothing may be pip-installed on a user's behalf.
 From nothing, on the machine that will host it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Jules-GP/slicer-remote-tool-server/main/scripts/setup-server.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-server.sh | sh
 ```
 
 That clones the repo, checks docker (telling you exactly what to run if it is
@@ -124,8 +124,8 @@ On a machine with nothing checked out - run it from the directory that should
 end up holding `DATA/`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Jules-GP/slicer-remote-tool-server/main/scripts/setup-models.sh | sh
-curl -fsSL https://raw.githubusercontent.com/Jules-GP/slicer-remote-tool-server/main/scripts/setup-testfiles.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-models.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-testfiles.sh | sh
 ```
 
 From a clone, the same thing without the network round trip (the wrappers
