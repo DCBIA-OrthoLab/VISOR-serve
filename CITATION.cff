@@ -3,6 +3,7 @@ message: If you use this software, please cite it using these metadata.
 title: VISOR-serve: a descriptor-driven server for environment-isolated tools
 abstract: An HTTP server that executes tools it never imports, each in its own interpreter, from one JSON descriptor per tool.
 type: software
+license: MIT
 authors:
   - given-names: Jules
     family-names: Grivot Pélisson
