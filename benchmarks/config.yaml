@@ -43,11 +43,11 @@ transfer:
 local:
   # container -- the virtualenvs inside the deployment image, reached with
   #              `docker exec`. Identical to what the server dispatches to.
-  # host      -- the virtualenvs in the sadt-tools working checkout. Models a
+  # host      -- the virtualenvs in the SADT-VISOR working checkout. Models a
   #              scientist who installed the tools on their own machine.
   mode: container
 
-  container: slicer-remote-tool-server-inference-venvs-1
+  container: visor-serve-inference-venvs-1
   container_user: sadt
   container_tools_dir: /tools
   container_runner: /opt/sadt/server/execution/runner.py
@@ -402,6 +402,6 @@ campaigns:
     # Which interpreter reads NIfTI/NRRD for the numeric distance. It must be a
     # path on the machine RUNNING THE HARNESS -- the comparison happens here,
     # not in the container -- and it must carry SimpleITK and numpy. A tool's
-    # own virtualenv in the sadt-tools checkout is the right answer, because it
+    # own virtualenv in the SADT-VISOR checkout is the right answer, because it
     # is the stack that wrote the file.
     imaging_interpreter: ../SADT-VISOR/tools/AMASSS/.venv/bin/python

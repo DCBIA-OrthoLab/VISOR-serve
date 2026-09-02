@@ -92,7 +92,7 @@ MULTICHOICE_BASE_TYPES = ("list[str]",)
 #   "paths" -> several, or a directory: zipped into an archive
 #   "text"  -> any JSON-serializable value, returned as JSON
 RETURN_KINDS = {
-    # What sadt-tools' describe.py actually emits: run() returns a Path, or a
+    # What SADT-VISOR's describe.py actually emits: run() returns a Path, or a
     # dict[str, Path] when it has several named outputs.
     "path": "files",
     "dict[str, path]": "files",
@@ -122,7 +122,7 @@ DEFAULT_RETURN_KIND = "text"
 #   hidden       never rendered, whatever the panel holds.
 #
 # The five presentation keys were dropped here for a while, and the effect was
-# invisible from both ends: sadt-tools published them, the client read them, and
+# invisible from both ends: SADT-VISOR published them, the client read them, and
 # nothing arrived. A key this server does not list is a key that silently does
 # not exist, so adding one is a deliberate act -- which is why they are named
 # and explained rather than passed through wholesale.
@@ -169,7 +169,7 @@ def is_packaged(folder: str) -> bool:
 def generate_schema(folder: str) -> dict:
     """Ask the tool to describe itself, with its own interpreter.
 
-    `scripts/describe.py` lives in the sadt-tools repository and reads the
+    `scripts/describe.py` lives in the SADT-VISOR repository and reads the
     schema out of `run()`'s signature, so the two cannot drift. It has to run
     inside the tool's virtualenv: importing a tool needs the tool's
     dependencies, which is the entire reason this server does not do it.

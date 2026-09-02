@@ -15,7 +15,7 @@
 # Build:
 #     docker buildx build -f docker/Dockerfile --build-context tools=<dir> -t sadt .
 #
-# where <dir> is the sadt-tools repository: `tools/<name>/` with pyproject.toml,
+# where <dir> is the SADT-VISOR repository: `tools/<name>/` with pyproject.toml,
 # uv.lock and src/, and `scripts/describe.py`, which is what turns a tool's
 # run() signature into the schema this server publishes. Without that context
 # the image builds with no tools at all, which is a valid (if empty) server:

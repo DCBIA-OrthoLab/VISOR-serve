@@ -16,7 +16,7 @@ after the last tool has made this trip.
 
 | | before | after |
 |---|---|---|
-| the code | `server/tools/AMASSS/` | `<TOOLS_DIR>/amasss/src/` (packaged in `sadt-tools`) |
+| the code | `server/tools/AMASSS/` | `<TOOLS_DIR>/amasss/src/` (packaged in `SADT-VISOR`) |
 | the argument schema | `ArgSpec` in Python | `.schema.json`, generated from the source |
 | the dependencies | `server/requirements.txt`, shared with everything | `pyproject.toml` + `uv.lock`, the tool's own |
 | `server_selectable` | in the tool's `ArgSpec` | `deployment.toml`, **server-side** |
@@ -29,7 +29,7 @@ business.
 
 ## The loop, per tool
 
-### 1. Package it (in `sadt-tools`)
+### 1. Package it (in `SADT-VISOR`)
 
 Produce a folder named **exactly after the tool**:
 
@@ -126,7 +126,7 @@ a `path`, is an error rather than a dropdown that never appears.
 ### 4. Build the image with it
 
 ```bash
-TOOLS_CONTEXT=../sadt-tools/dist docker compose --profile venvs build inference-venvs
+TOOLS_CONTEXT=../SADT-VISOR/dist docker compose --profile venvs build inference-venvs
 docker compose --profile venvs up -d inference-venvs        # port 8001
 docker run --rm <image> /opt/sadt/.venv/bin/python /opt/sadt/verify_dedup.py
 ```
