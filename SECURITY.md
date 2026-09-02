@@ -1,5 +1,5 @@
 # Rapport de sécurité et de conformité HIPAA
-## Projet `slicer-remote-tool-server` - serveur d'inférence GPU distant pour 3D Slicer
+## Projet `VISOR-serve` - serveur d'inférence GPU distant pour 3D Slicer
 
 *Version 1.0 - juillet 2026*
 *Périmètre : architecture, concepts, gestion système, bibliothèques, coût en performance. Aucun code.*

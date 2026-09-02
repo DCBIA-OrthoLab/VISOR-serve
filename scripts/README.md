@@ -113,7 +113,7 @@ one-line `chown` that fixes it.
 
 ### From Slicer instead
 
-The **Slicer Cloud** module in `SlicerAutomatedDentalToolsCloud` is a panel
+The **Slicer Cloud** module in `AutomatedDentalToolsRemote` is a panel
 over exactly these subcommands: install, update, start/stop, per-tool model
 selection, and it configures the extension's server URL and token for you when
 the server comes up.

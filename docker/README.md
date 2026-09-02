@@ -41,7 +41,7 @@ tools genuinely live in another one; a named context overrides the stage of the
 same name, so omitting it builds a server with no tools, which is valid.
 
 The context may be a working checkout, `.venv/` directories and all - those are
-excluded rather than copied, so pointing this at `~/code/sadt-tools/tools`
+excluded rather than copied, so pointing this at `~/code/SADT-VISOR/tools`
 works without a `dist/` staging step. A tool nested one level deeper (a
 grouping folder holding several related tools) is **not** discovered by the
 server today: `registry/` and `execution/dispatch.py` look one level down from
@@ -51,7 +51,7 @@ Through compose, where it is under a profile so nothing else changes:
 
 ```bash
 docker compose --profile venvs up -d --build inference-venvs          # fixtures
-TOOLS_CONTEXT=../sadt-tools/dist docker compose --profile venvs build # real tools
+TOOLS_CONTEXT=../SADT-VISOR/dist docker compose --profile venvs build # real tools
 ```
 
 ## Checking that it worked
@@ -115,7 +115,7 @@ hitting them.
 the tool fails to load with a message about a missing virtualenv rather than
 about the mount.
 
-    -v /home/you/code/sadt-tools:/home/you/code/sadt-tools:ro   # same path
+    -v /home/you/code/SADT-VISOR:/home/you/code/SADT-VISOR:ro   # same path
 
 **`~/.local/share/uv` must be mounted too.** uv does not copy an interpreter
 into the venv; `bin/python` is a symlink to a uv-managed one that lives outside

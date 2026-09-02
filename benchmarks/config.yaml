@@ -54,7 +54,7 @@ local:
   container_jobs_dir: /jobs
   container_data_dir: /DATA
 
-  host_tools_dir: ../sadt-tools/tools
+  host_tools_dir: ../SADT-VISOR/tools
   host_runner: server/execution/runner.py
   host_jobs_dir: /tmp/sadt-benchmarks/jobs
   host_data_dir: DATA
@@ -71,8 +71,8 @@ guards:
 # produced it.
 repos:
   server: .
-  tools: ../sadt-tools
-  client: ../SlicerAutomatedDentalToolsCloud
+  tools: ../SADT-VISOR
+  client: ../AutomatedDentalToolsRemote
 
 # ---------------------------------------------------------------------------
 # The tools
@@ -404,4 +404,4 @@ campaigns:
     # not in the container -- and it must carry SimpleITK and numpy. A tool's
     # own virtualenv in the sadt-tools checkout is the right answer, because it
     # is the stack that wrote the file.
-    imaging_interpreter: ../sadt-tools/tools/AMASSS/.venv/bin/python
+    imaging_interpreter: ../SADT-VISOR/tools/AMASSS/.venv/bin/python

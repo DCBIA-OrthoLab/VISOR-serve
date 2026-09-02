@@ -263,7 +263,7 @@ interpreter**, so it cannot drift from the code.
 To see a checkout served without building an image:
 
 ```bash
-SADT_TOOLS=~/code/sadt-tools ./run-local.sh      # port 8001, schemas generated on start
+SADT_TOOLS=~/code/SADT-VISOR ./run-local.sh      # port 8001, schemas generated on start
 ```
 
 Adding an in-process tool is still possible and is what `Test_Tool` and
