@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local test server, serving the PACKAGED tools from a sadt-tools checkout.
+# Local test server, serving the PACKAGED tools from a SADT-VISOR checkout.
 #
 # Port 8001 on purpose: 8000 is the docker deployment, and this must not fight
 # it. Nothing here touches that container -- it reads a different TOOLS_DIR and
@@ -10,7 +10,7 @@ SADT_TOOLS="${SADT_TOOLS:-$HOME/code/SADT-VISOR}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 export API_TOKEN="${API_TOKEN:-local-dev-token}"
-export TOOLS_DIR="$SADT_TOOLS/tools"          # <-- the link to sadt-tools
+export TOOLS_DIR="$SADT_TOOLS/tools"          # <-- the link to SADT-VISOR
 export DESCRIBE_PATH="$SADT_TOOLS/scripts/describe.py"
 export DATA_DIR="${DATA_DIR:-$HERE/DATA}"
 export SCHEMA_CACHE_DIR="${SCHEMA_CACHE_DIR:-$HERE/.schema-cache}"

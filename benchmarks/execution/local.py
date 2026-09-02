@@ -17,7 +17,7 @@ convenience -- see NOTES-local-path.md:
              `docker exec`. Byte-identical to what the server dispatches to,
              which is what makes a local-vs-loopback delta attributable to the
              protocol and nothing else. The default.
-  host       the virtualenvs in the sadt-tools working checkout. This models a
+  host       the virtualenvs in the SADT-VISOR working checkout. This models a
              scientist who installed the tools on their own workstation. It is
              a DIFFERENT build of the same lockfile and differs from the image
              by the dev dependency group; the notes quantify it.

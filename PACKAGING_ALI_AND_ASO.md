@@ -1,7 +1,7 @@
 # Packaging ALI and ASO
 
 Written for whoever works on
-[sadt-tools](https://github.com/DCBIA-OrthoLab/SADT-VISOR). It is the mirror of your
+[SADT-VISOR](https://github.com/DCBIA-OrthoLab/SADT-VISOR). It is the mirror of your
 `What the server has to do`: that one told this side what stopped happening in
 the tools, this one tells your side what the server will and will not do for
 the last two.

@@ -1,4 +1,4 @@
-"""The contract with sadt-tools, tested against what that repository actually
+"""The contract with SADT-VISOR, tested against what that repository actually
 emits rather than against the prose describing it.
 
 Every case here comes from a real difference found by reading the packaged
@@ -30,7 +30,7 @@ from registry.deployment import DeploymentConfig, ToolDeployment
 # ----------------------------------------------------------------------
 
 def test_the_hash_matches_the_algorithm_that_generates_it():
-    """Ported from sadt-tools' scripts/describe.py. The two sides disagreeing
+    """Ported from SADT-VISOR's scripts/describe.py. The two sides disagreeing
     by one separator means every tool looks stale -- which is what happened,
     and was only caught by hashing a real tool both ways.
 
@@ -234,7 +234,7 @@ def test_a_device_the_caller_picked_is_kept(make_tool_folder, monkeypatch, tmp_p
 
 def test_the_error_map_covers_what_the_tools_raise():
     """There is no shared exception type, because there is no shared package.
-    These four names are the convention sadt-tools documents."""
+    These four names are the convention SADT-VISOR documents."""
     assert main.TOOL_ERROR_STATUS["ToolInputError"] == 422
     assert main.TOOL_ERROR_STATUS["ValueError"] == 422
     assert main.TOOL_ERROR_STATUS["FileNotFoundError"] == 422
@@ -364,7 +364,7 @@ def _packaged_tools() -> list:
     ]
 
 
-@pytest.mark.skipif(not _packaged_tools(), reason="the sadt-tools checkout is not here")
+@pytest.mark.skipif(not _packaged_tools(), reason="the SADT-VISOR checkout is not here")
 @pytest.mark.parametrize("tool_name", _packaged_tools())
 def test_a_really_packaged_tool_loads(tool_name, tmp_path, monkeypatch):
     """The one test that would have caught every difference found by reading

@@ -43,7 +43,7 @@ and should not be changed to make a number look better.
 | Python 3.11+ with `requests` and `PyYAML` | everything | nothing runs |
 | A running server (`GET /health` -> `{"status":"ok"}`) | `loopback`, `lan`, B2, B4, B5 | those campaigns refuse to start, with a reason |
 | `API_TOKEN` in the environment or in the repository's `.env` | any authenticated call | refused with a message naming both places |
-| The deployment container running, or a `sadt-tools` checkout with built virtualenvs | `local`, B3, B5 | refused with a reason |
+| The deployment container running, or a `SADT-VISOR` checkout with built virtualenvs | `local`, B3, B5 | refused with a reason |
 | An NVIDIA card and `nvidia-smi` | B4's VRAM column, and every GPU tool | the column reads "unavailable" with the reason; GPU tools fail and are recorded as failures |
 | Docker | `local` in `container` mode only | switch `local.mode` to `host` |
 

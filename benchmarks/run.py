@@ -69,7 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--local-mode", default=None, choices=sorted(LOCAL_MODES),
         help=(
             "override local.mode for this run. 'container' is the execution the server "
-            "dispatches; 'host' is the sadt-tools checkout on this OS. They are not "
+            "dispatches; 'host' is the SADT-VISOR checkout on this OS. They are not "
             "interchangeable -- read NOTES-local-path.md. Recorded in every record as "
             "extra.local_mode either way."
         ),

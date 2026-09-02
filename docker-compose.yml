@@ -155,7 +155,7 @@ services:
   #
   #     docker compose --profile venvs up -d --build inference-venvs
   #
-  # `tools` is where the packaged tool folders come from -- the sadt-tools
+  # `tools` is where the packaged tool folders come from -- the SADT-VISOR
   # repository's output. It defaults to the build fixtures, which need no GPU
   # and no model and exist to prove the layout works:
   #

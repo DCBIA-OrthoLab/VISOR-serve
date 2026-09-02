@@ -31,7 +31,7 @@ docker buildx build -f docker/Dockerfile --build-context tools=<dir> -t sadt .
 ```
 
 `<dir>` holds one folder per tool - `pyproject.toml`, `uv.lock`, `src/` - which
-is what the `sadt-tools` repository holds. `.schema.json` is **generated during
+is what the `SADT-VISOR` repository holds. `.schema.json` is **generated during
 the build**, by running `describe.py` with that tool's own freshly-synced
 interpreter, because a schema read from a tool's source can only be produced by
 something that can import it.
@@ -106,7 +106,7 @@ image per torch version buys nothing.
 The image builds each tool's virtualenv **in place**, at the path it will be
 used from, which is why none of what follows applies to it. It applies to every
 other arrangement - a dev server pointed at a checkout, a CI job, anything that
-mounts `sadt-tools` rather than baking it - and both constraints were found by
+mounts `SADT-VISOR` rather than baking it - and both constraints were found by
 hitting them.
 
 **Mount paths must match host paths exactly.** A virtualenv is not relocatable:
@@ -119,7 +119,7 @@ about the mount.
 
 **`~/.local/share/uv` must be mounted too.** uv does not copy an interpreter
 into the venv; `bin/python` is a symlink to a uv-managed one that lives outside
-the tool tree entirely. Mounting `sadt-tools` alone gives you a venv whose
+the tool tree entirely. Mounting `SADT-VISOR` alone gives you a venv whose
 python points at nothing.
 
     -v /home/you/.local/share/uv:/home/you/.local/share/uv:ro
@@ -141,7 +141,7 @@ Found by hitting it: Batch_Dental_Seg answered 500 over HTTP while the identical
 run succeeded directly on the host, whose `/dev/shm` is half of RAM.
 
 **And the schemas have to come from somewhere.** `.schema.json` is a cache, not
-a committed file. Without `DESCRIBE_PATH` pointing at `sadt-tools/scripts/describe.py`
+a committed file. Without `DESCRIBE_PATH` pointing at `SADT-VISOR/scripts/describe.py`
 and a writable `SCHEMA_CACHE_DIR`, every packaged tool fails to load. The server
 now refuses to start in that case rather than serving only its in-process
 fixtures - a registry of two reads as a small deployment, not a broken one.
