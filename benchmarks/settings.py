@@ -283,7 +283,7 @@ def parse(document: dict, source_path: str = "<memory>") -> Config:
         container_jobs_dir=str(local_section.get("container_jobs_dir", "/jobs")),
         container_data_dir=str(local_section.get("container_data_dir", "/DATA")),
         host_tools_dir=resolve_path(
-            str(local_section.get("host_tools_dir", "../sadt-tools/tools"))
+            str(local_section.get("host_tools_dir", "../SADT-VISOR/tools"))
         ),
         host_runner=resolve_path(
             str(local_section.get("host_runner", "server/execution/runner.py"))
