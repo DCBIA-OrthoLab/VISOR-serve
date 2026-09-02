@@ -344,7 +344,7 @@ def test_a_zip_sent_for_a_path_argument_is_unpacked():
 # Against the real repository, when it is here
 # ----------------------------------------------------------------------
 
-SADT_TOOLS_REPO = os.environ.get("SADT_TOOLS_REPO", os.path.expanduser("~/code/sadt-tools"))
+SADT_TOOLS_REPO = os.environ.get("SADT_TOOLS_REPO", os.path.expanduser("~/code/SADT-VISOR"))
 
 
 def _packaged_tools() -> list:

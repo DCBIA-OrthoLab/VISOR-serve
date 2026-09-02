@@ -10,7 +10,7 @@
 #   curl -fsSL .../setup-server.sh | sh -s -- --tool AMASSS --tool ALI
 #
 # Options:
-#   --dir DIR       where to clone (default: ./slicer-remote-tool-server, or $INSTALL_DIR)
+#   --dir DIR       where to clone (default: ./VISOR-serve, or $INSTALL_DIR)
 #   --tool NAME     also download this tool's models and test files (repeatable).
 #                   Nothing is downloaded by default: the full set is ~29 GB, and
 #                   which tools a given site uses is not something to assume.
@@ -35,7 +35,7 @@ set -eu
 REPO="${REPO:-DCBIA-OrthoLab/VISOR-serve}"
 REF="${REF:-main}"
 REPO_URL="${REPO_URL:-https://github.com/${REPO}.git}"
-INSTALL_DIR="${INSTALL_DIR:-./slicer-remote-tool-server}"
+INSTALL_DIR="${INSTALL_DIR:-./VISOR-serve}"
 TOOLS=""
 DEVICE="auto"
 BIND="127.0.0.1"
