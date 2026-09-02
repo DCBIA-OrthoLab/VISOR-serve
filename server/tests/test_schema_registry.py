@@ -97,7 +97,7 @@ def _fake_venv(folder: str) -> None:
 
 
 def _stub_describe(tmp_path, schema: dict) -> str:
-    """Stands in for sadt-tools' scripts/describe.py: prints a schema."""
+    """Stands in for SADT-VISOR's scripts/describe.py: prints a schema."""
     script = tmp_path / "describe.py"
     # The JSON is embedded as a STRING literal, not as a Python dict: `true`
     # is not a Python name.

@@ -323,7 +323,7 @@ tools:
         extract: true
 
   # =========================================================================
-  # ASO -- automated standardized orientation. Packaged in sadt-tools;
+  # ASO -- automated standardized orientation. Packaged in SADT-VISOR;
   # the data below is still served from DATA/ASO/.
   #
   # Three bundles this block used to fetch have been REMOVED rather than left

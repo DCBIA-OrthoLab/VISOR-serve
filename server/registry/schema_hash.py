@@ -11,11 +11,11 @@ and one the tool has since added can never be sent at all.
 
     python server/schema_hash.py <path to a tool's src/>
 
-so the generator in `sadt-tools` can be checked against it byte for byte
+so the generator in `SADT-VISOR` can be checked against it byte for byte
 rather than against a description of it. Both sides have to agree exactly --
 if they do not, every tool refuses to start.
 
-**This is a port of `scripts/describe.py::source_hash` in the sadt-tools
+**This is a port of `scripts/describe.py::source_hash` in the SADT-VISOR
 repository, and it has to stay byte-for-byte equivalent to it.** That side
 generates the hash; this side only checks it. The two disagreeing by one
 separator means every tool looks stale and nothing loads -- which is exactly

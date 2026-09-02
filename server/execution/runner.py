@@ -83,7 +83,7 @@ SUPERVISOR_DEADLINE_ENV = "SADT_SUPERVISOR_DEADLINE"
 # a different chain, and job.json is what a caller writes.
 SUPERVISOR_CHAIN_ENV = "SADT_SUPERVISOR_CHAIN"
 
-# The tool's package under src/, when there is exactly one. sadt-tools names it
+# The tool's package under src/, when there is exactly one. SADT-VISOR names it
 # `sadt_<tool>`, but the rule is the one its own describe.py uses -- the single
 # importable package -- rather than the prefix, so a tool that names its
 # package something else still loads.
@@ -127,7 +127,7 @@ def _tool_dir() -> str:
 def _package_under(src_dir: str):
     """The one importable package under src/, or None.
 
-    Same rule as sadt-tools' own describe.py: exactly one directory holding an
+    Same rule as SADT-VISOR's own describe.py: exactly one directory holding an
     __init__.py. Deriving it rather than hardcoding `sadt_<tool>` means the
     runner and the schema generator agree on what they load, which is the only
     way the schema can describe what actually runs.
@@ -213,7 +213,7 @@ def _coerce(value, annotation):
     `.glob()`. Everything else the schema allows -- str, int, float, bool and
     lists of them -- arrives as the right type already.
 
-    Deliberately identical to sadt-tools' testkit driver
+    Deliberately identical to SADT-VISOR's testkit driver
     (`testkit/src/sadt_testkit/_driver.py`): every tool's integration tests run
     against that one, so a difference here is a suite that passes while
     production fails.
@@ -361,7 +361,7 @@ class _Supervisor:
 
     A tool never imports this class. It cannot -- the tool's venv holds none of
     the server -- and that is the point: the same object shape is produced by
-    `sadt-tools`' `scripts/run_tool.py` and faked in its tests, and a tool
+    `SADT-VISOR`'s `scripts/run_tool.py` and faked in its tests, and a tool
     cannot tell the three apart.
 
     `run()` re-enters THIS file with the sibling's interpreter, so the callee

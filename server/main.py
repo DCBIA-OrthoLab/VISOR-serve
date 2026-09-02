@@ -92,7 +92,7 @@ _ACCEPT_ALL_EXTENSIONS = "*"
 
 # A packaged tool's exception class NAME -> the status it means. The tools do
 # not share a base class, so this maps by name, which is the convention
-# sadt-tools documents:
+# SADT-VISOR documents:
 #
 #   the caller's fault, and every message is written to be read by whoever
 #   sent it -- a bad structure code, a table with no patient column;

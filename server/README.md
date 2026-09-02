@@ -1,7 +1,7 @@
 # Inference server (tool-registry architecture)
 
 FastAPI server exposing a generic `/run/{tool_name}` endpoint. **It knows no
-dental tool.** The tools live in [`sadt-tools`](https://github.com/DCBIA-OrthoLab/SADT-VISOR),
+dental tool.** The tools live in [`SADT-VISOR`](https://github.com/DCBIA-OrthoLab/SADT-VISOR),
 one isolated project each - its own interpreter, its own lockfile, its own
 torch - and this server discovers them from `TOOLS_DIR`, publishes them, and
 runs them **without importing a line of them**:
@@ -252,7 +252,7 @@ including what `run()` receives (`base.Selection`).
 
 ## How to add a new tool
 
-**You do not add it here.** A tool is a folder in `sadt-tools`; this server
+**You do not add it here.** A tool is a folder in `SADT-VISOR`; this server
 discovers it, publishes it and runs it with no change to this repository - not
 a route, not a registration list, not a line of `deployment.toml` in the normal
 case. [`ADDING_A_TOOL.md`](../ADDING_A_TOOL.md) is the whole contract; the
@@ -587,7 +587,7 @@ Five members, duck-typed, nothing shared: `sup.run(tool, **params)` (blocking,
 returns what that tool's `run()` returned), `sup.out`, `sup.tmp`,
 `sup.progress(fraction, message)`, `sup.log(message)`. A tool never imports the
 class - it cannot, its venv holds none of the server - and the same shape is
-produced by `sadt-tools`' `scripts/run_tool.py` and faked in its tests.
+produced by `SADT-VISOR`'s `scripts/run_tool.py` and faked in its tests.
 
 - **A cycle is refused by name.** The chain travels in the environment, so a
   tool asking for one already running above it fails immediately, naming the
@@ -635,7 +635,7 @@ machinery and of nothing else.
 
 ## The tools this server serves
 
-Every clinical tool lives in `sadt-tools`, and **its own `README.md` there is
+Every clinical tool lives in `SADT-VISOR`, and **its own `README.md` there is
 authoritative** for what it computes, what it was validated against and which
 pins produced that result. The sections below are the server-facing view:
 what to send, what comes back, and which bundle has to be staged under `DATA/`.
@@ -1006,7 +1006,7 @@ the API cannot import. They are not skipped here, they are somebody else's job:
 
 What the server's suite covers is the seam rather than the science: the
 discovery of both kinds of tool, the schema vocabulary, `source_hash` against
-the real generator (`test_tool_contract.py` runs `sadt-tools`' `describe.py`
+the real generator (`test_tool_contract.py` runs `SADT-VISOR`'s `describe.py`
 with the real tool interpreters, and skips where that checkout is absent), the
 dispatch loop through `_dispatch_probe`, the supervisor, the transfer
 endpoints, and `tests/golden/tools_response.json` - `GET /tools` captured per
