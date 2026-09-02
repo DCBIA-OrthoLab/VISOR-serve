@@ -6,7 +6,7 @@
 # writes its schema cache somewhere else.
 set -euo pipefail
 
-SADT_TOOLS="${SADT_TOOLS:-$HOME/code/sadt-tools}"
+SADT_TOOLS="${SADT_TOOLS:-$HOME/code/SADT-VISOR}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 export API_TOKEN="${API_TOKEN:-local-dev-token}"

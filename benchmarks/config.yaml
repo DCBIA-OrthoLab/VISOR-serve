@@ -72,7 +72,7 @@ guards:
 repos:
   server: .
   tools: ../sadt-tools
-  client: ../SlicerAutomatedDentalToolsCloud
+  client: ../AutomatedDentalToolsRemote
 
 # ---------------------------------------------------------------------------
 # The tools
