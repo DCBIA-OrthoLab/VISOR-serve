@@ -156,7 +156,7 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 Three repositories, and the seams between them are the design:
 
 ```
- SlicerAutomatedDentalToolsCloud        slicer-remote-tool-server              sadt-tools
+ AutomatedDentalToolsRemote                  VISOR-serve                       sadt-tools
  ┌────────────────────────┐  HTTPS  ┌───────────────────────────┐        ┌────────────────────┐
  │ 3D Slicer modules      │ ──────► │ FastAPI (uvicorn)         │        │ tools/<Name>/      │
  │  - build the panel     │ POST    │  - verify token           │        │   pyproject.toml   │
@@ -250,7 +250,7 @@ isolated project each, and reach this server through `TOOLS_DIR` - a folder of
 in-process demos, the dispatch fixture, and the parked `_AREG`.
 
 The Slicer client (thin modules + the generic inference client) lives in its
-own repo, `SlicerAutomatedDentalToolsCloud` - not here. Its **Slicer Cloud**
+own repo, `AutomatedDentalToolsRemote` - not here. Its **Slicer Cloud**
 module is a panel over `scripts/server_ctl.py`: it clones this repository,
 checks Docker, starts the container, reports when the clone has fallen behind
 and relaunches it, and picks which tools' bundles land in `DATA/`. The logic

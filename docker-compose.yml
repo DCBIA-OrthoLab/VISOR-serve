@@ -152,7 +152,7 @@ services:
   # repository's output. It defaults to the build fixtures, which need no GPU
   # and no model and exist to prove the layout works:
   #
-  #     TOOLS_CONTEXT=../sadt-tools docker compose --profile venvs build
+  #     TOOLS_CONTEXT=../SADT-VISOR docker compose --profile venvs build
   #
   # The ROOT of the checkout, not a dist/ subdirectory: the build copies
   # `tools` and `scripts` out of that context, and both sit at the top.
