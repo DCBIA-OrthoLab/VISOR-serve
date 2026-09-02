@@ -47,7 +47,7 @@ local:
   #              scientist who installed the tools on their own machine.
   mode: container
 
-  container: slicer-remote-tool-server-inference-venvs-1
+  container: visor-serve-inference-venvs-1
   container_user: sadt
   container_tools_dir: /tools
   container_runner: /opt/sadt/server/execution/runner.py

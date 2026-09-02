@@ -1,3 +1,10 @@
+# The compose project name, pinned. Without it the project is named after the
+# DIRECTORY the file sits in, so renaming a checkout silently orphans whatever
+# is running: `docker compose down` under the new name does not see the old
+# containers, and `up` starts a second stack that then collides on the port.
+# Pinned, the stack keeps one identity wherever it is cloned.
+name: visor-serve
+
 # Shared by the two server services below, which differ only in whether they
 # get the GPU. Two services rather than one, because a compose device
 # reservation is ALL-OR-NOTHING: a service asking for an nvidia device cannot
