@@ -111,3 +111,109 @@ def test_the_fixtures_pin_incompatible_dependencies_on_purpose():
     # And one that must resolve to the SAME wheel as another, or
     # docker/verify_dedup.py has nothing to compare and cannot fail.
     assert 'numpy>=2' in pins.get("numpy_twin", "")
+
+
+# ---------------------------------------------------------------------------
+# What an in-process tool may import
+# ---------------------------------------------------------------------------
+# The suite runs on a fat interpreter (conda: pandas, numpy, torch); the
+# deployed API runs on `/opt/sadt/.venv`, which holds the four packages above
+# and nothing else. So a module in `server/` can import pandas, pass every
+# test, and raise `ModuleNotFoundError` on the first real request -- which is
+# exactly what `Example_Tool` did, for months, while two tests that CALL it
+# went on passing. This walks the imports instead of trusting the interpreter.
+
+import ast
+import sys
+
+SERVER_DIR = os.path.join(REPO_ROOT, "server")
+
+# Third-party distributions the API venv provides, as the module names they
+# install under.
+API_MODULES = {
+    "fastapi", "starlette", "uvicorn", "multipart", "pydantic", "pydantic_settings",
+    "anyio", "sniffio", "idna", "click", "h11", "typing_extensions", "annotated_types",
+    "dotenv", "yaml", "certifi", "httpx", "httpcore", "watchfiles", "websockets",
+    "httptools", "uvloop", "colorama",
+}
+# The server's own top-level modules, importable because `server/` is on the path.
+SERVER_MODULES = {
+    os.path.splitext(name)[0]
+    for name in os.listdir(SERVER_DIR)
+    if name.endswith(".py") or os.path.isdir(os.path.join(SERVER_DIR, name))
+}
+
+
+def _catches_missing_module(handlers) -> bool:
+    """Whether a try block's handlers cover an absent module."""
+    names = set()
+    for handler in handlers:
+        node = handler.type
+        for part in (node.elts if isinstance(node, ast.Tuple) else [node]):
+            if isinstance(part, ast.Name):
+                names.add(part.id)
+    return bool(names & {"ImportError", "ModuleNotFoundError", "Exception"})
+
+
+def _imported_roots(node, guarded: bool = False) -> set:
+    """Every top-level module name imported WITHOUT a fallback, lazily or not.
+
+    An import inside `try: ... except ModuleNotFoundError:` is deliberate and
+    safe -- `tomllib` with a `tomli` fallback for 3.10 is the case in the tree
+    -- so it does not count. An unguarded one is a hard dependency wherever it
+    sits, function body included.
+    """
+    roots = set()
+    if isinstance(node, ast.Import) and not guarded:
+        roots.update(alias.name.split(".")[0] for alias in node.names)
+    elif isinstance(node, ast.ImportFrom) and not guarded and node.level == 0 and node.module:
+        roots.add(node.module.split(".")[0])
+
+    if isinstance(node, ast.Try):
+        covered = _catches_missing_module(node.handlers)
+        for child in node.body:
+            roots |= _imported_roots(child, guarded or covered)
+        for child in node.handlers + node.orelse + node.finalbody:
+            roots |= _imported_roots(child, guarded or covered)
+        return roots
+
+    for child in ast.iter_child_nodes(node):
+        roots |= _imported_roots(child, guarded)
+    return roots
+
+
+def _file_imports(path: str) -> set:
+    with open(path, encoding="utf-8") as handle:
+        return _imported_roots(ast.parse(handle.read(), filename=path))
+
+
+def _server_python_files() -> list:
+    found = []
+    for directory, _, names in os.walk(SERVER_DIR):
+        parts = set(directory.split(os.sep))
+        if parts & {"tests", "venv", ".venv", "__pycache__"}:
+            continue
+        found.extend(
+            os.path.join(directory, name) for name in names if name.endswith(".py")
+        )
+    return found
+
+
+def test_the_server_imports_nothing_the_api_venv_lacks():
+    """Including from an in-process tool, and including a lazy import inside a
+    function -- a `ModuleNotFoundError` raised there is a 500 on a real
+    request, not a failure anyone sees at startup."""
+    allowed = API_MODULES | SERVER_MODULES | set(sys.stdlib_module_names)
+    offenders = {}
+    for path in _server_python_files():
+        extra = sorted(_file_imports(path) - allowed)
+        if extra:
+            offenders[os.path.relpath(path, REPO_ROOT)] = extra
+
+    assert not offenders, (
+        f"These modules under server/ import packages the API virtualenv does not have: "
+        f"{offenders}. The suite's interpreter is fatter than the deployed one, so this "
+        f"passes here and answers 500 in production. An in-process tool may use the "
+        f"standard library and the server's own modules; anything else belongs to a "
+        f"packaged tool with its own venv."
+    )
