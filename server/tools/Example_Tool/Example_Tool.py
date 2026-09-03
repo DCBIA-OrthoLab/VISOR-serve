@@ -25,11 +25,124 @@ Three things worth copying from here:
 # config.ALLOWED_EXTENSIONS instead.
 """
 
+import csv
+import glob
+import json
 import os
 from typing import Optional
 
 import file_utils
 from base import ArgSpec, Tool, ToolArgumentError
+
+
+# ---------------------------------------------------------------------------
+# Reading the input, with the standard library and nothing else
+# ---------------------------------------------------------------------------
+# An IN-PROCESS tool runs inside the API's own virtualenv, and that venv holds
+# fastapi, uvicorn, python-multipart, pydantic-settings and NOTHING heavier --
+# `server/requirements-api.txt` is what it installs, and a test pins it there.
+# So this tool may use the standard library and the server's own modules, and
+# nothing else. It used to call `file_utils.load_tabular_*`, which reach for
+# pandas: absent from that venv, so every call answered 500 with
+# `ModuleNotFoundError: No module named 'pandas'` -- at run time only, the
+# import being lazy, which is why it survived startup and the schema.
+#
+# A PACKAGED tool has no such limit: it brings its own interpreter and pins
+# whatever it likes. That is the trade this file demonstrates from the other
+# side, and the reason to keep it small.
+
+
+class Table:
+    """A CSV as columns and rows of text, plus which columns hold numbers.
+
+    Deliberately not a DataFrame. A column counts as numeric when every value
+    in it that is not blank parses as a float, which is the rule pandas'
+    type inference applies to a CSV -- a blank becoming NaN and comparing
+    false against any threshold, as it does here.
+    """
+
+    def __init__(self, columns: list, rows: list):
+        self.columns = columns
+        self.rows = rows
+        self.numeric_columns = [
+            index
+            for index, _ in enumerate(columns)
+            if self._is_numeric(index)
+        ]
+
+    def _is_numeric(self, index: int) -> bool:
+        seen = False
+        for row in self.rows:
+            value = row[index].strip() if index < len(row) else ""
+            if not value:
+                continue
+            try:
+                float(value)
+            except ValueError:
+                return False
+            seen = True
+        return seen
+
+    def count_above(self, threshold: float) -> int:
+        total = 0
+        for row in self.rows:
+            for index in self.numeric_columns:
+                value = row[index].strip() if index < len(row) else ""
+                if value and float(value) > threshold:
+                    total += 1
+        return total
+
+    def head(self, count: int) -> list:
+        return self.rows[:count]
+
+    def cell(self, row: list, index: int):
+        """One value, as a number where its column is numeric."""
+        value = row[index].strip() if index < len(row) else ""
+        if not value:
+            return None
+        if index not in self.numeric_columns:
+            return value
+        number = float(value)
+        return int(number) if number.is_integer() and "." not in value else number
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+
+def read_csv(path: str) -> Table:
+    """One `.csv` as a Table. The first line names the columns."""
+    with open(path, newline="", encoding="utf-8-sig") as handle:
+        reader = csv.reader(handle)
+        try:
+            columns = next(reader)
+        except StopIteration:
+            raise ToolArgumentError(f"{os.path.basename(path)} is empty.")
+        return Table(columns, [row for row in reader if any(cell.strip() for cell in row)])
+
+
+def read_csv_directory(path: str) -> Table:
+    """Every `.csv` directly in a folder, stacked, sorted by name.
+
+    Only `.csv`: the single-file half of this argument declares `csv_file`,
+    and one vocabulary is better than two that disagree. A folder holding
+    `.xlsx` is refused by name rather than silently skipped.
+    """
+    files = sorted(
+        set(glob.glob(os.path.join(path, "*.csv")) + glob.glob(os.path.join(path, "*.CSV")))
+    )
+    if not files:
+        raise ToolArgumentError(f"No .csv file found directly in {os.path.basename(path)}.")
+
+    first = read_csv(files[0])
+    for other in files[1:]:
+        table = read_csv(other)
+        if table.columns != first.columns:
+            raise ToolArgumentError(
+                f"{os.path.basename(other)} has different columns from "
+                f"{os.path.basename(files[0])}: stacking them would misalign the rows."
+            )
+        first.rows.extend(table.rows)
+    return Table(first.columns, first.rows)
 
 
 class ExampleTool(Tool):
@@ -77,18 +190,17 @@ class ExampleTool(Tool):
         # which declared type it was resolved as. That is the whole point of a
         # multi-type argument -- no os.path.isdir() guessing needed here.
         if input.kind == "folder":
-            table = file_utils.load_tabular_directory(input)
+            table = read_csv_directory(input)
             source = f"folder, {len(os.listdir(input))} entries"
         else:
-            table = file_utils.load_tabular_file(input)
+            table = read_csv(input)
             source = "single file"
 
         # Outputs go in a scratch dir under TEMP_DIR, which main.py removes
         # once the response has been streamed (see file_utils.make_scratch_dir).
         output_dir = file_utils.make_scratch_dir("example_tool_")
 
-        numeric = table.select_dtypes("number")
-        above_threshold = int((numeric > threshold).sum().sum()) if not numeric.empty else 0
+        above_threshold = table.count_above(threshold)
 
         # `outputs` is a base.Selection: a dict holding EVERY declared option,
         # so `outputs["summary"]` is always safe -- no .get(name, False). Use
@@ -120,9 +232,17 @@ class ExampleTool(Tool):
             preview_path = os.path.join(output_dir, f"preview.{preview_format}")
             head = table.head(iterations or 5)
             if preview_format == "json":
-                head.to_json(preview_path, orient="records", indent=2)
+                records = [
+                    {name: table.cell(row, index) for index, name in enumerate(table.columns)}
+                    for row in head
+                ]
+                with open(preview_path, "w") as preview_file:
+                    json.dump(records, preview_file, indent=2)
             else:
-                head.to_csv(preview_path, index=False)
+                with open(preview_path, "w", newline="") as preview_file:
+                    writer = csv.writer(preview_file)
+                    writer.writerow(table.columns)
+                    writer.writerows(head)
             produced.append(preview_path)
 
         if outputs["columns"]:

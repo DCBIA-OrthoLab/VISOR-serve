@@ -1,24 +1,20 @@
-"""Shared helpers for tools: scratch directories, zip extraction and creation,
-medical scan extensions, and tabular data loading (CSV/XLSX/ODS).
+"""Shared helpers: scratch directories, zip extraction and creation, medical
+scan extensions, and finding what a run produced.
 
-Anything more than one tool needs belongs here rather than being reimplemented
-per tool. Tools never import each other.
+Everything here uses the standard library alone. This module is imported by
+`main.py` on every start, so it runs in the API's own virtualenv -- four
+packages and nothing heavier (see `tests/test_image_layout.py`). The tabular
+loaders that used to live here reached for pandas, which that venv does not
+have; they went with the last in-process tool that called them.
 """
 
 import contextvars
-import glob
 import os
 import tempfile
 import zipfile
 
 from config import settings
 
-# pandas is imported INSIDE load_tabular_file/load_tabular_directory, not
-# here. Those two are tool helpers -- only a tool that reads tabular data calls
-# them -- while this module is imported by main.py on every start. At module
-# level, pandas would be a hard dependency of the API process itself, which is
-# meant to carry fastapi and nothing heavier (see docker/Dockerfile: the server
-# venv holds no pandas, no numpy and no torch).
 
 
 # Scratch dirs handed out during the request being served, so main.py can
@@ -253,35 +249,3 @@ def split_scan_extension(filename: str) -> tuple:
 def compressed_extension(extension: str) -> str:
     """The compressed spelling ITK can write for a scan extension."""
     return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)
-
-
-def load_tabular_file(file_path: str):
-    """Load a single CSV, XLSX, or ODS file into a pandas DataFrame."""
-    import pandas as pd
-
-    ext = os.path.splitext(file_path)[1].lower()
-    if ext == ".csv":
-        return pd.read_csv(file_path)
-    if ext == ".xlsx":
-        return pd.read_excel(file_path)
-    if ext == ".ods":
-        return pd.read_excel(file_path, engine="odf")
-    raise ValueError(f"Unsupported file extension '{ext}' for tabular file: {file_path}")
-
-
-def load_tabular_directory(directory_path: str):
-    """Load and concatenate every CSV/XLSX/ODS file found directly in a directory."""
-    import pandas as pd
-
-    extensions = ["*.csv", "*.xlsx", "*.ods"]
-    all_files = []
-    for ext in extensions:
-        all_files.extend(glob.glob(os.path.join(directory_path, ext)))
-        all_files.extend(glob.glob(os.path.join(directory_path, ext.upper())))
-    all_files = sorted(set(all_files))
-
-    if not all_files:
-        raise FileNotFoundError(f"No valid CSV, XLSX, or ODS files found in: {directory_path}")
-
-    df_list = [load_tabular_file(file_path) for file_path in all_files]
-    return pd.concat(df_list, ignore_index=True)
