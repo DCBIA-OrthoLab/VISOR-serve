@@ -63,9 +63,23 @@ def _tools_backed_by_server_data():
     ]
 
 
-@pytest.mark.parametrize(
-    "tool", _tools_backed_by_server_data(), ids=lambda t: t.name
-)
+_BACKED = _tools_backed_by_server_data()
+
+if not _BACKED:
+    # An empty parameter set skips with "got empty parameter set for (tool)",
+    # which reads like a pytest quirk rather than the real cause: no packaged
+    # tool registered, because TOOLS_DIR points at the built-in demos. Say so.
+    pytest.skip(
+        f"No registered tool can be run from DATA_DIR alone. {len(TOOLS)} tool(s) "
+        f"registered ({', '.join(sorted(TOOLS)) or 'none'}), none with every "
+        f"required argument server_selectable. TOOLS_DIR is probably pointing at "
+        f"the built-in demos rather than at a SADT-VISOR checkout with built "
+        f"virtualenvs -- see the test-gpu service in docker-compose.yml.",
+        allow_module_level=True,
+    )
+
+
+@pytest.mark.parametrize("tool", _BACKED, ids=lambda t: t.name)
 def test_tool_runs_against_real_data(tool):
     form_data = {}
     for arg_name, spec in tool.arguments.items():
