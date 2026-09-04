@@ -20,7 +20,7 @@ from registry import deployment
 import registry
 from registry import schema_hash
 from registry import schema_tool
-from base import LIST_TYPE, ToolArgumentError
+from base import ArgSpec, LIST_TYPE, Tool, ToolArgumentError
 from config import settings
 import config
 from execution import dispatch
@@ -388,8 +388,13 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         # null, so the client falls back to ALLOWED_EXTENSIONS: the schema
         # says "a path" and nothing about which extensions are acceptable.
         "extensions": {"path": None},
-        "label": None,
-        "section": None,
+        # Derived, not null. A tool that declares no layout still gets a panel
+        # someone can read: `conventions.label_for` writes the argument name
+        # out, `conventions.section_for` puts a required path in Inputs. A tool
+        # that DOES declare them is never second-guessed -- which is what makes
+        # a layout.py an override rather than a restatement.
+        "label": "Scan",
+        "section": "Inputs",
         "visible_when": None,
         # Narrows a choice argument's own options; null on everything else.
         "options_when": None,
@@ -398,6 +403,16 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         "hidden": False,
         "ui": None,
         "groups": None,
+        # A vec2's two axes and their end labels. Null on every other type,
+        # which is what lets a client that ignores them render unchanged.
+        "x_range": None,
+        "y_range": None,
+        "x_labels": None,
+        "y_labels": None,
+        "section_columns": None,
+        "cell": None,
+        "x_label": None,
+        "y_label": None,
     }
     structures = entry["arguments"]["structures"]
     assert structures["type"] == LIST_TYPE and structures["initial"] == ["Mandible"]
@@ -575,3 +590,149 @@ def test_the_interpreter_is_found_in_a_later_catalogue(tmp_path, monkeypatch):
     )
 
     assert dispatch.tool_interpreter("Elsewhere") == str(interpreter)
+# ---------------------------------------------------------------------------
+# vec2: two numbers, and the ranges are not presentation
+
+
+def _vec2_declaration(**extra):
+    declaration = {
+        "type": "vec2",
+        "required": False,
+        "description": "Ratio and adjust of one corner.",
+        "x_range": [0.0, 1.0],
+        "y_range": [-5.0, 5.0],
+        "ui": "joystick",
+    }
+    declaration.update(extra)
+    return declaration
+
+
+def test_a_vec2_carries_its_axis_ranges_into_the_spec():
+    spec = schema_tool._argument_spec("T", "corner", _vec2_declaration(), deployment.ToolDeployment())
+
+    assert spec.types[0] == "vec2"
+    assert spec.x_range == (0.0, 1.0)
+    assert spec.y_range == (-5.0, 5.0)
+
+
+def test_the_ranges_are_tuples_so_a_reader_cannot_edit_them():
+    """An ArgSpec is shared by every request for that tool."""
+    spec = schema_tool._argument_spec("T", "corner", _vec2_declaration(), deployment.ToolDeployment())
+
+    assert isinstance(spec.x_range, tuple)
+
+
+def test_a_range_that_is_not_two_numbers_is_refused_at_startup():
+    with pytest.raises(schema_tool.SchemaError, match="two numbers"):
+        schema_tool._argument_spec(
+            "T", "corner", _vec2_declaration(x_range=[0.0]), deployment.ToolDeployment()
+        )
+
+
+def test_a_value_outside_the_declared_range_is_refused_by_validate():
+    """The one layout key that reaches validate(). A request that skips the
+    panel would otherwise place a patch corner off the arch and be answered with
+    a success."""
+    spec = schema_tool._argument_spec("T", "corner", _vec2_declaration(), deployment.ToolDeployment())
+
+    class _Probe(Tool):
+        name = "Probe"
+        output_kind = "text"
+        arguments = {"corner": spec}
+
+        def run(self, corner=None):
+            return corner
+
+    assert _Probe().invoke({"corner": "0.8,-3"}) == (0.8, -3.0)
+    with pytest.raises(ToolArgumentError, match="outside the declared range"):
+        _Probe().invoke({"corner": "0.8,9"})
+
+
+def test_a_mirrored_axis_is_written_by_inverting_the_range():
+    """`x_range: [15, -15]` puts 15 at the left end, which is how the client's
+    pad declares a mirrored axis."""
+    spec = schema_tool._argument_spec(
+        "T", "corner", _vec2_declaration(x_range=[15.0, -15.0]), deployment.ToolDeployment()
+    )
+
+    class _Probe(Tool):
+        name = "Probe"
+        output_kind = "text"
+        arguments = {"corner": spec}
+
+        def run(self, corner=None):
+            return corner
+
+    assert _Probe().invoke({"corner": "-10,0"}) == (-10.0, 0.0)
+
+
+def test_a_tool_declaring_a_vec2_passes_its_own_schema_check():
+    """The whole load path, not just _argument_spec.
+
+    `check_schema` keeps a second list of accepted types, and vec2 was added to
+    the registry's and not to that one: every unit test here went through
+    `_argument_spec` directly and passed, while a real tool declaring a pad
+    failed to load with "unknown type 'vec2'". Found by starting a server, which
+    is the only thing that walks both.
+    """
+    from base import VEC2_TYPE
+
+    class _Probe(Tool):
+        name = "Probe"
+        output_kind = "text"
+        arguments = {"corner": ArgSpec(type=VEC2_TYPE, x_range=(0.0, 1.0))}
+
+        def run(self, corner=None):
+            return corner
+
+    _Probe().check_schema()  # must not raise
+
+
+def test_a_tool_can_hide_its_own_argument():
+    """The key was accepted and then dropped.
+
+    `hidden` was read only from deployment.toml, so a tool declaring it in its
+    own layout got no warning and no effect -- FlexReg's four tooth numbers kept
+    rendering. A deployment can still hide more; neither side overrides the
+    other.
+    """
+    spec = schema_tool._argument_spec(
+        "T", "tooth", {"type": "int", "required": False, "hidden": True},
+        deployment.ToolDeployment(),
+    )
+
+    assert spec.hidden is True
+
+
+def test_a_declared_section_and_label_are_never_second_guessed(make_tool_folder):
+    """The conventions fill in what the schema leaves out, per argument -- so a
+    tool that says where an argument goes keeps saying it, and a tool that says
+    nothing still gets a readable panel."""
+    folder = make_tool_folder(
+        "declares",
+        arguments={
+            "scan": {"type": "path", "required": True,
+                     "section": "Patient data", "label": "CBCT volume"},
+            "reference": {"type": "path", "required": False},
+        },
+    )
+    tool = schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    assert tool.arguments["scan"].section == "Patient data"
+    assert tool.arguments["scan"].label == "CBCT volume"
+    # Silent, so derived: a `*_reference` is a model by name.
+    assert tool.arguments["reference"].section == "Model"
+    assert tool.arguments["reference"].label == "Reference"
+
+
+def test_a_tool_that_declares_only_a_label_still_gets_a_section(make_tool_folder):
+    """Half a declaration is the common case, and it must not disable the
+    other half."""
+    folder = make_tool_folder(
+        "half",
+        arguments={"tile_step_size": {"type": "float", "required": False, "label": "Overlap"}},
+    )
+    tool = schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    assert tool.arguments["tile_step_size"].label == "Overlap"
+    assert tool.arguments["tile_step_size"].section == "Advanced"

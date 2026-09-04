@@ -377,6 +377,23 @@ def list_tools() -> list:
                     # than treat it as an argument the server invented.
                     "hidden": spec.hidden,
                     "ui": spec.ui,
+                    # A vec2's two axes. The ranges are not presentation -- the
+                    # server validates against them -- but the client needs them
+                    # to build the pad, and the end labels to say what each end
+                    # means: "0.8" carries no meaning in a mouth, "mid"/"out"
+                    # does. Lists rather than tuples, so the wire shape does not
+                    # depend on how the schema spelled them.
+                    "x_range": list(spec.x_range) if spec.x_range else None,
+                    "y_range": list(spec.y_range) if spec.y_range else None,
+                    "x_labels": list(spec.x_labels) if spec.x_labels else None,
+                    # How many columns this argument's section is laid out in.
+                    "section_columns": spec.section_columns,
+                    # Arguments naming one cell are drawn together in it.
+                    "cell": spec.cell,
+                    # What each of the two numbers is, written beside its box.
+                    "x_label": spec.x_label,
+                    "y_label": spec.y_label,
+                    "y_labels": list(spec.y_labels) if spec.y_labels else None,
                     # Listed explicitly so the wire shape does not depend on
                     # whether a tool spelled its catalog as a tuple or a list.
                     "groups": (
