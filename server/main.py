@@ -725,6 +725,33 @@ def _checked_extension(tool, field_name: str, filename: str) -> str:
     return extension
 
 
+def _reject_upload_for_unknown_argument(tool, field_name: str) -> None:
+    """An upload naming an argument the tool does not declare is a 422 saying
+    exactly that.
+
+    It has to be checked BEFORE the extension is, or the caller is told
+    something untrue: `_expected_extensions` falls back to the global
+    ALLOWED_EXTENSIONS for an argument it cannot find, so a client sending
+    `scan=@x.nii.gz` to a tool whose argument is `scans` was answered
+    "Unsupported file extension for 'scan'. Allowed: ('.nii', '.nii.gz')" --
+    about a file whose extension is exactly right. Found by running
+    Example_Tool through the API with the wrong field name.
+
+    The message matches `Tool.validate`'s, which is what an unknown SCALAR
+    argument already gets, so a typo answers the same way whether or not the
+    value happened to arrive as a file.
+    """
+    if field_name not in tool.arguments:
+        known = ", ".join(sorted(tool.arguments))
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Unexpected argument(s) for tool '{tool.name}': {field_name}. "
+                f"This tool takes: {known}."
+            ),
+        )
+
+
 def _reject_upload_for_scalar(spec, field_name: str) -> None:
     """A scalar-typed argument must never arrive as a file: a server-side-only
     model (ArgSpec(type=str, server_selectable="model")) is selected by name.
@@ -846,6 +873,7 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
 
     try:
         for field_name, upload in uploaded_files.items():
+            _reject_upload_for_unknown_argument(tool, field_name)
             spec = tool.arguments.get(field_name)
             _reject_upload_for_scalar(spec, field_name)
             extension = _checked_extension(tool, field_name, upload.filename or "")
@@ -874,6 +902,7 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         # session's blob is RENAMED into the work dir rather than copied, so a
         # chunked upload costs no extra pass over the file at all.
         for field_name, upload_id in upload_references.items():
+            _reject_upload_for_unknown_argument(tool, field_name)
             spec = tool.arguments.get(field_name)
             _reject_upload_for_scalar(spec, field_name)
             try:

@@ -368,3 +368,47 @@ def test_an_imported_tool_with_no_virtualenv_runs_in_process(monkeypatch, tmp_pa
     monkeypatch.setattr(dispatch.settings, "TOOLS_DIR", str(tmp_path))
 
     assert _Imported().invoke({"text": "ok"}) == "OK"
+
+
+def test_the_peak_vram_the_runner_measured_is_logged(tmp_path, caplog):
+    """`runner.py` records `peak_vram_bytes` on every run so a VRAM budget can
+    be set from measurements rather than guesses. Until this, nothing read it
+    back: every measurement was written into a job directory and deleted with
+    it."""
+    import json as _json
+    import logging
+
+    from execution import dispatch as _dispatch
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "result.json").write_text(
+        _json.dumps({"result": "ok", "peak_vram_bytes": 39_845_888_000})
+    )
+
+    with caplog.at_level(logging.INFO, logger="execution.dispatch"):
+        assert _dispatch._read_result(str(job_dir), "Batch_Dental_Seg") == "ok"
+
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "peak_vram_bytes=39845888000" in logged
+    assert "Batch_Dental_Seg" in logged
+    assert "37.11 GiB" in logged
+
+
+def test_a_run_that_never_touched_the_gpu_logs_no_vram_line(tmp_path, caplog):
+    """`_peak_vram_bytes` returns None when torch was never imported, so the
+    key is absent rather than zero -- and a tabular tool must not appear in a
+    VRAM budget as if it had used the card."""
+    import json as _json
+    import logging
+
+    from execution import dispatch as _dispatch
+
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    (job_dir / "result.json").write_text(_json.dumps({"result": "ok"}))
+
+    with caplog.at_level(logging.INFO, logger="execution.dispatch"):
+        assert _dispatch._read_result(str(job_dir), "Surg_Mov_Pred") == "ok"
+
+    assert "peak_vram_bytes" not in "\n".join(r.getMessage() for r in caplog.records)

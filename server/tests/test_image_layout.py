@@ -171,10 +171,14 @@ def _imported_roots(node, guarded: bool = False) -> set:
 
     if isinstance(node, ast.Try):
         covered = _catches_missing_module(node.handlers)
-        for child in node.body:
+        # Only the BODY is protected. An import in `else:` runs after the body
+        # succeeded and in `finally:` runs regardless -- in both, the handler
+        # is already past, so a missing module raises out of the try. The
+        # handlers themselves are the fallback and are protected with the body.
+        for child in node.body + node.handlers:
             roots |= _imported_roots(child, guarded or covered)
-        for child in node.handlers + node.orelse + node.finalbody:
-            roots |= _imported_roots(child, guarded or covered)
+        for child in node.orelse + node.finalbody:
+            roots |= _imported_roots(child, guarded)
         return roots
 
     for child in ast.iter_child_nodes(node):
@@ -217,3 +221,51 @@ def test_the_server_imports_nothing_the_api_venv_lacks():
         f"standard library and the server's own modules; anything else belongs to a "
         f"packaged tool with its own venv."
     )
+
+
+def test_an_import_in_the_else_of_a_guarded_try_still_counts():
+    """`else:` runs after the body succeeded, so the handler is already past
+    and a missing module raises out of the try. Protecting it would let a
+    hard dependency into the API venv unnoticed."""
+    source = (
+        "try:\n"
+        "    import tomllib\n"
+        "except ModuleNotFoundError:\n"
+        "    import tomli as tomllib\n"
+        "else:\n"
+        "    import numpy\n"
+    )
+    assert "numpy" in _imported_roots(ast.parse(source))
+    assert "tomllib" not in _imported_roots(ast.parse(source))
+
+
+def test_an_import_in_the_finally_of_a_guarded_try_still_counts():
+    source = (
+        "try:\n"
+        "    import tomllib\n"
+        "except ModuleNotFoundError:\n"
+        "    pass\n"
+        "finally:\n"
+        "    import pandas\n"
+    )
+    assert "pandas" in _imported_roots(ast.parse(source))
+
+
+def test_the_fallback_import_in_the_handler_is_still_protected():
+    source = (
+        "try:\n"
+        "    import tomllib\n"
+        "except ModuleNotFoundError:\n"
+        "    import tomli as tomllib\n"
+    )
+    assert _imported_roots(ast.parse(source)) == set()
+
+
+def test_a_try_that_catches_the_wrong_error_protects_nothing():
+    source = (
+        "try:\n"
+        "    import numpy\n"
+        "except ValueError:\n"
+        "    pass\n"
+    )
+    assert "numpy" in _imported_roots(ast.parse(source))
