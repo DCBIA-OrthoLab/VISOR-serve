@@ -452,6 +452,19 @@ def _read_result(job_dir: str, tool_name: str) -> Any:
         raise ToolExecutionError(
             f"Tool '{tool_name}': {RESULT_FILE} must be an object with a 'result' field."
         )
+
+    # The runner measures this on every run precisely so a VRAM budget can be
+    # set later from measurements rather than guesses -- but until now nothing
+    # read it back, so every measurement was written into a job directory and
+    # deleted with it. One log line is what makes the instrumentation exist.
+    # It is a number, not patient data.
+    peak = payload.get("peak_vram_bytes")
+    if isinstance(peak, int):
+        logger.info(
+            "tool=%s peak_vram_bytes=%d (%.2f GiB)",
+            tool_name, peak, peak / 1024 ** 3,
+        )
+
     return payload["result"]
 
 
