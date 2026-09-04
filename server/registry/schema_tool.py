@@ -292,8 +292,14 @@ _PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "options_when",
                       "section_columns", "cell")
 
 
-def _presentation(declaration: dict) -> dict:
-    """The layout hints a declaration carries, if any.
+def _presentation(declaration: dict, argument_name: str = "") -> dict:
+    """The layout hints a declaration carries, plus the ones it does not.
+
+    A tool that declares nothing still gets a readable panel: `conventions`
+    derives a section from the argument's name and type, and a label from the
+    name. Both are filled in ONLY where the schema is silent, so a tool that
+    does declare them is never second-guessed -- which is what makes a
+    `layout.py` an override rather than a restatement.
 
     `x_range`/`y_range` ride along because they are declared the same way, but
     they are not presentation: validate() refuses a value outside them. Kept as
@@ -304,6 +310,9 @@ def _presentation(declaration: dict) -> dict:
         for key in _PRESENTATION_KEYS
         if declaration.get(key) is not None
     }
+    if argument_name:
+        hints.setdefault("section", conventions.section_for(argument_name, declaration))
+        hints.setdefault("label", conventions.label_for(argument_name))
     for axis in ("x_range", "y_range"):
         bounds = declaration.get(axis)
         if bounds is None:
@@ -373,7 +382,7 @@ def _argument_spec(
 
     choices = declaration.get("choices")
     if choices:
-        narrowed = _choice_spec(where, declared_type, declaration, choices)
+        narrowed = _choice_spec(where, declared_type, declaration, choices, argument_name)
         if narrowed is not None:
             narrowed.hidden = hidden
             return narrowed
@@ -391,7 +400,7 @@ def _argument_spec(
     # bundle from their laptop.
     if selectable == "model" and declared_type == "path":
         return ArgSpec(
-        **_presentation(declaration),
+        **_presentation(declaration, argument_name),
             type=str,
             required=required,
             description=declaration.get("description", ""),
@@ -407,7 +416,7 @@ def _argument_spec(
         )
 
     return ArgSpec(
-        **_presentation(declaration),
+        **_presentation(declaration, argument_name),
         type=ARGUMENT_TYPES[declared_type],
         required=required,
         description=declaration.get("description", ""),
@@ -424,7 +433,8 @@ def _argument_spec(
     )
 
 
-def _choice_spec(where: str, declared_type: str, declaration: dict, choices: list) -> ArgSpec:
+def _choice_spec(where: str, declared_type: str, declaration: dict, choices: list,
+                 argument_name: str = "") -> ArgSpec:
     """An argument narrowed to a fixed set: a picker rather than a text field.
 
     The generator derives `choices` from a `Literal[...]` annotation, so the
@@ -445,7 +455,7 @@ def _choice_spec(where: str, declared_type: str, declaration: dict, choices: lis
     if declared_type in MULTICHOICE_BASE_TYPES:
         selected = default if isinstance(default, list) else []
         return ArgSpec(
-        **_presentation(declaration),
+        **_presentation(declaration, argument_name),
             type=MULTICHOICE_TYPE,
             required=declaration.get("required", True),
             description=declaration.get("description", ""),
@@ -457,7 +467,7 @@ def _choice_spec(where: str, declared_type: str, declaration: dict, choices: lis
     # options offers them in a meaningful order.
     chosen = default if default in choices else choices[0]
     return ArgSpec(
-        **_presentation(declaration),
+        **_presentation(declaration, argument_name),
         type=CHOICE_TYPE,
         required=declaration.get("required", True),
         description=declaration.get("description", ""),

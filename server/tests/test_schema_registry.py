@@ -388,8 +388,13 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         # null, so the client falls back to ALLOWED_EXTENSIONS: the schema
         # says "a path" and nothing about which extensions are acceptable.
         "extensions": {"path": None},
-        "label": None,
-        "section": None,
+        # Derived, not null. A tool that declares no layout still gets a panel
+        # someone can read: `conventions.label_for` writes the argument name
+        # out, `conventions.section_for` puts a required path in Inputs. A tool
+        # that DOES declare them is never second-guessed -- which is what makes
+        # a layout.py an override rather than a restatement.
+        "label": "Scan",
+        "section": "Inputs",
         "visible_when": None,
         # Narrows a choice argument's own options; null on everything else.
         "options_when": None,
@@ -697,3 +702,37 @@ def test_a_tool_can_hide_its_own_argument():
     )
 
     assert spec.hidden is True
+
+
+def test_a_declared_section_and_label_are_never_second_guessed(make_tool_folder):
+    """The conventions fill in what the schema leaves out, per argument -- so a
+    tool that says where an argument goes keeps saying it, and a tool that says
+    nothing still gets a readable panel."""
+    folder = make_tool_folder(
+        "declares",
+        arguments={
+            "scan": {"type": "path", "required": True,
+                     "section": "Patient data", "label": "CBCT volume"},
+            "reference": {"type": "path", "required": False},
+        },
+    )
+    tool = schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    assert tool.arguments["scan"].section == "Patient data"
+    assert tool.arguments["scan"].label == "CBCT volume"
+    # Silent, so derived: a `*_reference` is a model by name.
+    assert tool.arguments["reference"].section == "Model"
+    assert tool.arguments["reference"].label == "Reference"
+
+
+def test_a_tool_that_declares_only_a_label_still_gets_a_section(make_tool_folder):
+    """Half a declaration is the common case, and it must not disable the
+    other half."""
+    folder = make_tool_folder(
+        "half",
+        arguments={"tile_step_size": {"type": "float", "required": False, "label": "Overlap"}},
+    )
+    tool = schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    assert tool.arguments["tile_step_size"].label == "Overlap"
+    assert tool.arguments["tile_step_size"].section == "Advanced"
