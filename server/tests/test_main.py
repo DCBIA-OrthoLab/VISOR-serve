@@ -1730,3 +1730,34 @@ def test_a_plain_uncompressed_input_is_left_alone(monkeypatch):
 
     assert response.status_code == 200, response.text
     assert reached
+
+
+def test_an_empty_upload_is_refused_whatever_its_extension(monkeypatch):
+    """`gzip.open` reads a zero-byte file without complaining, so the
+    truncation check alone let one through -- and a zero-byte `.nii.gz` reached
+    ASO, which came back with a successful orientation report on it. Nothing a
+    tool here reads is legitimately empty."""
+    reached = []
+
+    class _Probe(Tool):
+        name = "Empty_Probe"
+        arguments = {"scan": ArgSpec(type="path", accepts=(".nii.gz", ".vtk"))}
+        output_kind = "text"
+
+        def run(self, scan):
+            reached.append(scan)
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Empty_Probe", _Probe())
+
+    for name in ("empty.nii.gz", "empty.vtk"):
+        response = client.post(
+            "/run/Empty_Probe",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            files={"scan": (name, io.BytesIO(b""), "application/octet-stream")},
+        )
+        assert response.status_code == 400, (name, response.text)
+        assert name in response.json()["detail"]
+        assert "empty" in response.json()["detail"].lower()
+
+    assert not reached

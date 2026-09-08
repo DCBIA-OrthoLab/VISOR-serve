@@ -763,7 +763,7 @@ _GZIP_PROBE_CHUNK = 1 << 20
 
 
 def _reject_a_truncated_gzip(path: str, field_name: str, filename: str) -> None:
-    """Refuse a `.gz` whose stream does not reach its end-of-stream marker.
+    """Refuse an empty upload, and a `.gz` that never reaches its end marker.
 
     ITK's NIfTI reader does not report a truncated gzip. It reads the header,
     believes the dimensions it declares, and ZERO-FILLS whatever the stream
@@ -782,6 +782,23 @@ def _reject_a_truncated_gzip(path: str, field_name: str, filename: str) -> None:
     arrive. It reads the file once; on a 94 MB scan that is a fraction of what
     receiving it cost.
     """
+    # An empty upload first, and for every extension: zero bytes is not a
+    # volume, a mesh or a table, and `gzip.open` reads an empty file without
+    # complaining -- which is how a zero-byte `.nii.gz` reached ASO and came
+    # back as a successful orientation report.
+    try:
+        if os.path.getsize(path) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"'{filename or field_name}' is empty. An upload of zero "
+                    f"bytes is refused here rather than read as an empty "
+                    f"volume. Send it again."
+                ),
+            )
+    except OSError:
+        pass
+
     if not path.lower().endswith(".gz"):
         return
     try:
