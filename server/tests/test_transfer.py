@@ -354,8 +354,17 @@ def _spy_tool(monkeypatch, tool_name: str) -> dict:
     return seen
 
 
-def _run_chunked(tool_name: str, filename: str, payload: bytes = b"not a real volume"):
-    """Upload `payload` through a session, then run `tool_name` against it."""
+def _run_chunked(tool_name: str, filename: str, payload: bytes = None):
+    """Upload `payload` through a session, then run `tool_name` against it.
+
+    The default payload is a real gzip stream, because these tests name their
+    file `.nii.gz` and the server refuses a `.gz` that is not one -- a
+    truncated gzip is read by ITK as a volume of zeros, so it is stopped where
+    the bytes arrive rather than segmented. Nothing here is about the content;
+    the content just has to be honest about what its name claims.
+    """
+    if payload is None:
+        payload = gzip.compress(b"not a real volume")
     session = _open_session(payload, filename=filename)
     _put_parts(session["upload_id"], payload, session["chunk_size"])
     return client.post(
@@ -393,7 +402,8 @@ def test_both_upload_routes_stage_an_input_under_the_same_name(monkeypatch):
     multipart = client.post(
         "/run/Multipart_Spy",
         headers=AUTH,
-        files={"scan": ("MG_test_scan.nii.gz", b"not a real volume", "application/gzip")},
+        files={"scan": ("MG_test_scan.nii.gz", gzip.compress(b"not a real volume"),
+                        "application/gzip")},
     )
     assert multipart.status_code == 200, multipart.text
 

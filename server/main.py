@@ -759,6 +759,47 @@ def _staged_input_path(work_dir: str, field_name: str, filename: str, extension:
     return os.path.join(directory, f"{stem or field_name}{extension}")
 
 
+_GZIP_PROBE_CHUNK = 1 << 20
+
+
+def _reject_a_truncated_gzip(path: str, field_name: str, filename: str) -> None:
+    """Refuse a `.gz` whose stream does not reach its end-of-stream marker.
+
+    ITK's NIfTI reader does not report a truncated gzip. It reads the header,
+    believes the dimensions it declares, and ZERO-FILLS whatever the stream
+    could not supply -- measured on a scan cut to 4 kB: `sitk.ReadImage`
+    returned size (512, 512, 365), 95.7M voxels, of which **10 394 were
+    non-zero**, and raised nothing.
+
+    So a transfer that dropped halfway is not an error anywhere. It is a
+    successful run on a volume that is 99.99% empty: AMASSS segmented one in
+    28.6 s, Batch_Dental_Seg in 8.9 s, AutoCrop3D in 0.3 s, ASO in 0.7 s, and
+    ALI spent **21 minutes** of GPU on it. Every one answered 200.
+
+    Checked here rather than in each tool because it is the same check for all
+    of them, it costs no dependency (`gzip` is standard library, and the API
+    venv deliberately has nothing heavier), and it belongs where the bytes
+    arrive. It reads the file once; on a 94 MB scan that is a fraction of what
+    receiving it cost.
+    """
+    if not path.lower().endswith(".gz"):
+        return
+    try:
+        with gzip.open(path, "rb") as handle:
+            while handle.read(_GZIP_PROBE_CHUNK):
+                pass
+    except (EOFError, OSError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"'{filename or field_name}' is not a complete gzip file "
+                f"({type(error).__name__}). A transfer that stopped early is "
+                f"read by the imaging libraries as a volume of zeros, so it is "
+                f"refused here rather than segmented. Send it again."
+            ),
+        )
+
+
 def _checked_extension(tool, field_name: str, filename: str) -> str:
     """The extension an input will be saved under, or a 400 naming what was
     allowed. Shared by the multipart path and the chunked one so an upload is
@@ -907,6 +948,7 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail=f"File exceeds the {upload_limit_mb} MB limit.",
                 )
+            _reject_a_truncated_gzip(input_path, field_name, upload.filename or "")
             input_paths.append(input_path)
             # An argument can accept several types (e.g. ("csv_file",
             # "folder")): decide here which one this upload is and tag the path
@@ -942,6 +984,11 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                 await anyio.to_thread.run_sync(transfer.claim_upload, upload_id, input_path)
             except transfer.TransferError as exc:
                 raise _transfer_error(exc)
+            # The route every CBCT takes, so the route where a dropped transfer
+            # actually happens. Each PART is checksummed, but the parts only
+            # tile what the client SENT -- a client that stopped early sends a
+            # complete set of parts for an incomplete file.
+            _reject_a_truncated_gzip(input_path, field_name, session.filename)
             size += session.size
             input_paths.append(input_path)
             args[field_name] = await _as_resolved_path(
