@@ -421,9 +421,18 @@ def list_tool_data(tool_name: str) -> dict:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     slug = deployment_config.data_slug(tool.name)
+    # `models` and `testfiles` stay lists of NAMES, exactly as they were: an
+    # older client reads them unchanged. `entries` is additive, and carries the
+    # two things a name cannot say -- whether an entry is one file or a whole
+    # folder, and how many bytes picking it costs, now that the client
+    # downloads what a user picks rather than naming it to the server.
     return {
         "models": data_store.list_models(slug),
         "testfiles": data_store.list_testfiles(slug),
+        "entries": {
+            "models": data_store.describe(slug, "models"),
+            "testfiles": data_store.describe(slug, "testfiles"),
+        },
     }
 
 

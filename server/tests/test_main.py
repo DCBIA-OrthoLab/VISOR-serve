@@ -1568,3 +1568,41 @@ def test_two_arguments_can_carry_the_same_filename_without_colliding(monkeypatch
     assert os.path.basename(seen["left"]) == os.path.basename(seen["right"]) == "scan.nii.gz"
     assert seen["left_bytes"] == b"left"
     assert seen["right_bytes"] == b"right"
+
+
+def test_the_data_listing_says_what_each_entry_is_and_costs(monkeypatch, tmp_path):
+    """A picker that downloads what the user chooses has to show the price.
+
+    `CBCT_FullyAuto` is 336 MB of a forty-patient cohort and `ROI_box` is a
+    kilobyte; the names say neither, and neither says which is a folder. The
+    two name lists are unchanged, so an older client reads them as before.
+    """
+    import data_store as data_store_module
+    import main as main_module
+
+    root = tmp_path / "DATA"
+    (root / "Probe" / "testfiles" / "cohort").mkdir(parents=True)
+    (root / "Probe" / "testfiles" / "cohort" / "one.nii.gz").write_bytes(b"x" * 300)
+    (root / "Probe" / "testfiles" / "scan.nii.gz").write_bytes(b"y" * 42)
+
+    class _Probe(Tool):
+        name = "Probe"
+        arguments = {"scan": ArgSpec(type="path", server_selectable="testfile")}
+        output_kind = "text"
+
+        def run(self, scan):
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Probe", _Probe())
+    monkeypatch.setattr(main_module, "data_store",
+                        data_store_module.LocalDataStore(str(root)))
+
+    body = client.get(
+        "/tools/Probe/data", headers={"Authorization": f"Bearer {TOKEN}"}
+    ).json()
+
+    assert body["testfiles"] == ["cohort", "scan.nii.gz"]
+    described = {row["name"]: row for row in body["entries"]["testfiles"]}
+    assert described["cohort"] == {"name": "cohort", "kind": "folder", "size": 300}
+    assert described["scan.nii.gz"] == {"name": "scan.nii.gz", "kind": "file", "size": 42}
+    assert body["entries"]["models"] == []
