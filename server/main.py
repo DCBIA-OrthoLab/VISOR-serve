@@ -727,6 +727,29 @@ def _safe_stem(filename: str, extension: str) -> str:
     return cleaned[:_MAX_STEM]
 
 
+def _staged_input_path(work_dir: str, field_name: str, filename: str, extension: str) -> str:
+    """Where an uploaded file lands: `<work dir>/<argument>/<the file's name>`.
+
+    The argument gets a DIRECTORY, not a filename prefix. The prefix said the
+    same thing -- which argument a file belongs to -- but it said it inside the
+    NAME, and a tool that pairs two inputs by patient reads that name:
+    `A1_T1.nii.gz` sent as `files` and `A1_T1_transform.mat` sent as
+    `transforms` became patients `files_A1` and `transforms_A1`, and AutoMatrix
+    answered "1 file(s) had no transform, 1 transform(s) had no file" to a
+    request that was completely correct. GreedyReg's t1/t2 and AutoCrop3D's
+    scans/roi break the same way. Zipping each argument hid it, because the
+    prefix then landed on the archive rather than on the files inside.
+
+    A directory keeps the argument readable, keeps the patient's own name
+    intact, and cannot collide between two arguments. `_safe_stem` still
+    sanitises the name; an unusable one falls back to the argument's own.
+    """
+    stem = _safe_stem(filename or "", extension)
+    directory = os.path.join(work_dir, field_name)
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, f"{stem or field_name}{extension}")
+
+
 def _checked_extension(tool, field_name: str, filename: str) -> str:
     """The extension an input will be saved under, or a 400 naming what was
     allowed. Shared by the multipart path and the chunked one so an upload is
@@ -866,12 +889,8 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             spec = tool.arguments.get(field_name)
             _reject_upload_for_scalar(spec, field_name)
             extension = _checked_extension(tool, field_name, upload.filename or "")
-            # The field name stays as a prefix so the argument a file belongs to
-            # is still readable; the patient's own name follows it, so a batch's
-            # outputs can be told apart without counting requests.
-            stem = _safe_stem(upload.filename or "", extension)
-            base = f"{field_name}_{stem}" if stem else field_name
-            input_path = os.path.join(work_dir, f"{base}{extension}")
+            input_path = _staged_input_path(work_dir, field_name,
+                                            upload.filename or "", extension)
             try:
                 size += await _stream_to_disk(upload, input_path, upload_limit_bytes)
             except _UploadTooLargeError:
@@ -904,16 +923,13 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=f"File exceeds the {upload_limit_mb} MB limit.",
                     )
-                # Named exactly as the multipart branch above names it, and
-                # for the same clinical reason -- see _safe_stem. Staging this
-                # one as `<argument><extension>` was never a cosmetic
-                # difference: the chunked route is the one a client takes for
-                # any file large enough to be worth splitting, which is every
-                # CBCT, so in production it was the ONLY route that mattered
-                # and it dropped the patient's name from every input it staged.
-                stem = _safe_stem(session.filename, extension)
-                base = f"{field_name}_{stem}" if stem else field_name
-                input_path = os.path.join(work_dir, f"{base}{extension}")
+                # Staged exactly as the multipart branch stages it, and for
+                # the same clinical reason -- see `_staged_input_path`. The
+                # chunked route is the one a client takes for any file large
+                # enough to be worth splitting, which is every CBCT, so in
+                # production it is the route that matters.
+                input_path = _staged_input_path(work_dir, field_name,
+                                                session.filename, extension)
                 await anyio.to_thread.run_sync(transfer.claim_upload, upload_id, input_path)
             except transfer.TransferError as exc:
                 raise _transfer_error(exc)

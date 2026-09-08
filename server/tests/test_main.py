@@ -415,11 +415,13 @@ def test_surface_file_type_accepts_every_mesh_format_it_advertises(monkeypatch):
             files={"mesh": (f"scan{extension}", io.BytesIO(b"mesh bytes"), "application/octet-stream")},
         )
         assert response.status_code == 200, extension
-        # `mesh_scan`, not `mesh`: the field name, then the sanitized stem
+        # `scan`, not `mesh_scan`: the argument is the DIRECTORY the file sits
+        # in now, so the file keeps the name the caller gave it. A prefix used
+        # to change the name a tool pairs its patients by.
         # of what was uploaded. The extension is what this test is about
         # and is unchanged; the stem is there so a batch's outputs can be
         # told apart, every tool here naming its outputs after its input.
-        assert response.json() == {"result": f"mesh_scan{extension}"}
+        assert response.json() == {"result": f"scan{extension}"}
 
     response = client.post(
         "/run/surface_test_tool",
@@ -1454,7 +1456,9 @@ def test_an_uploaded_filename_reaches_the_tool_that_names_its_outputs_from_it(
     assert "patient" in received, received
     assert received.endswith(".nii.gz"), received
     # And the argument it belongs to is still readable.
-    assert received.startswith("scan_"), received
+    # Unchanged, not prefixed: this is the name the tool builds its outputs
+    # from, and a tool that pairs two inputs reads it to find the patient.
+    assert received == "patient_042_T1.nii.gz", received
 
 
 def test_a_traversing_filename_cannot_escape_the_work_directory(tmp_path, monkeypatch):
@@ -1484,4 +1488,83 @@ def test_a_traversing_filename_cannot_escape_the_work_directory(tmp_path, monkey
     assert response.status_code == 200, response.text
     received = seen["path"]
     assert ".." not in received, received
-    assert os.path.basename(received).startswith("scan_"), received
+    # Contained under the argument's own directory, with the traversal gone
+    # from the name rather than merely prefixed away.
+    assert os.path.basename(os.path.dirname(received)) == "scan", received
+
+
+def test_two_inputs_of_one_patient_keep_the_same_patient_name(monkeypatch):
+    """A tool that pairs two arguments by patient reads the name it is handed.
+
+    Prefixing each upload with its field name turned `A1_T1.nii.gz` sent as
+    `files` and `A1_T1_transform.mat` sent as `transforms` into patients
+    `files_A1` and `transforms_A1` -- so AutoMatrix answered "1 file(s) had no
+    transform, 1 transform(s) had no file" to a request that was correct, and
+    the same break applied to GreedyReg's t1/t2 and AutoCrop3D's scans/roi.
+    Zipping each argument hid it: the prefix landed on the archive instead.
+    """
+    seen = {}
+
+    class _Pairing(Tool):
+        name = "Pairing_Probe"
+        arguments = {
+            "files": ArgSpec(type="path"),
+            "transforms": ArgSpec(type="path"),
+        }
+        output_kind = "text"
+
+        def run(self, files, transforms):
+            seen["files"] = os.path.basename(str(files))
+            seen["transforms"] = os.path.basename(str(transforms))
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Pairing_Probe", _Pairing())
+
+    response = client.post(
+        "/run/Pairing_Probe",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={
+            "files": ("A1_T1.nii.gz", io.BytesIO(b"\x1f\x8b"), "application/gzip"),
+            "transforms": ("A1_T1.mat", io.BytesIO(b"1 0 0 0\n"), "text/plain"),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert seen["files"] == "A1_T1.nii.gz", seen
+    assert seen["transforms"] == "A1_T1.mat", seen
+
+
+def test_two_arguments_can_carry_the_same_filename_without_colliding(monkeypatch):
+    """The prefix also kept two arguments' identical filenames apart. A
+    directory each does the same job, and does it without touching the name."""
+    seen = {}
+
+    class _Same(Tool):
+        name = "Same_Name_Probe"
+        arguments = {"left": ArgSpec(type="path"), "right": ArgSpec(type="path")}
+        output_kind = "text"
+
+        def run(self, left, right):
+            # Read INSIDE the run: the work dir is deleted once the response
+            # has streamed, which is the cleanup guarantee working.
+            seen["left"], seen["right"] = str(left), str(right)
+            seen["left_bytes"] = open(str(left), "rb").read()
+            seen["right_bytes"] = open(str(right), "rb").read()
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Same_Name_Probe", _Same())
+
+    response = client.post(
+        "/run/Same_Name_Probe",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={
+            "left": ("scan.nii.gz", io.BytesIO(b"left"), "application/gzip"),
+            "right": ("scan.nii.gz", io.BytesIO(b"right"), "application/gzip"),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert seen["left"] != seen["right"], seen
+    assert os.path.basename(seen["left"]) == os.path.basename(seen["right"]) == "scan.nii.gz"
+    assert seen["left_bytes"] == b"left"
+    assert seen["right_bytes"] == b"right"
