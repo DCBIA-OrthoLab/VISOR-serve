@@ -445,7 +445,15 @@ def _remove_path(path: str) -> None:
         os.remove(path)
 
 
-@app.get("/tools/{tool_name}/testfiles/{filename}", dependencies=[Depends(verify_token)])
+# HEAD as well as GET, and it is not decoration. The client probes with a HEAD
+# to learn the size and whether ranges are served, and only then splits the
+# transfer across parallel connections. Starlette does not add HEAD to a GET
+# route, so the probe was answered `405 Method Not Allowed` -- every probe
+# failed, and every test file came down one connection at a time. Invisible on
+# a loopback at 378 MB/s; the whole point of the parallel path on the link a
+# clinician actually has.
+@app.api_route("/tools/{tool_name}/testfiles/{filename}", methods=["GET", "HEAD"],
+               dependencies=[Depends(verify_token)])
 async def download_testfile(tool_name: str, filename: str, background_tasks: BackgroundTasks):
     """Stream one of the tool's hosted test files, so a user can fill an input
     with reference data. The valid names are what GET /tools/{name}/data lists.

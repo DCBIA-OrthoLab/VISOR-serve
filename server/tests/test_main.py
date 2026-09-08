@@ -1761,3 +1761,49 @@ def test_an_empty_upload_is_refused_whatever_its_extension(monkeypatch):
         assert "empty" in response.json()["detail"].lower()
 
     assert not reached
+
+
+def test_a_test_file_answers_head_so_a_client_can_plan_a_ranged_download(monkeypatch, tmp_path):
+    """The client probes with a HEAD to learn the size and whether ranges are
+    served, and only then splits the transfer across parallel connections.
+    Starlette does not add HEAD to a GET route, so every probe was answered
+    `405 Method Not Allowed`, the probe failed, and every test file came down
+    one connection at a time -- invisible on a loopback at 378 MB/s, and the
+    whole point of the parallel path on the link a clinician actually has."""
+    import data_store as data_store_module
+    import main as main_module
+
+    root = tmp_path / "DATA"
+    (root / "Probe" / "testfiles").mkdir(parents=True)
+    (root / "Probe" / "testfiles" / "scan.nii.gz").write_bytes(gzip.compress(b"x" * 5000))
+
+    class _Probe(Tool):
+        name = "Probe"
+        arguments = {"scan": ArgSpec(type="path", server_selectable="testfile")}
+        output_kind = "text"
+
+        def run(self, scan):
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Probe", _Probe())
+    monkeypatch.setattr(main_module, "data_store",
+                        data_store_module.LocalDataStore(str(root)))
+
+    head = client.head("/tools/Probe/testfiles/scan.nii.gz",
+                       headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert head.status_code == 200, head.text
+    assert head.headers.get("accept-ranges") == "bytes"
+    assert int(head.headers["content-length"]) > 0
+    assert head.content == b"", "a HEAD carries no body"
+
+    # And the GET it plans is unchanged.
+    body = client.get("/tools/Probe/testfiles/scan.nii.gz",
+                      headers={"Authorization": f"Bearer {TOKEN}"})
+    assert body.status_code == 200
+    assert int(head.headers["content-length"]) == len(body.content)
+
+
+def test_a_head_on_a_test_file_still_needs_a_token():
+    response = client.head("/tools/AMASSS/testfiles/anything.nii.gz")
+    assert response.status_code == 401
