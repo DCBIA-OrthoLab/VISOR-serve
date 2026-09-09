@@ -291,6 +291,130 @@ def test_run_resolves_scalar_server_selectable_model_by_name(monkeypatch, tmp_pa
     assert response.json() == {"result": "stacking_v2.zip:11"}
 
 
+def _bundle_tool(monkeypatch, tmp_path, name="bundle_tool"):
+    """A tool whose `model` is hosted, and a data store that records what was
+    asked for. Mirrors ALI: a required argument the clinician must not answer."""
+    import base
+    import main
+    import registry
+    from data_store import ResolvedFile
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir(exist_ok=True)
+    asked = []
+
+    tool_name = name
+
+    class BundleTool(base.Tool):
+        # A class body cannot see the enclosing function's `name`.
+        name = tool_name
+        arguments = {
+            "scan": base.ArgSpec(type=str, required=False),
+            "model": base.ArgSpec(type=str, required=True, server_selectable="model"),
+        }
+        output_kind = "text"
+
+        def run(self, model: str, scan: str = "") -> str:
+            return os.path.basename(model)
+
+    monkeypatch.setitem(registry.TOOLS, name, BundleTool())
+
+    def resolve(tool_name, filename):
+        asked.append(filename)
+        return ResolvedFile(path=str(bundle / filename))
+
+    monkeypatch.setattr(main.data_store, "resolve_model", resolve)
+    return asked
+
+
+def _deployment_with(monkeypatch, tool_name, **fields):
+    import main
+    from registry import deployment as deployment_module
+
+    monkeypatch.setattr(
+        main.deployment_config,
+        "for_tool",
+        lambda name, _fields=fields, _tool=tool_name: (
+            deployment_module.ToolDeployment(**_fields)
+            if name == _tool
+            else deployment_module.ToolDeployment()
+        ),
+    )
+
+
+def test_a_bundle_the_deployment_answers_for_is_filled_in(monkeypatch, tmp_path):
+    """The clinician must not be asked which weights a run needs.
+
+    ALI's mode already decides it -- CBCT weights for a CBCT scan -- and the
+    facade publishes ONE dropdown for both engines with nothing to tell them
+    apart, so picking the intraoral bundle for a CBCT run was one click away.
+    With the argument `hidden`, nothing is sent for it, and this is what makes
+    the run work anyway.
+    """
+    asked = _bundle_tool(monkeypatch, tmp_path)
+    _deployment_with(monkeypatch, "bundle_tool",
+                     model_defaults={"model": "ALI_CBCT_Models"})
+
+    response = client.post(
+        "/run/bundle_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={"scan": "x"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert asked == ["ALI_CBCT_Models"]
+
+
+def test_a_bundle_the_caller_named_is_never_overridden(monkeypatch, tmp_path):
+    """It fills a gap, it does not take a decision away. A supervisor chaining
+    ALI, or an API client that knows what it wants, still wins."""
+    asked = _bundle_tool(monkeypatch, tmp_path)
+    _deployment_with(monkeypatch, "bundle_tool",
+                     model_defaults={"model": "ALI_CBCT_Models"})
+
+    response = client.post(
+        "/run/bundle_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={"model": "ALI_IOS_Models"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert asked == ["ALI_IOS_Models"]
+
+
+def test_a_default_for_an_argument_the_tool_does_not_have_is_ignored(monkeypatch, tmp_path):
+    """deployment.toml outlives the tool it describes. A stale entry must not
+    invent an argument the tool would then refuse as unexpected."""
+    asked = _bundle_tool(monkeypatch, tmp_path)
+    _deployment_with(monkeypatch, "bundle_tool",
+                     model_defaults={"model": "ALI_CBCT_Models",
+                                     "gone": "Whatever_Models"})
+
+    response = client.post(
+        "/run/bundle_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={},
+    )
+
+    assert response.status_code == 200, response.text
+    assert asked == ["ALI_CBCT_Models"]
+
+
+def test_nothing_is_filled_in_where_no_default_is_declared(monkeypatch, tmp_path):
+    """Every other tool keeps answering exactly as it did: a required hosted
+    argument nobody named is still a 422."""
+    _bundle_tool(monkeypatch, tmp_path)
+
+    response = client.post(
+        "/run/bundle_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={},
+    )
+
+    assert response.status_code == 422
+    assert "model" in response.json()["detail"]
+
+
 def test_concurrent_requests_run_in_parallel(monkeypatch):
     """Two /run requests must execute their tools at the same time, not one
     after the other. Each run() blocks on a 2-party barrier: it can only pass

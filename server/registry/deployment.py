@@ -49,7 +49,7 @@ SERVER_SELECTABLE_NONE = "none"
 SERVER_SELECTABLE_KINDS = ("model", "testfile", SERVER_SELECTABLE_NONE)
 
 _TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden",
-              "timeout_seconds", "dispatch")
+              "timeout_seconds", "dispatch", "model_defaults")
 
 
 class DeploymentConfigError(Exception):
@@ -90,6 +90,27 @@ class ToolDeployment:
     # business being asked. A deployment decision, which is why it lives here
     # and not in the tool: the tool knows nothing about who is looking at it.
     hidden: tuple = ()
+
+    # {argument name: the hosted bundle to use when the caller names none}.
+    #
+    # For an argument a clinician should not be answering. ALI is the case that
+    # asked for it: the mode already decides which bundle a run needs -- CBCT
+    # weights for a CBCT scan -- yet the panel asked again, and the facade
+    # publishes ONE dropdown for both engines with no way to tell them apart, so
+    # picking the intraoral bundle for a CBCT run was one click away. It has
+    # happened.
+    #
+    # Here rather than as a default in the tool's own `run()`, and that is the
+    # rule rather than a preference: a bundle name is not a path, and turning it
+    # into one needs DATA_DIR and this deployment's data slug. CONTRIBUTING.md
+    # in the tool repository forbids a tool from knowing either -- "run() does
+    # not read the environment and does not know about /DATA. Path resolution
+    # belongs to the server." So the tool keeps a required, honest argument and
+    # the deployment says what to put in it.
+    #
+    # Only ever fills an argument the caller left out, so a supervisor or a
+    # direct API call naming its own bundle still wins.
+    model_defaults: dict = field(default_factory=dict)
 
     # How long this tool may run before it is killed, in seconds. None falls
     # back to settings.TOOL_TIMEOUT_SECONDS, and 0 there means "no limit".
@@ -201,6 +222,16 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
             f"{where}: 'hidden' must be a list of argument names."
         )
 
+    defaults = table.get("model_defaults", {})
+    if not isinstance(defaults, dict) or not all(
+        isinstance(argument, str) and isinstance(bundle, str) and bundle.strip()
+        for argument, bundle in defaults.items()
+    ):
+        raise DeploymentConfigError(
+            f"{where}: 'model_defaults' must be a table of "
+            f"{{argument name = \"hosted bundle name\"}}."
+        )
+
     timeout = table.get("timeout_seconds")
     if timeout is not None and (
         isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0
@@ -212,6 +243,7 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
     return ToolDeployment(
         server_selectable=dict(selectable),
         max_upload_mb=limit,
+        model_defaults=dict(defaults),
         data_dir=data_dir,
         dispatch=dict(dispatch or {}),
         hidden=tuple(hidden),

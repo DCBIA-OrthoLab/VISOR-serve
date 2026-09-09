@@ -33,11 +33,28 @@ data_dir = "AREG"
 # The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
 # this each looks for DATA/<its own name>/ and falls back to the run-together
 # spelling (ALICBCT), which was never going to exist.
+#
+# They also carry the one thing a clinician must not be asked. The mode already
+# decides which weights a run needs -- a CBCT scan wants ALI_CBCT_Models, an
+# intraoral surface wants ALI_IOS_Models, and there is no third answer -- yet
+# the facade composes ONE "Model Bundle" dropdown from the two engines with
+# nothing to tell them apart, so picking the intraoral bundle for a CBCT run was
+# one click away. It happened (2026-07-31 changelog: "running ALI IOS with the
+# dropdown left on ALI_CBCT_Models").
+#
+# `hidden` takes it off the panel; `model_defaults` puts the right answer in.
+# BOTH engines need it: the facade publishes whichever target it composes first,
+# so declaring it on one alone leaves the published argument disagreeing with
+# itself. An explicit `model` from a supervisor or an API client still wins.
 [tools.ALI_CBCT]
 data_dir = "ALI"
+hidden = ["model"]
+model_defaults = { model = "ALI_CBCT_Models" }
 
 [tools.ALI_IOS]
 data_dir = "ALI"
+hidden = ["model"]
+model_defaults = { model = "ALI_IOS_Models" }
 
 # AREG became three tools when it was split, one per modality, because the
 # engines cannot share a virtualenv. This publishes the name callers already
