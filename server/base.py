@@ -229,6 +229,17 @@ class ArgSpec:
     # the tool's own check is what decides.
     options_when: Optional[dict] = None
 
+    # {other_arg: {its value: {group name: [option, ...]}}}. The same idea one
+    # level up: `options_when` says WHICH options apply, this says how to lay
+    # them out, because two engines behind one facade do not group the same
+    # options the same way. ALI's four anatomical regions and its five intraoral
+    # families are not two spellings of one grouping, and publishing whichever
+    # engine composed first put intraoral landmarks under `Cranial base`.
+    #
+    # Presentation only. A client that ignores it renders `groups` and parks the
+    # rest in a trailing "Other" tab, which is usable rather than wrong.
+    groups_when: Optional[dict] = None
+
     # Not rendered by a client, at all. The value is still the tool's own
     # default, and the spec still exists here -- dispatch.uses_the_gpu() reads
     # `device` to decide whether a run takes the card, so removing it from the

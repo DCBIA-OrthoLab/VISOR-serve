@@ -125,6 +125,7 @@ def compose(name: str, targets: dict, registry: dict) -> FacadeTool:
     # options differ -- AREG's `automation` offers three modes for CBCT, two for
     # IOS and three different ones for IOSCBCT.
     choices_by_mode: dict = {}
+    groups_by_mode: dict = {}
 
     for mode, target in targets.items():
         tool = registry[target]
@@ -143,6 +144,8 @@ def compose(name: str, targets: dict, registry: dict) -> FacadeTool:
                 arguments[argument_name] = copy.deepcopy(spec)
             if spec.choices:
                 choices_by_mode.setdefault(argument_name, {})[mode] = dict(spec.choices)
+            if getattr(spec, "groups", None):
+                groups_by_mode.setdefault(argument_name, {})[mode] = dict(spec.groups)
 
     for argument_name, spec in arguments.items():
         appears_in = seen_in[argument_name]
@@ -160,6 +163,29 @@ def compose(name: str, targets: dict, registry: dict) -> FacadeTool:
         if len({tuple(sorted(options)) for options in per_mode.values()}) > 1:
             spec.options_when = {
                 MODE_ARGUMENT: {mode: list(options) for mode, options in per_mode.items()}
+            }
+            # The UNION, not the first mode's. `options_when` narrows what is
+            # offered; it cannot add to it, so an option only the second engine
+            # has was published nowhere and could not be picked -- ALI's
+            # intraoral landmarks were simply absent, and the panel showed the
+            # CBCT catalogue in both modes. Each mode's own default is kept for
+            # its own options; an option a mode does not have is off there, and
+            # `options_when` hides it anyway.
+            merged = {}
+            for options in per_mode.values():
+                merged.update(options)
+            spec.choices = merged
+
+        # Same reasoning for the tabs the options are laid out in: ALI's four
+        # anatomical regions and its five intraoral families are not the same
+        # grouping of the same thing, and keeping whichever engine composed first
+        # put intraoral landmarks under `Cranial base`. A client that does not
+        # read `groups_when` still gets a usable panel -- `formgen._grouped`
+        # parks anything no group claims in a trailing "Other" tab.
+        per_mode_groups = groups_by_mode.get(argument_name, {})
+        if len({tuple(sorted(groups)) for groups in per_mode_groups.values()}) > 1:
+            spec.groups_when = {
+                MODE_ARGUMENT: {mode: dict(groups) for mode, groups in per_mode_groups.items()}
             }
 
     mode_spec = ArgSpec(
