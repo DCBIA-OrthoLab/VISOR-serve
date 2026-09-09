@@ -377,6 +377,23 @@ def list_tools() -> list:
                     # than treat it as an argument the server invented.
                     "hidden": spec.hidden,
                     "ui": spec.ui,
+                    # A vec2's two axes. The ranges are not presentation -- the
+                    # server validates against them -- but the client needs them
+                    # to build the pad, and the end labels to say what each end
+                    # means: "0.8" carries no meaning in a mouth, "mid"/"out"
+                    # does. Lists rather than tuples, so the wire shape does not
+                    # depend on how the schema spelled them.
+                    "x_range": list(spec.x_range) if spec.x_range else None,
+                    "y_range": list(spec.y_range) if spec.y_range else None,
+                    "x_labels": list(spec.x_labels) if spec.x_labels else None,
+                    # How many columns this argument's section is laid out in.
+                    "section_columns": spec.section_columns,
+                    # Arguments naming one cell are drawn together in it.
+                    "cell": spec.cell,
+                    # What each of the two numbers is, written beside its box.
+                    "x_label": spec.x_label,
+                    "y_label": spec.y_label,
+                    "y_labels": list(spec.y_labels) if spec.y_labels else None,
                     # Listed explicitly so the wire shape does not depend on
                     # whether a tool spelled its catalog as a tuple or a list.
                     "groups": (
@@ -404,9 +421,18 @@ def list_tool_data(tool_name: str) -> dict:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     slug = deployment_config.data_slug(tool.name)
+    # `models` and `testfiles` stay lists of NAMES, exactly as they were: an
+    # older client reads them unchanged. `entries` is additive, and carries the
+    # two things a name cannot say -- whether an entry is one file or a whole
+    # folder, and how many bytes picking it costs, now that the client
+    # downloads what a user picks rather than naming it to the server.
     return {
         "models": data_store.list_models(slug),
         "testfiles": data_store.list_testfiles(slug),
+        "entries": {
+            "models": data_store.describe(slug, "models"),
+            "testfiles": data_store.describe(slug, "testfiles"),
+        },
     }
 
 
@@ -419,7 +445,15 @@ def _remove_path(path: str) -> None:
         os.remove(path)
 
 
-@app.get("/tools/{tool_name}/testfiles/{filename}", dependencies=[Depends(verify_token)])
+# HEAD as well as GET, and it is not decoration. The client probes with a HEAD
+# to learn the size and whether ranges are served, and only then splits the
+# transfer across parallel connections. Starlette does not add HEAD to a GET
+# route, so the probe was answered `405 Method Not Allowed` -- every probe
+# failed, and every test file came down one connection at a time. Invisible on
+# a loopback at 378 MB/s; the whole point of the parallel path on the link a
+# clinician actually has.
+@app.api_route("/tools/{tool_name}/testfiles/{filename}", methods=["GET", "HEAD"],
+               dependencies=[Depends(verify_token)])
 async def download_testfile(tool_name: str, filename: str, background_tasks: BackgroundTasks):
     """Stream one of the tool's hosted test files, so a user can fill an input
     with reference data. The valid names are what GET /tools/{name}/data lists.
@@ -445,7 +479,11 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
         background_tasks.add_task(_remove_path, resolved.path)
 
     path = resolved.path
-    if os.path.isdir(path):
+    # Built for THIS request, rather than read off the disk. What that costs is
+    # decided a dozen lines below, where the response says whether it may be
+    # ranged.
+    generated = os.path.isdir(path)
+    if generated:
         # DATA_DIR is read-only: the archive is built in its own staging dir
         # under TEMP_DIR, which must outlive the response stream -- hence the
         # background task, and the inline cleanup on the one path where no
@@ -476,6 +514,23 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
         path,
         media_type=_media_type_of(path),
         filename=os.path.basename(path),
+        # An archive built for one request has no byte range worth offering, and
+        # offering one is far worse than useless: the client probes, sees
+        # ranges, and splits a 339 MB cohort across 43 parallel parts -- so the
+        # server builds the same 339 MB archive 43 times to deliver it once.
+        # Measured against AREG's CBCT_FullyAuto: one 8 MB range costs 40% of
+        # the entire download, and the transfer took 39.1s ranged against 1.5s
+        # in a single stream. `Accept-Ranges: none` is exactly what the client
+        # probes for, so it falls back to one connection, and one build.
+        #
+        # Only the ADVERTISEMENT is withdrawn. Starlette still answers a Range
+        # a client sends anyway, and that stays correct because two builds of
+        # one folder are byte-identical (pinned by a test) -- it is merely slow,
+        # which is the right way round for a client that ignores the header.
+        #
+        # A real file is untouched: it IS on disk, its ranges are free, and
+        # parallel connections are the whole point of the probe.
+        headers={"Accept-Ranges": "none"} if generated else None,
         background=background_tasks,
     )
 
@@ -710,6 +765,87 @@ def _safe_stem(filename: str, extension: str) -> str:
     return cleaned[:_MAX_STEM]
 
 
+def _staged_input_path(work_dir: str, field_name: str, filename: str, extension: str) -> str:
+    """Where an uploaded file lands: `<work dir>/<argument>/<the file's name>`.
+
+    The argument gets a DIRECTORY, not a filename prefix. The prefix said the
+    same thing -- which argument a file belongs to -- but it said it inside the
+    NAME, and a tool that pairs two inputs by patient reads that name:
+    `A1_T1.nii.gz` sent as `files` and `A1_T1_transform.mat` sent as
+    `transforms` became patients `files_A1` and `transforms_A1`, and AutoMatrix
+    answered "1 file(s) had no transform, 1 transform(s) had no file" to a
+    request that was completely correct. GreedyReg's t1/t2 and AutoCrop3D's
+    scans/roi break the same way. Zipping each argument hid it, because the
+    prefix then landed on the archive rather than on the files inside.
+
+    A directory keeps the argument readable, keeps the patient's own name
+    intact, and cannot collide between two arguments. `_safe_stem` still
+    sanitises the name; an unusable one falls back to the argument's own.
+    """
+    stem = _safe_stem(filename or "", extension)
+    directory = os.path.join(work_dir, field_name)
+    os.makedirs(directory, exist_ok=True)
+    return os.path.join(directory, f"{stem or field_name}{extension}")
+
+
+_GZIP_PROBE_CHUNK = 1 << 20
+
+
+def _reject_a_truncated_gzip(path: str, field_name: str, filename: str) -> None:
+    """Refuse an empty upload, and a `.gz` that never reaches its end marker.
+
+    ITK's NIfTI reader does not report a truncated gzip. It reads the header,
+    believes the dimensions it declares, and ZERO-FILLS whatever the stream
+    could not supply -- measured on a scan cut to 4 kB: `sitk.ReadImage`
+    returned size (512, 512, 365), 95.7M voxels, of which **10 394 were
+    non-zero**, and raised nothing.
+
+    So a transfer that dropped halfway is not an error anywhere. It is a
+    successful run on a volume that is 99.99% empty: AMASSS segmented one in
+    28.6 s, Batch_Dental_Seg in 8.9 s, AutoCrop3D in 0.3 s, ASO in 0.7 s, and
+    ALI spent **21 minutes** of GPU on it. Every one answered 200.
+
+    Checked here rather than in each tool because it is the same check for all
+    of them, it costs no dependency (`gzip` is standard library, and the API
+    venv deliberately has nothing heavier), and it belongs where the bytes
+    arrive. It reads the file once; on a 94 MB scan that is a fraction of what
+    receiving it cost.
+    """
+    # An empty upload first, and for every extension: zero bytes is not a
+    # volume, a mesh or a table, and `gzip.open` reads an empty file without
+    # complaining -- which is how a zero-byte `.nii.gz` reached ASO and came
+    # back as a successful orientation report.
+    try:
+        if os.path.getsize(path) == 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"'{filename or field_name}' is empty. An upload of zero "
+                    f"bytes is refused here rather than read as an empty "
+                    f"volume. Send it again."
+                ),
+            )
+    except OSError:
+        pass
+
+    if not path.lower().endswith(".gz"):
+        return
+    try:
+        with gzip.open(path, "rb") as handle:
+            while handle.read(_GZIP_PROBE_CHUNK):
+                pass
+    except (EOFError, OSError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"'{filename or field_name}' is not a complete gzip file "
+                f"({type(error).__name__}). A transfer that stopped early is "
+                f"read by the imaging libraries as a volume of zeros, so it is "
+                f"refused here rather than segmented. Send it again."
+            ),
+        )
+
+
 def _checked_extension(tool, field_name: str, filename: str) -> str:
     """The extension an input will be saved under, or a 400 naming what was
     allowed. Shared by the multipart path and the chunked one so an upload is
@@ -877,12 +1013,8 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
             spec = tool.arguments.get(field_name)
             _reject_upload_for_scalar(spec, field_name)
             extension = _checked_extension(tool, field_name, upload.filename or "")
-            # The field name stays as a prefix so the argument a file belongs to
-            # is still readable; the patient's own name follows it, so a batch's
-            # outputs can be told apart without counting requests.
-            stem = _safe_stem(upload.filename or "", extension)
-            base = f"{field_name}_{stem}" if stem else field_name
-            input_path = os.path.join(work_dir, f"{base}{extension}")
+            input_path = _staged_input_path(work_dir, field_name,
+                                            upload.filename or "", extension)
             try:
                 size += await _stream_to_disk(upload, input_path, upload_limit_bytes)
             except _UploadTooLargeError:
@@ -890,6 +1022,7 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail=f"File exceeds the {upload_limit_mb} MB limit.",
                 )
+            _reject_a_truncated_gzip(input_path, field_name, upload.filename or "")
             input_paths.append(input_path)
             # An argument can accept several types (e.g. ("csv_file",
             # "folder")): decide here which one this upload is and tag the path
@@ -916,19 +1049,21 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
                         status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                         detail=f"File exceeds the {upload_limit_mb} MB limit.",
                     )
-                # Named exactly as the multipart branch above names it, and
-                # for the same clinical reason -- see _safe_stem. Staging this
-                # one as `<argument><extension>` was never a cosmetic
-                # difference: the chunked route is the one a client takes for
-                # any file large enough to be worth splitting, which is every
-                # CBCT, so in production it was the ONLY route that mattered
-                # and it dropped the patient's name from every input it staged.
-                stem = _safe_stem(session.filename, extension)
-                base = f"{field_name}_{stem}" if stem else field_name
-                input_path = os.path.join(work_dir, f"{base}{extension}")
+                # Staged exactly as the multipart branch stages it, and for
+                # the same clinical reason -- see `_staged_input_path`. The
+                # chunked route is the one a client takes for any file large
+                # enough to be worth splitting, which is every CBCT, so in
+                # production it is the route that matters.
+                input_path = _staged_input_path(work_dir, field_name,
+                                                session.filename, extension)
                 await anyio.to_thread.run_sync(transfer.claim_upload, upload_id, input_path)
             except transfer.TransferError as exc:
                 raise _transfer_error(exc)
+            # The route every CBCT takes, so the route where a dropped transfer
+            # actually happens. Each PART is checksummed, but the parts only
+            # tile what the client SENT -- a client that stopped early sends a
+            # complete set of parts for an incomplete file.
+            _reject_a_truncated_gzip(input_path, field_name, session.filename)
             size += session.size
             input_paths.append(input_path)
             args[field_name] = await _as_resolved_path(

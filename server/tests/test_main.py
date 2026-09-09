@@ -4,6 +4,7 @@ Run with: cd server && ./venv/bin/pytest
 (requires requirements-dev.txt: pip install -r requirements-dev.txt)
 """
 
+import gzip
 import io
 import json
 import os
@@ -139,7 +140,7 @@ def test_run_example_tool_rejects_unsupported_extension():
         "/run/Example_Tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         data={"label": "case_3", "threshold": "0.5"},
-        files={"input": ("volume.nii.gz", b"not tabular", "application/gzip")},
+        files={"input": ("volume.nii.gz", gzip.compress(b"not tabular"), "application/gzip")},
     )
 
     assert response.status_code == 400
@@ -168,13 +169,22 @@ def test_run_tool_with_two_named_files(monkeypatch):
         "/run/two_file_test_tool",
         headers={"Authorization": f"Bearer {TOKEN}"},
         files={
-            "fixed_image": ("a.nii.gz", b"aaa", "application/gzip"),
-            "moving_image": ("b.nii.gz", b"bbbbb", "application/gzip"),
+            # Payloads chosen so their COMPRESSED sizes differ: gzip turns
+            # b"aaa" and b"bbbbb" into 23 bytes each, and the probe tells the
+            # two arguments apart by size.
+            "fixed_image": ("a.nii.gz", gzip.compress(b"a" * 100), "application/gzip"),
+            "moving_image": ("b.nii.gz", gzip.compress(b"b" * 9000), "application/gzip"),
         },
     )
 
     assert response.status_code == 200
-    assert response.json() == {"result": "3:5"}
+    # The probe answers "<size of fixed>:<size of moving>", which is how this
+    # test tells the two apart. The payloads are gzip streams now -- a `.gz`
+    # upload has to be one -- so the sizes are the compressed ones, and what
+    # matters is still that each argument received its OWN file.
+    fixed, moving = len(gzip.compress(b"a" * 100)), len(gzip.compress(b"b" * 9000))
+    assert fixed != moving, "the fingerprint has to distinguish them"
+    assert response.json() == {"result": "{}:{}".format(fixed, moving)}
 
 
 def test_run_tool_with_two_named_files_missing_one_is_422(monkeypatch):
@@ -197,7 +207,7 @@ def test_run_tool_with_two_named_files_missing_one_is_422(monkeypatch):
     response = client.post(
         "/run/two_file_test_tool_2",
         headers={"Authorization": f"Bearer {TOKEN}"},
-        files={"fixed_image": ("a.nii.gz", b"aaa", "application/gzip")},
+        files={"fixed_image": ("a.nii.gz", gzip.compress(b"aaa"), "application/gzip")},
     )
 
     assert response.status_code == 422
@@ -415,11 +425,13 @@ def test_surface_file_type_accepts_every_mesh_format_it_advertises(monkeypatch):
             files={"mesh": (f"scan{extension}", io.BytesIO(b"mesh bytes"), "application/octet-stream")},
         )
         assert response.status_code == 200, extension
-        # `mesh_scan`, not `mesh`: the field name, then the sanitized stem
+        # `scan`, not `mesh_scan`: the argument is the DIRECTORY the file sits
+        # in now, so the file keeps the name the caller gave it. A prefix used
+        # to change the name a tool pairs its patients by.
         # of what was uploaded. The extension is what this test is about
         # and is unchanged; the stem is there so a batch's outputs can be
         # told apart, every tool here naming its outputs after its input.
-        assert response.json() == {"result": f"mesh_scan{extension}"}
+        assert response.json() == {"result": f"scan{extension}"}
 
     response = client.post(
         "/run/surface_test_tool",
@@ -1438,7 +1450,7 @@ def test_an_uploaded_filename_reaches_the_tool_that_names_its_outputs_from_it(
     monkeypatch.setitem(registry.TOOLS, "Spy_Tool", _Spy())
 
     source = tmp_path / "patient 042 (T1).nii.gz"
-    source.write_bytes(b"not a real volume")
+    source.write_bytes(gzip.compress(b"not a real volume"))
     with open(source, "rb") as handle:
         response = client.post(
             "/run/Spy_Tool",
@@ -1454,7 +1466,9 @@ def test_an_uploaded_filename_reaches_the_tool_that_names_its_outputs_from_it(
     assert "patient" in received, received
     assert received.endswith(".nii.gz"), received
     # And the argument it belongs to is still readable.
-    assert received.startswith("scan_"), received
+    # Unchanged, not prefixed: this is the name the tool builds its outputs
+    # from, and a tool that pairs two inputs reads it to find the patient.
+    assert received == "patient_042_T1.nii.gz", received
 
 
 def test_a_traversing_filename_cannot_escape_the_work_directory(tmp_path, monkeypatch):
@@ -1473,7 +1487,7 @@ def test_a_traversing_filename_cannot_escape_the_work_directory(tmp_path, monkey
     monkeypatch.setitem(registry.TOOLS, "Spy_Tool_2", _Spy())
 
     source = tmp_path / "evil.nii.gz"
-    source.write_bytes(b"x")
+    source.write_bytes(gzip.compress(b"x"))
     with open(source, "rb") as handle:
         response = client.post(
             "/run/Spy_Tool_2",
@@ -1484,7 +1498,404 @@ def test_a_traversing_filename_cannot_escape_the_work_directory(tmp_path, monkey
     assert response.status_code == 200, response.text
     received = seen["path"]
     assert ".." not in received, received
-    assert os.path.basename(received).startswith("scan_"), received
+    # Contained under the argument's own directory, with the traversal gone
+    # from the name rather than merely prefixed away.
+    assert os.path.basename(os.path.dirname(received)) == "scan", received
+
+
+def test_two_inputs_of_one_patient_keep_the_same_patient_name(monkeypatch):
+    """A tool that pairs two arguments by patient reads the name it is handed.
+
+    Prefixing each upload with its field name turned `A1_T1.nii.gz` sent as
+    `files` and `A1_T1_transform.mat` sent as `transforms` into patients
+    `files_A1` and `transforms_A1` -- so AutoMatrix answered "1 file(s) had no
+    transform, 1 transform(s) had no file" to a request that was correct, and
+    the same break applied to GreedyReg's t1/t2 and AutoCrop3D's scans/roi.
+    Zipping each argument hid it: the prefix landed on the archive instead.
+    """
+    seen = {}
+
+    class _Pairing(Tool):
+        name = "Pairing_Probe"
+        arguments = {
+            "files": ArgSpec(type="path"),
+            "transforms": ArgSpec(type="path"),
+        }
+        output_kind = "text"
+
+        def run(self, files, transforms):
+            seen["files"] = os.path.basename(str(files))
+            seen["transforms"] = os.path.basename(str(transforms))
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Pairing_Probe", _Pairing())
+
+    response = client.post(
+        "/run/Pairing_Probe",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={
+            "files": ("A1_T1.nii.gz", io.BytesIO(gzip.compress(b"\x1f\x8b")), "application/gzip"),
+            "transforms": ("A1_T1.mat", io.BytesIO(b"1 0 0 0\n"), "text/plain"),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert seen["files"] == "A1_T1.nii.gz", seen
+    assert seen["transforms"] == "A1_T1.mat", seen
+
+
+def test_two_arguments_can_carry_the_same_filename_without_colliding(monkeypatch):
+    """The prefix also kept two arguments' identical filenames apart. A
+    directory each does the same job, and does it without touching the name."""
+    seen = {}
+
+    class _Same(Tool):
+        name = "Same_Name_Probe"
+        arguments = {"left": ArgSpec(type="path"), "right": ArgSpec(type="path")}
+        output_kind = "text"
+
+        def run(self, left, right):
+            # Read INSIDE the run: the work dir is deleted once the response
+            # has streamed, which is the cleanup guarantee working.
+            seen["left"], seen["right"] = str(left), str(right)
+            seen["left_bytes"] = open(str(left), "rb").read()
+            seen["right_bytes"] = open(str(right), "rb").read()
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Same_Name_Probe", _Same())
+
+    response = client.post(
+        "/run/Same_Name_Probe",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={
+            "left": ("scan.nii.gz", io.BytesIO(gzip.compress(b"left")), "application/gzip"),
+            "right": ("scan.nii.gz", io.BytesIO(gzip.compress(b"right")), "application/gzip"),
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert seen["left"] != seen["right"], seen
+    assert os.path.basename(seen["left"]) == os.path.basename(seen["right"]) == "scan.nii.gz"
+    # The bytes are gzip now -- a `.gz` upload has to be a real gzip stream,
+    # which is what stops a truncated transfer being segmented as zeros.
+    assert gzip.decompress(seen["left_bytes"]) == b"left"
+    assert gzip.decompress(seen["right_bytes"]) == b"right"
+
+
+def test_the_data_listing_says_what_each_entry_is_and_costs(monkeypatch, tmp_path):
+    """A picker that downloads what the user chooses has to show the price.
+
+    `CBCT_FullyAuto` is 336 MB of a forty-patient cohort and `ROI_box` is a
+    kilobyte; the names say neither, and neither says which is a folder. The
+    two name lists are unchanged, so an older client reads them as before.
+    """
+    import data_store as data_store_module
+    import main as main_module
+
+    root = tmp_path / "DATA"
+    (root / "Probe" / "testfiles" / "cohort").mkdir(parents=True)
+    (root / "Probe" / "testfiles" / "cohort" / "one.nii.gz").write_bytes(b"x" * 300)
+    (root / "Probe" / "testfiles" / "scan.nii.gz").write_bytes(b"y" * 42)
+
+    class _Probe(Tool):
+        name = "Probe"
+        arguments = {"scan": ArgSpec(type="path", server_selectable="testfile")}
+        output_kind = "text"
+
+        def run(self, scan):
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Probe", _Probe())
+    monkeypatch.setattr(main_module, "data_store",
+                        data_store_module.LocalDataStore(str(root)))
+
+    body = client.get(
+        "/tools/Probe/data", headers={"Authorization": f"Bearer {TOKEN}"}
+    ).json()
+
+    assert body["testfiles"] == ["cohort", "scan.nii.gz"]
+    described = {row["name"]: row for row in body["entries"]["testfiles"]}
+    assert described["cohort"] == {"name": "cohort", "kind": "folder", "size": 300}
+    assert described["scan.nii.gz"] == {"name": "scan.nii.gz", "kind": "file", "size": 42}
+    assert body["entries"]["models"] == []
+
+
+def test_a_truncated_gzip_is_refused_rather_than_segmented(monkeypatch, tmp_path):
+    """ITK's NIfTI reader does not report a truncated gzip: it believes the
+    header's dimensions and zero-fills the rest. Measured on a scan cut to
+    4 kB, `sitk.ReadImage` returned 512x512x365 with 10 394 non-zero voxels of
+    95.7M and raised nothing -- so five tools segmented it and answered 200,
+    ALI after 21 minutes of GPU."""
+    reached = []
+
+    class _Probe(Tool):
+        name = "Gzip_Probe"
+        arguments = {"scan": ArgSpec(type="path")}
+        output_kind = "text"
+
+        def run(self, scan):
+            reached.append(scan)
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Gzip_Probe", _Probe())
+
+    whole = gzip.compress(b"a complete volume" * 100)
+    response = client.post(
+        "/run/Gzip_Probe",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"scan": ("cut.nii.gz", io.BytesIO(whole[: len(whole) // 2]),
+                        "application/gzip")},
+    )
+
+    assert response.status_code == 400, response.text
+    detail = response.json()["detail"]
+    assert "cut.nii.gz" in detail
+    assert "gzip" in detail.lower()
+    assert not reached, "the tool ran on a truncated file"
+
+
+def test_a_complete_gzip_still_reaches_the_tool(monkeypatch):
+    """The other half: the check must not cost a correct upload its run."""
+    reached = []
+
+    class _Probe(Tool):
+        name = "Gzip_Probe_Ok"
+        arguments = {"scan": ArgSpec(type="path")}
+        output_kind = "text"
+
+        def run(self, scan):
+            reached.append(scan)
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Gzip_Probe_Ok", _Probe())
+
+    response = client.post(
+        "/run/Gzip_Probe_Ok",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"scan": ("whole.nii.gz", io.BytesIO(gzip.compress(b"x" * 5000)),
+                        "application/gzip")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert reached
+
+
+def test_a_file_that_is_not_gzip_at_all_is_refused_by_name(monkeypatch):
+    """A `.txt` renamed `.nii.gz` reaches the same check, and is refused with
+    the same message rather than reaching a tool that reports success on it --
+    ASO accepted one and wrote an orientation report."""
+
+    class _Probe(Tool):
+        name = "Gzip_Probe_Fake"
+        arguments = {"scan": ArgSpec(type="path")}
+        output_kind = "text"
+
+        def run(self, scan):
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Gzip_Probe_Fake", _Probe())
+
+    response = client.post(
+        "/run/Gzip_Probe_Fake",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"scan": ("fake.nii.gz", io.BytesIO(b"not gzipped at all"),
+                        "application/gzip")},
+    )
+
+    assert response.status_code == 400, response.text
+    assert "fake.nii.gz" in response.json()["detail"]
+
+
+def test_a_plain_uncompressed_input_is_left_alone(monkeypatch):
+    """The check is for gzip streams. A `.nii`, a `.vtk` or a `.csv` must not
+    be read through it, and must not be refused by it."""
+    reached = []
+
+    class _Probe(Tool):
+        name = "Gzip_Probe_Plain"
+        arguments = {"scan": ArgSpec(type="path", accepts=(".nii",))}
+        output_kind = "text"
+
+        def run(self, scan):
+            reached.append(scan)
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Gzip_Probe_Plain", _Probe())
+
+    response = client.post(
+        "/run/Gzip_Probe_Plain",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"scan": ("plain.nii", io.BytesIO(b"\x00" * 400), "application/octet-stream")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert reached
+
+
+def test_an_empty_upload_is_refused_whatever_its_extension(monkeypatch):
+    """`gzip.open` reads a zero-byte file without complaining, so the
+    truncation check alone let one through -- and a zero-byte `.nii.gz` reached
+    ASO, which came back with a successful orientation report on it. Nothing a
+    tool here reads is legitimately empty."""
+    reached = []
+
+    class _Probe(Tool):
+        name = "Empty_Probe"
+        arguments = {"scan": ArgSpec(type="path", accepts=(".nii.gz", ".vtk"))}
+        output_kind = "text"
+
+        def run(self, scan):
+            reached.append(scan)
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Empty_Probe", _Probe())
+
+    for name in ("empty.nii.gz", "empty.vtk"):
+        response = client.post(
+            "/run/Empty_Probe",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            files={"scan": (name, io.BytesIO(b""), "application/octet-stream")},
+        )
+        assert response.status_code == 400, (name, response.text)
+        assert name in response.json()["detail"]
+        assert "empty" in response.json()["detail"].lower()
+
+    assert not reached
+
+
+def test_a_test_file_answers_head_so_a_client_can_plan_a_ranged_download(monkeypatch, tmp_path):
+    """The client probes with a HEAD to learn the size and whether ranges are
+    served, and only then splits the transfer across parallel connections.
+    Starlette does not add HEAD to a GET route, so every probe was answered
+    `405 Method Not Allowed`, the probe failed, and every test file came down
+    one connection at a time -- invisible on a loopback at 378 MB/s, and the
+    whole point of the parallel path on the link a clinician actually has."""
+    import data_store as data_store_module
+    import main as main_module
+
+    root = tmp_path / "DATA"
+    (root / "Probe" / "testfiles").mkdir(parents=True)
+    (root / "Probe" / "testfiles" / "scan.nii.gz").write_bytes(gzip.compress(b"x" * 5000))
+
+    class _Probe(Tool):
+        name = "Probe"
+        arguments = {"scan": ArgSpec(type="path", server_selectable="testfile")}
+        output_kind = "text"
+
+        def run(self, scan):
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Probe", _Probe())
+    monkeypatch.setattr(main_module, "data_store",
+                        data_store_module.LocalDataStore(str(root)))
+
+    head = client.head("/tools/Probe/testfiles/scan.nii.gz",
+                       headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert head.status_code == 200, head.text
+    assert head.headers.get("accept-ranges") == "bytes"
+    assert int(head.headers["content-length"]) > 0
+    assert head.content == b"", "a HEAD carries no body"
+
+    # And the GET it plans is unchanged.
+    body = client.get("/tools/Probe/testfiles/scan.nii.gz",
+                      headers={"Authorization": f"Bearer {TOKEN}"})
+    assert body.status_code == 200
+    assert int(head.headers["content-length"]) == len(body.content)
+
+
+def test_a_head_on_a_test_file_still_needs_a_token():
+    response = client.head("/tools/AMASSS/testfiles/anything.nii.gz")
+    assert response.status_code == 401
+
+
+def _folder_entry(monkeypatch, tmp_path, name="cohort"):
+    """A hosted test entry that is a FOLDER, so the server has to build a zip."""
+    import data_store as data_store_module
+    import main as main_module
+
+    root = tmp_path / "DATA"
+    folder = root / "Probe" / "testfiles" / name
+    folder.mkdir(parents=True)
+    (folder / "a.csv").write_text("a\n1\n")
+    (folder / "b.csv").write_text("b\n2\n")
+    (root / "Probe" / "testfiles" / "scan.nii.gz").write_bytes(gzip.compress(b"x" * 5000))
+
+    class _Probe(Tool):
+        name = "Probe"
+        arguments = {"scan": ArgSpec(type="path", server_selectable="testfile")}
+        output_kind = "text"
+
+        def run(self, scan):
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Probe", _Probe())
+    monkeypatch.setattr(main_module, "data_store",
+                        data_store_module.LocalDataStore(str(root)))
+
+
+def test_a_zipped_folder_does_not_offer_ranges(monkeypatch, tmp_path):
+    """Because the archive is built for THIS request, not read off the disk.
+
+    Advertising ranges on it is not merely useless, it multiplies the work: the
+    client probes, sees `bytes`, and splits a 339 MB cohort across 43 parallel
+    parts -- so the server builds the same 339 MB archive 43 times to deliver it
+    once. Measured against AREG's CBCT_FullyAuto before this: one 8 MB range
+    cost 40% of the whole download, and the transfer took 39.1s ranged against
+    1.5s in a single stream, while ALI's 94 MB FILE managed 361 MB/s over the
+    same code.
+    """
+    _folder_entry(monkeypatch, tmp_path)
+
+    response = client.get("/tools/Probe/testfiles/cohort",
+                          headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert response.status_code == 200
+    assert response.headers.get("accept-ranges") == "none"
+
+
+def test_the_probe_on_a_zipped_folder_says_so_too(monkeypatch, tmp_path):
+    """The HEAD is where the client decides; the GET is too late to help."""
+    _folder_entry(monkeypatch, tmp_path)
+
+    head = client.head("/tools/Probe/testfiles/cohort",
+                       headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert head.status_code == 200, head.text
+    assert head.headers.get("accept-ranges") == "none"
+
+
+def test_a_real_file_still_offers_ranges(monkeypatch, tmp_path):
+    """The withdrawal is for generated archives only. A file IS on disk, its
+    ranges cost nothing, and parallel connections are the point of the probe."""
+    _folder_entry(monkeypatch, tmp_path)
+
+    response = client.get("/tools/Probe/testfiles/scan.nii.gz",
+                          headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert response.status_code == 200
+    assert response.headers.get("accept-ranges") == "bytes"
+
+
+def test_two_builds_of_one_folder_are_byte_identical(monkeypatch, tmp_path):
+    """What makes a range on a generated archive merely SLOW rather than wrong.
+
+    A ranged download assembles one file out of many responses. If two builds of
+    the same folder differed by a byte -- a build timestamp, a different walk
+    order -- the assembled archive would be a mix of several, and a zip mixed
+    that way is corrupt in silence, on medical data. Nothing in `make_zip`
+    declares this property, so it is pinned here: the header withdrawn above
+    protects our own client, this protects any other.
+    """
+    _folder_entry(monkeypatch, tmp_path)
+    url = "/tools/Probe/testfiles/cohort"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    first = client.get(url, headers=headers)
+    second = client.get(url, headers=headers)
+
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
 
 
 def test_an_upload_naming_an_unknown_argument_says_so_rather_than_blaming_its_extension():

@@ -210,3 +210,95 @@ def test_two_spellings_of_one_name_cannot_both_be_served():
 def test_a_genuinely_different_name_is_not_a_duplicate():
     served = {"ALI_CBCT": object()}
     registry._reject_duplicate("ALI_IOS", served)  # must not raise
+
+
+# --- the automatic panel ---------------------------------------------------
+#
+# A tool that configures nothing still has to produce a panel a clinician can
+# read. These pin the two rules a layout.py overrides.
+
+def test_a_model_argument_lands_in_the_model_section():
+    from registry import conventions
+
+    for name in ("model", "landmark_model", "reference", "cbct_reference"):
+        assert conventions.section_for(name, {"type": "path"}) == conventions.SECTION_MODEL, name
+
+
+def test_a_technical_knob_lands_in_advanced_whatever_its_type():
+    from registry import conventions
+
+    for name in ("device", "tile_step_size", "num_workers", "seed", "gpu_resampling"):
+        assert conventions.section_for(name, {"type": "float"}) == conventions.SECTION_ADVANCED, name
+
+
+def test_an_output_token_is_matched_whole_not_as_a_substring():
+    """`output` inside `output_dir` is a token. `put` inside `input` is not,
+    and neither is `suffix` inside a patient's name."""
+    from registry import conventions
+
+    assert conventions.section_for("output_suffix", {}) == conventions.SECTION_OUTPUTS
+    assert conventions.section_for("prediction_ID", {}) == conventions.SECTION_OUTPUTS
+    assert conventions.section_for("input", {"type": "path"}) == conventions.SECTION_INPUTS
+    assert conventions.section_for("throughput", {"type": "int"}) == conventions.SECTION_OPTIONS
+
+
+def test_a_required_path_is_an_input_and_an_optional_flag_is_an_option():
+    from registry import conventions
+
+    assert conventions.section_for("scans", {"type": "path", "required": True}) == "Inputs"
+    assert conventions.section_for("t2", {"type": "path", "required": False}) == "Inputs"
+    assert conventions.section_for("merge", {"type": "bool", "required": False}) == "Options"
+
+
+def test_a_label_is_sentence_case_not_title_case():
+    """The hand-written panels wrote "Tile step size", not "Tile Step Size"."""
+    from registry import conventions
+
+    assert conventions.label_for("tile_step_size") == "Tile step size"
+    assert conventions.label_for("name_output_after_transform") == "Name output after transform"
+
+
+def test_no_vocabulary_lives_in_the_server():
+    """The server derives a label; it does not know what the words mean.
+
+    This function used to case `cbct` as "CBCT" and `areg` as "AREG", which put
+    the list of the served tools inside the server -- the one thing it is built
+    not to know, and a build failure through scripts/domain_coupling.py. The
+    table moved to the client's formgen.label_for, which is allowed a dental
+    vocabulary because it IS the dental extension.
+
+    So the derivation stops at sentence case, and a clinician still reads "CBCT
+    regions" because the client finishes the job.
+    """
+    from registry import conventions
+
+    assert conventions.label_for("cbct_regions") == "Cbct regions"
+    assert conventions.label_for("ios_networks") == "Ios networks"
+
+
+def test_an_already_capitalised_token_is_left_alone():
+    """No table needed: what the tool wrote in caps stays in caps."""
+    from registry import conventions
+
+    assert conventions.label_for("prediction_ID") == "Prediction ID"
+
+
+def test_a_timepoint_is_a_code_not_a_word():
+    from registry import conventions
+
+    assert conventions.label_for("t1") == "T1"
+    assert conventions.label_for("t2") == "T2"
+
+
+def test_an_abbreviation_is_spelled_out():
+    from registry import conventions
+
+    assert conventions.label_for("num_workers") == "Number of workers"
+    assert conventions.label_for("max_tokens") == "Maximum tokens"
+
+
+def test_a_label_never_comes_back_empty():
+    from registry import conventions
+
+    for name in ("_", "__", "x"):
+        assert conventions.label_for(name), name

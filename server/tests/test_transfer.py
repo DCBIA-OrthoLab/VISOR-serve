@@ -354,8 +354,17 @@ def _spy_tool(monkeypatch, tool_name: str) -> dict:
     return seen
 
 
-def _run_chunked(tool_name: str, filename: str, payload: bytes = b"not a real volume"):
-    """Upload `payload` through a session, then run `tool_name` against it."""
+def _run_chunked(tool_name: str, filename: str, payload: bytes = None):
+    """Upload `payload` through a session, then run `tool_name` against it.
+
+    The default payload is a real gzip stream, because these tests name their
+    file `.nii.gz` and the server refuses a `.gz` that is not one -- a
+    truncated gzip is read by ITK as a volume of zeros, so it is stopped where
+    the bytes arrive rather than segmented. Nothing here is about the content;
+    the content just has to be honest about what its name claims.
+    """
+    if payload is None:
+        payload = gzip.compress(b"not a real volume")
     session = _open_session(payload, filename=filename)
     _put_parts(session["upload_id"], payload, session["chunk_size"])
     return client.post(
@@ -373,11 +382,13 @@ def test_a_chunked_upload_keeps_the_patient_in_the_staged_name(monkeypatch):
     response = _run_chunked("Chunked_Spy", "MG_test_scan.nii.gz")
 
     assert response.status_code == 200, response.text
-    received = os.path.basename(seen["path"])
-    assert "MG_test" in received, received
-    assert received.endswith(".nii.gz"), received
-    # And the argument it belongs to is still readable in front of it.
-    assert received.startswith("scan_"), received
+    staged = seen["path"]
+    assert "MG_test" in os.path.basename(staged), staged
+    assert staged.endswith(".nii.gz"), staged
+    # And the argument it belongs to is still readable -- as the directory the
+    # file sits in, rather than as a prefix inside its name. A prefix changed
+    # the name a tool pairs patients by; a directory does not.
+    assert os.path.basename(os.path.dirname(staged)) == "scan", staged
 
 
 def test_both_upload_routes_stage_an_input_under_the_same_name(monkeypatch):
@@ -391,7 +402,8 @@ def test_both_upload_routes_stage_an_input_under_the_same_name(monkeypatch):
     multipart = client.post(
         "/run/Multipart_Spy",
         headers=AUTH,
-        files={"scan": ("MG_test_scan.nii.gz", b"not a real volume", "application/gzip")},
+        files={"scan": ("MG_test_scan.nii.gz", gzip.compress(b"not a real volume"),
+                        "application/gzip")},
     )
     assert multipart.status_code == 200, multipart.text
 
@@ -424,7 +436,7 @@ def test_a_traversing_chunked_filename_cannot_escape_the_work_directory(monkeypa
     received = seen["path"]
     assert ".." not in received, received
     assert "\x00" not in received, received
-    assert os.path.basename(received).startswith("scan"), received
+    assert os.path.basename(os.path.dirname(received)) == "scan", received
     # Still inside the request's own work dir, which is under TEMP_DIR.
     temp_dir = os.path.realpath(settings.TEMP_DIR)
     assert os.path.realpath(received).startswith(temp_dir + os.sep), received
@@ -450,8 +462,8 @@ def test_a_chunked_filename_of_pure_punctuation_also_falls_back(monkeypatch):
     assert response.status_code == 200, response.text
     received = os.path.basename(seen["path"])
     # "%%%" is not in the whitelist; whatever survives, it is still a plain
-    # name under the field it belongs to and it still has its extension.
-    assert received.startswith("scan"), received
+    # name, under the directory of the field it belongs to, extension intact.
+    assert os.path.basename(os.path.dirname(seen["path"])) == "scan", seen["path"]
     assert received.endswith(".nii.gz"), received
 
 
@@ -464,8 +476,9 @@ def test_an_over_long_chunked_filename_is_truncated_not_refused(monkeypatch):
 
     assert response.status_code == 200, response.text
     received = os.path.basename(seen["path"])
-    assert received.startswith("scan_PPP"), received
+    assert received.startswith("PPP"), received
     assert len(received) < 128, len(received)
+    assert os.path.basename(os.path.dirname(seen["path"])) == "scan", seen["path"]
 
 
 # ----------------------------------------------------------------------

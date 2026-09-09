@@ -460,6 +460,11 @@ tools:
         url: https://github.com/DCBIA-OrthoLab/Fly-by-CNN/releases/download/3.0/07-21-22_val-loss0.169.pth
         size: 6612456
     testfiles:
+      - name: RegTestFiles.zip
+        dest: Arches
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AREG_IOSCBCT/RegTestFiles.zip
+        size: 222374572
+        extract: true
       - name: TestFiles.zip
         url: https://github.com/GaelleLeroux/SlicerAutomatedDentalTools/releases/download/testfileFlexReg/TestFiles.zip
         sha256: 494b58bc73ec2e1162ac9e483fe11afb8160905a6f679ffce6f3b7117e3d69a8
@@ -523,6 +528,12 @@ tools:
         url: https://github.com/gaudot/SlicerDentalSegmentator/releases/download/v1.0.0-alpha/Dataset111_453CT_v100.zip
         size: 229698747
         extract: true
+    testfiles:
+      # The same public CBCT AMASSS ships: all four bundles here segment teeth
+      # and jaw structures on a dental CT/CBCT, which is what this is.
+      - name: MG_test_scan.nii.gz
+        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        size: 98611496
 
   # =========================================================================
   # DOCShapeAXI -- shape classification. NOT PORTED YET.
@@ -544,6 +555,13 @@ tools:
       - name: cleft_4_class.ckpt
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/cleft_4_class.ckpt
         size: 71891882
+    # NO testfiles, deliberately. The five checkpoints grade an AIRWAY, a
+    # CONDYLE or a CLEFT, and nothing public is a surface of any of those --
+    # the only meshes anywhere in this manifest are dental arches. Handing one
+    # to a condyle classifier produces a confident severity grade for anatomy
+    # the network never saw, which is exactly the failure a test file is
+    # supposed to protect a new user from. Publish a real airway or condyle
+    # surface and this becomes two lines.
 
   # =========================================================================
   # CLIC -- NOT PORTED YET.
@@ -553,6 +571,13 @@ tools:
       - name: final_model.pth
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/CLIC_model/final_model.pth
         size: 176269352
+    testfiles:
+      # The same public CBCT AMASSS ships. CLIC looks for an impacted canine in
+      # a maxillary scan, so a whole-head CBCT is the right shape of input --
+      # and reusing one file across tools is what ALI already does.
+      - name: MG_test_scan.nii.gz
+        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        size: 98611496
 
   # =========================================================================
   # MedX -- report analysis. NOT PORTED YET.
@@ -604,6 +629,15 @@ tools:
         dest: TMJ/qwen-ft-q4_k_m.gguf
         url: https://huggingface.co/dcbia/Qwen-2.5-7B-Instruct-TMJ/resolve/main/qwen-ft-q4_k_m.gguf
         size: 4683073408
+    testfiles:
+      # One of the synthetic TMJ consult notes the module ships in its own
+      # repository -- not patient data, and the only note anywhere public.
+      # Fetched from the source tree rather than from a release: CNE has no
+      # release carrying test data.
+      - name: TMJ_note1.txt
+        dest: TMJ/TMJ_note1.txt
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/raw/main/CNE/Resources/testfiles/input_TMJ/TMJ_note1.txt
+        size: 4731
 
   # =========================================================================
   # MRI2CBCT -- MRI/CBCT registration. NOT PORTED YET.
@@ -655,4 +689,46 @@ tools:
       - name: Mirror.zip
         url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixMirror/Mirror.zip
         size: 468
+        extract: true
+
+  # =========================================================================
+  # GreedyReg -- two-timepoint CBCT registration. LIVE on the server.
+  #
+  # No models: picsl_greedy is an algorithm, not a network.
+  # =========================================================================
+  GreedyReg:
+    testfiles:
+      # AREG's own two-timepoint cohort: T1 and T2 of the same patients, which
+      # is exactly what this tool pairs. Reused rather than duplicated -- AREG
+      # declares the same archive. Renamed on the way in: `AREG_test_scans`
+      # says whose archive it was, not what it holds, and the name is what a
+      # user reads in the dropdown.
+      - name: AREG_test_scans.zip
+        dest: CBCT_T1_T2_pair
+        url: https://github.com/HUTIN1/AREG/releases/download/v1.0.0/AREG_test_scans.zip
+        size: 3700969
+        extract: true
+
+  # =========================================================================
+  # AutoCrop3D -- crop a cohort to a Slicer ROI box. LIVE on the server.
+  #
+  # No models: this is pure geometry.
+  # =========================================================================
+  AutoCrop3D:
+    testfiles:
+      - name: MG_test_scan.nii.gz
+        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        size: 98611496
+      # The box itself, and the tool cannot be tried without one. It lives in
+      # the upstream source tree rather than in a release, so it is fetched
+      # from there -- the same file the upstream module's own test uses.
+      # `dest` because the archive is called ROI.mrk.zip, and extracting it
+      # under its own name gives a FOLDER called `ROI.mrk` -- which reads like
+      # a truncated extension in the panel's dropdown. The list is shared by
+      # both of this tool's arguments, so the name is the only thing telling a
+      # user which is the scan and which is the box.
+      - name: ROI.mrk.zip
+        dest: ROI_box
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/raw/main/AutoCrop3D/Crop_Volumes_UI/Testing/Test_data/ROI.mrk.zip
+        size: 1121
         extract: true
