@@ -1485,3 +1485,35 @@ def test_a_traversing_filename_cannot_escape_the_work_directory(tmp_path, monkey
     received = seen["path"]
     assert ".." not in received, received
     assert os.path.basename(received).startswith("scan_"), received
+
+
+def test_an_upload_naming_an_unknown_argument_says_so_rather_than_blaming_its_extension():
+    """`_expected_extensions` falls back to the global ALLOWED_EXTENSIONS for
+    an argument it cannot find, so a typo'd field name used to be answered
+    "Unsupported file extension for 'scan'. Allowed: ('.nii', '.nii.gz')" --
+    about a file whose extension was exactly right. Found by running
+    Example_Tool through the API with the wrong field name."""
+    response = client.post(
+        "/run/Test_Tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={"text_1": "a", "text_2": "b"},
+        files={"not_an_argument": ("scan.nii.gz", b"\x1f\x8b", "application/gzip")},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "not_an_argument" in detail
+    assert "extension" not in detail.lower()
+    assert "text_1" in detail and "text_2" in detail
+
+
+def test_an_upload_with_a_genuinely_wrong_extension_still_says_so():
+    """The honest half of the same check: a DECLARED argument given a file it
+    cannot accept is still a 400 naming what was allowed."""
+    response = client.post(
+        "/run/Example_Tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        data={"label": "demo", "threshold": "1"},
+        files={"input": ("notes.docx", b"PK\x03\x04", "application/octet-stream")},
+    )
+    assert response.status_code == 400
+    assert "extension" in response.json()["detail"].lower()
