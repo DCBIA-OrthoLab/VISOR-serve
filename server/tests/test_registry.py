@@ -258,12 +258,29 @@ def test_a_label_is_sentence_case_not_title_case():
     assert conventions.label_for("name_output_after_transform") == "Name output after transform"
 
 
-def test_an_acronym_keeps_its_own_shape():
+def test_no_vocabulary_lives_in_the_server():
+    """The server derives a label; it does not know what the words mean.
+
+    This function used to case `cbct` as "CBCT" and `areg` as "AREG", which put
+    the list of the served tools inside the server -- the one thing it is built
+    not to know, and a build failure through scripts/domain_coupling.py. The
+    table moved to the client's formgen.label_for, which is allowed a dental
+    vocabulary because it IS the dental extension.
+
+    So the derivation stops at sentence case, and a clinician still reads "CBCT
+    regions" because the client finishes the job.
+    """
     from registry import conventions
 
-    assert conventions.label_for("cbct_regions") == "CBCT regions"
+    assert conventions.label_for("cbct_regions") == "Cbct regions"
+    assert conventions.label_for("ios_networks") == "Ios networks"
+
+
+def test_an_already_capitalised_token_is_left_alone():
+    """No table needed: what the tool wrote in caps stays in caps."""
+    from registry import conventions
+
     assert conventions.label_for("prediction_ID") == "Prediction ID"
-    assert conventions.label_for("ios_networks") == "IOS networks"
 
 
 def test_a_timepoint_is_a_code_not_a_word():

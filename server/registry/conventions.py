@@ -66,17 +66,6 @@ SECTION_ADVANCED = "Advanced"
 # `output_dir` is a token, `put` inside `input` is not.
 _OUTPUT_TOKENS = frozenset({"output", "outputs", "suffix", "prediction", "naming"})
 
-# Words a clinician reads as one unit, kept in their own case rather than
-# sentence-cased into nonsense. `cbct_regions` is "CBCT regions", not "Cbct
-# regions"; `prediction_ID` is "Prediction ID", not "Prediction Id".
-_ACRONYMS = {
-    "cbct": "CBCT", "ios": "IOS", "mri": "MRI", "ct": "CT", "roi": "ROI",
-    "id": "ID", "gpu": "GPU", "cpu": "CPU", "vram": "VRAM", "dicom": "DICOM",
-    "vtk": "VTK", "stl": "STL", "nifti": "NIfTI", "tmj": "TMJ", "llm": "LLM",
-    "3d": "3D", "2d": "2D", "fdi": "FDI", "icp": "ICP", "aso": "ASO",
-    "ali": "ALI", "areg": "AREG", "amasss": "AMASSS",
-}
-
 # Abbreviations a label reads better spelled out. `num_workers` is "Number of
 # workers"; nobody says "num".
 _EXPANSIONS = {"num": "number of", "nb": "number of", "max": "maximum", "min": "minimum"}
@@ -112,16 +101,28 @@ def label_for(argument_name: str) -> str:
     """The argument name written out for a clinician.
 
     Sentence case, not title case: "Tile step size", the way the hand-written
-    panels wrote their labels. Acronyms and short codes keep their own shape.
+    panels wrote their labels. Short codes keep their own shape, and an
+    abbreviation nobody says out loud is spelled out.
+
+    **No vocabulary lives here, and that is the whole rule.** This used to hold
+    a table casing `cbct` as "CBCT" and `areg` as "AREG" -- which made the
+    server carry the list of the tools it serves, the one thing it is built not
+    to know (`scripts/domain_coupling.py` fails the build over it). The table
+    now lives in the client's `formgen.label_for`: the client IS the dental
+    extension, so a dental word is its to know. What is left here is derivation
+    -- splitting, casing, spelling out -- and none of it names anything.
+
+    So `cbct_regions` comes off this function as "Cbct regions" and reaches a
+    clinician as "CBCT regions". A tool that wants a word no rule can produce
+    ("Scan / Landmark Folder") declares its own `label`, which nothing here or
+    in the client overwrites.
     """
     words = []
     for index, token in enumerate(argument_name.split("_")):
         if not token:
             continue
         lowered = token.lower()
-        if lowered in _ACRONYMS:
-            words.append(_ACRONYMS[lowered])
-        elif lowered in _EXPANSIONS and index == 0:
+        if lowered in _EXPANSIONS and index == 0:
             words.append(_EXPANSIONS[lowered].capitalize())
         elif lowered in _EXPANSIONS:
             words.append(_EXPANSIONS[lowered])
