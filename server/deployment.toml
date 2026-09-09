@@ -48,7 +48,11 @@ data_dir = "ALI"
 dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "CBCT to IOS" = "AREG_IOSCBCT" }
 
 [tools.ALI]
-dispatch = { "CBCT" = "ALI_CBCT", "Intraoral scan" = "ALI_IOS" }
+# "IOS", the word AREG's facade already uses and the word the original
+# extension used. One tool saying "Intraoral scan" and its neighbour saying
+# "IOS" for the same thing is a difference a reader has to check is not a
+# difference.
+dispatch = { "CBCT" = "ALI_CBCT", "IOS" = "ALI_IOS" }
 
 # FlexReg's `reference` is the patient's OWN other timepoint, uploaded with the
 # rest, not a hosted bundle. The convention reads any argument named `reference`
