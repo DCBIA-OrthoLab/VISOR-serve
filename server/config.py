@@ -11,6 +11,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 _SERVER_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# The catalogue that ships with the server. Always scanned, so the two kinds
+# of tool -- one the server imports, one it never does -- can sit side by side.
+BUILTIN_TOOLS_DIR = os.path.join(_SERVER_DIR, "tools")
+
 DISPATCH_INPROCESS = "inprocess"
 DISPATCH_SUBPROCESS = "subprocess"
 DISPATCH_MODES = (DISPATCH_INPROCESS, DISPATCH_SUBPROCESS)
@@ -31,7 +35,33 @@ class Settings(BaseSettings):
     # server never imports torch and releases the tool's VRAM when it exits.
     # "inprocess" is the old path. TEMPORARY, removed once every tool has moved.
     SADT_DISPATCH_MODE: str = DISPATCH_INPROCESS
-    TOOLS_DIR: str = os.path.join(_SERVER_DIR, "tools")  # <tool>/{.venv,src}
+    # One catalogue, or several separated by os.pathsep. A catalogue is just a
+    # directory of tool folders, so serving a second one is a path, not a code
+    # change -- which is the point of a server that holds no tool knowledge.
+    # BUILTIN_TOOLS_DIR is always scanned, last, so a packaged tool dropped
+    # beside the imported ones is found even when TOOLS_DIR names somewhere
+    # else, as the deployment image does.
+    TOOLS_DIR: str = BUILTIN_TOOLS_DIR  # <tool>/{.venv,src}
+
+    def tool_roots(self) -> tuple:
+        """Every directory scanned for packaged tools, in order, deduplicated.
+
+        Order is precedence: a name found in an earlier root wins, and the
+        later duplicate is reported at startup rather than silently shadowing.
+        """
+        roots = []
+        for entry in str(self.TOOLS_DIR).split(os.pathsep):
+            entry = entry.strip()
+            if entry:
+                roots.append(os.path.abspath(entry))
+        if os.path.abspath(BUILTIN_TOOLS_DIR) not in roots:
+            roots.append(os.path.abspath(BUILTIN_TOOLS_DIR))
+        seen, ordered = set(), []
+        for root in roots:
+            if root not in seen:
+                seen.add(root)
+                ordered.append(root)
+        return tuple(ordered)
     # Injected by path, never installed into a tool venv, so runner and server
     # are always the same version.
     RUNNER_PATH: str = os.path.join(_SERVER_DIR, "execution", "runner.py")

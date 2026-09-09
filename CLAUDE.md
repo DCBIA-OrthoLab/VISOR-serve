@@ -26,7 +26,7 @@ Do **not** add Celery/Redis/async job queues yet.
 > it is what `base.py` still implements - `ArgSpec`, `validate()` before
 > `run()`, `ToolArgumentError` → 422. What changed is where a tool's
 > declaration comes from: a clinical tool is no longer a subclass here, it is a
-> `.schema.json` generated from a `run()` signature in `sadt-tools`, which the
+> `.schema.json` generated from a `run()` signature in `SADT-VISOR`, which the
 > registry turns into exactly this object (`registry/schema_tool.py`). Read the
 > contract below as the contract the SERVER honours; read `ADDING_A_TOOL.md`
 > for how a tool is actually written today.
@@ -118,7 +118,7 @@ Rules that hold for both:
 
 ## The registered tools
 
-Every clinical tool now lives in **`sadt-tools`**, one isolated project each,
+Every clinical tool now lives in **`SADT-VISOR`**, one isolated project each,
 and is served from `TOOLS_DIR` without this server importing a line of it.
 Names are what a client sends to `/run/<name>`, and they are the folder names
 on that side:
@@ -139,6 +139,16 @@ on that side:
   together.
 - `Surg_Mov_Pred` - surgical movement prediction from tabular measurements
   (stacking models, server-side model bundles).
+- `CLIC` - impacted canine segmentation on CBCT (torchvision Mask R-CNN).
+- `GreedyReg` - two-timepoint CBCT registration with `picsl_greedy`. No torch.
+- `AutoMatrix` - applies a transform to scans, segmentations and landmarks.
+- `AutoCrop3D` - crops a cohort of volumes to a Slicer ROI box, and can pad the
+  crop back to the original geometry.
+- `DOCShapeAXI` - classifies a 3D shape (airway, condyle, cleft) and paints the
+  GradCAM attribution onto the surface. Pinned to shapeaxi 1.x: the published
+  checkpoints predate the 2.0 network signature.
+- `CNE` - structured extraction from free-text clinical notes, with a local
+  quantised GGUF model. The only tool whose weights are an LLM.
 
 Two in-process tools stay in this repository, and only these two. They are the
 demonstration of the `Tool`/`ArgSpec` path, not clinical tools:
@@ -156,7 +166,7 @@ accommodate them without change to the core. See `ADDING_A_TOOL.md`.
 Three repositories, and the seams between them are the design:
 
 ```
- SlicerAutomatedDentalToolsCloud        slicer-remote-tool-server              sadt-tools
+ AutomatedDentalToolsRemote                  VISOR-serve                       SADT-VISOR
  ┌────────────────────────┐  HTTPS  ┌───────────────────────────┐        ┌────────────────────┐
  │ 3D Slicer modules      │ ──────► │ FastAPI (uvicorn)         │        │ tools/<Name>/      │
  │  - build the panel     │ POST    │  - verify token           │        │   pyproject.toml   │
@@ -188,7 +198,7 @@ re-enters the same file with the sibling's interpreter, so chaining and nesting
 ```
 .
 ├── CLAUDE.md
-├── ADDING_A_TOOL.md         # the contract for writing a tool (in sadt-tools)
+├── ADDING_A_TOOL.md         # the contract for writing a tool (in SADT-VISOR)
 ├── MIGRATING_A_TOOL.md      # the record of how the tools left this repo
 ├── docker-compose.yml       # inference (GPU) + inference-cpu + inference-venvs + test services
 ├── docker/                  # the deployment image: one container, N tool virtualenvs
@@ -199,7 +209,7 @@ re-enters the same file with the sibling's interpreter, so chaining and nesting
 ├── .env.example             # the three variables compose interpolates
 ├── .githooks/pre-push       # runs `docker compose run --rm test` before a push
 ├── .github/workflows/       # the same suite on every push and PR, plus the image build
-├── run-local.sh             # a local server serving a sadt-tools checkout, port 8001
+├── run-local.sh             # a local server serving a SADT-VISOR checkout, port 8001
 ├── scripts/                 # stand the server up, and populate DATA/
 │   ├── setup-server.sh      #   curl-pipeable: clone, check docker, start
 │   ├── install-docker.sh    #   Docker Engine + compose plugin (Linux, root)
@@ -228,7 +238,7 @@ re-enters the same file with the sibling's interpreter, so chaining and nesting
 │   ├── wire/                # the HTTP edge that is not routing
 │   │   ├── transfer.py      #   chunked resumable uploads, range-served results
 │   │   └── security.py      #   Bearer token verification
-│   ├── deployment.toml      # per-tool overrides; empty, because the conventions cover them
+│   ├── deployment.toml      # per-tool overrides: the ALI and AREG facades, mostly
 │   ├── deployment.toml.example
 │   ├── tools/               # NOT where the tools are any more - see below
 │   │   ├── _dispatch_probe/ # test fixture: underscore = never discovered
@@ -244,13 +254,13 @@ re-enters the same file with the sibling's interpreter, so chaining and nesting
 └── DATA/                    # DATA_DIR mount, read-only, gitignored: <tool_name>/{models,testfiles}/
 ```
 
-**The real tools are not in this repository.** They live in `sadt-tools`, one
+**The real tools are not in this repository.** They live in `SADT-VISOR`, one
 isolated project each, and reach this server through `TOOLS_DIR` - a folder of
 `<Tool_Name>/{.schema.json,.venv,src}`. `server/tools/` keeps only the two
 in-process demos, the dispatch fixture, and the parked `_AREG`.
 
 The Slicer client (thin modules + the generic inference client) lives in its
-own repo, `SlicerAutomatedDentalToolsCloud` - not here. Its **Slicer Cloud**
+own repo, `AutomatedDentalToolsRemote` - not here. Its **Slicer Cloud**
 module is a panel over `scripts/server_ctl.py`: it clones this repository,
 checks Docker, starts the container, reports when the clone has fallen behind
 and relaunches it, and picks which tools' bundles land in `DATA/`. The logic
@@ -331,7 +341,7 @@ model, a reference test dataset) instead of the client uploading it every call.
 - Defines `TestTool(Tool)` with `name = "Test_Tool"`, the two required string
   args, and a `run` returning a str. It is the minimal proof that the HTTP
   round trip works with no dependency in the way - **not** the template for a
-  new tool any more. A new tool is a package in `sadt-tools`; see
+  new tool any more. A new tool is a package in `SADT-VISOR`; see
   `ADDING_A_TOOL.md`.
 
 ### Endpoints (`main.py`)
@@ -688,8 +698,8 @@ rather than described.
   upstreams runs in it, on confidential imaging.
 
 `server/requirements-api.txt` is the API's whole dependency list - fastapi,
-uvicorn, python-multipart, pydantic-settings - and a test asserts it stays that
-way, because an API that quietly regrows numpy is pinned to what the tools can
+uvicorn[standard], python-multipart, pydantic-settings - and two tests in
+`tests/test_image_layout.py` assert it stays that way, because an API that quietly regrows numpy is pinned to what the tools can
 agree on all over again.
 
 **Tests:** 427 server tests (+4). The image itself is verified by building it,

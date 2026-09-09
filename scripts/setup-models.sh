@@ -3,7 +3,7 @@
 #
 # From anywhere, without cloning:
 #
-#   curl -fsSL https://raw.githubusercontent.com/Jules-GP/slicer-remote-tool-server/main/scripts/setup-models.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-models.sh | sh
 #
 # To fetch one tool's models only, pass arguments through `sh -s --`:
 #
@@ -23,7 +23,7 @@
 
 set -eu
 
-REPO="${REPO:-Jules-GP/slicer-remote-tool-server}"
+REPO="${REPO:-DCBIA-OrthoLab/VISOR-serve}"
 REF="${REF:-main}"
 RAW="https://raw.githubusercontent.com/${REPO}/${REF}/scripts"
 

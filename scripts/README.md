@@ -15,6 +15,7 @@ model bundles around.
 | [`setup-testfiles.sh`](setup-testfiles.sh) | Fetch reference test files. Runnable straight from GitHub. |
 | [`fetch_data.py`](fetch_data.py) | The download engine the wrappers call. Standard library only. |
 | [`data-manifest.yml`](data-manifest.yml) | What exists, where it comes from, where it goes. |
+| [`domain_coupling.py`](domain_coupling.py) | Counts application-domain words in the server's own code. Publishes the word list it counts. Standard library only. |
 
 Everything here is **standard library only**, on purpose: it runs on a host
 before any `requirements.txt` is installed, and - for `server_ctl.py` - inside
@@ -25,7 +26,7 @@ Slicer's own interpreter, where nothing may be pip-installed on a user's behalf.
 From nothing, on the machine that will host it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Jules-GP/slicer-remote-tool-server/main/scripts/setup-server.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-server.sh | sh
 ```
 
 That clones the repo, checks docker (telling you exactly what to run if it is
@@ -112,7 +113,7 @@ one-line `chown` that fixes it.
 
 ### From Slicer instead
 
-The **Slicer Cloud** module in `SlicerAutomatedDentalToolsCloud` is a panel
+The **Slicer Cloud** module in `AutomatedDentalToolsRemote` is a panel
 over exactly these subcommands: install, update, start/stop, per-tool model
 selection, and it configures the extension's server URL and token for you when
 the server comes up.
@@ -123,8 +124,8 @@ On a machine with nothing checked out - run it from the directory that should
 end up holding `DATA/`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Jules-GP/slicer-remote-tool-server/main/scripts/setup-models.sh | sh
-curl -fsSL https://raw.githubusercontent.com/Jules-GP/slicer-remote-tool-server/main/scripts/setup-testfiles.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-models.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-testfiles.sh | sh
 ```
 
 From a clone, the same thing without the network round trip (the wrappers
@@ -245,3 +246,26 @@ a mismatch discards the download rather than installing it. To pin an entry,
 run the fetch once, take the hash the script prints, and paste it into the
 manifest - the hashes are not published by GitHub, so inventing them would be
 worse than leaving the field out.
+
+
+## Measuring that the server stays domain-independent
+
+This server serves dental and craniofacial tools and knows nothing about
+either. `domain_coupling.py` is that claim's measurement rather than its
+restatement: the word list is in the script, and the count comes from the
+parsed syntax tree, so comments and docstrings are excluded by construction
+instead of by a filter someone chose.
+
+```bash
+python3 scripts/domain_coupling.py           # per-module table
+python3 scripts/domain_coupling.py --json    # one JSON object on stdout
+```
+
+CI runs it with `--max 2`. The budget is the two illustrative examples in
+`base.py`'s error messages (`choices={'mandible': True, 'skull': False}`); a
+third occurrence fails the build, so it has to be argued for in review rather
+than arrive unnoticed.
+
+Read the number as an upper bound on coupling, not as proof of its absence: a
+server could branch on a tool name without spelling a dental word. What this
+measures is vocabulary, which is where coupling shows first.

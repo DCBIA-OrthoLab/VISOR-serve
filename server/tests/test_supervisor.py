@@ -509,3 +509,37 @@ def test_the_caller_facing_names_match_the_servers_own_table():
     from execution import runner
 
     assert set(runner.CALLER_FACING_ERRORS) == set(main.TOOL_ERROR_STATUS)
+
+
+def test_a_tool_can_call_one_in_another_catalogue(tools_dir, tmp_path, monkeypatch):
+    """TOOLS_DIR may name several catalogues, and a chain may cross them.
+
+    The runner derives its root from where its own tool lives, which is the one
+    thing the invocation fixes. With one catalogue that is the whole answer.
+    With several it is not: the caller here sits in the first and its child in
+    the second, two directories apart, and looking beside itself finds nothing.
+    The server's boot check would have declared the chain complete -- it reads
+    every catalogue -- so the failure would land at run time, on a tool the
+    deployment was told it had.
+    """
+    make_tool(tools_dir, "Caller", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Call a tool served from a different catalogue.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Leaf", scans=scans, output_dir=sup.tmp / "leaf")
+        return output_dir
+    """)
+    # Deliberately NOT under tools_dir or its parent: either would be reachable
+    # by the caller's own two roots, and the test would pass without the lookup
+    # it exists to pin.
+    second = tmp_path / "elsewhere" / "catalogue-two"
+    second.mkdir(parents=True)
+    make_tool(second, "Leaf", LEAF)
+    monkeypatch.setenv("TOOLS_DIR", str(second))
+
+    completed, _ = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+    )
+    assert completed.returncode == 0, completed.stderr

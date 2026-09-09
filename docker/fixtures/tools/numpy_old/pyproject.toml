@@ -11,3 +11,7 @@ name = "numpy-old"
 version = "0.0.0"
 requires-python = ">=3.11,<3.13"
 dependencies = ["numpy<2"]
+
+[tool.sadt]
+tool = true
+name = "numpy_old"

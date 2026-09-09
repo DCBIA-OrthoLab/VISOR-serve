@@ -15,7 +15,7 @@ which are fixtures rather than tools and are not going anywhere.
 
 IF THIS TEST FAILS, the client breaks. Do not regenerate the fixture to make it
 pass -- report the difference instead. It is regenerated deliberately: when a
-tool leaves for sadt-tools, or together with a client release.
+tool leaves for SADT-VISOR, or together with a client release.
 
     cd server && API_TOKEN=x python -c "import json, os; \
         os.environ['API_TOKEN']='x'; \

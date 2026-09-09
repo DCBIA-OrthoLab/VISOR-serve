@@ -1,3 +1,10 @@
+# The compose project name, pinned. Without it the project is named after the
+# DIRECTORY the file sits in, so renaming a checkout silently orphans whatever
+# is running: `docker compose down` under the new name does not see the old
+# containers, and `up` starts a second stack that then collides on the port.
+# Pinned, the stack keeps one identity wherever it is cloned.
+name: visor-serve
+
 # Shared by the two server services below, which differ only in whether they
 # get the GPU. Two services rather than one, because a compose device
 # reservation is ALL-OR-NOTHING: a service asking for an nvidia device cannot
@@ -125,12 +132,35 @@ services:
   #
   # A separate service rather than a flag on `test`, the reservation being
   # all-or-nothing -- which is why the hook keeps pointing at `test`.
+  # `SADT_TOOLS` is mounted at ITS OWN PATH, not at a tidy /tools. Each tool
+  # is a virtualenv, and a virtualenv's `pyvenv.cfg` and script shebangs hold
+  # absolute paths -- moved anywhere else, `<venv>/bin/python` no longer finds
+  # its own interpreter. Same path in and out is what makes them runnable.
+  # Without it, TOOLS_DIR falls back to the built-in demos, no packaged tool
+  # registers, and the real-data suite silently has nothing to parametrize.
   test-gpu:
     <<: *test-base
+    volumes:
+      - ./server:/workspace/server
+      - ./DATA:/data:ro
+      - ./scripts:/workspace/scripts:ro
+      - ./docker:/workspace/docker:ro
+      - ${SADT_TOOLS:-./docker/fixtures}:${SADT_TOOLS:-/workspace/docker/fixtures}:ro
+      # And the interpreters those virtualenvs point AT. uv installs its own
+      # CPython outside the checkout and symlinks `.venv/bin/python` to it, so
+      # without this every tool's venv is a dangling link and every schema
+      # fails to generate. Optional: unset, this resolves to the fixtures path
+      # that is already mounted, which is a no-op.
+      - ${UV_PYTHON_STORE:-./docker/fixtures}:${UV_PYTHON_STORE:-/workspace/docker/fixtures}:ro
     environment:
       - API_TOKEN=test-token
       - DATA_DIR=/data
       - DEVICE=cuda
+      - TOOLS_DIR=${SADT_TOOLS:-/workspace/docker/fixtures}/tools
+      # The mount above is read-only, so the regenerated schemas need somewhere
+      # of their own to land.
+      - SCHEMA_CACHE_DIR=/tmp/schema-cache
+      - DESCRIBE_PATH=${SADT_TOOLS:-/workspace/docker/fixtures}/scripts/describe.py
       # The whole reason this service exists: the real-data suite.
       - RUN_REAL_DATA_TESTS=1
     shm_size: 8gb
@@ -148,11 +178,11 @@ services:
   #
   #     docker compose --profile venvs up -d --build inference-venvs
   #
-  # `tools` is where the packaged tool folders come from -- the sadt-tools
+  # `tools` is where the packaged tool folders come from -- the SADT-VISOR
   # repository's output. It defaults to the build fixtures, which need no GPU
   # and no model and exist to prove the layout works:
   #
-  #     TOOLS_CONTEXT=../sadt-tools docker compose --profile venvs build
+  #     TOOLS_CONTEXT=../SADT-VISOR docker compose --profile venvs build
   #
   # The ROOT of the checkout, not a dist/ subdirectory: the build copies
   # `tools` and `scripts` out of that context, and both sit at the top.

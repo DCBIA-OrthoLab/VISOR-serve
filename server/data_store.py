@@ -40,6 +40,30 @@ class ResolvedFile:
     is_temporary: bool = False
 
 
+def _size_on_disk(path: str):
+    """Bytes an entry holds, walking a folder. None if it cannot be read.
+
+    A folder's size is the sum of its files, not its own inode: what a client
+    downloads is everything inside it. Symlinks are counted by their target's
+    size only when the target is inside -- an unreadable entry reports None
+    rather than a wrong number, because the number is shown to a user deciding
+    whether to start a transfer.
+    """
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        total = 0
+        for directory, _subdirs, names in os.walk(path):
+            for name in names:
+                try:
+                    total += os.path.getsize(os.path.join(directory, name))
+                except OSError:
+                    continue
+        return total
+    except OSError:
+        return None
+
+
 class DataStore(ABC):
     """Read-only access to server-side models and test files, per tool."""
 
@@ -50,6 +74,23 @@ class DataStore(ABC):
     @abstractmethod
     def list_testfiles(self, tool_name: str) -> list:
         ...
+
+    def describe(self, tool_name: str, kind: str) -> list:
+        """`[{"name", "kind", "size"}]` for one of "models"/"testfiles".
+
+        A name alone cannot say whether an entry is one scan or a cohort of
+        forty, and the client now downloads what a user picks -- so the picker
+        has to show what the click costs. `kind` is "file" or "folder", which a
+        bare name never said either: a folder simply looked like a file whose
+        extension was missing.
+
+        Default implementation so a backend that cannot cheaply size its
+        entries still lists them; it reports `None` for both fields rather
+        than guessing.
+        """
+        return [{"name": name, "kind": None, "size": None}
+                for name in (self.list_models(tool_name) if kind == "models"
+                             else self.list_testfiles(tool_name))]
 
     @abstractmethod
     def resolve_model(self, tool_name: str, filename: str) -> ResolvedFile:
@@ -85,6 +126,18 @@ class LocalDataStore(DataStore):
 
     def resolve_testfile(self, tool_name: str, filename: str) -> ResolvedFile:
         return ResolvedFile(path=self._resolve(tool_name, "testfiles", filename))
+
+    def describe(self, tool_name: str, kind: str) -> list:
+        directory = os.path.join(self._root, tool_name, kind)
+        described = []
+        for name in self._list(tool_name, kind):
+            path = os.path.join(directory, name)
+            described.append({
+                "name": name,
+                "kind": "folder" if os.path.isdir(path) else "file",
+                "size": _size_on_disk(path),
+            })
+        return described
 
     def _list(self, tool_name: str, kind: str) -> list:
         directory = os.path.join(self._root, tool_name, kind)

@@ -1,0 +1,15 @@
+tool,path,runs,warmup_discarded,failed,n,median_s,min_s,max_s,first_error
+ALI_CBCT,local,6,1,0,5,414.8655,410.9571,423.9952,
+ALI_CBCT,loopback,6,1,0,5,383.3395,368.1009,751.9986,
+AMASSS,local,6,1,0,5,77.3117,77.1153,79.6327,
+AMASSS,loopback,6,1,0,5,80.1728,77.0767,87.4463,
+AREG_IOSCBCT,local,6,1,0,5,1.0039,0.9759,1.0225,
+AREG_IOSCBCT,loopback,6,1,0,5,1.7509,1.7171,1.7942,
+ASO,local,6,1,0,5,53.8794,53.2317,55.5914,
+ASO,loopback,6,1,0,5,54.0458,53.4777,54.6259,
+Crown_Seg,local,6,1,0,5,59.0349,58.0527,60.3675,
+Crown_Seg,loopback,6,1,0,5,58.9099,58.4003,59.3648,
+Example_Tool,loopback,6,1,6,0,,,,"POST /run/Example_Tool -> 500: {""detail"":""Tool execution failed.""}"
+Surg_Mov_Pred,local,6,1,0,5,11.0795,10.4511,11.2668,
+Surg_Mov_Pred,loopback,6,1,0,5,10.0499,9.775,10.9955,
+Test_Tool,loopback,6,1,0,5,0.0024,0.0023,0.0039,

@@ -1,7 +1,9 @@
 """Discovery of the tools this server serves, from two sources.
 
 **A tool declared by a `.schema.json`** (the one this is moving to). A folder
-under TOOLS_DIR holding `.schema.json`, `.venv/` and `src/`. The server reads
+holding `.schema.json`, `.venv/` and `src/`, under any of the directories
+TOOLS_DIR names -- one catalogue or several, separated the way PATH is, with
+the server's own tools/ always scanned last. The server reads
 the JSON, checks it against the hash of the source next to it, and builds the
 tool from it -- it imports NOTHING. That is the whole point: a tool's
 dependencies then have nothing to agree with the server's, and two tools
@@ -415,7 +417,10 @@ def _refuse_if_nothing_packaged_loaded(registry: dict) -> None:
     # Walked once: _tool_folders stats every candidate folder, and this runs at
     # startup on a mount that may be slow.
     packaged = [
-        name for name, folder in _tool_folders(settings.TOOLS_DIR) if is_packaged(folder)
+        name
+        for root in settings.tool_roots()
+        for name, folder in _tool_folders(root)
+        if is_packaged(folder)
     ]
     loaded_packaged = [name for name in packaged if name in registry]
     if packaged and not loaded_packaged:
@@ -442,13 +447,22 @@ def _refuse_if_nothing_packaged_loaded(registry: dict) -> None:
 def _build_registry() -> dict:
     registry: dict = {}
 
-    for folder, tool in _discover_schema_tools(settings.TOOLS_DIR):
-        try:
-            _reject_duplicate(tool.name, registry)
-        except Exception as exc:
-            _record_failure(folder, exc)
-            continue
-        registry[tool.name] = tool
+    # Several catalogues, scanned in the order TOOLS_DIR names them and the
+    # server's own last. A name found twice is refused rather than shadowed:
+    # two catalogues disagreeing about what `AMASSS` is would otherwise be
+    # settled by directory order, which nobody chose.
+    for root in settings.tool_roots():
+        for folder, tool in _discover_schema_tools(root):
+            try:
+                _reject_duplicate(tool.name, registry)
+            except Exception as exc:
+                # Keyed by the tool's own folder, not by its name: with several
+                # catalogues the name is exactly what two of them share, and a
+                # banner reading "Twice" without saying which directory is a
+                # diagnostic that sends the reader to the wrong one.
+                _record_failure(getattr(tool, "folder", folder), exc)
+                continue
+            registry[tool.name] = tool
 
     schema_tools = len(registry)
 

@@ -9,6 +9,7 @@ deliberately not the tool's.
 
 import json
 import os
+import shutil
 import sys
 
 import pytest
@@ -21,6 +22,8 @@ from registry import schema_hash
 from registry import schema_tool
 from base import ArgSpec, LIST_TYPE, Tool, ToolArgumentError
 from config import settings
+import config
+from execution import dispatch
 
 
 def _schema_path(folder: str) -> str:
@@ -94,7 +97,7 @@ def _fake_venv(folder: str) -> None:
 
 
 def _stub_describe(tmp_path, schema: dict) -> str:
-    """Stands in for sadt-tools' scripts/describe.py: prints a schema."""
+    """Stands in for SADT-VISOR's scripts/describe.py: prints a schema."""
     script = tmp_path / "describe.py"
     # The JSON is embedded as a STRING literal, not as a Python dict: `true`
     # is not a Python name.
@@ -385,8 +388,13 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         # null, so the client falls back to ALLOWED_EXTENSIONS: the schema
         # says "a path" and nothing about which extensions are acceptable.
         "extensions": {"path": None},
-        "label": None,
-        "section": None,
+        # Derived, not null. A tool that declares no layout still gets a panel
+        # someone can read: `conventions.label_for` writes the argument name
+        # out, `conventions.section_for` puts a required path in Inputs. A tool
+        # that DOES declare them is never second-guessed -- which is what makes
+        # a layout.py an override rather than a restatement.
+        "label": "Scan",
+        "section": "Inputs",
         "visible_when": None,
         # Narrows a choice argument's own options; null on everything else.
         "options_when": None,
@@ -500,6 +508,88 @@ def test_some_tools_failing_still_starts(make_tool_folder, monkeypatch):
     assert "Broken" not in built
 
 
+# --- several catalogues ----------------------------------------------------
+#
+# TOOLS_DIR names one directory of tool folders, so serving a second catalogue
+# should be a path and not a code change. These four tests are what makes that
+# true: discovery, precedence, the builtin catalogue, and the interpreter
+# lookup, which is the one that decides whether a tool can actually run.
+
+
+def _second_catalogue(tmp_path, make_tool_folder, name, **overrides):
+    """Install a tool, then move its folder into a catalogue of its own."""
+    source = make_tool_folder(name, **overrides)
+    other = tmp_path / "other-catalogue"
+    other.mkdir(exist_ok=True)
+    destination = other / name
+    shutil.move(source, str(destination))
+    return str(other)
+
+
+def test_a_second_catalogue_is_served(tmp_path, make_tool_folder, monkeypatch):
+    """Two directories, two tools, one catalogue on the wire."""
+    make_tool_folder("FromFirst")
+    other = _second_catalogue(tmp_path, make_tool_folder, "FromSecond")
+    monkeypatch.setattr(
+        settings, "TOOLS_DIR", os.pathsep.join([make_tool_folder.root, other])
+    )
+
+    built = registry._build_registry()
+
+    assert {"FromFirst", "FromSecond"} <= set(built)
+
+
+def test_the_builtin_catalogue_is_always_scanned(make_tool_folder, monkeypatch):
+    """The deployment image points TOOLS_DIR at /tools, and a packaged tool
+    dropped beside the imported ones must still be found."""
+    monkeypatch.setattr(settings, "TOOLS_DIR", make_tool_folder.root)
+
+    roots = settings.tool_roots()
+
+    assert os.path.abspath(config.BUILTIN_TOOLS_DIR) in roots
+    assert roots[0] == os.path.abspath(make_tool_folder.root)
+    assert roots[-1] == os.path.abspath(config.BUILTIN_TOOLS_DIR)
+
+
+def test_the_same_name_in_two_catalogues_is_refused_not_shadowed(
+    tmp_path, make_tool_folder, monkeypatch
+):
+    """Directory order is not a decision anyone made, so the second one is
+    reported rather than silently losing to the first."""
+    first = make_tool_folder("Twice")
+    other = tmp_path / "other-catalogue"
+    other.mkdir(exist_ok=True)
+    # Copied, not installed twice: the fixture keeps one root, and what is
+    # being tested is the same tool folder present in two catalogues.
+    shutil.copytree(first, other / "Twice")
+    other = str(other)
+    monkeypatch.setattr(
+        settings, "TOOLS_DIR", os.pathsep.join([make_tool_folder.root, other])
+    )
+    registry.FAILED_TOOLS.clear()
+
+    built = registry._build_registry()
+
+    assert built["Twice"].folder == first
+    duplicate = os.path.join(other, "Twice")
+    assert duplicate in registry.FAILED_TOOLS
+    assert "Duplicate" in registry.FAILED_TOOLS[duplicate]
+
+
+def test_the_interpreter_is_found_in_a_later_catalogue(tmp_path, monkeypatch):
+    """A tool the first catalogue does not carry still runs: the lookup walks
+    every root, not only the first."""
+    first = tmp_path / "first"
+    first.mkdir()
+    second = tmp_path / "second"
+    interpreter = second / "Elsewhere" / ".venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text("")
+    monkeypatch.setattr(
+        dispatch.settings, "TOOLS_DIR", os.pathsep.join([str(first), str(second)])
+    )
+
+    assert dispatch.tool_interpreter("Elsewhere") == str(interpreter)
 # ---------------------------------------------------------------------------
 # vec2: two numbers, and the ranges are not presentation
 
@@ -612,3 +702,37 @@ def test_a_tool_can_hide_its_own_argument():
     )
 
     assert spec.hidden is True
+
+
+def test_a_declared_section_and_label_are_never_second_guessed(make_tool_folder):
+    """The conventions fill in what the schema leaves out, per argument -- so a
+    tool that says where an argument goes keeps saying it, and a tool that says
+    nothing still gets a readable panel."""
+    folder = make_tool_folder(
+        "declares",
+        arguments={
+            "scan": {"type": "path", "required": True,
+                     "section": "Patient data", "label": "CBCT volume"},
+            "reference": {"type": "path", "required": False},
+        },
+    )
+    tool = schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    assert tool.arguments["scan"].section == "Patient data"
+    assert tool.arguments["scan"].label == "CBCT volume"
+    # Silent, so derived: a `*_reference` is a model by name.
+    assert tool.arguments["reference"].section == "Model"
+    assert tool.arguments["reference"].label == "Reference"
+
+
+def test_a_tool_that_declares_only_a_label_still_gets_a_section(make_tool_folder):
+    """Half a declaration is the common case, and it must not disable the
+    other half."""
+    folder = make_tool_folder(
+        "half",
+        arguments={"tile_step_size": {"type": "float", "required": False, "label": "Overlap"}},
+    )
+    tool = schema_tool.load_tool(folder, deployment.DeploymentConfig({}))
+
+    assert tool.arguments["tile_step_size"].label == "Overlap"
+    assert tool.arguments["tile_step_size"].section == "Advanced"

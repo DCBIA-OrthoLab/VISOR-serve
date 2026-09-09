@@ -1,6 +1,6 @@
 # Adding a tool
 
-**You never edit this repository.** A tool is a folder in `sadt-tools`; the
+**You never edit this repository.** A tool is a folder in `SADT-VISOR`; the
 server discovers it, publishes it, and runs it with no change here.
 
 ## The whole thing
@@ -56,7 +56,7 @@ message)`, `sup.log(message)`.
 
 - **Never import a supervisor type.** It is duck-typed on purpose: a tool
   importing one would need a package shared with this repository, which is what
-  the split removes. The same shape is produced by `sadt-tools`'
+  the split removes. The same shape is produced by `SADT-VISOR`'s
   `scripts/run_tool.py` and faked in its tests.
 - `sup.run("ALI", ...)`, never `sup.ALI(...)`. A typo in a string is greppable;
   a typo in an attribute is an `AttributeError` an hour into a job.

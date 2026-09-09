@@ -151,6 +151,11 @@ def main(argv=None) -> int:
         default=0,
         help="Only report duplicated files at least this large (all still count).",
     )
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="exit 0 when fewer than two tools are installed",
+    )
     arguments = parser.parse_args(argv)
 
     site_packages = site_packages_dirs(arguments.tools_dir)
@@ -159,7 +164,11 @@ def main(argv=None) -> int:
             f"Fewer than two tools installed under {arguments.tools_dir} "
             f"({', '.join(site_packages) or 'none'}): nothing to share, nothing to check."
         )
-        return 0
+        # Not a pass. An image built with no virtualenvs reaches this line, and
+        # returning 0 made CI green on exactly the build this script exists to
+        # reject: the fixtures lost their [tool.sadt] marker, uv sync skipped
+        # all three, and nothing said so for twelve days.
+        return 0 if arguments.allow_empty else 1
 
     print(f"Tools: {', '.join(site_packages)}")
 

@@ -1,0 +1,11 @@
+# The harness's own virtualenv (the repository's top-level .gitignore already
+# covers `.venv/`; repeated here so this directory is self-explanatory).
+.venv/
+
+# Working space for a running campaign: job directories, packed inputs,
+# downloaded results. Emptied by the harness when a campaign ends, and never
+# evidence.
+results/scratch/
+
+__pycache__/
+.pytest_cache/

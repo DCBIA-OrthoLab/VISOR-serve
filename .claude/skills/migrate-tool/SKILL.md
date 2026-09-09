@@ -1,6 +1,6 @@
 ---
 name: migrate-tool
-description: Migrate a Slicer module into a packaged SADT tool, or split an existing tool whose two engines have incompatible dependencies. Use when porting a tool from SlicerAutomatedDentalTools, when a tool needs its own pinned torch, or when adding a tool to sadt-tools.
+description: Migrate a Slicer module into a packaged SADT tool, or split an existing tool whose two engines have incompatible dependencies. Use when porting a tool from SlicerAutomatedDentalTools, when a tool needs its own pinned torch, or when adding a tool to SADT-VISOR.
 ---
 
 # Migrating a tool

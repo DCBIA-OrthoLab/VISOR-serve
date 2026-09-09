@@ -1,0 +1,10 @@
+# The whole harness. Deliberately three packages: it has to import and its unit
+# tests have to pass on a reviewer's machine with no GPU, no Docker and no
+# server, and every dependency added here is one more thing that has to.
+#
+# Note what is NOT here: no numpy, no SimpleITK, no torch. B5's numeric distance
+# is computed by a TOOL's own interpreter (see _imaging_diff.py), because the
+# stack that wrote a file is the right stack to read it with.
+requests>=2.28
+PyYAML>=6.0
+pytest>=8.0

@@ -32,7 +32,7 @@ KINDS = ("models", "testfiles")
 
 _CHUNK = 1024 * 1024
 # GitHub answers 403 to a request with no User-Agent.
-_HEADERS = {"User-Agent": "slicer-remote-tool-server-fetch/1.0"}
+_HEADERS = {"User-Agent": "visor-serve-fetch/1.0"}
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_MANIFEST = os.path.join(_SCRIPT_DIR, "data-manifest.yml")
