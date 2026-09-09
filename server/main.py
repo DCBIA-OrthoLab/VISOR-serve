@@ -479,7 +479,11 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
         background_tasks.add_task(_remove_path, resolved.path)
 
     path = resolved.path
-    if os.path.isdir(path):
+    # Built for THIS request, rather than read off the disk. What that costs is
+    # decided a dozen lines below, where the response says whether it may be
+    # ranged.
+    generated = os.path.isdir(path)
+    if generated:
         # DATA_DIR is read-only: the archive is built in its own staging dir
         # under TEMP_DIR, which must outlive the response stream -- hence the
         # background task, and the inline cleanup on the one path where no
@@ -510,6 +514,23 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
         path,
         media_type=_media_type_of(path),
         filename=os.path.basename(path),
+        # An archive built for one request has no byte range worth offering, and
+        # offering one is far worse than useless: the client probes, sees
+        # ranges, and splits a 339 MB cohort across 43 parallel parts -- so the
+        # server builds the same 339 MB archive 43 times to deliver it once.
+        # Measured against AREG's CBCT_FullyAuto: one 8 MB range costs 40% of
+        # the entire download, and the transfer took 39.1s ranged against 1.5s
+        # in a single stream. `Accept-Ranges: none` is exactly what the client
+        # probes for, so it falls back to one connection, and one build.
+        #
+        # Only the ADVERTISEMENT is withdrawn. Starlette still answers a Range
+        # a client sends anyway, and that stays correct because two builds of
+        # one folder are byte-identical (pinned by a test) -- it is merely slow,
+        # which is the right way round for a client that ignores the header.
+        #
+        # A real file is untouched: it IS on disk, its ranges are free, and
+        # parallel connections are the whole point of the probe.
+        headers={"Accept-Ranges": "none"} if generated else None,
         background=background_tasks,
     )
 

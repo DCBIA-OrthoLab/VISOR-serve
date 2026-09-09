@@ -1807,3 +1807,92 @@ def test_a_test_file_answers_head_so_a_client_can_plan_a_ranged_download(monkeyp
 def test_a_head_on_a_test_file_still_needs_a_token():
     response = client.head("/tools/AMASSS/testfiles/anything.nii.gz")
     assert response.status_code == 401
+
+
+def _folder_entry(monkeypatch, tmp_path, name="cohort"):
+    """A hosted test entry that is a FOLDER, so the server has to build a zip."""
+    import data_store as data_store_module
+    import main as main_module
+
+    root = tmp_path / "DATA"
+    folder = root / "Probe" / "testfiles" / name
+    folder.mkdir(parents=True)
+    (folder / "a.csv").write_text("a\n1\n")
+    (folder / "b.csv").write_text("b\n2\n")
+    (root / "Probe" / "testfiles" / "scan.nii.gz").write_bytes(gzip.compress(b"x" * 5000))
+
+    class _Probe(Tool):
+        name = "Probe"
+        arguments = {"scan": ArgSpec(type="path", server_selectable="testfile")}
+        output_kind = "text"
+
+        def run(self, scan):
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Probe", _Probe())
+    monkeypatch.setattr(main_module, "data_store",
+                        data_store_module.LocalDataStore(str(root)))
+
+
+def test_a_zipped_folder_does_not_offer_ranges(monkeypatch, tmp_path):
+    """Because the archive is built for THIS request, not read off the disk.
+
+    Advertising ranges on it is not merely useless, it multiplies the work: the
+    client probes, sees `bytes`, and splits a 339 MB cohort across 43 parallel
+    parts -- so the server builds the same 339 MB archive 43 times to deliver it
+    once. Measured against AREG's CBCT_FullyAuto before this: one 8 MB range
+    cost 40% of the whole download, and the transfer took 39.1s ranged against
+    1.5s in a single stream, while ALI's 94 MB FILE managed 361 MB/s over the
+    same code.
+    """
+    _folder_entry(monkeypatch, tmp_path)
+
+    response = client.get("/tools/Probe/testfiles/cohort",
+                          headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert response.status_code == 200
+    assert response.headers.get("accept-ranges") == "none"
+
+
+def test_the_probe_on_a_zipped_folder_says_so_too(monkeypatch, tmp_path):
+    """The HEAD is where the client decides; the GET is too late to help."""
+    _folder_entry(monkeypatch, tmp_path)
+
+    head = client.head("/tools/Probe/testfiles/cohort",
+                       headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert head.status_code == 200, head.text
+    assert head.headers.get("accept-ranges") == "none"
+
+
+def test_a_real_file_still_offers_ranges(monkeypatch, tmp_path):
+    """The withdrawal is for generated archives only. A file IS on disk, its
+    ranges cost nothing, and parallel connections are the point of the probe."""
+    _folder_entry(monkeypatch, tmp_path)
+
+    response = client.get("/tools/Probe/testfiles/scan.nii.gz",
+                          headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert response.status_code == 200
+    assert response.headers.get("accept-ranges") == "bytes"
+
+
+def test_two_builds_of_one_folder_are_byte_identical(monkeypatch, tmp_path):
+    """What makes a range on a generated archive merely SLOW rather than wrong.
+
+    A ranged download assembles one file out of many responses. If two builds of
+    the same folder differed by a byte -- a build timestamp, a different walk
+    order -- the assembled archive would be a mix of several, and a zip mixed
+    that way is corrupt in silence, on medical data. Nothing in `make_zip`
+    declares this property, so it is pinned here: the header withdrawn above
+    protects our own client, this protects any other.
+    """
+    _folder_entry(monkeypatch, tmp_path)
+    url = "/tools/Probe/testfiles/cohort"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    first = client.get(url, headers=headers)
+    second = client.get(url, headers=headers)
+
+    assert first.status_code == second.status_code == 200
+    assert first.content == second.content
