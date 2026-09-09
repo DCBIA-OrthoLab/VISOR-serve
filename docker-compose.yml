@@ -132,12 +132,35 @@ services:
   #
   # A separate service rather than a flag on `test`, the reservation being
   # all-or-nothing -- which is why the hook keeps pointing at `test`.
+  # `SADT_TOOLS` is mounted at ITS OWN PATH, not at a tidy /tools. Each tool
+  # is a virtualenv, and a virtualenv's `pyvenv.cfg` and script shebangs hold
+  # absolute paths -- moved anywhere else, `<venv>/bin/python` no longer finds
+  # its own interpreter. Same path in and out is what makes them runnable.
+  # Without it, TOOLS_DIR falls back to the built-in demos, no packaged tool
+  # registers, and the real-data suite silently has nothing to parametrize.
   test-gpu:
     <<: *test-base
+    volumes:
+      - ./server:/workspace/server
+      - ./DATA:/data:ro
+      - ./scripts:/workspace/scripts:ro
+      - ./docker:/workspace/docker:ro
+      - ${SADT_TOOLS:-./docker/fixtures}:${SADT_TOOLS:-/workspace/docker/fixtures}:ro
+      # And the interpreters those virtualenvs point AT. uv installs its own
+      # CPython outside the checkout and symlinks `.venv/bin/python` to it, so
+      # without this every tool's venv is a dangling link and every schema
+      # fails to generate. Optional: unset, this resolves to the fixtures path
+      # that is already mounted, which is a no-op.
+      - ${UV_PYTHON_STORE:-./docker/fixtures}:${UV_PYTHON_STORE:-/workspace/docker/fixtures}:ro
     environment:
       - API_TOKEN=test-token
       - DATA_DIR=/data
       - DEVICE=cuda
+      - TOOLS_DIR=${SADT_TOOLS:-/workspace/docker/fixtures}/tools
+      # The mount above is read-only, so the regenerated schemas need somewhere
+      # of their own to land.
+      - SCHEMA_CACHE_DIR=/tmp/schema-cache
+      - DESCRIBE_PATH=${SADT_TOOLS:-/workspace/docker/fixtures}/scripts/describe.py
       # The whole reason this service exists: the real-data suite.
       - RUN_REAL_DATA_TESTS=1
     shm_size: 8gb

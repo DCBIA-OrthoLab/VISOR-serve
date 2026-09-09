@@ -139,6 +139,16 @@ on that side:
   together.
 - `Surg_Mov_Pred` - surgical movement prediction from tabular measurements
   (stacking models, server-side model bundles).
+- `CLIC` - impacted canine segmentation on CBCT (torchvision Mask R-CNN).
+- `GreedyReg` - two-timepoint CBCT registration with `picsl_greedy`. No torch.
+- `AutoMatrix` - applies a transform to scans, segmentations and landmarks.
+- `AutoCrop3D` - crops a cohort of volumes to a Slicer ROI box, and can pad the
+  crop back to the original geometry.
+- `DOCShapeAXI` - classifies a 3D shape (airway, condyle, cleft) and paints the
+  GradCAM attribution onto the surface. Pinned to shapeaxi 1.x: the published
+  checkpoints predate the 2.0 network signature.
+- `CNE` - structured extraction from free-text clinical notes, with a local
+  quantised GGUF model. The only tool whose weights are an LLM.
 
 Two in-process tools stay in this repository, and only these two. They are the
 demonstration of the `Tool`/`ArgSpec` path, not clinical tools:
@@ -228,7 +238,7 @@ re-enters the same file with the sibling's interpreter, so chaining and nesting
 │   ├── wire/                # the HTTP edge that is not routing
 │   │   ├── transfer.py      #   chunked resumable uploads, range-served results
 │   │   └── security.py      #   Bearer token verification
-│   ├── deployment.toml      # per-tool overrides; empty, because the conventions cover them
+│   ├── deployment.toml      # per-tool overrides: the ALI and AREG facades, mostly
 │   ├── deployment.toml.example
 │   ├── tools/               # NOT where the tools are any more - see below
 │   │   ├── _dispatch_probe/ # test fixture: underscore = never discovered
@@ -688,8 +698,8 @@ rather than described.
   upstreams runs in it, on confidential imaging.
 
 `server/requirements-api.txt` is the API's whole dependency list - fastapi,
-uvicorn, python-multipart, pydantic-settings - and a test asserts it stays that
-way, because an API that quietly regrows numpy is pinned to what the tools can
+uvicorn[standard], python-multipart, pydantic-settings - and two tests in
+`tests/test_image_layout.py` assert it stays that way, because an API that quietly regrows numpy is pinned to what the tools can
 agree on all over again.
 
 **Tests:** 427 server tests (+4). The image itself is verified by building it,
