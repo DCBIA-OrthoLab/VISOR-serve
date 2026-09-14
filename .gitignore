@@ -36,3 +36,7 @@ local-server.log
 
 # Scratch from manual validation runs (landmark comparisons, resolve probes).
 .validation/
+
+# Local dev servers: a second instance's schema cache and its log.
+.schema-cache-*/
+local-server-*.log
