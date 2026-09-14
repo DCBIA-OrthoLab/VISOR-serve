@@ -594,6 +594,19 @@ def wait_for_health(url: str, timeout: int, service: str) -> bool:
                     "Its dependencies are not installed and pip could not reach its index. "
                     "This container needs network access once; connect and start it again."
                 )
+            if _CONFIG_AHEAD_MARKER in out:
+                # The one boot failure whose obvious repair is the wrong one.
+                # deployment.toml is mounted from this checkout, so it can be
+                # newer than the server in the image -- and the traceback below
+                # reads as "your file is wrong", which invites deleting the line
+                # that a newer server needs. Said here in one sentence, above
+                # the trace, because that is what gets read.
+                log(
+                    "Its deployment.toml asks for something this image's server does not know: "
+                    "the file is mounted from this checkout and has moved ahead of the image. "
+                    "Rebuild the image (`docker compose --profile venvs build inference-venvs`) "
+                    "rather than editing the file back."
+                )
             log("Last log lines:")
             cmd_logs_tail(service, 40)
             return False
@@ -605,6 +618,10 @@ def wait_for_health(url: str, timeout: int, service: str) -> bool:
 
 _DEPS_SKIPPED_MARKER = "DEPENDENCY-INSTALL-SKIPPED"
 _DEPS_FATAL_MARKER = "DEPENDENCY-INSTALL-FATAL"
+# registry.deployment.CONFIG_AHEAD_MARKER. Written down rather than imported:
+# this script runs in Slicer's interpreter too, where the server package is not
+# importable. A test pins the two strings to each other.
+_CONFIG_AHEAD_MARKER = "DEPLOYMENT-CONFIG-AHEAD-OF-SERVER"
 
 
 def warn_if_deps_skipped(service: str) -> bool:

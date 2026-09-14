@@ -17,9 +17,13 @@ upload-only and MAX_UPLOAD_MB applies. Nothing here is required for a tool to
 work.
 
 The file is validated at startup rather than on first use: an entry naming an
-argument that does not exist, or a `server_selectable` kind that is neither
-"model" nor "testfile", would otherwise be a dropdown that silently never
-appears.
+argument that does not exist, or a `server_selectable` kind this server does not
+know, would otherwise be a dropdown that silently never appears.
+
+It is also MOUNTED into the container rather than baked into the image, so that
+changing one line does not cost a 23 GB rebuild. The cost of that choice is that
+the file can move ahead of the server reading it; `_unknown_value` is what makes
+that legible when it happens.
 """
 
 from __future__ import annotations
@@ -48,12 +52,56 @@ logger = logging.getLogger("inference_server")
 SERVER_SELECTABLE_NONE = "none"
 SERVER_SELECTABLE_KINDS = ("model", "testfile", SERVER_SELECTABLE_NONE)
 
+# Put in the message of every "this file asks for a value this server does not
+# know" refusal, so `scripts/server_ctl.py` can recognise it in a container's log
+# and explain it in one sentence instead of leaving an operator reading a
+# traceback. Same device as its DEPENDENCY-INSTALL-FATAL marker, and here for a
+# sharper reason: see `_unknown_value`.
+CONFIG_AHEAD_MARKER = "DEPLOYMENT-CONFIG-AHEAD-OF-SERVER"
+
+
 _TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden",
               "timeout_seconds", "dispatch")
 
 
 class DeploymentConfigError(Exception):
     """Raised at startup when deployment.toml cannot be trusted."""
+
+
+def _unknown_value(where: str, subject: str, known) -> "DeploymentConfigError":
+    """The refusal for a value this server does not recognise, and the ADVICE.
+
+    The advice is the point, and it was learned the hard way. `deployment.toml`
+    is MOUNTED into the container from the installation, precisely so a config
+    change does not cost a 23 GB rebuild -- which means the file can move ahead
+    of the server reading it, and stay ahead silently: it is read once, at
+    startup, so a container already running never notices. The mismatch surfaces
+    at the next restart, or after a reboot, on a machine nobody is watching, as a
+    crash loop.
+
+    That happened on 2026-09-14: an image built on 2026-08-27 met a file using
+    `server_selectable = "none"`, added on 2026-08-20 and first used today.
+
+    The old message said only "expected one of ['model', 'testfile']", which
+    reads as "your file is wrong" and invites the one repair that must not
+    happen: deleting the value. Every value here was added to fix something --
+    that `none` stops ALI being handed ASO's model folder and predicting with
+    the wrong weights, silently, which was measured in a real run. Editing it out
+    restores the defect and the server starts, so nothing says it came back.
+
+    So the message names the likely cause and the correct repair: update the
+    server.
+    """
+    return DeploymentConfigError(
+        f"{where}: {subject}, which this server does not know "
+        f"(it knows {list(known)}).\n"
+        f"deployment.toml is mounted from the installation, so it can be NEWER "
+        f"than the server reading it -- that is the usual reason for this. "
+        f"Rebuild or update the server rather than editing the file: the value "
+        f"was added to fix something, and removing it brings that back without "
+        f"saying so. [{CONFIG_AHEAD_MARKER}]"
+    )
+
 
 
 @dataclass(frozen=True)
@@ -155,11 +203,12 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
 
     unknown = sorted(set(table) - set(_TOOL_KEYS))
     if unknown:
-        # A typo here is silent otherwise: `server_selectible` would simply
-        # leave every argument upload-only, with no dropdown and no error.
-        raise DeploymentConfigError(
-            f"{where}: unknown key(s) {unknown}. Expected any of {list(_TOOL_KEYS)}."
-        )
+        # Two causes, and the message has to carry both. A typo is silent
+        # otherwise: `server_selectible` would simply leave every argument
+        # upload-only, with no dropdown and no error. A key a NEWER file adds is
+        # the other, and it is the one an operator cannot guess -- see
+        # `_unknown_value`.
+        raise _unknown_value(where, f"unknown key(s) {unknown}", _TOOL_KEYS)
 
     selectable = table.get("server_selectable", {})
     if not isinstance(selectable, dict):
@@ -169,9 +218,10 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
         )
     for argument, kind in selectable.items():
         if kind not in SERVER_SELECTABLE_KINDS:
-            raise DeploymentConfigError(
-                f"{where}: argument '{argument}' is declared server_selectable as {kind!r}; "
-                f"expected one of {list(SERVER_SELECTABLE_KINDS)}."
+            raise _unknown_value(
+                where,
+                f"argument '{argument}' is declared server_selectable as {kind!r}",
+                SERVER_SELECTABLE_KINDS,
             )
 
     dispatch = table.get("dispatch", {})
