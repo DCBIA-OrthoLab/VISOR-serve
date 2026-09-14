@@ -126,6 +126,7 @@ def compose(name: str, targets: dict, registry: dict) -> FacadeTool:
     # IOS and three different ones for IOSCBCT.
     choices_by_mode: dict = {}
     groups_by_mode: dict = {}
+    help_by_mode: dict = {}
 
     for mode, target in targets.items():
         tool = registry[target]
@@ -146,6 +147,8 @@ def compose(name: str, targets: dict, registry: dict) -> FacadeTool:
                 choices_by_mode.setdefault(argument_name, {})[mode] = dict(spec.choices)
             if getattr(spec, "groups", None):
                 groups_by_mode.setdefault(argument_name, {})[mode] = dict(spec.groups)
+            if getattr(spec, "option_help", None):
+                help_by_mode.setdefault(argument_name, {})[mode] = dict(spec.option_help)
 
     for argument_name, spec in arguments.items():
         appears_in = seen_in[argument_name]
@@ -182,6 +185,18 @@ def compose(name: str, targets: dict, registry: dict) -> FacadeTool:
         # put intraoral landmarks under `Cranial base`. A client that does not
         # read `groups_when` still gets a usable panel -- `formgen._grouped`
         # parks anything no group claims in a trailing "Other" tab.
+        # The UNION again, and unlike the groups it needs no `_when`: a line
+        # saying what an option IS describes the option, not the mode it was
+        # reached through, so the same option means the same thing in both. An
+        # option only one engine offers is simply described by that engine, and
+        # `options_when` already hides it in the other mode.
+        per_mode_help = help_by_mode.get(argument_name, {})
+        if per_mode_help:
+            merged_help: dict = {}
+            for texts in per_mode_help.values():
+                merged_help.update(texts)
+            spec.option_help = merged_help
+
         per_mode_groups = groups_by_mode.get(argument_name, {})
         if len({tuple(sorted(groups)) for groups in per_mode_groups.values()}) > 1:
             spec.groups_when = {

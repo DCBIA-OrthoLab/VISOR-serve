@@ -97,15 +97,25 @@ VEC2_TYPE = "vec2"
 #   "grid"   -> one ROW per `groups` entry, for options whose position carries
 #               meaning (ASO's 32 teeth, upper arch above lower arch).
 #   "inline" -> a single horizontal row, for a handful of short options.
-UI_LAYOUTS = ("tabs", "grid", "inline")
+#   "chips"  -> the tabbed layout's grid without the tabs: options as chips,
+#               wrapped over as many lines as they need. For a handful too many
+#               for one row and too few to hide behind a tab bar.
+UI_LAYOUTS = ("tabs", "grid", "inline", "chips")
 
 # How a "vec2" is offered. Without it the argument is two spin boxes, which is
 # the same value; with it the client adds a 2D pad that writes into them, so a
 # drag sets both at once and the knob sits where the point sits.
 VEC2_LAYOUTS = ("joystick",)
 
-# The layouts that are meaningless without ArgSpec.groups.
+# The layouts that are meaningless without ArgSpec.groups: a tab bar with no
+# tabs and a chart with no rows are both nothing.
 _GROUPED_LAYOUTS = ("tabs", "grid")
+
+# The layouts groups may be given to. Wider than the pair above, because "chips"
+# READS them without needing them: given groups it draws a heading and a grid
+# per group, and given none it draws one grid. Two lists rather than one, so
+# "may have groups" and "is nothing without groups" stay different questions.
+_LAYOUTS_ACCEPTING_GROUPS = _GROUPED_LAYOUTS + ("chips",)
 
 
 class Selection(dict):
@@ -138,10 +148,6 @@ class ResolvedPath(str):
         resolved = super().__new__(cls, path)
         resolved.kind = kind
         return resolved
-
-    @property
-    def is_folder(self) -> bool:
-        return self.kind == FOLDER_TYPE
 
 
 @dataclass
@@ -290,6 +296,28 @@ class ArgSpec:
     # must exist in `choices`; options left out of every group are rendered
     # after the groups rather than dropped.
     groups: Optional[dict] = None
+
+    # {option: one line saying what that option is}. For a catalogue whose
+    # options are CODES rather than words -- ALI publishes `UR1MB` and `Ba` --
+    # the label alone tells a clinician nothing, and the argument's own
+    # description covers all of them at once. The words are the tool's, exactly
+    # as `groups`' names are: this server knows the key and never a landmark.
+    option_help: Optional[dict] = None
+
+    # How few options a "multichoice" may be left with. Absent means none is a
+    # meaningful answer -- ALI's empty `landmarks` says "let the regions decide"
+    # -- which is why a client treats an empty multichoice as filled by default.
+    # A tool that cannot run on nothing says so here instead, and both sides
+    # then agree: validate() refuses it, and a panel can grey Apply out rather
+    # than let a clinician send a request only to be told no.
+    min_selected: Optional[int] = None
+
+    # MULTICHOICE only: offer "select all" / "select none" above the options.
+    # Presentation, and nothing else -- whatever a client does with it, what
+    # arrives on the wire is the same {option: ticked} dict as always. A
+    # catalogue of a hundred landmarks and a chain of four steps have the same
+    # problem, so this is a property of the ARGUMENT rather than of one panel.
+    select_all: bool = False
 
     @property
     def types(self) -> tuple:
@@ -459,9 +487,9 @@ class Tool(ABC):
                 )
 
         if spec.groups is not None:
-            if spec.ui not in _GROUPED_LAYOUTS:
+            if spec.ui not in _LAYOUTS_ACCEPTING_GROUPS:
                 raise ToolSchemaError(
-                    f"{where}: 'groups' only applies to the {sorted(_GROUPED_LAYOUTS)} "
+                    f"{where}: 'groups' only applies to the {sorted(_LAYOUTS_ACCEPTING_GROUPS)} "
                     f"layouts (ui={spec.ui!r})."
                 )
             if not isinstance(spec.groups, dict) or not spec.groups:
@@ -477,6 +505,24 @@ class Tool(ABC):
             raise ToolSchemaError(
                 f"{where}: the {spec.ui!r} layout needs 'groups' to say what to group."
             )
+
+        if spec.min_selected is not None:
+            if spec.types[0] != MULTICHOICE_TYPE:
+                raise ToolSchemaError(
+                    f"{where}: 'min_selected' only applies to a "
+                    f"{MULTICHOICE_TYPE!r}, not a {spec.types[0]!r}."
+                )
+            if not isinstance(spec.min_selected, int) or spec.min_selected < 1:
+                raise ToolSchemaError(
+                    f"{where}: 'min_selected' must be a positive whole number, "
+                    f"got {spec.min_selected!r}."
+                )
+            if spec.choices and spec.min_selected > len(spec.choices):
+                raise ToolSchemaError(
+                    f"{where}: 'min_selected' is {spec.min_selected} but the "
+                    f"argument offers only {len(spec.choices)} option(s), so no "
+                    f"selection could ever satisfy it."
+                )
 
         self._check_options_when(where, spec)
 
@@ -779,10 +825,24 @@ class Tool(ABC):
             )
         # Rebuilt from the declaration, so run() always sees every option in
         # declaration order and never has to guard a missing key.
-        return Selection(
+        selection = Selection(
             (name, self._coerce_bool(arg_name, provided[name]) if name in provided else False)
             for name in spec.choices
         )
+        if spec.min_selected is not None:
+            chosen = sum(1 for on in selection.values() if on)
+            if chosen < spec.min_selected:
+                # Refused HERE rather than minutes into a run. The tool checks
+                # this too, and keeps checking it -- a direct call reaches run()
+                # without passing through here at all.
+                raise ToolArgumentError(
+                    f"Argument '{arg_name}': select at least "
+                    f"{spec.min_selected} of {', '.join(spec.choices)}."
+                    if spec.min_selected > 1 else
+                    f"Argument '{arg_name}': select at least one of "
+                    f"{', '.join(spec.choices)}."
+                )
+        return selection
 
     def invoke(self, args: dict):
         """Validate args, then run the tool. This is what the server calls.
