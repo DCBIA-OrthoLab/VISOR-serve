@@ -57,6 +57,9 @@ response (no job queue / polling).
 | `DELETE /uploads/{id}` | | Bearer |
 | `GET /results/{id}` | honours `Range` → `206` | Bearer |
 | `DELETE /results/{id}` | release a result held by reference | Bearer |
+| `GET /runs/{id}` | a run's progress, as one snapshot | Bearer |
+| `GET /runs/{id}/events` | the same, as Server-Sent Events, tailed live | Bearer |
+| `DELETE /runs/{id}` | cancel a run → `204`; the run's POST then answers `499` | Bearer |
 
 The chunked endpoints are **optional**: a client that ignores them still works,
 and one that uses them against an older server falls back on the `404`. They
@@ -66,6 +69,37 @@ connection dropped at 95% otherwise starts again from zero. An input that
 arrived that way is named in the reserved `__uploads__` form field of the run,
 and its blob is **renamed** into the job's work directory rather than copied,
 so a 2 GB upload becomes a tool's input in microseconds.
+
+The `/runs` endpoints are optional the same way. A client that wants to show
+progress mints a run id with `secrets.token_urlsafe(24)` and sends it on the
+run itself:
+
+```
+POST /run/AMASSS
+X-Run-Id: 3PqVh0v-Rn2mYcT8xK1LZs9dJf4wQeUa
+```
+
+and then watches `GET /runs/<id>/events` from a SECOND connection, because the
+first is blocked inside the POST until the tool is finished. The server records
+a phase of its own at every step with no tool cooperation at all - `received`,
+`staging`, `queued_gpu`, `running`, `packaging`, and one of `done` / `failed` /
+`cancelled` - so a multi-minute wait for the card stops looking exactly like a
+multi-hour segmentation. A tool can add its own messages on top by appending to
+the file named by `SADT_PROGRESS_FILE`.
+
+`DELETE /runs/<id>` stops the run: it writes a marker the run notices even
+before it has a process, and signals the tool's process group when it has one -
+which works from a `uvicorn` worker that never started the run, because the
+group id travelled through the run directory rather than through memory. The
+run's own POST then answers **`499`**, nginx's "client closed request", chosen
+because no standard code means "the caller withdrew this" and a client has to
+tell that from a failure without reading a message.
+
+A client that sends no `X-Run-Id` gets byte for byte the behaviour it always
+had, and one that calls these against an older server gets a `404` it is meant
+to read as "no progress here" rather than as an error. The whole contract,
+including what a tool writes and what the client does with it, is
+[`../RUN_PROGRESS.md`](../RUN_PROGRESS.md).
 
 A result over `RESULT_REFERENCE_MIN_MB` can be handed back as a reference
 (`X-Result-Delivery: reference`) and fetched over parallel ranges. Below that
@@ -169,6 +203,34 @@ curl -k -X POST https://localhost:8000/run/Surg_Mov_Pred \
   -F "model=all_models" \
   -F "measurements=@/path/to/measurements.xlsx"
 ```
+
+Watching a run, and stopping it, from two terminals:
+
+```bash
+RUN_ID=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))")
+
+# Terminal 1 - the run, blocking as it always did
+curl -k -X POST https://localhost:8000/run/AMASSS \
+  -H "Authorization: Bearer change-me-to-a-long-random-secret" \
+  -H "X-Run-Id: $RUN_ID" \
+  -F "input=@/path/to/scan.nii.gz" -F "model=AMASSS_Models"
+
+# Terminal 2 - the progress, from the moment the id was minted
+curl -kN https://localhost:8000/runs/$RUN_ID/events \
+  -H "Authorization: Bearer change-me-to-a-long-random-secret"
+# -> data: {"seq":0,"at":...,"state":"pending","phase":"received",...}
+#    data: {"seq":1,...,"phase":"staging","message":"input 1 of 1"}
+#    data: {"seq":2,...,"phase":"queued_gpu"}
+
+# Terminal 2 - and stopping it
+curl -k -X DELETE https://localhost:8000/runs/$RUN_ID \
+  -H "Authorization: Bearer change-me-to-a-long-random-secret"
+# terminal 1 then answers 499 {"detail": "Run cancelled by the client."}
+```
+
+`-N` matters: without it curl buffers the stream and prints nothing until the
+run ends, which is the same mistake `X-Accel-Buffering: no` tells a proxy not
+to make.
 
 ## File-typed arguments
 

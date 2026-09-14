@@ -56,10 +56,14 @@ def manifest(fetch_data):
     [
         # Renames that only moved underscores: resolved by normalizing, the same
         # rule the registry uses when it refuses two spellings of one tool.
-        ("Crown_Seg", "CrownSeg"),
-        ("CrownSeg", "CrownSeg"),
-        ("Batch_Dental_Seg", "BatchDentalSeg"),
-        ("Surg_Mov_Pred", "SurgMovPred"),
+        # Harmonised 2026-09-10: a DATA folder is now named exactly as the tool
+        # it belongs to, so a name resolves to itself. The run-together spellings
+        # are kept as INPUTS -- an older deployment still has those folders, and
+        # `data_slug` still falls back to them.
+        ("Crown_Seg", "Crown_Seg"),
+        ("CrownSeg", "Crown_Seg"),
+        ("Batch_Dental_Seg", "Batch_Dental_Seg"),
+        ("Surg_Mov_Pred", "Surg_Mov_Pred"),
         # Splits: one bundle now feeds several tools, which no naming rule can
         # derive. The manifest says so with `provides:`.
         ("ALI_CBCT", "ALI"),
@@ -69,6 +73,7 @@ def manifest(fetch_data):
         ("AREG_IOSCBCT", "AREG"),
     ],
 )
+
 def test_a_served_tool_name_resolves_to_its_bundle(fetch_data, manifest, served, expected):
     assert fetch_data.resolve_tools(manifest, [served]) == [expected]
 
@@ -115,7 +120,7 @@ def test_listing_honours_the_filter(fetch_data, manifest, capsys):
     fetch_data._list_manifest(manifest, ["Crown_Seg"])
     printed = capsys.readouterr().out
 
-    assert "CrownSeg" in printed
+    assert "Crown_Seg" in printed
     assert "AMASSS" not in printed, "--tool was dropped and everything was listed"
 
 
@@ -125,3 +130,30 @@ def test_listing_without_a_filter_shows_everything(fetch_data, manifest, capsys)
 
     for key in manifest:
         assert key in printed, key
+
+
+def test_aso_and_ali_landmark_weights_come_from_different_publications(manifest):
+    """They are two trainings of the same landmarks, not two copies of one.
+
+    An earlier note in the manifest said they were the same and suggested
+    hard-linking one at the other to save disk. Measured 2026-09-10: every
+    checkpoint differs, at both scales, for every landmark compared. ASO's
+    published reference planes were built with ASO's weights, so swapping in
+    ALI's would move the landmarks a little, move the registration with them,
+    and produce oriented scans nobody could tell were wrong.
+
+    Pinned by SOURCE rather than by bytes, because the bytes are not in the
+    repository and this has to fail on a laptop with an empty DATA/.
+    """
+    def urls(tool, prefix):
+        entries = manifest.get(tool, {}).get("models", [])
+        return {e["url"] for e in entries if str(e.get("dest", "")).startswith(prefix)}
+
+    aso = urls("ASO", "CBCT_landmark_models/")
+    ali = urls("ALI", "ALI_CBCT_Models/")
+    assert aso, "ASO declares no landmark weights"
+    assert ali, "ALI declares no landmark weights"
+    assert not (aso & ali), (
+        "ASO and ALI now share a landmark weight archive. They are separate "
+        "trainings; sharing one silently changes what ASO registers on."
+    )

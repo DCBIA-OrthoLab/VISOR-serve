@@ -88,7 +88,7 @@ tools:
   # =========================================================================
   # SurgMovPred -- surgical movement prediction. LIVE on the server.
   # =========================================================================
-  SurgMovPred:
+  Surg_Mov_Pred:
     models:
       # Unpacks to one <target>_Pred/ folder per predicted measurement, each
       # holding a stacking_package.pkl -- which is what LoadData.extract_model
@@ -110,7 +110,7 @@ tools:
   # 13 GB of CBCT models. Ask for them on their own:
   #     python3 scripts/fetch_data.py --kind models --tool ALI
   #
-  # Both bundle names below are what the tool actually reads:
+  # All three bundle names below are what the tool actually reads:
   #   * ALI_CBCT_Models/ -> engine.discover_weights walks it recursively for
   #     <landmark>/<scale>/*.pth, so the eight region archives unpack side by
   #     side into one bundle and one dropdown entry.
@@ -118,6 +118,16 @@ tools:
   #     Upper_C_model.pth, Lower_C_model.pth (verified against the published
   #     archive). Each name carries an O/C token and an Upper/Lower one, which
   #     is the single naming rule ALI_IOS/engine.discover_weights applies.
+  #   * Crown_Seg_Model/ -> the crown-segmentation checkpoint, read by
+  #     Crown_Seg and not by ALI. See below for why it is staged here.
+  #
+  # Three bundles under DATA/ALI/models/ and none of them can be mistaken for
+  # another: the server hands a hosted-model argument the whole models FOLDER
+  # when the caller names no bundle, and each engine recognises its own weights
+  # inside by their shape (dispatch._server_provided). ALI_CBCT walks for
+  # <landmark>/<scale>/*.pth, ALI_IOS for the O/C plus Upper/Lower tokens, and
+  # Crown_Seg for the `val-loss` token of a Fly-by-CNN training run -- so all
+  # 244 .pth files can sit side by side and each tool picks out its own.
   #
   # Two published packagings of the same CBCT weights exist:
   #
@@ -200,6 +210,31 @@ tools:
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Upper_Right_Teeth_v2.zip
         size: 2054773872
         extract: true
+      # --- Crown segmentation: not ALI's weights, and ALI still needs them ---
+      #
+      # ALI_IOS places landmarks on TEETH, so a mesh that carries no tooth-label
+      # array is nothing its networks can be asked about. Rather than refuse a
+      # cohort where half the meshes have been through Crown_Seg and half have
+      # not -- which is a distinction a clinician has no reason to be tracking --
+      # it labels the raw ones mid-run, through the supervisor, and hands
+      # Crown_Seg THE MODELS DIRECTORY IT WAS ITSELF HANDED. The checkpoint has
+      # to be inside that directory for the call to find it, and the directory
+      # is this one: GET /tools/{tool}/data is per tool, and ALI_IOS reads
+      # DATA/ALI/ (deployment.toml).
+      #
+      # Same file CrownSeg and FlexReg list, duplicated because DATA/ is per
+      # tool. 6.6 MB, so unlike AREG's 758 MB of landmark weights there is
+      # nothing to gain by hard-linking it.
+      #
+      # `dest` files it under a folder of its own rather than leaving it loose
+      # at the top: server_selectable="model" shows one dropdown entry per
+      # top-level name, and `07-21-22_val-loss0.169.pth` in ALI's model picker
+      # would read as a landmark bundle nobody should choose. The FILE NAME
+      # inside is what Crown_Seg's discovery keys on, so it is kept exactly.
+      - name: 07-21-22_val-loss0.169.pth
+        dest: Crown_Seg_Model/07-21-22_val-loss0.169.pth
+        url: https://github.com/DCBIA-OrthoLab/Fly-by-CNN/releases/download/3.0/07-21-22_val-loss0.169.pth
+        size: 6612456
     testfiles:
       - name: T1_01_U_segmented.vtk
         url: https://github.com/baptistebaquero/ALIDDM/releases/download/v1.0.4/T1_01_U_segmented.vtk
@@ -211,15 +246,17 @@ tools:
   # =========================================================================
   # CrownSeg -- per-tooth labelling of intraoral scans. LIVE on the server.
   #
-  # One checkpoint, and settings.CROWNSEG_MODEL names it: a caller that picks
-  # no model gets this one. That default is what lets ALI's IOS mode segment
-  # an unlabelled mesh without naming CrownSeg's data -- and what keeps the
-  # library from downloading the file from GitHub mid-request, which is not
-  # something a server holding patient data should do.
+  # One checkpoint. A caller that names no model is handed this whole folder
+  # and Crown_Seg finds the checkpoint in it (pipeline.find_checkpoint), which
+  # is what lets ALI's IOS mode segment an unlabelled mesh without naming
+  # Crown_Seg's data -- and what keeps the library from downloading the file
+  # from GitHub mid-request, which is not something a server holding patient
+  # data should do.
   #
-  # Same file FlexReg lists, duplicated because DATA/ is per tool.
+  # Same file FlexReg lists, and ALI now lists too, duplicated because DATA/ is
+  # per tool.
   # =========================================================================
-  CrownSeg:
+  Crown_Seg:
     models:
       - name: 07-21-22_val-loss0.169.pth
         url: https://github.com/DCBIA-OrthoLab/Fly-by-CNN/releases/download/3.0/07-21-22_val-loss0.169.pth
@@ -353,12 +390,24 @@ tools:
       # per tool: the client's dropdown lists DATA/ASO/models/ and main.py
       # resolves the name there before ASO ever runs.
       #
-      # These are the SAME weights DATA/ALI/models/ will hold. A deployment
-      # tight on disk can HARD-LINK CBCT_landmark_models/<LM> at ALI's copy
-      # (`cp -al`) instead of fetching both. NOT a symlink: data_store._resolve
-      # requires the realpath to stay inside `DATA/<tool>/<kind>/`, not merely
-      # inside DATA_DIR, so a symlink across tools is listed and then refused
-      # with "No such model" (verified 2026-08-10).
+      # These are NOT the weights DATA/ALI/models/ holds, and an earlier note
+      # here said they were -- inviting a `cp -al` that would have replaced them
+      # silently. Measured 2026-09-10: every checkpoint differs, at both scales,
+      # for every landmark compared (Ba, S, N, RPo). Two separate publications,
+      # two separate trainings of the same landmarks:
+      #
+      #     ASO   lucanchling/ALI_CBCT                models_v01
+      #     ALI   DCBIA-OrthoLab/SlicerAutomated...   v0.1-v2.0_models
+      #
+      # So DO NOT hard-link them, and do not deduplicate them. ASO's published
+      # reference planes were built with THESE weights; swapping in ALI's would
+      # move the landmarks a little, move the registration with them, and produce
+      # oriented scans nobody could tell were wrong -- every one of them
+      # plausible.
+      #
+      # Each tool keeps its own: ALI's predict for ALI, ASO's for ASO. That costs
+      # 782 MB and buys the only thing that matters here -- knowing which weights
+      # a result came from.
       #
       # Curated to the seven landmarks the published reference planes are
       # built on (ASO's own defaults), not all 112: that is 758 MB instead of
@@ -483,7 +532,7 @@ tools:
   # walks, and it reads the fold from a subdirectory named after it. Flat, the
   # bundle downloads perfectly and then no model is ever found.
   # =========================================================================
-  BatchDentalSeg:
+  Batch_Dental_Seg:
     models:
       - name: checkpoint_final.pth
         dest: UniversalLab/fold_0/checkpoint_final.pth
@@ -564,7 +613,12 @@ tools:
     # surface and this becomes two lines.
 
   # =========================================================================
-  # CLIC -- NOT PORTED YET.
+  # CLIC -- impacted canine classification. LIVE on the server.
+  #
+  # One checkpoint, and the tool loads it without being told which when the
+  # caller names none. A SECOND `.pth` staged here is therefore a refusal
+  # naming both, not a silent change of model -- upstream took the
+  # alphabetically first file, so which vintage ran depended on file names.
   # =========================================================================
   CLIC:
     models:
