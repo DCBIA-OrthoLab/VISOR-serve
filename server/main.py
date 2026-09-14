@@ -21,7 +21,7 @@ from typing import Optional
 import anyio.to_thread
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
@@ -29,7 +29,7 @@ from execution import dispatch
 from registry import facade
 from registry.facade import FacadeTool
 import file_utils
-from wire import transfer
+from wire import runs, transfer
 from base import (
     FILE_TYPES,
     FOLDER_TYPE,
@@ -51,18 +51,24 @@ os.makedirs(settings.TEMP_DIR, exist_ok=True)
 
 
 async def _reaper_loop() -> None:
-    """Sweep expired transfer directories for as long as the server runs.
+    """Sweep expired transfer and run directories for as long as the server runs.
 
     A timer, not only the opportunistic sweep transfer.py does when a session
     is created: an abandoned upload sits longest exactly when no new request
     comes in to trigger that sweep.
+
+    Runs ride the same loop rather than a second one. Their normal cleanup is
+    the request that owns them, so this is the safety net for a client that
+    vanished mid-POST -- and it is needed because a progress message is written
+    by a tool and can name a file.
     """
     while True:
         await anyio.sleep(settings.TRANSFER_SWEEP_SECONDS)
-        try:
-            await anyio.to_thread.run_sync(transfer.reap_expired)
-        except Exception:  # noqa: BLE001 - one bad sweep must not end the loop
-            logger.exception("transfer reaper sweep failed")
+        for sweep in (transfer.reap_expired, runs.reap_expired):
+            try:
+                await anyio.to_thread.run_sync(sweep)
+            except Exception:  # noqa: BLE001 - one bad sweep must not end the loop
+                logger.exception("reaper sweep failed")
 
 
 @contextlib.asynccontextmanager
@@ -118,6 +124,18 @@ _UPLOADS_FIELD = "__uploads__"
 # gets exactly the response it always got.
 _RESULT_DELIVERY_HEADER = "X-Result-Delivery"
 _DELIVER_BY_REFERENCE = "reference"
+
+# The run id, minted by the client with secrets.token_urlsafe(24) and sent on
+# the run it identifies. Optional in both directions: a client that sends none
+# gets exactly the behaviour it always got, and one that sends it to an older
+# server simply finds no /runs endpoints.
+_RUN_ID_HEADER = "X-Run-Id"
+
+# nginx's, and non-standard on purpose: no standard code means "the caller
+# withdrew this". The client has to tell a cancellation from a failure without
+# reading a message -- one closes the panel quietly, the other opens an error
+# dialog.
+CLIENT_CLOSED_REQUEST = 499
 
 # Caps how many tool executions run at once (settings.MAX_CONCURRENT_TOOLS).
 # Dedicated to tool runs, so waiting inference jobs never starve the threadpool
@@ -401,6 +419,24 @@ def list_tools() -> list:
                         if spec.groups
                         else None
                     ),
+                    # Only when a facade actually has one, unlike every other
+                    # hint above. Emitting `"groups_when": null` on every
+                    # argument of every tool would change the published shape of
+                    # tools that have nothing to do with facades, and that shape
+                    # is pinned byte for byte by tests/golden/tools_response.json
+                    # -- a fixture whose whole point is that the Slicer client
+                    # builds its panel from it, so it is not what gets updated.
+                    **({"groups_when": spec.groups_when} if spec.groups_when else {}),
+                    # Same reasoning, same shape: omitted rather than null, so a
+                    # tool that names none of its options publishes exactly what
+                    # it published before this field existed.
+                    **({"option_help": spec.option_help} if spec.option_help else {}),
+                    # Same shape again: omitted rather than null, because an
+                    # empty multichoice is a meaningful answer everywhere it is
+                    # not declared, and saying so on every argument of every
+                    # tool would change a shape pinned byte for byte.
+                    **({"min_selected": spec.min_selected} if spec.min_selected else {}),
+                    **({"select_all": True} if spec.select_all else {}),
                 }
                 for arg_name, spec in tool.arguments.items()
             },
@@ -692,6 +728,103 @@ async def delete_result(result_id: str) -> dict:
     return {"status": "ok"}
 
 
+# ----------------------------------------------------------------------
+# Run progress and cancellation
+# ----------------------------------------------------------------------
+#
+# All three are optional in both directions, exactly as the chunked-transfer
+# endpoints are: a client that never sends X-Run-Id never reaches them, and one
+# that calls them against an older server gets a 404 it is told to read as "no
+# progress here" rather than as an error. See RUN_PROGRESS.md.
+
+
+def _run_error(exc: runs.RunError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=str(exc))
+
+
+@app.get("/runs/{run_id}", dependencies=[Depends(verify_token)])
+async def run_snapshot(run_id: str) -> dict:
+    """Where a run stands, and every event it has written.
+
+    For tests, for debugging, and for a client that cannot hold a streaming
+    connection open. The Slicer client watches the event stream instead, so
+    nothing here is on any hot path.
+    """
+    try:
+        return await anyio.to_thread.run_sync(runs.snapshot, run_id)
+    except runs.RunError as exc:
+        raise _run_error(exc)
+
+
+@app.get("/runs/{run_id}/events", dependencies=[Depends(verify_token)])
+async def run_events(run_id: str) -> StreamingResponse:
+    """Server-Sent Events, oldest first, INCLUDING what was written before this
+    watcher connected.
+
+    That last part is the whole design: the client opens this from a second
+    thread the moment it has minted the id, while the first thread is still
+    blocked inside the POST, and the two cannot be ordered. A watcher that
+    attaches late must never be behind, so the stream starts from the beginning
+    of the file rather than from the moment of connection.
+
+    The file is read in a worker thread, never on the event loop: this handler
+    lives for the whole run -- hours, for a cohort -- and a blocking read here
+    would stall every other request for as long as it took.
+    """
+    try:
+        directory = await anyio.to_thread.run_sync(runs.run_directory, run_id)
+    except runs.RunError as exc:
+        raise _run_error(exc)
+
+    async def frames():
+        reader = runs.EventReader(directory)
+        while True:
+            for event in await anyio.to_thread.run_sync(reader.read):
+                yield f"data: {json.dumps(event)}\n\n".encode("utf-8")
+            if reader.finished:
+                # A terminal event was delivered, or the directory went away
+                # with the request that owned it. Either way the run is over
+                # and holding the connection open would only look like one
+                # still going.
+                return
+            await anyio.sleep(settings.RUN_EVENT_POLL_SECONDS)
+
+    return StreamingResponse(
+        frames(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-store",
+            # nginx buffers a proxied response by default, which for a stream
+            # means the client sees nothing until the run ends -- the exact
+            # failure this endpoint exists to prevent.
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.delete("/runs/{run_id}", dependencies=[Depends(verify_token)],
+            status_code=status.HTTP_204_NO_CONTENT)
+async def cancel_run(run_id: str) -> Response:
+    """Stop a run. Idempotent; `404` for an id this server never had.
+
+    Two things happen, because neither covers the whole window. The marker is
+    written first and is what a run with no process yet -- staging its inputs,
+    or queued for the card -- notices on its next poll. Then, if a process
+    group has been recorded, it is signalled: that is what actually stops a
+    two-hour nnUNet, and it works from a uvicorn worker that holds no handle on
+    that process because the group id travelled through the run directory
+    rather than through this process's memory.
+    """
+    try:
+        pgid = await anyio.to_thread.run_sync(runs.request_cancel, run_id)
+    except runs.RunError as exc:
+        raise _run_error(exc)
+    if pgid is not None:
+        await anyio.to_thread.run_sync(dispatch.kill_process_group, pgid)
+    logger.info("endpoint=/runs status=204 action=cancel signalled=%s", pgid is not None)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
 def _upload_references(raw) -> dict:
     """{argument name: upload id} from the request's `__uploads__` field."""
     if not raw:
@@ -923,8 +1056,77 @@ async def _as_resolved_path(spec, input_path: str, extension: str, work_dir: str
     return ResolvedPath(extracted, FOLDER_TYPE)
 
 
+def _registered_run(request: Request) -> Optional[str]:
+    """Claim the run id the client sent, or None when it sent none.
+
+    Called as the FIRST thing the handler does, before `await request.form()`,
+    and the ordering is the point. Parsing the form IS the multipart upload --
+    minutes of it for a CBCT, which is precisely the stretch a client today can
+    say nothing about -- and the client opens its event stream from a second
+    thread the instant it has minted the id. Registering after the form was
+    parsed would answer that watcher a 404, which the client is told to read as
+    "an older server, stop watching": the feature would silently do nothing on
+    exactly the runs it exists for. Registering first leaves a window of
+    microseconds, and the client tolerates a brief 404 to close it.
+    """
+    raw = request.headers.get(_RUN_ID_HEADER)
+    if not raw:
+        return None
+    try:
+        return runs.register(raw)
+    except runs.RunError as exc:
+        raise _run_error(exc)
+
+
 @app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
 async def run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks):
+    """The run, with its progress recorded when the client asked for it.
+
+    Everything the run actually does is in `_run_tool`; this is only the shell
+    that owns the run directory -- registering it before anything is read,
+    writing the terminal event whichever way the run ends, and taking the
+    directory down afterwards. A client that sends no `X-Run-Id` takes the
+    first branch and reaches byte-for-byte the behaviour it always had.
+    """
+    run_id = _registered_run(request)
+    if run_id is None:
+        return await _run_tool(tool_name, request, background_tasks)
+
+    # Set here, read by dispatch in the worker thread anyio copies this context
+    # into. A run id is request scope, not tool input, so it travels the way
+    # file_utils tracks scratch dirs rather than through Tool.invoke's
+    # signature -- which every tool and both dispatch paths agree on.
+    token = runs.CURRENT_RUN.set(run_id)
+    try:
+        runs.emit(runs.PHASE_RECEIVED)
+        response = await _run_tool(tool_name, request, background_tasks)
+    except dispatch.RunCancelled:
+        runs.finish(run_id, runs.PHASE_CANCELLED)
+        runs.discard(run_id)
+        logger.info("endpoint=/run/%s status=%d", tool_name, CLIENT_CLOSED_REQUEST)
+        raise HTTPException(
+            status_code=CLIENT_CLOSED_REQUEST, detail="Run cancelled by the client."
+        )
+    except BaseException:
+        # Every failure path, the 404 for an unknown tool included -- the tool
+        # is resolved after the run is registered, so that one now has a
+        # directory to clean up like any other.
+        runs.finish(run_id, runs.PHASE_FAILED)
+        runs.discard(run_id)
+        raise
+    finally:
+        runs.CURRENT_RUN.reset(token)
+
+    runs.finish(run_id, runs.PHASE_DONE)
+    # Queued rather than done now, so the directory survives until the response
+    # has finished streaming -- which gives a watcher the whole download to
+    # collect the terminal event. Waiting out the TTL instead is not an option:
+    # a progress message is written by a tool and can name a file.
+    background_tasks.add_task(runs.discard, run_id)
+    return response
+
+
+async def _run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks):
     start_time = time.monotonic()
 
     try:
@@ -997,6 +1199,7 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         if spec is not None and spec.server_selectable:
             server_file_args[field_name] = args.pop(field_name)
 
+
     work_dir = None
     input_paths = []
     resolved_files = []
@@ -1007,8 +1210,16 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     if uploaded_files or upload_references:
         work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
 
+    # For the staging events below. A position in the batch, never a file name:
+    # the message travels to a panel and is written to disk, and an input's name
+    # is the patient's.
+    staged_total = len(uploaded_files) + len(upload_references)
+    staged = 0
+
     try:
         for field_name, upload in uploaded_files.items():
+            staged += 1
+            runs.emit(runs.PHASE_STAGING, message=f"input {staged} of {staged_total}")
             _reject_upload_for_unknown_argument(tool, field_name)
             spec = tool.arguments.get(field_name)
             _reject_upload_for_scalar(spec, field_name)
@@ -1035,6 +1246,8 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         # session's blob is RENAMED into the work dir rather than copied, so a
         # chunked upload costs no extra pass over the file at all.
         for field_name, upload_id in upload_references.items():
+            staged += 1
+            runs.emit(runs.PHASE_STAGING, message=f"input {staged} of {staged_total}")
             _reject_upload_for_unknown_argument(tool, field_name)
             spec = tool.arguments.get(field_name)
             _reject_upload_for_scalar(spec, field_name)
@@ -1158,6 +1371,13 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         logger.warning("endpoint=/run/%s status=501", tool_name)
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc))
+    except dispatch.RunCancelled:
+        # The client withdrew this run. Cleaned up exactly like a failure --
+        # nothing will be streamed and the inputs are confidential -- but
+        # re-raised unchanged, because only the caller of this function knows
+        # the run id and so only it can record how the run ended.
+        _discard(work_dir, scratch_dirs)
+        raise
     except Exception:
         logger.exception("endpoint=/run/%s status=500", tool_name)
         _discard(work_dir, scratch_dirs)
@@ -1173,6 +1393,11 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
         for resolved in resolved_files:
             if resolved.is_temporary and os.path.exists(resolved.path):
                 os.remove(resolved.path)
+
+    # The tool has returned; what is left is building the response. For a cohort
+    # that is a multi-GB archive and minutes of it, so it is a phase of its own
+    # rather than a gap between the last progress message and the download.
+    runs.emit(runs.PHASE_PACKAGING)
 
     if tool.output_kind in ("file", "segmentation", "files"):
         # `result` is a path to the output file the tool wrote -- or, for

@@ -98,6 +98,25 @@ class Settings(BaseSettings):
     # own extensions. "*" accepts everything.
     ALLOWED_EXTENSIONS: tuple[str, ...] = (".nii", ".nii.gz")
 
+    # --- run progress and cancellation --------------------------------
+    # Idle TTL of a run directory, the same shape as TRANSFER_TTL_SECONDS:
+    # every event appended and every event read stamps it, so a cohort
+    # reporting progress for hours never expires under itself. The normal path
+    # removes a run with its request; this bounds the one whose client vanished
+    # mid-POST, and a progress message can name a file.
+    RUN_TTL_SECONDS: int = 900
+    # How often GET /runs/{id}/events tails the file. Small because it is the
+    # latency a clinician sees on a progress bar, and cheap because it is one
+    # read of the bytes appended since the last poll.
+    RUN_EVENT_POLL_SECONDS: float = 0.25
+    # How often a run in flight checks whether the client has cancelled it: one
+    # stat per interval, per running tool.
+    RUN_CANCEL_POLL_SECONDS: float = 1.0
+    # Events reported per run. A chatty tool in a 500-patient cohort must not
+    # fill TEMP_DIR; past the cap one "not reported" event is delivered and the
+    # rest are dropped, terminal events always excepted.
+    MAX_RUN_EVENTS: int = 2000
+
 
     @field_validator("SADT_DISPATCH_MODE")
     @classmethod
