@@ -361,7 +361,31 @@ def _packaged_tools() -> list:
         # the tool's own interpreter, and a tool that has not been synced yet
         # is not something this server could serve either.
         and os.path.isfile(os.path.join(tools, name, ".venv", "bin", "python"))
+        # AND whose source is on the branch that is checked out. A venv is
+        # gitignored, so switching branches leaves the venvs of tools that live
+        # on the other one behind -- a folder holding `.venv` and an empty
+        # `src/<package>/__pycache__`. Four of those (Agent, AutoCrop3D, CNE,
+        # DOCShapeAXI, all on `wip/integration`) failed this test for weeks,
+        # saying "expected exactly one package under src, found none": a real
+        # message about a tool that is simply not here.
+        and _has_sources(os.path.join(tools, name))
     ]
+
+
+def _has_sources(folder: str) -> bool:
+    """Whether `folder/src` holds an importable package.
+
+    The same rule describe.py applies -- a directory under `src/` with an
+    `__init__.py` -- so a folder this returns False for is one the generator
+    could not describe either.
+    """
+    src = os.path.join(folder, "src")
+    if not os.path.isdir(src):
+        return False
+    return any(
+        os.path.isfile(os.path.join(src, entry, "__init__.py"))
+        for entry in os.listdir(src)
+    )
 
 
 @pytest.mark.skipif(not _packaged_tools(), reason="the SADT-VISOR checkout is not here")
