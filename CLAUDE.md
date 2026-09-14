@@ -142,6 +142,9 @@ on that side:
 - `CLIC` - impacted canine segmentation on CBCT (torchvision Mask R-CNN).
 - `GreedyReg` - two-timepoint CBCT registration with `picsl_greedy`. No torch.
 - `AutoMatrix` - applies a transform to scans, segmentations and landmarks.
+- `FlexReg` - builds a registration patch on an intraoral arch and registers two
+  timepoints on it. Served since the image of 2026-09-14 and absent from this
+  list until then, which is how a tool ends up deployed and undocumented.
 - `AutoCrop3D` - crops a cohort of volumes to a Slicer ROI box, and can pad the
   crop back to the original geometry.
 - `DOCShapeAXI` - classifies a 3D shape (airway, condyle, cleft) and paints the
