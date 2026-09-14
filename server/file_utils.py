@@ -225,27 +225,3 @@ def _add_to_zip(zf: zipfile.ZipFile, file_path: str, arcname: str, written: set)
     # settings.ZIP_COMPRESSLEVEL); already-compressed members opt out of it.
     stored = arcname.lower().endswith(_STORED_EXTENSIONS)
     zf.write(file_path, arcname, compress_type=zipfile.ZIP_STORED if stored else None)
-
-
-# Medical volume formats the tools read and write, longest extension first so
-# ".nii.gz" is never cut short by ".nii".
-SCAN_EXTENSIONS = (".nii.gz", ".nrrd.gz", ".gipl.gz", ".nii", ".nrrd", ".gipl")
-
-# The compressed spelling ITK can WRITE for each scan extension. NIfTI and GIPL
-# take an external .gz; NRRD compresses inside the file and ITK has no
-# ".nrrd.gz" writer at all, so that spelling maps back down to ".nrrd".
-_COMPRESSED_EXTENSIONS = {".nii": ".nii.gz", ".gipl": ".gipl.gz", ".nrrd.gz": ".nrrd"}
-
-
-def split_scan_extension(filename: str) -> tuple:
-    """('scan.nii.gz') -> ('scan', '.nii.gz'), compound extensions preserved."""
-    lower = filename.lower()
-    for extension in SCAN_EXTENSIONS:
-        if lower.endswith(extension):
-            return filename[: -len(extension)], filename[-len(extension):]
-    return os.path.splitext(filename)
-
-
-def compressed_extension(extension: str) -> str:
-    """The compressed spelling ITK can write for a scan extension."""
-    return _COMPRESSED_EXTENSIONS.get(extension.lower(), extension)

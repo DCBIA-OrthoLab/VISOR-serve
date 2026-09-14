@@ -71,7 +71,6 @@ CORE = [
     "server/config.py",
     "server/data_store.py",
     "server/file_utils.py",
-    "server/transfer.py",
     "server/registry",
     "server/execution",
     "server/wire",
