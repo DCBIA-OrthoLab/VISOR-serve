@@ -60,6 +60,7 @@ the model-weight fetcher and the test-file fetcher.
 | [`docs/TOOL_GRAPH.md`](docs/TOOL_GRAPH.md) | How one tool declares a call to another |
 | [`ADDING_A_TOOL.md`](ADDING_A_TOOL.md) | Adding a tool: one `run()` function, no base class |
 | [`MIGRATING_A_TOOL.md`](MIGRATING_A_TOOL.md) | Porting an existing Slicer module into a served tool |
+| [`RUN_PROGRESS.md`](RUN_PROGRESS.md) | Reporting a run's progress, and cancelling it |
 | [`SECURITY.md`](SECURITY.md) | The threat model this server does and does not address |
 | [`server/README.md`](server/README.md) | The API surface, endpoint by endpoint |
 | [`benchmarks/`](benchmarks/) | The measurement harness, re-runnable |

@@ -279,15 +279,6 @@ def _instantiate(folder: str, cls, registry: dict):
     return instance
 
 
-def _comparable(name: str) -> str:
-    """One tool's name reduced to what does not vary between spellings.
-
-    `Batch_Dental_Seg` and `BatchDentalSeg` are the same tool written two ways,
-    so neither case nor separators may decide whether they collide.
-    """
-    return "".join(character for character in name.casefold() if character.isalnum())
-
-
 def canonical_name(name: str) -> str:
     """A tool name with case and separators removed.
 
@@ -466,7 +457,7 @@ def _build_registry() -> dict:
 
     schema_tools = len(registry)
 
-    packaged = {_comparable(name): name for name in registry}
+    packaged = {canonical_name(name): name for name in registry}
 
     legacy_root = tools_package.__path__[0] if tools_package is not None else ""
     for folder, cls in _discover_tool_classes(legacy_root):
@@ -475,7 +466,7 @@ def _build_registry() -> dict:
         # normal, `AMASSS` on both sides -- _instantiate's duplicate check fires
         # first and the tool is reported as FAILED TO LOAD, in a banner, at
         # every startup. It has not failed: it has been replaced.
-        superseded = packaged.get(_comparable(getattr(cls, "name", "") or ""))
+        superseded = packaged.get(canonical_name(getattr(cls, "name", "") or ""))
         if superseded is not None:
             logger.info(
                 "Not serving imported tool '%s': superseded by the packaged '%s'. "

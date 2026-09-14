@@ -47,8 +47,22 @@ data_dir = "ALI"
 [tools.AREG]
 dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "CBCT to IOS" = "AREG_IOSCBCT" }
 
+[tools.ASO]
+# `landmark_model` is no longer a bundle this tool HOSTS. It names the weights
+# the landmark tool predicts with, and that tool now finds its own -- so the
+# convention that reads `*_model` as "pick one from DATA/ASO/models/" would fill
+# it with ASO's own model folder and pass that on as ALI's bundle. Measured in a
+# real run on 2026-09-11: ALI received `DATA/ASO/models` and predicted with the
+# wrong weights, silently. "none" opts it out; a caller may still name a bundle
+# to pin which weights ran.
+server_selectable = { landmark_model = "none" }
+
 [tools.ALI]
-dispatch = { "CBCT" = "ALI_CBCT", "Intraoral scan" = "ALI_IOS" }
+# "IOS", the word AREG's facade already uses and the word the original
+# extension used. One tool saying "Intraoral scan" and its neighbour saying
+# "IOS" for the same thing is a difference a reader has to check is not a
+# difference.
+dispatch = { "CBCT" = "ALI_CBCT", "IOS" = "ALI_IOS" }
 
 # FlexReg's `reference` is the patient's OWN other timepoint, uploaded with the
 # rest, not a hosted bundle. The convention reads any argument named `reference`
@@ -56,6 +70,20 @@ dispatch = { "CBCT" = "ALI_CBCT", "Intraoral scan" = "ALI_IOS" }
 # empty dropdown and reporting "no model available on the server" for a tool
 # that has none and needs none. `surfaces` is likewise always uploaded: there
 # are no reference arches to run against.
+# AutoMatrix's `reference` is the SAME case, and had the same symptom: an
+# optional volume the caller supplies to define the output grid, read by the
+# convention as a hosted bundle and rendered as a dropdown over an empty
+# `DATA/AutoMatrix/models/`. A clinician could not pick their own file at all.
+# "testfile" rather than "none" so a deployment that stages a standard grid
+# offers it, while an upload stays possible either way.
+[tools.AutoMatrix]
+# Not a hosted anything. `reference` matched the `*_reference` convention and
+# was published as a MODEL, behind a dropdown of an empty models folder; making
+# it a test file only swapped that for a dropdown of whole demo datasets, which
+# is no more a reference volume than a bundle was. It is an ordinary optional
+# input the caller supplies, and the panel hides it.
+server_selectable = { reference = "none" }
+
 [tools.FlexReg]
 # Both take a hosted arch now: DATA/FlexReg/testfiles/Arches holds one upper and
 # one lower, each carrying per-tooth labels. `reference` stays out of the model

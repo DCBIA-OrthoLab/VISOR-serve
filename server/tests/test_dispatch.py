@@ -412,3 +412,92 @@ def test_a_run_that_never_touched_the_gpu_logs_no_vram_line(tmp_path, caplog):
         assert _dispatch._read_result(str(job_dir), "Surg_Mov_Pred") == "ok"
 
     assert "peak_vram_bytes" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# The models directory a tool is handed when nobody named a bundle
+# ---------------------------------------------------------------------------
+
+
+def _model_tool(name="bundle_tool"):
+    """A tool with one hosted-model argument, shaped like ALI's."""
+    import base
+
+    tool_name = name
+
+    class ModelTool(base.Tool):
+        name = tool_name
+        arguments = {
+            "scan": base.ArgSpec(type="path"),
+            "model": base.ArgSpec(type=str, server_selectable="model"),
+        }
+        output_kind = "text"
+
+        def run(self, scan, model):
+            return "ok"
+
+    return ModelTool()
+
+
+def test_a_tool_is_handed_its_models_directory_when_no_bundle_is_named(monkeypatch, tmp_path):
+    """Which weights an engine needs is the engine's business -- ALI_CBCT is the
+    CBCT engine and can want nothing else. WHERE they sit is this machine's, and
+    a tool is not allowed to know it. So the server says where and the tool says
+    which, by recognising its own bundle's shape inside."""
+    models = tmp_path / "DATA" / "bundle_tool" / "models"
+    models.mkdir(parents=True)
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(tmp_path / "DATA"))
+
+    filled = dispatch._server_provided(_model_tool(), {"scan": "/tmp/a.nii.gz"}, str(tmp_path))
+
+    assert filled["model"] == str(models)
+
+
+def test_a_bundle_the_caller_named_is_left_alone(monkeypatch, tmp_path):
+    """It fills a gap, it does not take a decision away: a supervisor chaining
+    ALI, or an API client that knows which bundle it wants, still wins."""
+    models = tmp_path / "DATA" / "bundle_tool" / "models"
+    (models / "Chosen").mkdir(parents=True)
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(tmp_path / "DATA"))
+
+    filled = dispatch._server_provided(
+        _model_tool(), {"model": str(models / "Chosen")}, str(tmp_path)
+    )
+
+    assert filled["model"] == str(models / "Chosen")
+
+
+def test_nothing_is_invented_where_no_models_are_staged(monkeypatch, tmp_path):
+    """A tool whose bundles were never downloaded must report that itself, in
+    its own words. A path to a directory that does not exist would reach the
+    engine as "not a directory", which says nothing about what is missing."""
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(tmp_path / "DATA"))
+
+    filled = dispatch._server_provided(_model_tool(), {}, str(tmp_path))
+
+    assert "model" not in filled
+
+
+def test_only_a_hosted_model_argument_is_filled(monkeypatch, tmp_path):
+    """A test file is the user's choice and an ordinary upload is theirs too;
+    neither is answered for them."""
+    import base
+
+    models = tmp_path / "DATA" / "other_tool" / "models"
+    models.mkdir(parents=True)
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(tmp_path / "DATA"))
+
+    class OtherTool(base.Tool):
+        name = "other_tool"
+        arguments = {
+            "scan": base.ArgSpec(type="path", server_selectable="testfile"),
+            "plain": base.ArgSpec(type="path"),
+        }
+        output_kind = "text"
+
+        def run(self, scan, plain):
+            return "ok"
+
+    filled = dispatch._server_provided(OtherTool(), {}, str(tmp_path))
+
+    assert filled == {}

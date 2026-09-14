@@ -24,6 +24,7 @@ and on the error paths too. Nothing here needs its own cleanup timer.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -39,6 +40,13 @@ import file_utils
 from base import ToolUnavailableError
 from config import settings
 from registry.deployment import deployment_config
+from wire import runs
+
+# The folder holding a tool's hosted weights, under DATA_DIR/<data slug>/. The
+# same name data_store.py lists models from; stated here rather than imported so
+# this module keeps depending on nothing that touches the filesystem for a
+# request.
+MODELS_DIRNAME = "models"
 
 logger = logging.getLogger("inference_server")
 
@@ -137,6 +145,51 @@ class ToolExecutionError(RuntimeError):
     500 handler, which logs the detail server-side and answers the client with
     "Tool execution failed." -- exactly what an in-process crash does today.
     """
+
+
+class RunCancelled(RuntimeError):
+    """The client withdrew this run, through `DELETE /runs/{id}`.
+
+    A class of its own, deliberately NOT a ToolFailure: main.py answers it with
+    499, and a client has to be able to tell "I stopped this" from "this broke"
+    without reading a message -- one closes the panel quietly, the other opens
+    an error dialog. Sharing an exception type with a tool that raised would
+    make that distinction a string comparison.
+    """
+
+
+def _raise_if_cancelled(run_id: Optional[str]) -> None:
+    """One stat, at each point where the run could still be stopped cheaply.
+
+    The marker is the half of cancellation that covers the window with no
+    process in it -- inputs staged, the job file about to be written, the run
+    sitting in the GPU queue. Once there IS a process, `DELETE` signals its
+    group directly and this only notices afterwards.
+    """
+    if run_id and runs.is_cancelled(run_id):
+        raise RunCancelled("The client cancelled this run.")
+
+
+@contextlib.contextmanager
+def _gpu_slot(run_id: Optional[str]):
+    """The card, waited for in a way a cancellation can interrupt.
+
+    Without a run id this is the plain blocking acquire it has always been. With
+    one, the wait is broken into RUN_CANCEL_POLL_SECONDS slices so a client that
+    gives up on a queued run is not held until the slot it no longer wants frees
+    -- which, behind a multi-hour cohort, is the longest wait in the system.
+    """
+    semaphore = _gpu_semaphore()
+    if run_id is None:
+        with semaphore:
+            yield
+        return
+    while not semaphore.acquire(timeout=settings.RUN_CANCEL_POLL_SECONDS):
+        _raise_if_cancelled(run_id)
+    try:
+        yield
+    finally:
+        semaphore.release()
 
 
 def _registered_folder(tool_name: str):
@@ -252,6 +305,27 @@ def _server_provided(tool, params: dict, job_dir: str) -> dict:
     be `settings.DEVICE` read inside each tool; a tool that no longer reads the
     environment would otherwise always run on its own default (cuda), on a
     server configured for CPU.
+
+    A hosted MODEL argument nobody named gets this tool's models DIRECTORY, and
+    the tool picks its own bundle inside it. Which weights an engine needs is
+    the engine's own business -- ALI_CBCT is the CBCT engine and can want
+    nothing else -- but WHERE they sit is this machine's, and a tool is not
+    allowed to know (CONTRIBUTING.md: "run() does not read the environment and
+    does not know about /DATA. Path resolution belongs to the server.").
+    So the server says where, and the tool says which.
+
+    That works because a bundle is recognisable by its own shape and no other:
+    measured against DATA/ALI/models/, which holds both, ALI_CBCT's
+    `discover_weights` finds its 119 landmarks under `<landmark>/<scale>/*.pth`
+    and ignores the intraoral bundle, while ALI_IOS's finds its six flat
+    checkpoints by their network and jaw tokens and ignores 238 CBCT files.
+    A tool whose weights are not recognisable there simply reports what it
+    always reported for a bundle it cannot read.
+
+    Only ever fills a gap: a supervisor chaining ALI, or an API client that
+    names its bundle, has already put it in `params` and is left alone. And
+    `model` stays a required argument of `run()`, so the tool is still usable
+    with no server at all -- a direct call passes a path, as it always did.
     """
     filled = dict(params)
     if getattr(tool, "wants_output_dir", False):
@@ -260,19 +334,39 @@ def _server_provided(tool, params: dict, job_dir: str) -> dict:
         filled["output_dir"] = output_dir
     if DEVICE_ARGUMENT in tool.arguments and DEVICE_ARGUMENT not in filled:
         filled[DEVICE_ARGUMENT] = settings.DEVICE
+    for name, spec in tool.arguments.items():
+        if getattr(spec, "server_selectable", None) != "model" or name in filled:
+            continue
+        models = os.path.join(
+            settings.DATA_DIR, deployment_config.data_slug(tool.name), MODELS_DIRNAME
+        )
+        if os.path.isdir(models):
+            filled[name] = models
     return filled
 
 
 def _write_job_file(job_dir: str, job_id: str, tool_name: str, params: dict) -> str:
-    """Write job.json. Every path in `params` is already resolved by the server
-    (uploads streamed to disk, server_selectable names looked up through
-    data_store): the tool never sees a reference it would have to resolve, and
-    never reads DATA_DIR by itself."""
+    """Write job.json.
+
+    Every path in `params` is already resolved by the server (uploads streamed
+    to disk, server_selectable names looked up through data_store): the tool
+    never sees a reference it would have to resolve for its OWN arguments.
+
+    `data_dir` is the one exception, and it is there for supervised calls only.
+    A tool asking the supervisor for a neighbour has to hand it a model bundle,
+    and nothing resolves that: `_server_provided` runs here, on the top-level
+    request, and a supervised call never passes through it. So the root is
+    published and `Supervisor.datapath` hands it on, letting a caller build
+    `<root>/<tool>/models` from a name it already holds. That works because a
+    DATA folder is named after the tool it belongs to -- harmonised 2026-09-10,
+    and the reason it was worth doing.
+    """
     job = {
         "job_id": job_id,
         "tool": tool_name,
         "job_dir": job_dir,
         "params": params,
+        "data_dir": settings.DATA_DIR,
     }
     job_path = os.path.join(job_dir, JOB_FILE)
     with open(job_path, "w", encoding="utf-8") as handle:
@@ -290,7 +384,8 @@ def _jsonable(value):
     )
 
 
-def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = None) -> dict:
+def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = None,
+                       progress_file: Optional[str] = None) -> dict:
     """The environment the tool process runs in.
 
     Inherited rather than rebuilt: tools legitimately need PATH, HOME,
@@ -310,6 +405,17 @@ def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = Non
         # chain": AREG_IOSCBCT computes for a second and spends the rest inside
         # its children, so the budget it is given has to be theirs too.
         environment["SADT_SUPERVISOR_DEADLINE"] = repr(time.monotonic() + timeout)
+    if progress_file:
+        # An absolute path to this run's events.jsonl, set ONLY when the run has
+        # a directory -- a tool that finds the variable can rely on the file
+        # existing. It is inherited by every supervised child, which is the
+        # whole implementation of chain progress: a nested tool appends to the
+        # same file as its parent, one depth deeper.
+        environment[runs.PROGRESS_FILE_ENV] = progress_file
+    else:
+        # A stale value from the server's own environment would send a tool's
+        # progress into a file belonging to nothing.
+        environment.pop(runs.PROGRESS_FILE_ENV, None)
     environment.update(
         {
             "SADT_API": settings.SADT_API,
@@ -340,7 +446,7 @@ def _stderr_tail(job_dir: str) -> str:
 
 
 def _execute(command: list, job_dir: str, environment: dict, timeout: Optional[float],
-             tool_name: str = "") -> int:
+             tool_name: str = "", run_id: Optional[str] = None) -> int:
     """Run the tool process to completion; return its exit code.
 
     stdout and stderr go to FILES, not to pipes: a tool can print for hours
@@ -375,18 +481,63 @@ def _execute(command: list, job_dir: str, environment: dict, timeout: Optional[f
         except OSError as exc:
             raise ToolExecutionError(f"Could not start the tool process: {exc}")
 
+        if run_id is not None:
+            # Both of these belong to the same instant, and the order matters:
+            # the group id is what a DELETE served by ANOTHER uvicorn worker
+            # signals, so it goes down before anything is told the run started.
+            runs.set_pgid(run_id, process.pid)
+            runs.append(run_id, runs.PHASE_RUNNING)
+            # The race the marker check exists for: a cancel written between
+            # Popen and set_pgid signalled nothing, because there was nothing
+            # recorded to signal yet.
+            if runs.is_cancelled(run_id):
+                _kill_group(process)
+                raise RunCancelled("The client cancelled this run.")
+
+        return _wait(process, timeout, tool_name, run_id)
+
+
+def _wait(process: subprocess.Popen, timeout: Optional[float], tool_name: str,
+          run_id: Optional[str]) -> int:
+    """Wait for the tool, in slices short enough to notice a cancellation.
+
+    The timeout semantics are exactly the ones a single `process.wait(timeout)`
+    had: the same budget, the same kill, the same message naming both knobs.
+    What changed is only that the wait is broken up, so a client that cancels a
+    two-hour nnUNet is not waiting for the timeout to be the thing that ends it
+    -- and so a `DELETE` served by another worker, which kills the group and
+    tells this process nothing, is read as a cancellation rather than as a tool
+    that exited with -15.
+    """
+    deadline = None if not timeout else time.monotonic() + timeout
+    poll = settings.RUN_CANCEL_POLL_SECONDS if run_id is not None else None
+    while True:
+        slice_seconds = poll
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _kill_group(process)
+                # Naming both knobs, because which one applied is not visible
+                # from the outside and the operator's next move differs: a
+                # per-tool entry raises it for this tool alone, the global
+                # setting for everything.
+                raise ToolExecutionError(
+                    f"Tool '{tool_name}' did not finish within its timeout ({timeout}s). "
+                    f"Raise it with [tools.{tool_name}] timeout_seconds in deployment.toml, "
+                    f"or TOOL_TIMEOUT_SECONDS for every tool."
+                )
+            slice_seconds = remaining if slice_seconds is None else min(slice_seconds, remaining)
         try:
-            return process.wait(timeout=timeout)
+            exit_code = process.wait(timeout=slice_seconds)
         except subprocess.TimeoutExpired:
-            _kill_group(process)
-            # Naming both knobs, because which one applied is not visible from
-            # the outside and the operator's next move differs: a per-tool entry
-            # raises it for this tool alone, the global setting for everything.
-            raise ToolExecutionError(
-                f"Tool '{tool_name}' did not finish within its timeout ({timeout}s). "
-                f"Raise it with [tools.{tool_name}] timeout_seconds in deployment.toml, "
-                f"or TOOL_TIMEOUT_SECONDS for every tool."
-            )
+            if run_id is not None and runs.is_cancelled(run_id):
+                _kill_group(process)
+                raise RunCancelled("The client cancelled this run.")
+            continue
+        # It exited. A cancel that arrived while it ran is what killed it, and
+        # the exit code says nothing useful about that.
+        _raise_if_cancelled(run_id)
+        return exit_code
 
 
 def _kill_group(process: subprocess.Popen) -> None:
@@ -419,6 +570,34 @@ def _kill_group(process: subprocess.Popen) -> None:
         # Unreapable after SIGKILL means the process is stuck in the kernel
         # (uninterruptible I/O). Nothing further is possible from here.
         logger.error("Tool process %s survived SIGKILL; it is now a zombie.", process.pid)
+
+
+def kill_process_group(pgid: int) -> None:
+    """SIGTERM a process group named only by its id. What `DELETE /runs/{id}`
+    does with the pgid the run directory recorded.
+
+    Only TERM, and only once, which is the whole difference from `_kill_group`
+    above: the endpoint holds no handle on that process -- it may well be in
+    another uvicorn worker -- so it can neither wait for it nor reap it, and a
+    blocking escalation would hold the 204 for the grace period. Escalation
+    belongs to the side that HAS the handle: the worker running `_wait` sees
+    the cancel marker on its next poll and applies the full TERM-then-KILL
+    discipline. This signal is what makes the stop immediate rather than
+    RUN_CANCEL_POLL_SECONDS late.
+
+    The pgid guard is not defensive style. `os.killpg(0, ...)` signals the
+    CALLER's group, which is this server: a truncated or absent pgid file must
+    never be able to take the API down on a cancel.
+    """
+    if not isinstance(pgid, int) or pgid <= 1:
+        logger.warning("refusing to signal an implausible process group")
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError):
+        # It finished between the marker and the signal, which is the normal
+        # case for a run cancelled just as it ended.
+        pass
 
 
 def _read_result(job_dir: str, tool_name: str) -> Any:
@@ -477,9 +656,16 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
     interpreter = _checked_interpreter(tool.name)
     runner = _checked_runner()
     job_id = job_id or uuid.uuid4().hex
+    # Set by the endpoint and carried into this worker thread by anyio's context
+    # copy. None whenever the client sent no X-Run-Id, which is what makes every
+    # progress and cancellation call below a no-op for such a run.
+    run_id = runs.CURRENT_RUN.get()
     job_dir = _create_job_dir(job_id)
 
     try:
+        # Before a byte of the job is written: a cancel that arrived while the
+        # inputs were still being staged costs nothing more than this stat.
+        _raise_if_cancelled(run_id)
         params = _server_provided(tool, params, job_dir)
         job_path = _write_job_file(job_dir, job_id, tool.name, params)
         command = [interpreter, runner, "--job", job_path]
@@ -487,16 +673,25 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
         # a cohort legitimately needs. Computed BEFORE the environment, which
         # carries it down to every supervised level as a deadline.
         timeout = deployment_config.timeout_seconds(tool.name) or None
-        environment = _child_environment(job_id, job_dir, timeout)
+        environment = _child_environment(
+            job_id, job_dir, timeout, runs.progress_file(run_id)
+        )
 
         if uses_the_gpu(tool, params):
+            # Announced before the wait, and only here: a multi-minute queue for
+            # the card is today indistinguishable from a tool that is running,
+            # which is the single most confusing thing a client can show.
+            runs.append(run_id, runs.PHASE_QUEUED_GPU)
             # Held for the whole run, and released by leaving the block on any
             # path. Blocking on purpose: the request already waits for the tool,
             # and a queue is what a single card wants.
-            with _gpu_semaphore():
-                exit_code = _execute(command, job_dir, environment, timeout, tool.name)
+            with _gpu_slot(run_id):
+                _raise_if_cancelled(run_id)
+                exit_code = _execute(command, job_dir, environment, timeout,
+                                     tool.name, run_id)
         else:
-            exit_code = _execute(command, job_dir, environment, timeout, tool.name)
+            exit_code = _execute(command, job_dir, environment, timeout,
+                                 tool.name, run_id)
 
         if exit_code != 0:
             # A tool that recorded WHICH exception it was gets to say so; the

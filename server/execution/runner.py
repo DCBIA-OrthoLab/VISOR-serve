@@ -39,6 +39,7 @@ import json
 import logging
 import os
 import subprocess
+import shutil
 import sys
 import time
 import traceback
@@ -59,6 +60,51 @@ JOB_FILE = "job.json"
 # client never sends one, because it is not data.
 SUPERVISOR_ARGUMENT = "sup"
 
+# The read-only DATA root, injected the same way and for the same reason: a tool
+# that needs its OWN model bundle can find it, without the path being a value
+# anyone passes in. Declared exactly as `sup` is -- keyword-only, unannotated --
+# so `describe.py` keeps it out of the schema and no client can name it.
+#
+# It exists because of supervised calls. The server resolves a hosted-model
+# argument on the way in, but a supervised call is not a request and never
+# passes that way, which used to leave the CALLER naming its neighbour's bundle
+# -- ASO composing a path into ALI's data folder. Now ALI answers that itself,
+# from its own name, and ASO passes only the landmarks it wants.
+DATA_ROOT_ARGUMENT = "data_root"
+
+# Where a tool writes. Over HTTP no client can name it: the server strips it from
+# the published schema and fills it with the job's own `output/`. A SUPERVISED
+# call is not a request but has the same property -- where a callee writes is the
+# infrastructure's business, not the caller's -- so the supervisor drops any
+# `output_dir` a caller passed and the callee's own runner fills it in the same
+# way, from its own job directory.
+#
+# It is injected here rather than passed down because a tool that declares no
+# `output_dir` would fail on `run(**params)` if one arrived anyway. Only the
+# runner that imported the tool can see whether it takes one.
+OUTPUT_DIR_ARGUMENT = "output_dir"
+OUTPUT_DIR_NAME = "output"
+
+# Set by a caller that wants what the tools BELOW this one produced, not only
+# this tool's own results. Declared by any tool that makes supervised calls; the
+# tool itself does nothing with it, because collecting is the same operation for
+# every chain and is done once, here, after run() returns.
+KEEP_INTERMEDIATE_ARGUMENT = "keep_intermediate"
+
+# Where the collected outputs land inside the caller's own output directory.
+INTERMEDIATE_DIRNAME = "intermediate"
+
+# The supervisor's own subtree of a job directory: one numbered folder per
+# nested call, which is what gives the collected results a name a reader can
+# match to the order the chain ran in.
+SUP_DIRNAME = "sup"
+
+# "every step", for the spellings that cannot name them: a direct Python call
+# passing True, where listing the chain would mean knowing it. Matched by
+# IDENTITY, so its contents never stand for a tool -- but non-empty, because an
+# empty set is the answer for "keep nothing" and the two must not be confused.
+_ALL_STEPS = frozenset({"*"})
+
 # A backstop, and only that. The real cycle protection is the CHAIN check below,
 # which refuses a tool already running above the call and names it; this catches
 # the other shape -- a chain that grows without ever repeating -- and nothing
@@ -76,6 +122,29 @@ MAX_SUPERVISOR_DEPTH = 10
 # down so every level can give its child only the time it has left. See
 # _remaining_seconds.
 SUPERVISOR_DEADLINE_ENV = "SADT_SUPERVISOR_DEADLINE"
+
+# The file a tool appends its progress to, absolute, set by the server only when
+# the run has a directory to hold it. Inherited by every supervised child, so a
+# chain writes one file and `depth` is what tells the levels apart -- which is
+# the whole implementation of chain progress.
+#
+# It is NOT the recommended way for a tool to report progress. A tool appends to
+# this path itself, with its own ~15-line helper; only the four tools that
+# already take a supervisor reach it through sup.progress(), and they keep
+# working unchanged. See RUN_PROGRESS.md.
+PROGRESS_FILE_ENV = "SADT_PROGRESS_FILE"
+
+# One record, one write(), and under PIPE_BUF so the append is atomic against
+# every other level of the chain. 200 characters of message cannot approach it;
+# the check exists because the message comes from a tool.
+MAX_PROGRESS_MESSAGE = 200
+MAX_PROGRESS_RECORD_BYTES = 4096
+
+# The disk backstop, and the only one this side can enforce: a tool's process
+# cannot know how many events the run already holds -- several processes of one
+# chain append to the same file -- so it bounds the BYTES it can add rather than
+# the count. The server applies the real MAX_RUN_EVENTS cap when it reads.
+MAX_PROGRESS_FILE_BYTES = 8 * 1024 * 1024
 
 # The tools already on the stack, innermost last, as one comma-separated value.
 # It travels in the environment rather than in job.json because it belongs to
@@ -332,8 +401,79 @@ def _configure_logging() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Progress
+# ---------------------------------------------------------------------------
+
+def _append_progress(fraction, message, depth: int) -> None:
+    """Append one progress record to SADT_PROGRESS_FILE, if there is one.
+
+    Best effort in the strictest sense: nothing here may reach the tool. A run
+    that cannot report its progress is a run, and turning a failed `write` into
+    a failed cohort would be an absurd trade.
+
+    Three things make the append safe with several processes of one chain
+    writing to the same file, and all three are load-bearing:
+
+    - `O_APPEND`, never a seek. Two writers cannot land on the same offset.
+    - ONE `write()` of under PIPE_BUF, which POSIX makes atomic, so a record
+      never interleaves with another level's.
+    - No `O_CREAT`. The server creates the file when it registers the run; a
+      stale variable inherited from somewhere else must not cause this to
+      litter whatever it points at.
+
+    The file's SIZE is the only cap this side can apply. How many events a run
+    already holds is not knowable from here -- a chain appends from several
+    processes -- so the count is capped by the server when it reads, and the
+    bytes are capped here, which is what actually protects the disk.
+    """
+    path = os.environ.get(PROGRESS_FILE_ENV)
+    if not path:
+        return
+    try:
+        try:
+            value = float(fraction)
+            if value != value or value in (float("inf"), float("-inf")):
+                value = None
+            else:
+                value = min(1.0, max(0.0, value))
+        except (TypeError, ValueError):
+            value = None
+        text = "" if message is None else str(message)
+        # `at` and `depth`, and nothing else the server would only override:
+        # a tool's line says how far along it is, never what phase the RUN is
+        # in. These two are facts only this side knows -- the depth of a
+        # supervised level, and when the line was actually written rather than
+        # when a poll happened to notice it.
+        record = {
+            "at": time.time(),
+            "fraction": value,
+            # A newline inside a record would be read as the end of it, and a
+            # message is free text written by a tool.
+            "message": text.replace("\r", " ").replace("\n", " ")[:MAX_PROGRESS_MESSAGE],
+            "depth": depth,
+        }
+        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(payload) > MAX_PROGRESS_RECORD_BYTES:
+            return
+        handle = os.open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            if os.fstat(handle).st_size + len(payload) > MAX_PROGRESS_FILE_BYTES:
+                return
+            os.write(handle, payload)
+        finally:
+            os.close(handle)
+    except Exception:  # noqa: BLE001 - progress must never break a run
+        pass
+
+
+# ---------------------------------------------------------------------------
 # The supervisor
 # ---------------------------------------------------------------------------
+
+def _takes_data_root(run) -> bool:
+    """Does this run() ask for the DATA root? Same shape rule as `sup`."""
+    return _declares_injected(run, DATA_ROOT_ARGUMENT)
+
 
 def _takes_supervisor(run) -> bool:
     """Does this run() ask for a supervisor?
@@ -344,15 +484,90 @@ def _takes_supervisor(run) -> bool:
     nothing else this shape could be, and a tool cannot grow a supervisor by
     forgetting a type.
     """
+    return _declares_injected(run, SUPERVISOR_ARGUMENT)
+
+
+def _takes(run, name: str) -> bool:
+    """Whether run() has a parameter of that name, injected or not."""
     try:
-        parameter = inspect.signature(run).parameters.get(SUPERVISOR_ARGUMENT)
+        return name in inspect.signature(run).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _wanted_steps(value) -> set:
+    """Which steps of the chain a caller asked to keep.
+
+    A multichoice arrives as `{tool: ticked}` -- every declared option, so an
+    unticked one is present and False rather than missing. The other spellings
+    are here because this runner is also driven by `scripts/run_tool.py`, where
+    a developer writes a list, and by a direct Python call, where `True` is the
+    obvious way to say "all of them".
+    """
+    if value is True:
+        return _ALL_STEPS
+    if isinstance(value, dict):
+        return {str(name) for name, on in value.items() if on}
+    if isinstance(value, (list, tuple, set)):
+        return {str(name) for name in value}
+    return set()
+
+
+def _collect_supervised_outputs(job_dir: str, output_dir, wanted: set) -> list:
+    """Move what the WANTED supervised calls produced under `output_dir`.
+
+    One folder per kept call, named as the supervisor named it -- `01_ALI_CBCT`
+    -- so a reader can match a result to the order the chain ran in, and two
+    calls to the same tool stay apart.
+
+    What is collected is only the callee's OWN output directory. A chain's work
+    dir also holds the caller's inputs unpacked, its reference bundle, its
+    conversions; returning those would send a patient's own scans back to them
+    and double an archive to do it. What a supervised tool produced is the part
+    nobody can otherwise see.
+
+    Moved, not copied: both sides are in the same job directory, so it is a
+    rename, and the job directory is removed either way.
+    """
+    root = os.path.join(job_dir, SUP_DIRNAME)
+    if not wanted or not output_dir or not os.path.isdir(root):
+        return []
+
+    collected = []
+    for entry in sorted(os.listdir(root)):
+        # "01_ALI_CBCT" -> "ALI_CBCT". The number is the call's position, which
+        # is what keeps two calls to one tool from colliding.
+        _, _, tool = entry.partition("_")
+        if wanted is not _ALL_STEPS and tool not in wanted:
+            continue
+        produced = os.path.join(root, entry, OUTPUT_DIR_NAME)
+        if not os.path.isdir(produced) or not os.listdir(produced):
+            # A call that wrote nowhere. Nothing to say about it: the run
+            # succeeded, and an empty folder would read as a lost result.
+            continue
+        destination = os.path.join(str(output_dir), INTERMEDIATE_DIRNAME, entry)
+        os.makedirs(os.path.dirname(destination), exist_ok=True)
+        shutil.move(produced, destination)
+        collected.append(destination)
+    return collected
+
+
+def _declares_injected(run, name: str) -> bool:
+    """A keyword-only, UNANNOTATED parameter of that name.
+
+    Unannotated is the marker rather than an accident: every other parameter
+    must be annotated, so there is nothing else this shape could be, and a tool
+    cannot grow one of these by forgetting a type.
+    """
+    try:
+        parameter = inspect.signature(run).parameters.get(name)
         hints = typing.get_type_hints(run)
     except Exception:  # noqa: BLE001 - an unresolvable annotation is not fatal
         return False
     return (
         parameter is not None
         and parameter.kind is parameter.KEYWORD_ONLY
-        and SUPERVISOR_ARGUMENT not in hints
+        and name not in hints
     )
 
 
@@ -418,7 +633,8 @@ class _Supervisor:
             )
         return left
 
-    def __init__(self, tools_dir: str, job_dir: str, depth: int, chain=(), job_id=None, root=None):
+    def __init__(self, tools_dir: str, job_dir: str, depth: int, chain=(), job_id=None,
+                 root=None, data_dir=None):
         self._tools_dir = tools_dir
         self._job_dir = job_dir
         self._depth = depth
@@ -440,6 +656,20 @@ class _Supervisor:
         # than inside what the caller keeps.
         self.tmp = Path(job_dir) / "tmp"
         self.tmp.mkdir(parents=True, exist_ok=True)
+        # The read-only DATA root, for building a NEIGHBOUR's model path:
+        #
+        #     sup.run("ALI_CBCT", model=sup.datapath / "ALI" / "models", ...)
+        #
+        # A tool's own arguments are resolved by the server before it ever runs,
+        # and this does not change that. What it answers is the one thing the
+        # server cannot: a supervised call is not a request, so it never passes
+        # through the admission path where a hosted-model argument is filled in,
+        # and the caller has to name the bundle itself.
+        #
+        # A NAME is all the caller needs -- a DATA folder is named after the tool
+        # it belongs to (harmonised 2026-09-10). None on a deployment that
+        # publishes no root, which a tool must handle rather than assume.
+        self.datapath = Path(data_dir) if data_dir else None
 
     # -- the frozen interface ----------------------------------------------
 
@@ -462,6 +692,14 @@ class _Supervisor:
             )
 
         interpreter = self._interpreter(tool)
+        # Where a callee writes is not the caller's to choose, exactly as it is
+        # not an HTTP client's: the server strips `output_dir` from the
+        # published schema and fills it with the job's own output/. Dropping it
+        # here gives a supervised call the same property, and it is what lets
+        # `keep_intermediate` find what a chain produced -- a callee pointed at
+        # the caller's scratch directory has its results deleted with it, before
+        # anything could collect them.
+        params.pop(OUTPUT_DIR_ARGUMENT, None)
         self._calls += 1
         nested_dir = os.path.join(self._job_dir, "sup", f"{self._calls:02d}_{tool}")
         os.makedirs(os.path.join(nested_dir, "output"), exist_ok=True)
@@ -477,6 +715,9 @@ class _Supervisor:
                     "params": params,
                     "parent": self._job_id,
                     "root": self._root,
+                    # Inherited, or a tool two levels down could not reach a
+                    # neighbour's models while its parent could.
+                    "data_dir": str(self.datapath) if self.datapath else None,
                 },
                 handle,
                 default=_jsonable,
@@ -562,6 +803,7 @@ class _Supervisor:
             self.log(f"{float(fraction):.0%} {message}")
         except (TypeError, ValueError):
             self.log(str(message))
+        _append_progress(fraction, message, self._depth)
 
     def log(self, message: str) -> None:
         # Through logging, not print: the runner owns handlers and the server
@@ -692,6 +934,7 @@ def _supervisor_for(run, job: dict):
         chain=chain,
         job_id=job.get("job_id"),
         root=job.get("root"),
+        data_dir=job.get("data_dir"),
     )
 
 
@@ -724,13 +967,42 @@ def main(argv=None) -> int:
         job = _load_job(arguments.job)
         module = _import_tool(job["tool"], os.path.join(_tool_dir(), SRC_DIR_NAME))
         run = _run_function(module, job["tool"])
-        arguments = _call_arguments(run, job["params"])
+        params = dict(job["params"])
+        # Taken back out before the tool ever sees it: no tool declares this
+        # argument. The server publishes it for anything that calls another
+        # tool, and collecting what a chain produced is done below -- once,
+        # here, rather than written into every orchestrating tool.
+        keep_intermediate = _wanted_steps(params.pop(KEEP_INTERMEDIATE_ARGUMENT, None))
+        if _takes(run, OUTPUT_DIR_ARGUMENT) and OUTPUT_DIR_ARGUMENT not in params:
+            # A supervised call arrives without one: the supervisor drops what
+            # the caller passed, for the same reason the server strips it from
+            # the published schema. Filled from this job's own directory, which
+            # is what dispatch does for a request.
+            nested_output = os.path.join(job["job_dir"], OUTPUT_DIR_NAME)
+            os.makedirs(nested_output, exist_ok=True)
+            params[OUTPUT_DIR_ARGUMENT] = nested_output
+        arguments = _call_arguments(run, params)
         supervisor = _supervisor_for(run, job)
         if supervisor is not None:
             # Injected, never taken from job.json: it is not data, and a client
             # that could name one would be naming a process to start.
             arguments[SUPERVISOR_ARGUMENT] = supervisor
+        if _takes_data_root(run) and job.get("data_dir"):
+            # A path, not a value: the tool builds its own bundle path under it
+            # and nobody outside names one.
+            arguments[DATA_ROOT_ARGUMENT] = Path(job["data_dir"])
         result = run(**arguments)
+        if keep_intermediate:
+            # After run(), never before: a tool removes its own scratch on the
+            # way out, and what a chain produced has to survive that.
+            collected = _collect_supervised_outputs(
+                job["job_dir"], arguments.get(OUTPUT_DIR_ARGUMENT), keep_intermediate
+            )
+            if collected:
+                print(
+                    "kept what {} supervised call(s) produced".format(len(collected)),
+                    file=sys.stderr,
+                )
         _write_result(job["job_dir"], result)
     except RunnerError as exc:
         # Ours, and already precise: the traceback would only point back here.

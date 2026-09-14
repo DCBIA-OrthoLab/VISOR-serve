@@ -32,19 +32,14 @@ import os
 import re
 import secrets
 import shutil
-import time
 from dataclasses import dataclass
 from typing import Optional
 
 from config import settings
+from wire import _scratch
 
 logger = logging.getLogger("inference_server.transfer")
 
-# Ids go straight into a filesystem path, so they are matched against this
-# BEFORE any path is built from them -- "../../etc" must never be looked up,
-# not even to be reported as missing. token_urlsafe's alphabet is exactly
-# [A-Za-z0-9_-], so a legitimate id always passes.
-_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 _META_NAME = "meta.json"
 _BLOB_NAME = "blob"
@@ -70,7 +65,7 @@ def _result_root() -> str:
 
 
 def _validated_dir(root: str, identifier: str, kind: str) -> str:
-    if not _ID_RE.match(identifier or ""):
+    if not _scratch.is_valid_id(identifier or ""):
         raise TransferError(f"Malformed {kind} id.", status_code=404)
     path = os.path.join(root, identifier)
     if not os.path.isdir(path):
@@ -96,19 +91,11 @@ def _write_meta(directory: str, meta: dict) -> None:
 # Expiry
 # ----------------------------------------------------------------------
 
-def touch(directory: str) -> None:
-    """Mark a session or result as still in use, right now.
-
-    Called on every part written and every range read, which is what makes
-    TRANSFER_TTL_SECONDS an IDLE timeout rather than an age limit: a transfer
-    still moving can take as long as it needs, one whose client vanished
-    expires quickly. Best effort -- a failed `utime` costs an early reap, never
-    a failed request.
-    """
-    try:
-        os.utime(directory)
-    except OSError as exc:
-        logger.debug("could not touch %s: %s", directory, exc)
+# Called on every part written and every range read, which is what makes
+# TRANSFER_TTL_SECONDS an IDLE timeout rather than an age limit: a transfer
+# still moving can take as long as it needs, one whose client vanished expires
+# quickly. Re-exported because main.py calls `transfer.touch`.
+touch = _scratch.touch
 
 
 def reap_expired(now: Optional[float] = None) -> int:
@@ -119,28 +106,12 @@ def reap_expired(now: Optional[float] = None) -> int:
     transfer sits longest exactly when no new request arrives to trigger the
     opportunistic sweep, so an idle server would hold patient data forever.
     """
-    now = time.time() if now is None else now
-    deadline = now - settings.TRANSFER_TTL_SECONDS
-    removed = 0
-    for root in (_upload_root(), _result_root()):
-        try:
-            entries = os.listdir(root)
-        except FileNotFoundError:
-            continue
-        for entry in entries:
-            directory = os.path.join(root, entry)
-            try:
-                if os.path.getmtime(directory) > deadline:
-                    continue
-            except OSError:
-                continue
-            # ignore_errors: several uvicorn workers run their own reaper, so
-            # losing the race to delete the same directory is expected.
-            shutil.rmtree(directory, ignore_errors=True)
-            removed += 1
-    if removed:
-        logger.info("transfer reaper removed %d expired directory(ies)", removed)
-    return removed
+    return _scratch.reap(
+        (_upload_root(), _result_root()),
+        settings.TRANSFER_TTL_SECONDS,
+        "transfer",
+        now,
+    )
 
 
 # ----------------------------------------------------------------------

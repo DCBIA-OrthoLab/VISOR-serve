@@ -46,8 +46,12 @@ def make_tool(tools_dir: Path, name: str, body: str) -> Path:
     return tools_dir / name
 
 
-def run_job(tools_dir: Path, name: str, job_dir: Path, params: dict):
-    """Invoke the runner exactly as the server does, and hand back result.json."""
+def run_job(tools_dir: Path, name: str, job_dir: Path, params: dict, env: dict = None):
+    """Invoke the runner exactly as the server does, and hand back result.json.
+
+    `env` adds to the inherited environment, which is how the server passes the
+    variables a run carries -- SADT_PROGRESS_FILE among them.
+    """
     job_dir.mkdir(parents=True, exist_ok=True)
     (job_dir / "output").mkdir(exist_ok=True)
     job_path = job_dir / "job.json"
@@ -61,6 +65,7 @@ def run_job(tools_dir: Path, name: str, job_dir: Path, params: dict):
         [str(tools_dir / name / ".venv" / "bin" / "python"), str(RUNNER),
          "--job", str(job_path)],
         capture_output=True, text=True, cwd=str(job_dir),
+        env=dict(os.environ, **(env or {})),
     )
     result = {}
     if (job_dir / "result.json").is_file():
@@ -77,6 +82,11 @@ LEAF = """
         return output_dir
 """
 
+# It names an `output_dir` for the callee and the supervisor drops it -- where a
+# supervised tool writes is not the caller's to choose. Left written that way on
+# purpose: it is how ASO and ALI_IOS were spelled, and it has to keep working,
+# because the caller learns where its callee wrote from the RETURN value.
+# `test_keep_intermediate.py` is where that overruling is asserted directly.
 CALLER = """
     def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
         \"\"\"Call the leaf tool, then write what it produced.\"\"\"
@@ -543,3 +553,101 @@ def test_a_tool_can_call_one_in_another_catalogue(tools_dir, tmp_path, monkeypat
         {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_progress_from_a_chain_lands_in_one_file_with_its_depth(tools_dir, tmp_path):
+    """`SADT_PROGRESS_FILE` is inherited, so a child appends to its parent's
+    file one level deeper. That is the whole implementation of chain progress:
+    a panel shows `AREG -> ASO 30%` without the client knowing what a chain is,
+    and no level had to be told about any other.
+
+    The supervisor is the COMPATIBILITY path here, not the recommended one --
+    a tool appends to that file itself (see RUN_PROGRESS.md). It is what these
+    two fixtures happen to have, and it must keep working.
+    """
+    make_tool(tools_dir, "Leaf", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Report from one level down.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.progress(0.9, "leaf: scan 9 of 10")
+        return output_dir
+    """)
+    make_tool(tools_dir, "Caller", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Report, then call the leaf, then report again.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.progress(0.1, "caller: starting")
+        sup.run("Leaf", scans=scans, output_dir=sup.tmp / "leaf")
+        sup.progress(1.0, "caller: done")
+        return output_dir
+    """)
+
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text("", encoding="utf-8")
+
+    completed, _ = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env={"SADT_PROGRESS_FILE": str(events_file)},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    records = [json.loads(line) for line in
+               events_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+    # Interleaved in the order they happened, and the depth is what tells the
+    # levels apart -- the child never learned it was in a chain.
+    assert [(record["depth"], record["fraction"]) for record in records] == [
+        (0, 0.1), (1, 0.9), (0, 1.0)
+    ]
+    # Nothing else: a tool's line says how far along it is, and the server
+    # stamps the phase, the state and the sequence when it reads them back.
+    assert all(set(record) == {"at", "fraction", "message", "depth"}
+               for record in records)
+
+
+def test_a_tool_reporting_progress_with_no_file_set_is_a_no_op(tools_dir, tmp_path):
+    """The variable is absent for every run whose client sent no id, which is
+    every run today. sup.progress() must stay exactly what it was: a log line."""
+    make_tool(tools_dir, "Leaf", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Report into nothing at all.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.progress(0.5, "halfway")
+        return output_dir
+    """)
+
+    completed, result = run_job(
+        tools_dir, "Leaf", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert result["result"]
+    assert "50% halfway" in completed.stderr
+
+
+def test_a_progress_file_that_does_not_exist_never_reaches_the_tool(tools_dir, tmp_path):
+    """Best effort means best effort: the append opens without O_CREAT, so a
+    stale variable pointing nowhere costs a no-op rather than a failed cohort."""
+    make_tool(tools_dir, "Leaf", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Report into a file that was never created.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.progress(0.5, "halfway")
+        return output_dir
+    """)
+
+    completed, result = run_job(
+        tools_dir, "Leaf", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env={"SADT_PROGRESS_FILE": str(tmp_path / "gone" / "events.jsonl")},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert result["result"]
+    assert not (tmp_path / "gone").exists()

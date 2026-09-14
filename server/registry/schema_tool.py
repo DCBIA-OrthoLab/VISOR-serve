@@ -134,6 +134,10 @@ DEFAULT_RETURN_KIND = "text"
 _ARGUMENT_KEYS = (
     "type", "required", "default", "description", "extensions", "choices",
     "section", "ui", "groups", "visible_when", "options_when", "label", "hidden",
+    "option_help", "min_selected",
+    # MULTICHOICE only: offer a "select all" / "select none" pair above the
+    # options. For a catalogue nobody would tick one box at a time.
+    "select_all",
     # A "vec2"'s two axes. Alone among the keys here they reach validate():
     # a value outside them is refused, not merely left un-rendered.
     "x_range", "y_range",
@@ -153,7 +157,7 @@ OUTPUT_DIR_ARGUMENT = "output_dir"
 # as unknown, and so a deployment can be told which tools need siblings present.
 _TOP_LEVEL_KEYS = (
     "name", "description", "arguments", "returns", "source_hash", "supervisor",
-    "calls",
+    "calls", "injected_layout",
 )
 
 
@@ -288,6 +292,7 @@ def read_schema(folder: str) -> dict:
 # and nothing arrived. In one function because there are four places an ArgSpec
 # is built and three of them are easy to forget.
 _PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label",
+                      "option_help", "min_selected", "select_all",
                       "x_labels", "y_labels", "x_label", "y_label",
                       "section_columns", "cell")
 
@@ -327,6 +332,80 @@ def _presentation(declaration: dict, argument_name: str = "") -> dict:
         except (TypeError, ValueError):
             raise SchemaError("{!r} must be two numbers.".format(axis))
     return hints
+
+
+# The argument a chaining tool never declares. Named here rather than imported
+# from `execution.runner`, which is executed by a TOOL's interpreter and must
+# stay standard-library only; the two are pinned equal by a test.
+KEEP_INTERMEDIATE_ARGUMENT = "keep_intermediate"
+
+# Its own box on the panel. Named once here: the tools do not declare the
+# argument, so there is nowhere else this could be written.
+KEEP_INTERMEDIATE_SECTION = "Intermediate results"
+
+# The section the client fills with the output folder. An argument landing
+# in it is the marker for "everything after this is about the result".
+_OUTPUTS_SECTION = "Outputs"
+
+
+def _keep_intermediate_spec(calls: tuple, layout: dict) -> ArgSpec:
+    """The steps of a chain, each one keepable, for a tool that calls others.
+
+    A MULTICHOICE over the tools this one runs, every option off: the ordinary
+    run wants the result, and a caller who ticks a step is asking to see the
+    working -- the landmarks a prediction placed, the meshes a segmentation
+    labelled -- usually to check it before trusting what was built on top.
+
+    The options are the tool names, which is what `describe.py` read out of
+    `sup.run(...)` and what the registry has already checked names something
+    real. That is also what a reader sees elsewhere in the extension, so a step
+    called `Crown_Seg` is recognisable rather than jargon.
+
+    `select_all` because a chain of four is four boxes nobody wants to tick one
+    at a time; `inline` because the names are short and there are never many.
+    """
+    return ArgSpec(
+        type=MULTICHOICE_TYPE,
+        required=False,
+        choices={tool: False for tool in calls},
+        description=(
+            "Return what a step produced, beside this tool's own results. Each "
+            "one is written under `intermediate/` in the output folder."
+        ),
+        label=layout.get("label") or "Steps to keep",
+        # A section of its own, and NOT "Advanced": this decides what comes back
+        # from the run, which is a question about the result rather than a knob
+        # on how it is computed. Placed just above Outputs by `_ordered_with`.
+        section=layout.get("section") or KEEP_INTERMEDIATE_SECTION,
+        ui=layout.get("ui") or "inline",
+        select_all=True,
+        option_help=layout.get("option_help"),
+        visible_when=layout.get("visible_when"),
+        hidden=bool(layout.get("hidden")),
+    )
+
+
+def _ordered_with(arguments: dict, name: str, spec: ArgSpec) -> dict:
+    """`arguments` with `spec` inserted just before the first output argument.
+
+    Section order is argument order -- the client lists boxes in the order the
+    schema first mentions them -- so where this lands in the dict IS where the
+    box lands on the panel. Before the outputs, because what a run returns is
+    read together: the steps to keep, then where everything is written.
+
+    Appended when a tool names no output argument at all: the client adds its
+    own "Outputs" box after every declared section, so the end is still just
+    above it.
+    """
+    placed, inserted = {}, False
+    for argument_name, argument in arguments.items():
+        if not inserted and argument.section == _OUTPUTS_SECTION:
+            placed[name] = spec
+            inserted = True
+        placed[argument_name] = argument
+    if not inserted:
+        placed[name] = spec
+    return placed
 
 
 def _argument_spec(
@@ -402,7 +481,15 @@ def _argument_spec(
         return ArgSpec(
         **_presentation(declaration, argument_name),
             type=str,
-            required=required,
+            # A hidden bundle is one the SERVER answers for: dispatch hands the
+            # tool its models directory and the engine recognises its own
+            # weights inside. Published as optional so `validate()` -- which
+            # runs before dispatch, and refused the run outright -- lets it
+            # through. The tool's own signature still requires it, so a direct
+            # call with no server behaves exactly as it always did; this only
+            # says who supplies it over HTTP. Same shape as `output_dir`, which
+            # is taken out of the published schema for the same reason.
+            required=required and not hidden,
             description=declaration.get("description", ""),
             server_selectable=selectable,
             hidden=hidden,
@@ -531,6 +618,25 @@ class SchemaTool(Tool):
             for argument_name, declaration in arguments.items()
             if argument_name != OUTPUT_DIR_ARGUMENT
         }
+        # A tool that calls another gets this WITHOUT declaring it, and that is
+        # the point: what a chain leaves behind is the same question whatever
+        # the chain, so the answer lives in one place. The tool writes nothing;
+        # `runner.py` takes the argument back out before calling run() and does
+        # the collecting itself, after the chain has finished.
+        #
+        # Keyed on `calls`, not on `supervisor`: CLIC, Crown_Seg and
+        # Surg_Mov_Pred all declare `sup` and call nobody, and a check box that
+        # can only ever collect nothing is worse than no check box.
+        if self.calls:
+            self.arguments = _ordered_with(
+                self.arguments,
+                KEEP_INTERMEDIATE_ARGUMENT,
+                _keep_intermediate_spec(
+                    self.calls,
+                    (schema.get("injected_layout") or {}).get(
+                        KEEP_INTERMEDIATE_ARGUMENT) or {},
+                ),
+            )
         self.output_kind = RETURN_KINDS.get(schema.get("returns"), DEFAULT_RETURN_KIND)
         self.source_hash = schema.get("source_hash", "")
 
