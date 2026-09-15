@@ -18,6 +18,8 @@ weights from their laptop. See schema_tool's `selectable == "model"` branch.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from . import deployment as deployment_module
 from .deployment import ToolDeployment
 
@@ -141,7 +143,62 @@ def is_model(argument_name: str) -> bool:
     return any(argument_name == name or argument_name.endswith("_" + name) for name in MODEL_NAMES)
 
 
-def derive(arguments: dict, declared: ToolDeployment) -> ToolDeployment:
+# --- splitting a cohort ----------------------------------------------------
+
+
+def batch_axis_for(arguments: dict) -> Optional[str]:
+    """The argument a cohort is split on, or None if this tool cannot be split.
+
+    The rule is "exactly one REQUIRED `path` argument", and the tools it
+    EXCLUDES are the reason it is written this way rather than "the first path
+    argument". A tool taking two required folders pairs them per patient --
+    AREG's `t1`/`t2`, AutoCrop3D's `scans`/`roi`, AutoMatrix's
+    `files`/`transforms`, GreedyReg's `t1`/`t2`. Splitting one of them without
+    splitting the other by the same key changes which scan is registered
+    against which, and that does not fail: it returns a plausible wrong result.
+
+    So a tool of that shape is never offered for batching by convention, and
+    the day a new one is added it is excluded without anyone having had to
+    notice. Naming its axis in deployment.toml stays possible and is then a
+    deliberate act, made by someone who has decided how the pairing survives.
+    """
+    required_paths = [
+        name
+        for name, declaration in arguments.items()
+        if isinstance(declaration, dict)
+        and declaration.get("type") == "path"
+        and declaration.get("required")
+    ]
+    return required_paths[0] if len(required_paths) == 1 else None
+
+
+def batch_plan(arguments: dict, declared: ToolDeployment, defaults: tuple) -> Optional[dict]:
+    """How a client should split a cohort for this tool, or None to send it whole.
+
+    `defaults` is this server's `(max MB, max files)`. A tool may override
+    either -- the same escape hatch `max_upload_mb` and `timeout_seconds` have
+    -- but the normal case is that it does not, batching being a property of
+    the deployment and not of the tool.
+    """
+    if declared.batch_enabled is False:
+        return None
+    axis = declared.batch_axis or batch_axis_for(arguments)
+    if not axis:
+        return None
+
+    max_mb, max_files = defaults
+    if declared.batch_max_mb is not None:
+        max_mb = declared.batch_max_mb
+    if declared.batch_max_files is not None:
+        max_files = declared.batch_max_files
+    # Either number alone is a usable plan; both off is how a deployment turns
+    # batching off without editing a tool table.
+    if max_mb <= 0 and max_files <= 0:
+        return None
+    return {"axis": axis, "max_mb": max_mb, "max_files": max_files}
+
+
+def derive(arguments: dict, declared: ToolDeployment, batch_defaults: tuple) -> ToolDeployment:
     """`declared` (from deployment.toml) merged over these conventions.
 
     Anything stated explicitly wins, per argument, so an exception costs one
@@ -167,4 +224,5 @@ def derive(arguments: dict, declared: ToolDeployment) -> ToolDeployment:
         max_upload_mb=declared.max_upload_mb,
         data_dir=declared.data_dir,
         hidden=tuple(sorted(hidden)),
+        batch=batch_plan(arguments, declared, batch_defaults),
     )

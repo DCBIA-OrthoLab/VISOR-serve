@@ -602,6 +602,11 @@ class SchemaTool(Tool):
         # the server would send something meaningless, and offered nothing
         # would make every run a 422 for a missing required argument.
         self.wants_output_dir = OUTPUT_DIR_ARGUMENT in arguments
+        # How a client splits a cohort for this tool, or None to send it
+        # whole. Resolved once here rather than per request: it depends on
+        # the schema and on deployment.toml, and neither moves under a
+        # running server.
+        self.batch = deployment.batch
         # The runner builds one when it sees `*, sup` in the signature; this is
         # the same fact, published, so `/tools` can say a chain is involved and
         # a deployment check can verify the siblings are actually installed.
@@ -719,7 +724,11 @@ def load_tool(folder: str, config, name: str = None) -> SchemaTool:
         )
 
     arguments = schema.get("arguments") or {}
-    deployment = conventions.derive(arguments if isinstance(arguments, dict) else {}, config.for_tool(name))
+    deployment = conventions.derive(
+        arguments if isinstance(arguments, dict) else {},
+        config.for_tool(name),
+        config.batch_defaults,
+    )
     tool = SchemaTool(folder, schema, deployment)
     try:
         tool.check_schema()

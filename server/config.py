@@ -80,6 +80,30 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_GPU_JOBS: int = 1
     TOOL_TIMEOUT_SECONDS: float = 0  # 0 = none; a cohort legitimately takes hours
 
+    # --- splitting a cohort -------------------------------------------
+    #
+    # A folder of 20 CBCTs is ~2 GB sent as one archive: the card sits idle
+    # until its last byte lands, nothing survives a connection that drops at
+    # 95%, and it is over MAX_UPLOAD_MB anyway. A client splits such a folder
+    # into batches and sends each as its own run; these two numbers are what
+    # this server tells it to split on.
+    #
+    # **Megabytes, not a file count, and that is the whole design.** What a
+    # batch protects is the server's own bandwidth, disk and upload limit --
+    # none of which is a property of a tool, so none of which belongs in a
+    # per-tool table. Sizing by bytes also gets for free what a fixed count
+    # cannot: 20 intraoral surfaces of 5 MB batch together, 8 CBCTs of 50 MB do
+    # not, and a cohort of unusually large volumes shrinks its own batches --
+    # with nobody having had to write "IOS" or "CBCT" anywhere.
+    #
+    # Deliberately under MAX_UPLOAD_MB: a batch that cannot be uploaded is a
+    # cohort split into pieces that each answer 413.
+    BATCH_MAX_MB: int = 400
+    # The ceiling bytes cannot supply. 5 000 clinical notes of 20 KB are 100 MB
+    # -- one batch, comfortably under the cap, and not one partial result until
+    # the last note is done. Whichever of the two binds first wins.
+    BATCH_MAX_FILES: int = 25
+
     # --- uploads and results ------------------------------------------
     MAX_UPLOAD_MB: int = 500  # over this, 413
     MAX_EXTRACTED_MB: int = 2000  # zip-bomb cap on an extracted archive, 400
