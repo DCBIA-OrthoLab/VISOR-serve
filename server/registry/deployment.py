@@ -61,7 +61,12 @@ CONFIG_AHEAD_MARKER = "DEPLOYMENT-CONFIG-AHEAD-OF-SERVER"
 
 
 _TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden",
-              "timeout_seconds", "dispatch")
+              "timeout_seconds", "dispatch", "batch")
+
+# What a [tools.X] `batch` table may say. `axis` names the argument a cohort is
+# split on when the convention cannot derive it; the two caps override this
+# server's own numbers for this tool alone.
+_BATCH_KEYS = ("axis", "max_mb", "max_files")
 
 
 class DeploymentConfigError(Exception):
@@ -148,16 +153,59 @@ class ToolDeployment:
     # every fast tool that hangs holds a slot until then.
     timeout_seconds: Optional[float] = None
 
+    # --- splitting a cohort, as deployment.toml declared it ---------------
+    #
+    # `batch = false` on a tool whose model load is what a run costs. CNE holds
+    # a 4.4 GB GGUF and loads it once per call: splitting a cohort of notes into
+    # five batches is five loads of 4.4 GB to save nothing, the notes themselves
+    # being kilobytes. The server cannot see that from a schema -- what a tool
+    # pays to start is the one input to this decision that is genuinely the
+    # tool's -- so it is declared.
+    batch_enabled: Optional[bool] = None
+    # `batch = { axis = "scans" }` where the convention derives none. See
+    # conventions.batch_axis_for for what declaring this takes responsibility
+    # for: a tool with two required folders pairs them per patient.
+    batch_axis: Optional[str] = None
+    # Overrides of this server's own caps, for this tool alone. Normally unset:
+    # how much this deployment sends at once is the deployment's business, not
+    # the tool's, which is the whole reason the numbers live in config.py.
+    batch_max_mb: Optional[int] = None
+    batch_max_files: Optional[int] = None
+
+    # The RESOLVED plan a client is handed -- `{axis, max_mb, max_files}`, or
+    # None for a cohort that travels whole. Filled by conventions.derive, never
+    # read from the file: the fields above are what was declared, this is what
+    # those declarations came to once the conventions and the server's numbers
+    # had their say.
+    batch: Optional[dict] = None
+
 
 _NOTHING_DECLARED = ToolDeployment()
 
 
 class DeploymentConfig:
-    def __init__(self, tools: dict):
+    def __init__(self, tools: dict, batch: Optional[dict] = None):
         self._tools = tools
+        self._batch = batch or {}
 
     def for_tool(self, tool_name: str) -> ToolDeployment:
         return self._tools.get(tool_name, _NOTHING_DECLARED)
+
+    @property
+    def batch_defaults(self) -> tuple:
+        """`(max MB, max files)` this server asks a client to split a cohort on.
+
+        Here as well as in config.py because this file is MOUNTED while the
+        settings come from the environment: changing the number in the
+        environment costs a container recreate, which drops whatever was
+        running. This is the knob to turn while looking for the right value.
+        """
+        max_mb = self._batch.get("max_mb")
+        max_files = self._batch.get("max_files")
+        return (
+            settings.BATCH_MAX_MB if max_mb is None else max_mb,
+            settings.BATCH_MAX_FILES if max_files is None else max_files,
+        )
 
     @property
     def configured_tools(self) -> tuple:
@@ -259,6 +307,8 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
             f"{where}: 'timeout_seconds' must be a non-negative number (0 means no limit)."
         )
 
+    batch_enabled, batch_axis, batch_max_mb, batch_max_files = _batch_declaration(where, table)
+
     return ToolDeployment(
         server_selectable=dict(selectable),
         max_upload_mb=limit,
@@ -266,6 +316,58 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
         dispatch=dict(dispatch or {}),
         hidden=tuple(hidden),
         timeout_seconds=float(timeout) if timeout is not None else None,
+        batch_enabled=batch_enabled,
+        batch_axis=batch_axis,
+        batch_max_mb=batch_max_mb,
+        batch_max_files=batch_max_files,
+    )
+
+
+def _positive_cap(where: str, key: str, value) -> Optional[int]:
+    """A batch cap: a non-negative integer, 0 meaning "this one does not bind"."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DeploymentConfigError(
+            f"{where}: '{key}' must be a non-negative integer (0 means no limit on this axis)."
+        )
+    return value
+
+
+def _batch_declaration(where: str, table: dict) -> tuple:
+    """`batch` on a [tools.X] table, as the four things it can say.
+
+    Two spellings, because the two things an operator wants to say are of
+    different kinds: `batch = false` turns batching off for this tool, and
+    `batch = { ... }` configures it. A bare `true` is accepted and means
+    "nothing more than the conventions already decided" -- so that writing it
+    down, to record that someone looked, costs nothing.
+    """
+    declared = table.get("batch")
+    if declared is None:
+        return (None, None, None, None)
+    if isinstance(declared, bool):
+        return (declared, None, None, None)
+    if not isinstance(declared, dict):
+        raise DeploymentConfigError(
+            f"{where}: 'batch' must be false, or a table of "
+            f"{{{', '.join(_BATCH_KEYS)}}}."
+        )
+
+    unknown = sorted(set(declared) - set(_BATCH_KEYS))
+    if unknown:
+        raise _unknown_value(where, f"unknown batch key(s) {unknown}", _BATCH_KEYS)
+
+    axis = declared.get("axis")
+    if axis is not None and (not isinstance(axis, str) or not axis.strip()):
+        raise DeploymentConfigError(
+            f"{where}: batch 'axis' must name the argument a cohort is split on."
+        )
+    return (
+        None,
+        axis,
+        _positive_cap(where, "batch.max_mb", declared.get("max_mb")),
+        _positive_cap(where, "batch.max_files", declared.get("max_files")),
     )
 
 
@@ -282,17 +384,28 @@ def load(path: Optional[str] = None) -> DeploymentConfig:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise DeploymentConfigError(f"Cannot read {path}: {exc}")
 
-    unknown = sorted(set(document) - {"tools"})
+    unknown = sorted(set(document) - {"tools", "batch"})
     if unknown:
-        raise DeploymentConfigError(f"{path}: unknown top-level table(s) {unknown}. Expected [tools].")
+        raise DeploymentConfigError(
+            f"{path}: unknown top-level table(s) {unknown}. Expected [tools] or [batch]."
+        )
 
     tools = document.get("tools", {})
     if not isinstance(tools, dict):
         raise DeploymentConfigError(f"{path}: [tools] must be a table of tool name -> settings.")
 
+    batch = document.get("batch", {})
+    if not isinstance(batch, dict):
+        raise DeploymentConfigError(f"{path}: [batch] must be a table of max_mb / max_files.")
+    unknown = sorted(set(batch) - {"max_mb", "max_files"})
+    if unknown:
+        raise _unknown_value(f"{path}, [batch]", f"unknown key(s) {unknown}", ("max_mb", "max_files"))
+    for key in ("max_mb", "max_files"):
+        _positive_cap(f"{path}, [batch]", key, batch.get(key))
+
     configured = {name: _tool_deployment(name, table) for name, table in tools.items()}
     logger.info("Deployment config: %d tool(s) configured (%s)", len(configured), path)
-    return DeploymentConfig(configured)
+    return DeploymentConfig(configured, batch)
 
 
 deployment_config: DeploymentConfig = load()

@@ -441,6 +441,17 @@ def list_tools() -> list:
                 for arg_name, spec in tool.arguments.items()
             },
             "output_kind": tool.output_kind,
+            # How to split a folder of inputs into several runs:
+            # `{"axis": the argument to split, "max_mb": ..., "max_files": ...}`,
+            # whichever cap binds first. Advisory -- a client that ignores it
+            # sends the cohort whole, exactly as every client did before this
+            # existed, and every request is still a request.
+            #
+            # Omitted rather than null, like the argument-level hints above and
+            # for the same reason: tests/golden/tools_response.json pins the
+            # published shape byte for byte, and a tool that cannot be split
+            # must publish what it published before the field existed.
+            **({"batch": tool.batch} if tool.batch else {}),
         }
         for tool in TOOLS.values()
     ]

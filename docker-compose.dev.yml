@@ -1,0 +1,22 @@
+# Development override: run the server from the CHECKOUT instead of the image.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+#                  --profile venvs up -d inference-venvs
+#
+# The image bakes `server/` (docker/Dockerfile, `COPY server/ /opt/sadt/server/`),
+# so a one-line change to the API costs a rebuild. The tools and their virtualenvs
+# are what that rebuild is actually for -- 22 of them, ~16 minutes, tens of GB --
+# and they are NOT what changes while the server is being worked on.
+#
+# Mounted read-only, and nothing else moves: the schema cache is at
+# /var/cache/sadt, outside this path, so the container still writes everything it
+# needs to. `deployment.toml` is mounted by the base file over the same tree and
+# stays mounted; the two agree, it is the same file either way.
+#
+# Not the default, on purpose. A published image must carry its own server, or it
+# is not an image -- this only points one machine at one working tree.
+services:
+  inference-venvs:
+    volumes:
+      - ./DATA:/DATA:ro
+      - ./server:/opt/sadt/server:ro

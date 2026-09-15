@@ -90,3 +90,12 @@ server_selectable = { reference = "none" }
 # convention -- it is the patient's own other timepoint, not a bundle -- but it
 # is a surface a caller may well want to pick from the server.
 server_selectable = { surfaces = "testfile", reference = "testfile" }
+
+[tools.CNE]
+# The one tool whose run is dominated by loading its model: a 4.4 GB quantised
+# GGUF, once per call. Notes are kilobytes, so a cohort of them is never a
+# transfer problem -- splitting it into five batches would be five loads of
+# 4.4 GB bought with nothing. This is the input to the batching decision that
+# is genuinely the tool's rather than this machine's, which is why the server
+# cannot derive it and it is written down here.
+batch = false

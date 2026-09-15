@@ -29,6 +29,10 @@ from registry.deployment import DeploymentConfig, DeploymentConfigError, ToolDep
 client = TestClient(main.app)
 AUTH = {"Authorization": "Bearer test-token"}
 
+# This server's (max MB, max files) for splitting a cohort, which derive()
+# resolves a tool's batch plan against. See test_batching.py.
+BATCH_DEFAULTS = (settings.BATCH_MAX_MB, settings.BATCH_MAX_FILES)
+
 
 def _write(tmp_path, text: str) -> str:
     path = tmp_path / "deployment.toml"
@@ -241,7 +245,7 @@ def test_a_deployment_can_opt_an_argument_out_of_a_naming_convention():
         server_selectable={"reference": deployment.SERVER_SELECTABLE_NONE}
     )
 
-    merged = conventions.derive(arguments, declared)
+    merged = conventions.derive(arguments, declared, BATCH_DEFAULTS)
 
     assert "reference" not in merged.server_selectable
     # Untouched: an exception costs one line rather than restating the rest.

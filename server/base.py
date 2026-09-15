@@ -404,6 +404,11 @@ class Tool(ABC):
     # "files"               -> run() returns a list of paths, or one directory
     #                          path; main.py zips them and streams the archive
     output_kind: str = "text"
+    # {axis, max_mb, max_files}: how a client splits a cohort of inputs into
+    # several runs, or None to send it in one. Set by the registry from the
+    # schema and deployment.toml; an in-process tool declares none, and the
+    # two demos have no folder argument to split anyway.
+    batch: Optional[dict] = None
 
     def check_schema(self) -> None:
         """Reject an invalid `arguments` declaration. Called by registry.py at

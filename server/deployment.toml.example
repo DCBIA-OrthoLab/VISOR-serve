@@ -31,6 +31,42 @@
 # not an error: a deployment file outliving one tool must not stop the others.
 
 # ---------------------------------------------------------------------------
+# batch: splitting a cohort into several runs
+# ---------------------------------------------------------------------------
+#
+# A folder of inputs is sent as several runs rather than one archive. HOW MUCH
+# goes in one of them is this server's business, not any tool's, so it is set
+# once at the top level and not per tool:
+#
+#     [batch]
+#     max_mb = 400       # whichever of the two binds first wins
+#     max_files = 25     # 0 on both turns batching off for this server
+#
+# Here as well as in the environment (BATCH_MAX_MB / BATCH_MAX_FILES) because
+# this file is MOUNTED: tuning the number costs no container recreate, so
+# nothing running is dropped to try a different value.
+#
+# WHICH argument holds the cohort is derived: the tool's one required `path`
+# argument. A tool with two of them pairs them per patient (AREG's t1/t2,
+# AutoCrop3D's scans/roi), and splitting one side without the other registers a
+# patient against somebody else's baseline - quietly, returning a plausible
+# wrong result. Those are excluded by the convention itself, and the two keys
+# below are the only ways past it:
+#
+# [tools.MyTool]
+# batch = false                      # never split a cohort for this tool
+# batch = { axis = "scans" }         # split on this argument, pairing and all
+#
+# `batch = false` is for a tool whose run is dominated by loading its model -
+# see [tools.CNE] in deployment.toml, which loads 4.4 GB per call. Naming an
+# `axis` is the opposite: a deliberate statement by someone who has decided how
+# the pairing survives the split.
+#
+# Per-tool caps exist too (`batch = { max_mb = 200 }`) and are the exception,
+# not the pattern. If a number is right for one tool it is usually right for
+# the server.
+
+# ---------------------------------------------------------------------------
 # timeout_seconds, and the one case where it is not about compute
 # ---------------------------------------------------------------------------
 #
