@@ -71,14 +71,14 @@ def test_a_typo_in_a_key_is_refused(tmp_path):
     upload-only, with no dropdown and nothing saying why."""
     path = _write(tmp_path, '[tools.amasss]\nserver_selectible = { model = "model" }\n')
 
-    with pytest.raises(DeploymentConfigError, match="unknown key"):
+    with pytest.raises(DeploymentConfigError, match=r"unknown key\(s\) \['server_selectible'\]"):
         deployment.load(path)
 
 
 def test_an_unknown_selectable_kind_is_refused(tmp_path):
     path = _write(tmp_path, '[tools.amasss]\nserver_selectable = { model = "weights" }\n')
 
-    with pytest.raises(DeploymentConfigError, match="expected one of"):
+    with pytest.raises(DeploymentConfigError, match="this server does not know"):
         deployment.load(path)
 
 
@@ -246,3 +246,70 @@ def test_a_deployment_can_opt_an_argument_out_of_a_naming_convention():
     assert "reference" not in merged.server_selectable
     # Untouched: an exception costs one line rather than restating the rest.
     assert merged.server_selectable["scans"] == "testfile"
+
+
+# ----------------------------------------------------------------------
+# A file that has moved ahead of the server reading it
+
+
+def test_an_unknown_kind_says_the_file_may_be_newer_than_the_server(tmp_path):
+    """The message has to name the likely cause, because the obvious repair is
+    the wrong one.
+
+    `deployment.toml` is MOUNTED into the container, so it can be newer than the
+    server in the image -- that is what happened on 2026-09-14, an image built
+    on 2026-08-27 meeting a `server_selectable = "none"` first used that day.
+    The old message said only "expected one of ['model', 'testfile']", which
+    reads as "your file is wrong" and invites deleting the value. Every value
+    here was added to fix something: that `none` is what stops ALI being handed
+    ASO's model folder and predicting with the wrong weights, silently.
+    """
+    path = _write(tmp_path, '[tools.amasss]\nserver_selectable = { model = "weights" }\n')
+
+    with pytest.raises(DeploymentConfigError) as raised:
+        deployment.load(path)
+
+    message = str(raised.value)
+    assert "mounted" in message and "NEWER" in message
+    assert "Rebuild or update the server" in message
+    assert "editing the file" in message
+
+
+def test_an_unknown_key_says_the_same_thing(tmp_path):
+    """A newer file adds KEYS too, not only values, and an operator cannot guess
+    that from "unknown key(s)"."""
+    path = _write(tmp_path, '[tools.amasss]\nsomething_new = 3\n')
+
+    with pytest.raises(DeploymentConfigError) as raised:
+        deployment.load(path)
+
+    assert deployment.CONFIG_AHEAD_MARKER in str(raised.value)
+
+
+def test_the_refusal_still_says_what_is_wrong_and_what_is_allowed(tmp_path):
+    """The advice is added, not substituted: an operator with a genuine typo
+    still needs the offending value and the list of good ones."""
+    path = _write(tmp_path, '[tools.amasss]\nserver_selectable = { model = "weights" }\n')
+
+    with pytest.raises(DeploymentConfigError) as raised:
+        deployment.load(path)
+
+    message = str(raised.value)
+    assert "'weights'" in message
+    assert "model" in message and "testfile" in message and "none" in message
+    assert "[tools.amasss]" in message
+
+
+def test_server_ctl_looks_for_the_marker_this_module_writes():
+    """The two live in different files and cannot import each other --
+    `server_ctl.py` runs in Slicer's interpreter, where the server package is not
+    importable. So the string is written twice, and pinned here."""
+    import re
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    with open(os.path.join(root, "scripts", "server_ctl.py"), encoding="utf-8") as handle:
+        source = handle.read()
+
+    found = re.search(r'_CONFIG_AHEAD_MARKER = "([^"]+)"', source)
+    assert found, "server_ctl.py no longer names the marker"
+    assert found.group(1) == deployment.CONFIG_AHEAD_MARKER
