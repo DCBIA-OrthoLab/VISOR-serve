@@ -150,7 +150,11 @@ _ARGUMENT_KEYS = (
 # it -- it is the job's own output/ -- so it is filled in at dispatch time and
 # never published: a client has no business picking a directory on the server,
 # and a file picker for one is the single fastest way to make every run a 422.
-OUTPUT_DIR_ARGUMENT = "output_dir"
+#
+# Defined in conventions.py, which has to know it too: what a raw schema calls a
+# required path is not what a caller is asked for, and a rule reading the schema
+# rather than the published arguments must apply the same exclusions this does.
+OUTPUT_DIR_ARGUMENT = conventions.OUTPUT_DIR_ARGUMENT
 
 # `supervisor` is a flag, not an argument: the tool calls another tool and the
 # runner injects the object that lets it. Read here only so it is not reported

@@ -26,6 +26,14 @@ from .deployment import ToolDeployment
 # Suffixes that mean "the server hosts this, the caller names it".
 MODEL_NAMES = ("model", "reference")
 
+# The output directory every tool declares and no caller ever supplies: the
+# server fills it in with the job's own output/ and takes it out of the
+# published schema entirely (schema_tool imports this name from here). Written
+# down in this file because the rules below read the RAW schema, where it is
+# still a required `path` like any other -- which is exactly how a first version
+# of batch_axis_for came to nominate it as the argument to divide.
+OUTPUT_DIR_ARGUMENT = "output_dir"
+
 # Arguments a clinician is never asked: device placement, tiling, worker
 # counts, search budgets, mesh tuning. The tool still declares them and still
 # applies its own defaults -- they are the deployment's business.
@@ -168,6 +176,15 @@ def batch_axis_for(arguments: dict) -> Optional[str]:
         if isinstance(declaration, dict)
         and declaration.get("type") == "path"
         and declaration.get("required")
+        # Two required `path` arguments no caller ever sends a folder for, and
+        # both invisible in what GET /tools publishes. Counting them gets the
+        # answer wrong in BOTH directions, measured on the real tools: AMASSS
+        # reads as three required folders (scans, model, output_dir) and is
+        # excluded from batching altogether, while a tool whose only other path
+        # is optional reads as exactly one and has its OUTPUT DIRECTORY
+        # nominated as the thing to divide.
+        and name != OUTPUT_DIR_ARGUMENT
+        and not is_model(name)
     ]
     return required_paths[0] if len(required_paths) == 1 else None
 

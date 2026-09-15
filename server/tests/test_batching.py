@@ -44,15 +44,49 @@ def _plan(arguments: dict, declared=None, defaults=DEFAULTS):
 # ----------------------------------------------------------------------
 
 def test_the_one_required_folder_a_tool_takes_is_the_axis_a_cohort_splits_on():
-    """AMASSS, ALI, CLIC, Crown_Seg, Batch_Dental_Seg: one folder in, one
-    result per scan out. Nothing has to be declared for any of them."""
+    """AMASSS's own declarations, verbatim from its .schema.json.
+
+    **Written from the RAW schema and not from what GET /tools publishes**,
+    which is the shape this rule actually reads -- and where `output_dir` and
+    `model` are still required `path` arguments like any other. A first version
+    of these tests used the published shape, passed, and shipped a rule that
+    excluded AMASSS from batching and nominated another tool's OUTPUT DIRECTORY
+    as the thing to divide.
+    """
     arguments = {
         "scans": {"type": "path", "required": True},
-        "structures": {"type": "multichoice", "required": False},
+        "model": {"type": "path", "required": True},
+        "output_dir": {"type": "path", "required": True},
+        "structures": {"type": "list[str]", "required": False},
         "device": {"type": "str", "required": False},
     }
 
     assert conventions.batch_axis_for(arguments) == "scans"
+
+
+def test_the_output_directory_is_never_the_thing_that_gets_divided():
+    """The server fills it in with the job's own output/ and no caller supplies
+    it. A tool declaring nothing else required has no cohort, not a cohort made
+    of its results."""
+    arguments = {
+        "output_dir": {"type": "path", "required": True},
+        "catalog_file": {"type": "path", "required": False},
+    }
+
+    assert conventions.batch_axis_for(arguments) is None
+
+
+def test_a_hosted_model_is_not_a_cohort():
+    """`model` and `*_reference` are published as a NAME picked from this
+    server's DATA/ -- never a folder a client uploads, so never one it splits."""
+    arguments = {
+        "meshes": {"type": "path", "required": True},
+        "model": {"type": "path", "required": True},
+        "atlas_reference": {"type": "path", "required": True},
+        "output_dir": {"type": "path", "required": True},
+    }
+
+    assert conventions.batch_axis_for(arguments) == "meshes"
 
 
 def test_a_tool_pairing_two_folders_per_patient_is_never_split_by_convention():
@@ -72,6 +106,7 @@ def test_a_tool_pairing_two_folders_per_patient_is_never_split_by_convention():
         arguments = {
             first: {"type": "path", "required": True},
             second: {"type": "path", "required": True},
+            "output_dir": {"type": "path", "required": True},
         }
 
         assert conventions.batch_axis_for(arguments) is None
@@ -103,8 +138,8 @@ def test_a_tool_that_takes_no_folder_at_all_is_not_split():
 
 
 def test_a_tool_whose_only_paths_are_optional_is_not_split():
-    """Agent's `catalog_file`: nothing says the run is about that file, so
-    nothing says splitting it divides the work rather than breaking it."""
+    """Nothing says the run is ABOUT that file, so nothing says dividing it
+    divides the work rather than breaking it."""
     arguments = {"catalog_file": {"type": "path", "required": False}}
 
     assert conventions.batch_axis_for(arguments) is None
