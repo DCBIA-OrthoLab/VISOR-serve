@@ -78,12 +78,17 @@ PHASE_PACKAGING = "packaging"
 PHASE_DONE = "done"
 PHASE_FAILED = "failed"
 PHASE_CANCELLED = "cancelled"
+PHASE_PAUSED = "paused"
 
 STATE_PENDING = "pending"
 STATE_RUNNING = "running"
 STATE_DONE = "done"
 STATE_FAILED = "failed"
 STATE_CANCELLED = "cancelled"
+# A run that stopped where it was asked to, and can be told to carry on.
+# NOT terminal: the client is expected to come back, and the reaper's idle
+# timeout is what bounds how long that is worth waiting for.
+STATE_PAUSED = "paused"
 
 TERMINAL_STATES = (STATE_DONE, STATE_FAILED, STATE_CANCELLED)
 
@@ -100,6 +105,7 @@ _STATE_OF_PHASE = {
     PHASE_DONE: STATE_DONE,
     PHASE_FAILED: STATE_FAILED,
     PHASE_CANCELLED: STATE_CANCELLED,
+    PHASE_PAUSED: STATE_PAUSED,
 }
 
 # A progress message is free text written by a tool, so it is bounded here
@@ -633,6 +639,65 @@ def get_pgid(run_id: str) -> Optional[int]:
     # 0 means "the caller's own process group" to killpg, which is this server.
     # A truncated write must not be able to take the API down on a cancel.
     return pgid if pgid > 1 else None
+
+
+# Where a paused run's job directory is recorded, beside its events. One
+# line, because that is all a resume needs to find everything else.
+PAUSED_FILE = "paused.json"
+
+
+def pause(run_id: str, job_dir: str, stopped_after: str) -> None:
+    """Record that this run stopped, and where its work is.
+
+    The job directory is what a resume reads: the memo each supervised call
+    left behind, and the outputs a reader is about to correct. Written here
+    rather than held in a module global for the same reason the process group
+    is -- the POST that resumes may be served by a different `uvicorn
+    --workers` process, which holds nothing.
+    """
+    try:
+        directory = run_directory(run_id)
+    except RunError:
+        return
+    try:
+        with open(os.path.join(directory, PAUSED_FILE), "w", encoding="utf-8") as handle:
+            json.dump({"job_dir": job_dir, "stopped_after": stopped_after}, handle)
+    except OSError as exc:
+        logger.warning("could not record the pause for run %s: %s", run_id, exc)
+        return
+    touch(directory)
+    append(run_id, phase=PHASE_PAUSED)
+
+
+def paused_at(run_id: str) -> Optional[dict]:
+    """`{"job_dir": ..., "stopped_after": ...}` for a paused run, or None."""
+    try:
+        directory = run_directory(run_id)
+    except RunError:
+        return None
+    try:
+        with open(os.path.join(directory, PAUSED_FILE), encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    job_dir = record.get("job_dir")
+    if not job_dir or not os.path.isdir(job_dir):
+        # The directory went with the reaper, or the server was restarted on
+        # a fresh TEMP_DIR. A resume cannot be offered for work that is gone.
+        return None
+    return record
+
+
+def clear_pause(run_id: str) -> None:
+    """Forget the pause, once the run has been told to carry on."""
+    try:
+        directory = run_directory(run_id)
+    except RunError:
+        return
+    try:
+        os.remove(os.path.join(directory, PAUSED_FILE))
+    except OSError:
+        pass
 
 
 def request_cancel(run_id: str) -> Optional[int]:

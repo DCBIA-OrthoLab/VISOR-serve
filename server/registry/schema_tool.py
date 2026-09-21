@@ -161,7 +161,7 @@ OUTPUT_DIR_ARGUMENT = conventions.OUTPUT_DIR_ARGUMENT
 # as unknown, and so a deployment can be told which tools need siblings present.
 _TOP_LEVEL_KEYS = (
     "name", "description", "arguments", "returns", "source_hash", "supervisor",
-    "calls", "injected_layout",
+    "calls", "injected_layout", "quality_controls",
 )
 
 
@@ -383,6 +383,55 @@ def _keep_intermediate_spec(calls: tuple, layout: dict) -> ArgSpec:
         section=layout.get("section") or KEEP_INTERMEDIATE_SECTION,
         ui=layout.get("ui") or "inline",
         select_all=True,
+        option_help=layout.get("option_help"),
+        visible_when=layout.get("visible_when"),
+        hidden=bool(layout.get("hidden")),
+    )
+
+
+# The argument a tool never declares, and the second of its kind. Where
+# `keep_intermediate` says what a chain should HAND BACK, this says where it
+# should STOP -- and both are questions about a chain rather than about a
+# tool, so both are answered once here instead of in every orchestrator.
+STOP_AFTER_ARGUMENT = "stop_after"
+STOP_AFTER_SECTION = "Quality control"
+
+
+def _stop_after_spec(calls: tuple, controls: tuple, layout: dict) -> ArgSpec:
+    """Where a run may be stopped so a reader can look before the rest is
+    built on it.
+
+    A MULTICHOICE, every option OFF: a run that was not asked to stop does
+    not stop, and that has to be the resting state of a server other people
+    are queueing on.
+
+    Two kinds of option, offered together because a reader choosing where to
+    look does not care which mechanism provides the point:
+
+    * every tool this one CALLS -- the boundary already exists, the callee
+      has just written its output and nothing has consumed it yet;
+    * every point the tool DECLARED with `sup.declareQualityControl(...)`,
+      which is how a tool offers one in the middle of its own work, where no
+      call boundary exists. AMASSS segmenting five structures has no callee
+      and still has a moment worth stopping at.
+
+    The order is the order they are listed in, not the order they happen in:
+    a chain decides what to call from the data, so no static list can promise
+    a sequence.
+    """
+    options = list(calls) + [name for name in controls if name not in calls]
+    return ArgSpec(
+        type=MULTICHOICE_TYPE,
+        required=False,
+        choices={name: False for name in options},
+        description=(
+            "Stop the run after this step and return what it produced, instead "
+            "of carrying on. Nothing is ticked by default and a run that is not "
+            "asked to stop does not stop."
+        ),
+        label=layout.get("label") or "Stop after",
+        section=layout.get("section") or STOP_AFTER_SECTION,
+        ui=layout.get("ui") or "inline",
         option_help=layout.get("option_help"),
         visible_when=layout.get("visible_when"),
         hidden=bool(layout.get("hidden")),
@@ -636,6 +685,21 @@ class SchemaTool(Tool):
         # Keyed on `calls`, not on `supervisor`: CLIC, Crown_Seg and
         # Surg_Mov_Pred all declare `sup` and call nobody, and a check box that
         # can only ever collect nothing is worse than no check box.
+        # BEFORE `keep_intermediate`, because both land just above the outputs
+        # and the last one inserted sits closest to them. The three then read
+        # in the order a caller decides them: where the run stops, what it
+        # hands back, where that is written.
+        self.quality_controls = tuple(schema.get("quality_controls") or ())
+        if self.calls or self.quality_controls:
+            self.arguments = _ordered_with(
+                self.arguments,
+                STOP_AFTER_ARGUMENT,
+                _stop_after_spec(
+                    self.calls, self.quality_controls,
+                    (schema.get("injected_layout") or {}).get(
+                        STOP_AFTER_ARGUMENT) or {},
+                ),
+            )
         if self.calls:
             self.arguments = _ordered_with(
                 self.arguments,

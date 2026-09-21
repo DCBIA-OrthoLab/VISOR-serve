@@ -101,6 +101,28 @@ OUTPUT_DIR_NAME = "output"
 # tool itself does nothing with it, because collecting is the same operation for
 # every chain and is done once, here, after run() returns.
 KEEP_INTERMEDIATE_ARGUMENT = "keep_intermediate"
+# Pinned equal to `registry.schema_tool.STOP_AFTER_ARGUMENT` by a test: this
+# file is run by a TOOL's interpreter and may not import the server.
+STOP_AFTER_ARGUMENT = "stop_after"
+
+# Set by the server when a paused run is picked up again. Its presence is the
+# whole difference between a first run and a resumed one: what a nested call
+# already produced is READ instead of recomputed.
+RESUME_ENV = "SADT_RESUME"
+
+# What a nested call leaves behind so a resume can hand its answer back
+# without launching anything. One per slot, beside the slot's own output.
+MEMO_FILE = "memo.json"
+
+# Where a stop is recorded, at the root of the job. A resume reads it to know
+# which checkpoint it is standing on -- and to disarm exactly that one, or the
+# run would stop on the same breath it was told to carry on.
+STOPPED_FILE = "stopped.json"
+
+# Where the server stages what a reader corrected: one directory per slot,
+# named as the slot is. Its contents REPLACE that slot's output before the
+# memo answers, which is the entire point of stopping.
+RESUME_DIRNAME = "resume"
 
 # Where the collected outputs land inside the caller's own output directory.
 INTERMEDIATE_DIRNAME = "intermediate"
@@ -115,6 +137,25 @@ SUP_DIRNAME = "sup"
 # IDENTITY, so its contents never stand for a tool -- but non-empty, because an
 # empty set is the answer for "keep nothing" and the two must not be confused.
 _ALL_STEPS = frozenset({"*"})
+
+
+class QualityControlStop(Exception):
+    """A run stopping where it was ASKED to stop, which is not a failure.
+
+    Raised inside the tool's own code -- by `sup.declareQualityControl` or by
+    the supervisor on the way out of a `sup.run()` the caller armed -- and
+    caught at the top of `main`. It unwinds the tool the way any exception
+    does, so a `finally` that removes a scratch directory still runs, and
+    what the chain has already produced is on disk where it was written.
+
+    NOT a `RunnerError`: that class means the run cannot go on, and this one
+    means it was not supposed to. The difference reaches the caller as a 200
+    with a result naming the step, rather than a 500.
+    """
+
+    def __init__(self, name: str):
+        super().__init__("stopped after {}".format(name))
+        self.name = name
 
 # A backstop, and only that. The real cycle protection is the CHAIN check below,
 # which refuses a tool already running above the call and names it; this catches
@@ -851,6 +892,26 @@ def _measurements() -> dict:
     return measured
 
 
+def _record_stop(job_dir: str, name: str) -> None:
+    """Write down which checkpoint this run is standing on."""
+    try:
+        with open(os.path.join(job_dir, STOPPED_FILE), "w", encoding="utf-8") as handle:
+            json.dump({"stopped_after": name}, handle)
+    except OSError as exc:
+        # The run still stopped and still reported it; what is lost is the
+        # ability to disarm this one checkpoint on the way back in, which a
+        # resume would then trip over immediately.
+        print("could not record the stop: {}".format(exc), file=sys.stderr)
+
+
+def _stopped_at(job_dir: str) -> str:
+    try:
+        with open(os.path.join(job_dir, STOPPED_FILE), encoding="utf-8") as handle:
+            return str(json.load(handle).get("stopped_after") or "")
+    except (OSError, ValueError):
+        return ""
+
+
 def _write_result(job_dir: str, result) -> None:
     """Write {"result": ...} atomically.
 
@@ -1397,7 +1458,8 @@ def _wanted_steps(value) -> set:
     return set()
 
 
-def _collect_supervised_outputs(job_dir: str, output_dir, wanted: set) -> list:
+def _collect_supervised_outputs(job_dir: str, output_dir, wanted: set,
+                                move: bool = True) -> list:
     """Move what the WANTED supervised calls produced under `output_dir`.
 
     One folder per kept call, named as the supervisor named it -- `01_ALI_CBCT`
@@ -1412,6 +1474,12 @@ def _collect_supervised_outputs(job_dir: str, output_dir, wanted: set) -> list:
 
     Moved, not copied: both sides are in the same job directory, so it is a
     rename, and the job directory is removed either way.
+
+    `move=False` for a run that STOPPED. That job directory is kept so the
+    run can be picked up again, and the memo each slot left behind points at
+    `sup/<slot>/output` -- moving it away would hand a resumed chain a path
+    to nothing. The copy is what the reader downloads; the original is what
+    the resume reads.
     """
     root = os.path.join(job_dir, SUP_DIRNAME)
     if not wanted or not output_dir or not os.path.isdir(root):
@@ -1431,7 +1499,10 @@ def _collect_supervised_outputs(job_dir: str, output_dir, wanted: set) -> list:
             continue
         destination = os.path.join(str(output_dir), INTERMEDIATE_DIRNAME, entry)
         os.makedirs(os.path.dirname(destination), exist_ok=True)
-        shutil.move(produced, destination)
+        if move:
+            shutil.move(produced, destination)
+        else:
+            shutil.copytree(produced, destination, dirs_exist_ok=True)
         collected.append(destination)
     return collected
 
@@ -1518,7 +1589,20 @@ class _Supervisor:
         return left
 
     def __init__(self, tools_dir: str, job_dir: str, depth: int, chain=(), job_id=None,
-                 root=None, data_dir=None, tool=None):
+                 root=None, data_dir=None, tool=None, stops=()):
+        # Where the caller asked this run to stop: tool names it calls, and
+        # names it declared itself. Empty on every ordinary run, and empty is
+        # what makes `declareQualityControl` free to sprinkle through a tool.
+        #
+        # NOT inherited by a child. A stop is a place in THIS tool's work, and
+        # a name that means "after ALI" to a chain would mean nothing inside
+        # ALI -- worse, a child sharing the set could stop on a name its
+        # parent meant for a sibling.
+        self._stops = frozenset(stops)
+        self._resuming = bool(os.environ.get(RESUME_ENV))
+        # Latched the moment a memo is missing or names another tool: the
+        # slots after it were numbered by a run that took a different path.
+        self._diverged = False
         self._tools_dir = tools_dir
         self._job_dir = job_dir
         self._depth = depth
@@ -1590,7 +1674,24 @@ class _Supervisor:
         # anything could collect them.
         params.pop(OUTPUT_DIR_ARGUMENT, None)
         self._calls += 1
-        nested_dir = os.path.join(self._job_dir, "sup", f"{self._calls:02d}_{tool}")
+        slot = f"{self._calls:02d}_{tool}"
+        nested_dir = os.path.join(self._job_dir, "sup", slot)
+
+        # A resumed run re-enters the tool from the top: nothing preserves a
+        # Python stack across a process that exited, and asking every
+        # orchestrator to become re-enterable by hand is thirteen chances to
+        # get it subtly wrong. So the tool runs again and the CALLS are what
+        # is remembered -- keyed on the slot, which is the same identity the
+        # reader saw in `intermediate/01_ALI_CBCT/`.
+        remembered = self._memo(slot, tool)
+        if remembered is not None:
+            self._substitute(slot, nested_dir)
+            _append_progress(None, "", self._depth + 1, tool=tool)
+            _append_progress(None, "", self._depth + 1, tool=tool)
+            if tool in self._stops:
+                raise QualityControlStop(tool)
+            return remembered["result"]
+
         os.makedirs(os.path.join(nested_dir, "output"), exist_ok=True)
 
         child_id = f"{os.path.basename(self._job_dir)}.{self._calls}"
@@ -1676,11 +1777,97 @@ class _Supervisor:
         # end.
         _append_progress(None, "", self._depth + 1, tool=tool)
         try:
-            return self._nested_subprocess(
+            produced = self._nested_subprocess(
                 tool, interpreter, job_path, nested_dir, environment, remaining
             )
         finally:
             _append_progress(None, "", self._depth + 1, tool=tool)
+
+        self._remember(nested_dir, tool, produced)
+
+        # AFTER the child has finished and its span is closed, which is the
+        # whole point of stopping here: the callee has written everything it
+        # is going to write and nothing has consumed it yet. Stopping before
+        # the call would leave nothing to look at.
+        if tool in self._stops:
+            raise QualityControlStop(tool)
+        return produced
+
+    def _memo(self, slot: str, tool: str):
+        """What this slot produced last time, or None to run it for real.
+
+        Only on a resume, and only when the chain is asking for the SAME tool
+        at the SAME position. A correction can change an earlier decision --
+        moved landmarks can send a mode down another branch -- and a chain
+        that diverged must not be handed a neighbour's answer. Refused from
+        that slot on, by the `_diverged` latch: once the sequence differs,
+        every later slot is suspect too.
+        """
+        if not self._resuming or self._diverged:
+            return None
+        path = os.path.join(self._job_dir, "sup", slot, MEMO_FILE)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                remembered = json.load(handle)
+        except (OSError, ValueError):
+            # Nothing recorded here: this is the call the run had not reached
+            # when it stopped. Everything after it is new work, so the latch
+            # goes down and no later memo is trusted either -- their slots
+            # were numbered by a run that took a different path.
+            self._diverged = True
+            return None
+        if remembered.get("tool") != tool:
+            print(
+                "resume: slot {} recorded '{}' and the chain now asks for '{}'; "
+                "running the rest for real".format(
+                    slot, remembered.get("tool"), tool),
+                file=sys.stderr,
+            )
+            self._diverged = True
+            return None
+        return remembered
+
+    def _remember(self, nested_dir: str, tool: str, produced) -> None:
+        """Record what this call answered, so a resume need not repeat it."""
+        try:
+            with open(os.path.join(nested_dir, MEMO_FILE), "w",
+                      encoding="utf-8") as handle:
+                # `default=_jsonable`, the same converter a result file uses:
+                # a tool returns a Path far more often than a string, and
+                # without it every memo silently failed to be written and
+                # every resume re-ran the whole chain.
+                json.dump({"tool": tool, "result": produced}, handle,
+                          default=_jsonable)
+        except (OSError, TypeError) as exc:
+            # A result that will not serialise costs the resume, not the run.
+            # The next resume re-runs this call, which is slow and correct.
+            print("could not record {}: {}".format(tool, exc), file=sys.stderr)
+
+    def _substitute(self, slot: str, nested_dir: str) -> None:
+        """Put what the reader corrected where the memo's answer points.
+
+        The files a reader edited came off THEIR disk, not this one, so a
+        resume that trusted the server's copy would carry on with exactly the
+        data the reader stopped to reject. The server stages the replacements
+        under `resume/<slot>/` and they are moved over the slot's output --
+        the one place the memo's returned path can point at.
+        """
+        staged = os.path.join(self._job_dir, RESUME_DIRNAME, slot)
+        if not os.path.isdir(staged):
+            return
+        produced = os.path.join(nested_dir, "output")
+        try:
+            if os.path.isdir(produced):
+                shutil.rmtree(produced)
+            shutil.move(staged, produced)
+            print("resume: {} replaced with what came back".format(slot),
+                  file=sys.stderr)
+        except OSError as exc:
+            raise RunnerError(
+                "Could not put the corrected files for '{}' in place: {}. The "
+                "run would have carried on with the data it was stopped to "
+                "let somebody reject.".format(slot, exc)
+            )
 
     def _nested_subprocess(self, tool, interpreter, job_path, nested_dir,
                            environment, remaining):
@@ -1833,6 +2020,27 @@ class _Supervisor:
         self.log("{} channel(s) of {} asked for".format(answer, asked or "any"))
         return _record_width(answer)
 
+    def declareQualityControl(self, name: str) -> bool:
+        """Offer the caller a place to stop, here, and stop if they asked.
+
+        Called by a tool in the MIDDLE of its own work, where no `sup.run()`
+        boundary exists: AMASSS between its crop and its prediction, ALI once
+        the points are placed and before anything is built on them.
+
+        Returns False and costs nothing when the caller armed nothing, which
+        is every ordinary run -- so a tool may declare as many as it likes and
+        a run that was not asked to stop does not stop. It never returns True:
+        an armed name raises, because a tool that had to check the answer and
+        return early would be writing the unwinding itself, thirteen times
+        over, and getting it subtly different each time.
+
+        The name must be the one `describe.py` read out of this call, or the
+        server published a checkpoint that can never fire.
+        """
+        if name in self._stops:
+            raise QualityControlStop(name)
+        return False
+
     def progress(self, fraction: float, message: str) -> None:
         try:
             self.log(f"{float(fraction):.0%} {message}")
@@ -1950,7 +2158,7 @@ class _Supervisor:
         return value
 
 
-def _supervisor_for(run, job: dict):
+def _supervisor_for(run, job: dict, stops=()):
     """A supervisor for this job, or None when the tool does not ask for one."""
     if not _takes_supervisor(run):
         return None
@@ -1972,6 +2180,7 @@ def _supervisor_for(run, job: dict):
         job_dir=job["job_dir"],
         depth=depth,
         chain=chain,
+        stops=stops,
         job_id=job.get("job_id"),
         root=job.get("root"),
         data_dir=job.get("data_dir"),
@@ -2018,6 +2227,18 @@ def main(argv=None) -> int:
         # tool, and collecting what a chain produced is done below -- once,
         # here, rather than written into every orchestrating tool.
         keep_intermediate = _wanted_steps(params.pop(KEEP_INTERMEDIATE_ARGUMENT, None))
+        # Taken back out the same way and for the same reason: no tool
+        # declares it, the server publishes it for anything with somewhere to
+        # stop, and what it means is handled here rather than in every
+        # orchestrator.
+        stops = _wanted_steps(params.pop(STOP_AFTER_ARGUMENT, None))
+        stops = set() if stops is _ALL_STEPS else set(stops)
+        if os.environ.get(RESUME_ENV):
+            # The checkpoint this run is standing on is the one it was told
+            # to carry on past. Disarming only THAT one: a reader may have
+            # armed two, and continuing past the first must still stop at the
+            # second.
+            stops.discard(_stopped_at(job["job_dir"]))
         if _takes(run, OUTPUT_DIR_ARGUMENT) and OUTPUT_DIR_ARGUMENT not in params:
             # A supervised call arrives without one: the supervisor drops what
             # the caller passed, for the same reason the server strips it from
@@ -2028,7 +2249,7 @@ def main(argv=None) -> int:
             params[OUTPUT_DIR_ARGUMENT] = nested_output
         _grant_channels(run, params, job["tool"])
         arguments = _call_arguments(run, params)
-        supervisor = _supervisor_for(run, job)
+        supervisor = _supervisor_for(run, job, stops=stops)
         if supervisor is not None:
             # Injected, never taken from job.json: it is not data, and a client
             # that could name one would be naming a process to start.
@@ -2050,6 +2271,35 @@ def main(argv=None) -> int:
                     file=sys.stderr,
                 )
         _write_result(job["job_dir"], result)
+    except QualityControlStop as stop:
+        # Not a failure: the run did what it was told. Everything the chain
+        # produced is collected whatever `keep_intermediate` said -- a reader
+        # who asked to stop and look is asking for exactly that, and being
+        # made to tick a second box to see it would be a trap.
+        print("stopped after {}".format(stop.name), file=sys.stderr)
+        produced = []
+        if job:
+            _record_stop(job["job_dir"], stop.name)
+            # `arguments` is the call's keyword dict by the time a stop can
+            # be raised -- it is raised from inside run() -- but this is an
+            # except clause and the name is also argparse's earlier in the
+            # function. Asked rather than assumed.
+            where = arguments.get(OUTPUT_DIR_ARGUMENT) if isinstance(arguments, dict) else None
+            produced = _collect_supervised_outputs(
+                job["job_dir"], where, _ALL_STEPS, move=False)
+            _write_result(job["job_dir"], {
+                "stopped_after": stop.name,
+                # Named so a client can tell this from a finished run without
+                # parsing prose. A run that completed has no such key.
+                "quality_control": True,
+                "produced": [os.path.basename(path) for path in produced],
+                # The canonical shape for "what this run produced", which is
+                # what the server packs. A stopped run still has an answer --
+                # everything the chain got through -- and it travels the same
+                # way a finished one's does.
+                "outputs": {os.path.basename(path): path for path in produced},
+            })
+        return 0
     except RunnerError as exc:
         # Ours, and already precise: the traceback would only point back here.
         print(str(exc), file=sys.stderr)

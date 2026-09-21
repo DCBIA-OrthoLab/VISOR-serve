@@ -963,11 +963,58 @@ def _reset_job(job_dir: str) -> None:
     os.makedirs(output, exist_ok=True)
 
 
-def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
+RESUME_ENV = "SADT_RESUME"
+
+# Where corrections are staged, one directory per slot. Pinned equal to
+# `execution.runner.RESUME_DIRNAME` by a test, for the same reason.
+RESUME_DIRNAME = "resume"
+
+# Where the supervised calls of a run live, one directory per slot. Pinned
+# equal to `execution.runner.SUP_DIRNAME` by a test: it is how the server
+# tells a reader which steps a stopped run actually got through.
+SUP_DIRNAME = "sup"
+
+
+def _kept_if_paused(result, run_id, job_dir: str, tool_name: str):
+    """Hold on to the job directory when the run stopped to be looked at.
+
+    Everything a request makes is removed when the response has streamed,
+    which is right for confidential imaging and wrong for exactly one case:
+    a run that stopped at a checkpoint is going to be asked to carry on, and
+    carrying on means reading the memo each of its calls left behind. Deleting
+    that is deleting the only reason the stop was worth anything.
+
+    The reaper still bounds it -- `runs.pause` records it against the run, and
+    a run that expires takes its directory with it -- so a reader who never
+    comes back costs the same as one who abandons a transfer.
+    """
+    if not isinstance(result, dict) or not result.get("quality_control"):
+        return result
+    if not run_id:
+        # No run id means nothing can ask for it back: the client sent no
+        # X-Run-Id, so there is no handle to resume through and keeping the
+        # directory would only leak it.
+        logger.warning("%s stopped at a checkpoint with no run id to resume through",
+                       tool_name)
+        return result
+    file_utils.forget_scratch_dir(job_dir)
+    runs.pause(run_id, job_dir, str(result.get("stopped_after") or ""))
+    return result
+
+
+def dispatch(tool, params: dict, job_id: Optional[str] = None,
+             resume_from: Optional[str] = None) -> Any:
     """Run `tool` on already-validated `params` in the tool's own interpreter.
 
     Returns exactly what the tool's run() returned, so callers -- Tool.invoke,
     and through it main.py -- cannot tell which side of the flag they are on.
+
+    `resume_from` is a job directory a previous run STOPPED in. Everything
+    else is identical, and deliberately: a resumed run queues for the machine
+    like any other, times out like any other and can be cancelled like any
+    other. What differs is two things -- the directory is reused rather than
+    created, so the memo each supervised call left behind is still there, and
+    the runner is told it is a resume.
     """
     interpreter = _checked_interpreter(tool.name)
     runner = _checked_runner()
@@ -976,14 +1023,22 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
     # copy. None whenever the client sent no X-Run-Id, which is what makes every
     # progress and cancellation call below a no-op for such a run.
     run_id = runs.CURRENT_RUN.get()
-    job_dir = _create_job_dir(job_id)
+    resuming = bool(resume_from)
+    job_dir = resume_from if resuming else _create_job_dir(job_id)
 
     try:
         # Before a byte of the job is written: a cancel that arrived while the
         # inputs were still being staged costs nothing more than this stat.
         _raise_if_cancelled(run_id)
-        params = _server_provided(tool, params, job_dir)
-        job_path = _write_job_file(job_dir, job_id, tool.name, params)
+        if resuming:
+            # The job file is the one the stopped run was given. Rewriting it
+            # from `params` would be rewriting the request, and a resume is
+            # the SAME request carrying on -- the inputs it was staged with
+            # are in that directory and nowhere else now.
+            job_path = os.path.join(job_dir, JOB_FILE)
+        else:
+            params = _server_provided(tool, params, job_dir)
+            job_path = _write_job_file(job_dir, job_id, tool.name, params)
         command = [interpreter, runner, "--job", job_path]
         # Per tool, falling back to the global setting. 0 means no limit, which
         # a cohort legitimately needs. Computed BEFORE the environment, which
@@ -992,6 +1047,12 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
         environment = _child_environment(
             job_id, job_dir, timeout, runs.progress_file(run_id)
         )
+        if resuming:
+            # The one flag the runner reads to answer a supervised call from
+            # its memo instead of launching it. Set here rather than written
+            # into job.json: the job file is the REQUEST, and a resume is not
+            # a different request.
+            environment[RESUME_ENV] = "1"
 
         # Every run passes through admission, not only the ones heading for the
         # card. Held for the whole run and released by leaving the block on any
@@ -1047,7 +1108,10 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
                 # the answer for the run's whole life rather than for the
                 # instant it was admitted: a neighbour that arrived halfway
                 # through has already falsified it by now.
-                return _read_result(job_dir, tool.name, solo=grant.solo)
+                return _kept_if_paused(
+                    _read_result(job_dir, tool.name, solo=grant.solo),
+                    run_id, job_dir, tool.name,
+                )
             except (ToolFailure, ToolExecutionError) as exc:
                 if not _out_of_memory(exc, exit_code, job_dir):
                     raise

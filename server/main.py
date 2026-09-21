@@ -318,9 +318,16 @@ def _media_type_of(path: str) -> str:
     return media_type
 
 
-def _human_bytes(size: int) -> str:
+def _human_bytes(size) -> str:
     """Byte count in the largest unit that keeps it readable. Logged alongside
-    the exact figure, never instead of it."""
+    the exact figure, never instead of it.
+
+    An absent count reads as absent rather than raising: this is a log line,
+    and a log line must never be what takes a finished run down. It already
+    did once -- a resume carries no input bytes and passed None through.
+    """
+    if size is None:
+        return "-"
     value = float(size)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024 or unit == "TB":
@@ -1260,6 +1267,13 @@ async def _detached_run(tool_name: str, request: Request, run_id: str) -> None:
     token = runs.CURRENT_RUN.set(run_id)
     try:
         response = await _run_tool(tool_name, request, cleanup, detached=True)
+        if runs.paused_at(run_id) is not None:
+            # Same reasoning as the blocking path: a stopped run has not
+            # finished, and its `paused` event is already on the stream the
+            # client is watching. A terminal event here would tell that
+            # client to stop watching a run it is about to resume.
+            logger.info("endpoint=/run/%s paused (detached)", tool_name)
+            return
         runs.finish(run_id, runs.PHASE_DONE, result=_collectable(response))
     except dispatch.RunCancelled:
         runs.finish(run_id, runs.PHASE_CANCELLED)
@@ -1309,6 +1323,172 @@ async def _detach(tool_name: str, request: Request, run_id, background_tasks):
     )
 
 
+# One directory per slot, named as the slot is (`01_ALI_CBCT`). The runner
+# moves each over that slot's output before answering from its memo.
+_RESUME_SLOT = re.compile(r"^[0-9]{2}_[A-Za-z0-9_-]{1,64}$")
+
+
+def _suffixes_of(name: str) -> set:
+    """`{".json", ".mrk.json"}` for `points.mrk.json`.
+
+    Both, because this ecosystem's extensions are compound half the time --
+    `.nii.gz`, `.nrrd.gz`, `.mrk.json` -- and the single form alone would
+    tell a reader to send a `.json` when what came out was a `.mrk.json`.
+    Derived from the real file rather than from a table, so a tool that
+    starts writing something else needs no edit here.
+    """
+    parts = name.lower().split(".")
+    found = set()
+    if len(parts) >= 2:
+        found.add("." + parts[-1])
+    if len(parts) >= 3:
+        found.add("." + ".".join(parts[-2:]))
+    return found
+
+
+def _checked_correction(job_dir: str, slot: str, filename: str) -> None:
+    """Refuse a correction that is not the kind of thing that went out.
+
+    NOT `settings.ALLOWED_EXTENSIONS`: that is the whitelist for a tool's
+    INPUTS, and a correction replaces a step's OUTPUT -- landmarks, a
+    labelled mesh, a transform. On this deployment the input list is
+    `('.nii', '.nii.gz')`, so reusing it refused the very `.mrk.json` the
+    reader had just been handed.
+
+    What it is compared against instead is that step's own output, which is
+    on disk a few directories away: a reader sends back what they were
+    given. A `.zip` is always allowed -- a folder has no other way to
+    travel.
+    """
+    produced = os.path.join(job_dir, dispatch.SUP_DIRNAME, slot,
+                            dispatch.JOB_OUTPUT_DIRNAME)
+    allowed = {".zip"}
+    for _root, _directories, names in os.walk(produced):
+        for name in names:
+            allowed.update(_suffixes_of(name))
+    if _matched_extension(filename, tuple(sorted(allowed))) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(f"'{filename}' is not what step '{slot}' produced. Send one "
+                    f"of {tuple(sorted(allowed))}, or a .zip of the folder."),
+        )
+
+
+def _stage_corrections(tool, job_dir: str, form) -> list:
+    """Put what a reader sends back where the resumed run will read it.
+
+    The files came off THEIR disk: a resume that trusted the server's copy
+    would carry on with exactly the data they stopped to reject. A `.zip` is
+    unpacked -- a folder has no other way to travel -- and anything else is
+    written as the single file it is.
+
+    The slot name is matched against a pattern BEFORE any path is built from
+    it, the same discipline every id in `wire/` follows: it arrives over HTTP
+    and it becomes a directory.
+    """
+    # What the run actually has. A correction for a step that never ran is a
+    # typo, and a typo that is silently accepted is a resume the reader
+    # believes carries their work and does not.
+    steps = sorted(
+        name for name in os.listdir(os.path.join(job_dir, dispatch.SUP_DIRNAME))
+    ) if os.path.isdir(os.path.join(job_dir, dispatch.SUP_DIRNAME)) else []
+
+    staged = []
+    for slot, value in form.multi_items():
+        if not isinstance(value, StarletteUploadFile):
+            continue
+        if not _RESUME_SLOT.match(slot):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(f"'{slot}' is not a step of that run. Name a correction "
+                        "after the folder it came back in, such as 01_ALI_CBCT."),
+            )
+        if slot not in steps:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(f"That run has no step '{slot}'. It ran: "
+                        f"{', '.join(steps) or 'nothing'}."),
+            )
+        _checked_correction(job_dir, slot, value.filename or "")
+
+        destination = os.path.join(job_dir, dispatch.RESUME_DIRNAME, slot)
+        shutil.rmtree(destination, ignore_errors=True)
+        os.makedirs(destination, exist_ok=True)
+        name = os.path.basename(value.filename or slot)
+        landed = os.path.join(destination, name)
+        with open(landed, "wb") as handle:
+            shutil.copyfileobj(value.file, handle)
+        if landed.lower().endswith(".zip"):
+            # Untrusted: `extract_zip` refuses zip slip, symlink members and
+            # anything over MAX_EXTRACTED_MB before a byte is written.
+            file_utils.extract_zip(landed, destination)
+            os.remove(landed)
+        if not any(os.scandir(destination)):
+            # An empty replacement would put NOTHING where the step's output
+            # was, and the chain would carry on with an empty folder rather
+            # than with the reader's correction. Refused: the reader meant to
+            # send something.
+            shutil.rmtree(destination, ignore_errors=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"The correction sent for '{slot}' is empty.",
+            )
+        staged.append(slot)
+    return staged
+
+
+@app.post("/runs/{run_id}/resume", dependencies=[Depends(verify_token)])
+async def resume_run(run_id: str, request: Request,
+                     background_tasks: BackgroundTasks):
+    """Tell a run that stopped at a checkpoint to carry on.
+
+    The request may carry corrections: one file field per step, named after
+    the folder that step came back in. They are staged and the run re-enters
+    its tool from the top -- nothing preserves a Python stack across a
+    process that exited -- with every call it already made answering from
+    what it recorded instead of running again.
+
+    It queues for the machine like any other run, because it IS one: the work
+    left to do is real work, and a resumed cohort must not jump a clinician
+    who has been waiting.
+    """
+    paused = await anyio.to_thread.run_sync(runs.paused_at, run_id)
+    if paused is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(f"Run '{run_id}' is not stopped at a checkpoint. A run that "
+                    "finished, failed or expired cannot be carried on."),
+        )
+    job_dir = paused["job_dir"]
+    try:
+        with open(os.path.join(job_dir, dispatch.JOB_FILE), encoding="utf-8") as handle:
+            tool_name = json.load(handle)["tool"]
+    except (OSError, ValueError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="The work this run stopped in is no longer on the server.",
+        )
+
+    try:
+        tool = get_tool(tool_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    _stage_corrections(tool, job_dir, await request.form())
+    # Cleared BEFORE the run, not after: it is standing on this checkpoint
+    # right up until it moves, and a second resume arriving while the first
+    # is running must not be offered the same directory.
+    await anyio.to_thread.run_sync(runs.clear_pause, run_id)
+
+    token = runs.CURRENT_RUN.set(run_id)
+    try:
+        logger.info("endpoint=/runs/resume tool=%s after=%s",
+                    tool_name, paused.get("stopped_after"))
+        return await _run_tool(tool_name, request, background_tasks,
+                               resume_from=job_dir)
+    finally:
+        runs.CURRENT_RUN.reset(token)
+
+
 @app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
 async def run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks):
     """The run, with its progress recorded when the client asked for it.
@@ -1350,6 +1530,16 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     finally:
         runs.CURRENT_RUN.reset(token)
 
+    if runs.paused_at(run_id) is not None:
+        # The run STOPPED where it was asked to. Not finished, so no terminal
+        # event; and above all not discarded -- the run directory is what
+        # `POST /runs/{id}/resume` looks the work up through, and taking it
+        # down here is what made the whole feature unreachable the first time
+        # it was tried end to end. It lives on the idle TTL, like an
+        # abandoned transfer, and every read pushes that back.
+        logger.info("endpoint=/run/%s paused", tool_name)
+        return response
+
     runs.finish(run_id, runs.PHASE_DONE)
     # Queued rather than done now, so the directory survives until the response
     # has finished streaming -- which gives a watcher the whole download to
@@ -1360,13 +1550,36 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
 
 
 async def _run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks,
-                    detached: bool = False):
+                    detached: bool = False, resume_from: Optional[str] = None):
+    """`resume_from` is the job directory of a run that STOPPED at a
+    checkpoint. Everything after the tool has run is identical -- the same
+    packing, the same delivery, the same cleanup -- which is the whole reason
+    a resume comes through here rather than through a second endpoint that
+    would have to learn all of it again. What it skips is the front half:
+    there is no form to read and no argument to validate, because a resume is
+    the same request carrying on and its inputs are already staged.
+    """
     start_time = time.monotonic()
 
     try:
         tool = get_tool(tool_name)
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    if resume_from:
+        return await _finish_run(
+            tool, tool_name, start_time, background_tasks, detached,
+            # Zero, not None: a resume carries no input bytes -- its inputs
+            # were staged by the run it is picking up -- and the log line
+            # wants a number.
+            size=0,
+            work_dir=None, scratch_dirs=file_utils.track_scratch_dirs(),
+            result=await anyio.to_thread.run_sync(
+                functools.partial(dispatch.dispatch, tool, {},
+                                  resume_from=resume_from),
+                limiter=_get_tool_limiter(),
+            ),
+        )
 
     # Generic argument collection: whatever scalar fields and/or files the
     # caller sends, whichever tool it targets. Each uploaded file is matched to
@@ -1628,10 +1841,96 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             if resolved.is_temporary and os.path.exists(resolved.path):
                 os.remove(resolved.path)
 
+    return await _finish_run(
+        tool, tool_name, start_time, background_tasks, detached, work_dir,
+        scratch_dirs, result, size,
+        wants_reference=(
+            request.headers.get(_RESULT_DELIVERY_HEADER, "").lower()
+            == _DELIVER_BY_REFERENCE
+        ),
+    )
+
+
+async def _finish_stopped_run(tool, tool_name: str, start_time: float,
+                              background_tasks: BackgroundTasks, work_dir,
+                              scratch_dirs, record: dict, size):
+    """Deliver a run that stopped at a checkpoint.
+
+    What goes back is the record -- which checkpoint, and what was produced
+    -- with the files themselves parked as a result reference. The job
+    directory stays where it is: it is what a resume reads, and packing is a
+    copy out of it rather than a move.
+    """
+    outputs = file_utils.output_paths(record)
+    reference = None
+    if outputs:
+        if work_dir is None:
+            work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
+        archive = await anyio.to_thread.run_sync(
+            file_utils.make_zip, outputs,
+            os.path.join(work_dir, f"{tool_name}_stopped.zip"),
+        )
+        stored = await anyio.to_thread.run_sync(
+            transfer.store_result, str(archive), "application/zip"
+        )
+        reference = stored.as_reference()
+        background_tasks.add_task(shutil.rmtree, work_dir, ignore_errors=True)
+    for directory in list(scratch_dirs):
+        background_tasks.add_task(shutil.rmtree, directory, ignore_errors=True)
+
+    # Last, so the phase a watcher reads is where the run actually is: the
+    # zip is built and the reference is parked, and from here it waits.
+    runs.emit(runs.PHASE_PAUSED)
+    _log_served(tool_name, start_time, size, None)
+    return JSONResponse(
+        {
+            "quality_control": True,
+            "stopped_after": record.get("stopped_after"),
+            "produced": record.get("produced") or [],
+            "result_ref": reference,
+        },
+        background=background_tasks,
+    )
+
+
+async def _finish_run(tool, tool_name: str, start_time: float,
+                      background_tasks: BackgroundTasks, detached: bool,
+                      work_dir, scratch_dirs, result, size=None,
+                      wants_reference: bool = False):
+    """Turn what a tool returned into what the caller receives.
+
+    Split out of `_run_tool` so a RESUME reaches it too. Everything here is
+    about the answer and nothing about the request, which is exactly the half
+    the two paths share: the same packing, the same reference delivery, the
+    same background cleanup. A second endpoint would have had to learn all of
+    it again, and would have drifted.
+
+    `size` is how many bytes the request carried IN, logged beside what goes
+    out. A resume carried none: its inputs were staged by the run it is
+    picking up.
+    """
     # The tool has returned; what is left is building the response. For a cohort
     # that is a multi-GB archive and minutes of it, so it is a phase of its own
     # rather than a gap between the last progress message and the download.
-    runs.emit(runs.PHASE_PACKAGING)
+    stopped = isinstance(result, dict) and result.get("quality_control")
+    if not stopped:
+        # Not for a stopped run: `packaging` would be appended AFTER the
+        # `paused` event dispatch already wrote, and the latest phase is what
+        # a watcher reads as the state. The run would report itself as
+        # running, packaging, for as long as it sat there waiting to be
+        # picked up.
+        runs.emit(runs.PHASE_PACKAGING)
+
+    if stopped:
+        # A run that STOPPED has an answer of a different shape: not the
+        # tool's declared output, which it never got to produce, but
+        # everything the chain got through plus the name of the checkpoint it
+        # is standing on. Delivered as JSON with a reference rather than as
+        # the archive alone, because the client needs both -- the files to
+        # look at, and the fact that this run can be told to carry on.
+        return await _finish_stopped_run(tool, tool_name, start_time,
+                                         background_tasks, work_dir,
+                                         scratch_dirs, result, size)
 
     if tool.output_kind in ("file", "segmentation", "files"):
         # `result` is a path to the output file the tool wrote -- or, for
@@ -1708,7 +2007,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # takes a reference -- the size floor below is about cleanup, and a
         # detached run's cleanup is the reaper either way.
         deliver_by_reference = detached or (
-            request.headers.get(_RESULT_DELIVERY_HEADER, "").lower() == _DELIVER_BY_REFERENCE
+            wants_reference
             and os.path.getsize(result) >= _RESULT_REFERENCE_MIN_BYTES
         )
         stored = None
@@ -1755,6 +2054,10 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         background_tasks.add_task(shutil.rmtree, directory, ignore_errors=True)
     _log_served(tool_name, start_time, size, None)
     return {"result": result}
+
+
+
+
 
 
 if __name__ == "__main__":

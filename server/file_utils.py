@@ -46,6 +46,19 @@ def register_scratch_dir(directory: str) -> str:
     return directory
 
 
+def forget_scratch_dir(directory: str) -> None:
+    """Stop tracking a directory, so the request's cleanup leaves it alone.
+
+    For the one thing that has to outlive its request: a run stopped at a
+    quality-control checkpoint keeps its job directory, because picking it up
+    again means reading what its calls already produced. Everything else the
+    request made is still removed.
+    """
+    tracked = _scratch_dirs.get()
+    if tracked is not None and directory in tracked:
+        tracked.remove(directory)
+
+
 def make_scratch_dir(prefix: str = "tool_") -> str:
     """Fresh writable scratch dir under settings.TEMP_DIR for one request.
 
