@@ -1,0 +1,55 @@
+# Development override: run the server from the CHECKOUT instead of the image.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+#                  --profile venvs up -d inference-venvs
+#
+# The image bakes `server/` (docker/Dockerfile, `COPY server/ /opt/sadt/server/`),
+# so a one-line change to the API costs a rebuild. The tools and their virtualenvs
+# are what that rebuild is actually for -- 22 of them, ~16 minutes, tens of GB --
+# and they are NOT what changes while the server is being worked on.
+#
+# Mounted read-only, and nothing else moves: the schema cache is at
+# /var/cache/sadt, outside this path, so the container still writes everything it
+# needs to. `deployment.toml` is mounted by the base file over the same tree and
+# stays mounted; the two agree, it is the same file either way.
+#
+# Not the default, on purpose. A published image must carry its own server, or it
+# is not an image -- this only points one machine at one working tree.
+services:
+  inference-venvs:
+    volumes:
+      - ./DATA:/DATA:ro
+      - ./server:/opt/sadt/server:ro
+      # What a benchmark campaign measured, for GET /benchmarks and the status
+      # page. Read-only, and absent on a deployment that ran none -- the
+      # endpoint answers "nothing measured here" rather than failing.
+      - ./benchmarks/results/summary:/benchmarks:ro
+      # Each tool's SOURCE from the checkout, over the image's -- the same
+      # bargain `server/` gets one line above, and for the same reason: the
+      # image exists for the 22 virtualenvs, which are not what changes while a
+      # tool is being worked on. Rebuilding for a source edit means shipping
+      # 19 GB of build context to the daemon and ~15 minutes.
+      #
+      # Only `src/`. The `.venv` beside it stays the image's, so a tool keeps
+      # the interpreter and the pinned dependencies it was built with -- which
+      # is the whole point of the layout and must not be bypassed here. A
+      # source edit that needs a NEW dependency is exactly the case that still
+      # requires a rebuild, and it fails loudly rather than silently.
+      #
+      # The `.schema.json` in the image then no longer matches the source's
+      # hash. That is not a problem and not a workaround: the server treats a
+      # stale hash as a stale cache and regenerates it with the tool's own
+      # interpreter into SCHEMA_CACHE_DIR, which is what `source_hash` is for.
+      #
+      # Listed one by one rather than mounted wholesale, so adding a tool here
+      # is a decision. These are the ones carrying work not yet in an image.
+      - ../SADT-VISOR/tools/ALI/ALI_CBCT/src:/tools/ALI/ALI_CBCT/src:ro
+      - ../SADT-VISOR/tools/ALI/ALI_IOS/src:/tools/ALI/ALI_IOS/src:ro
+      - ../SADT-VISOR/tools/AMASSS/src:/tools/AMASSS/src:ro
+      - ../SADT-VISOR/tools/ASO/src:/tools/ASO/src:ro
+      - ../SADT-VISOR/tools/AutoCrop3D/src:/tools/AutoCrop3D/src:ro
+      - ../SADT-VISOR/tools/AutoMatrix/src:/tools/AutoMatrix/src:ro
+      - ../SADT-VISOR/tools/Batch_Dental_Seg/src:/tools/Batch_Dental_Seg/src:ro
+      - ../SADT-VISOR/tools/CLIC/src:/tools/CLIC/src:ro
+      - ../SADT-VISOR/tools/Crown_Seg/src:/tools/Crown_Seg/src:ro
+      - ../SADT-VISOR/tools/GreedyReg/src:/tools/GreedyReg/src:ro

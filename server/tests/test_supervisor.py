@@ -599,12 +599,21 @@ def test_progress_from_a_chain_lands_in_one_file_with_its_depth(tools_dir, tmp_p
 
     # Interleaved in the order they happened, and the depth is what tells the
     # levels apart -- the child never learned it was in a chain.
+    #
+    # The two `(1, None)` records are the supervisor's own markers BRACKETING
+    # the nested call, which is what makes the call visible to a reader that
+    # sees only events: without them a leaf reporting nothing at all would
+    # leave a chain indistinguishable from a parent that simply went quiet.
     assert [(record["depth"], record["fraction"]) for record in records] == [
-        (0, 0.1), (1, 0.9), (0, 1.0)
+        (0, 0.1), (1, None), (1, 0.9), (1, None), (0, 1.0)
+    ]
+    # A marker names the tool; a tool's own line never does.
+    assert [record.get("tool") for record in records] == [
+        None, "Leaf", None, "Leaf", None
     ]
     # Nothing else: a tool's line says how far along it is, and the server
     # stamps the phase, the state and the sequence when it reads them back.
-    assert all(set(record) == {"at", "fraction", "message", "depth"}
+    assert all(set(record) - {"tool"} == {"at", "fraction", "message", "depth"}
                for record in records)
 
 
@@ -651,3 +660,385 @@ def test_a_progress_file_that_does_not_exist_never_reaches_the_tool(tools_dir, t
     assert completed.returncode == 0, completed.stderr
     assert result["result"]
     assert not (tmp_path / "gone").exists()
+
+
+# ----------------------------------------------------------------------
+# What a chain hands down is ROOM, and the child decides its own width
+# ----------------------------------------------------------------------
+#
+# Everything below runs the real thing: two interpreters, a real cost table on
+# disk, and the child reporting the number it was actually called with. The
+# unit tests in test_concurrency.py pin the arithmetic; these pin that the
+# arithmetic survives a process boundary, which is the only place it matters.
+
+WIDE_LEAF = """
+    def run(scans: Path, output_dir: Path, num_workers: int = 1) -> int:
+        \"\"\"Report the width the server or its parent settled on.\"\"\"
+        return num_workers
+"""
+
+WIDE_CALLER = """
+    def run(scans: Path, output_dir: Path, num_workers: int = 1, *, sup=None) -> int:
+        \"\"\"Call the leaf and hand back the width IT was given.\"\"\"
+        return sup.run("Leaf", scans=scans, output_dir=output_dir)
+"""
+
+
+def _costs_file(tmp_path, table):
+    path = tmp_path / "tool_costs.json"
+    path.write_text(json.dumps(table), encoding="utf-8")
+    return str(path)
+
+
+def _chain_env(tmp_path, table, budget, channels, axes=None):
+    """The environment a server builds for a root run, minus the tool paths."""
+    environment = {
+        "SADT_COST_TABLE": _costs_file(tmp_path, table),
+        "SADT_CHANNEL_BUDGET": budget,
+        "SADT_CHANNELS": str(channels),
+        "SADT_MAX_CHANNELS": "0",
+    }
+    if axes is not None:
+        environment["SADT_WIDTH_AXIS"] = json.dumps(axes)
+    return environment
+
+
+def test_a_child_sizes_itself_from_its_own_cost(tools_dir, tmp_path):
+    """The parent holds 12 GiB and may open 4 channels, so one channel -- and
+    therefore its child -- may spend 3 GiB. A leaf measured at 1 GiB a channel
+    takes three of them, and nothing in that sentence is a core count."""
+    make_tool(tools_dir, "Leaf", WIDE_LEAF)
+    make_tool(tools_dir, "Caller", WIDE_CALLER)
+
+    completed, result = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env=_chain_env(
+            tmp_path,
+            {"Caller": {"vram_bytes": 3 << 30}, "Leaf": {"vram_bytes": 1 << 30}},
+            budget="{},0".format(12 << 30), channels=4,
+        ),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert result["result"] == 3
+
+
+def test_a_chain_cannot_multiply_across_the_process_boundary(tools_dir, tmp_path):
+    """The parent's four channels times the child's three is twelve, and twelve
+    channels of 1 GiB is exactly the 12 GiB the root was admitted against. The
+    bytes were divided on the way down, so the product cannot exceed them."""
+    make_tool(tools_dir, "Leaf", WIDE_LEAF)
+    make_tool(tools_dir, "Caller", WIDE_CALLER)
+
+    completed, result = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env=_chain_env(
+            tmp_path,
+            {"Caller": {"vram_bytes": 3 << 30}, "Leaf": {"vram_bytes": 1 << 30}},
+            budget="{},0".format(12 << 30), channels=4,
+        ),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert 4 * result["result"] * (1 << 30) <= 12 << 30
+
+
+def test_an_unused_parent_grant_does_not_shrink_the_child(tools_dir, tmp_path):
+    """Measured on 2026-09-18: ASO was granted five channels, opened one, and
+    its child's budget was divided by five anyway. A reservation is a
+    per-channel cost times the channel count, so the grant now inflates the
+    numerator by exactly what it inflates the denominator by -- the child gets
+    the same width at every grant its parent could have been given."""
+    make_tool(tools_dir, "Leaf", WIDE_LEAF)
+    make_tool(tools_dir, "Caller", WIDE_CALLER)
+
+    widths = []
+    for granted in (1, 5):
+        completed, result = run_job(
+            tools_dir, "Caller", tmp_path / "job{}".format(granted),
+            {"scans": str(tmp_path / "in"),
+             "output_dir": str(tmp_path / "job{}".format(granted) / "output")},
+            env=_chain_env(
+                tmp_path,
+                {"Caller": {"vram_bytes": 4 << 30}, "Leaf": {"vram_bytes": 1 << 30}},
+                # What admission would have reserved at that width: the
+                # per-channel cost times the channels it granted.
+                budget="{},0".format(granted * (4 << 30)), channels=granted,
+            ),
+        )
+        assert completed.returncode == 0, completed.stderr
+        widths.append(result["result"])
+
+    assert widths == [4, 4]
+
+
+def test_a_child_nothing_has_measured_still_reserves_everything(tools_dir, tmp_path):
+    """An empty cost table has to behave at depth exactly as it does at the
+    top: one channel, the whole budget, and no guessing."""
+    make_tool(tools_dir, "Leaf", WIDE_LEAF)
+    make_tool(tools_dir, "Caller", WIDE_CALLER)
+
+    completed, result = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env=_chain_env(tmp_path, {}, budget="{},0".format(64 << 30), channels=1),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert result["result"] == 1
+
+
+def test_a_child_is_bounded_by_the_items_its_own_request_carries(tools_dir, tmp_path):
+    """ALI under ASO can afford more channels than it has landmarks. The axis
+    to count comes down from the server, so both levels bound a width by the
+    same rule."""
+    make_tool(tools_dir, "Leaf", """
+    def run(scans: Path, output_dir: Path, landmarks: dict = None,
+            num_workers: int = 1) -> int:
+        \"\"\"Report the width, having been asked for a handful of landmarks.\"\"\"
+        return num_workers
+    """)
+    make_tool(tools_dir, "Caller", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> int:
+        \"\"\"Ask the leaf for two of its four landmarks.\"\"\"
+        return sup.run("Leaf", scans=scans, output_dir=output_dir,
+                       landmarks={"Ba": True, "S": True, "N": False, "RPo": False})
+    """)
+
+    completed, result = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env=_chain_env(
+            tmp_path,
+            {"Caller": {"vram_bytes": 16 << 30}, "Leaf": {"vram_bytes": 1 << 30}},
+            budget="{},0".format(16 << 30), channels=1,
+            axes={"Leaf": "landmarks"},
+        ),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert result["result"] == 2, "sixteen affordable, two asked for"
+
+
+def test_a_child_never_inherits_its_parent_s_own_width(tools_dir, tmp_path):
+    """The supervisor copies this process's environment, so SADT_CHANNELS has
+    to be REMOVED rather than left. Inheriting it would give the child its
+    parent's width, which is the one number that is certainly not its own."""
+    make_tool(tools_dir, "Leaf", WIDE_LEAF)
+    make_tool(tools_dir, "Caller", WIDE_CALLER)
+
+    completed, result = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env=_chain_env(
+            tmp_path,
+            {"Caller": {"vram_bytes": 6 << 30}, "Leaf": {"vram_bytes": 2 << 30}},
+            budget="{},0".format(6 << 30), channels=3,
+        ),
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert result["result"] == 1, "6 GiB over 3 channels is 2 GiB, one leaf's worth"
+
+
+# ----------------------------------------------------------------------
+# The tool asks: `sup.channels(wanted)`
+# ----------------------------------------------------------------------
+#
+# The other half of the same budget, arriving from the other direction. The
+# server fills in `num_workers` by counting a request's items from the OUTSIDE,
+# before the run -- which for several tools it cannot do at all: ALI_IOS counts
+# teeth out of a mesh's label array, CLIC counts slices of a volume it has not
+# read, and AutoCrop3D, AutoMatrix and GreedyReg take two paired folders where
+# splitting either alone re-pairs patients. For those the outside answer is "no
+# bound", and an unbounded width is RESERVED all the same: measured on this
+# machine on 2026-09-18, AMASSS at 19.1 GiB a channel against a 93.8 GiB host
+# budget was granted 3 channels for a request holding ONE scan, so 57.3 GiB was
+# held and one run fitted where four had -- six concurrent AMASSS 143 s ->
+# 275 s, ten 158 s -> 425 s, with a single run unchanged at 79 s throughout.
+#
+# `sup.channels(wanted)` asks the side that knows. What makes it safe to answer
+# after the run has started is that the SHARE is the reservation: admission
+# reserved room for this run before it began, and the answer is only ever what
+# that room can pay for.
+
+ASK_LEAF = """
+    def run(scans: Path, output_dir: Path, wanted: int = 0, *, sup=None) -> int:
+        \"\"\"Ask for a width and hand back what the machine allowed.\"\"\"
+        return sup.channels(wanted)
+"""
+
+# It declares `num_workers` as well, which is the migration shape: the argument
+# stays, because it is how the tool is driven from a CLI with no server around
+# it, and the server goes on filling it in. A tool that ASKS ignores it.
+ASK_CALLER = """
+    def run(scans: Path, output_dir: Path, mine: int = 0, theirs: int = 0,
+            num_workers: int = 1, *, sup=None) -> list:
+        \"\"\"Take a width of its own, then let the leaf take one of the rest.\"\"\"
+        own = sup.channels(mine)
+        return [own, sup.run("Leaf", scans=scans, output_dir=output_dir,
+                             wanted=theirs)]
+"""
+
+
+def _ask(tools_dir, tmp_path, name, params, table, budget=None, channels=None,
+         cap="0", label="job"):
+    """Run one asking tool, with the environment a server would have built."""
+    environment = {"SADT_COST_TABLE": _costs_file(tmp_path, table),
+                   "SADT_MAX_CHANNELS": cap}
+    if budget is not None:
+        environment["SADT_CHANNEL_BUDGET"] = budget
+    if channels is not None:
+        environment["SADT_CHANNELS"] = str(channels)
+    job = tmp_path / label
+    completed, result = run_job(
+        tools_dir, name, job,
+        dict(params, scans=str(tmp_path / "in"), output_dir=str(job / "output")),
+        env=environment,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return result["result"]
+
+
+def test_a_tool_asking_for_more_than_its_share_gets_the_share(tools_dir, tmp_path):
+    """Three channels were reserved at 2 GiB each, so three is what there is.
+
+    The answer is the room divided by the MEASURED per-channel cost, which is
+    what makes it safe to give after the run has started: every channel it
+    permits was paid for before the process existed."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+
+    assert _ask(tools_dir, tmp_path, "Leaf", {"wanted": 10},
+                {"Leaf": {"vram_bytes": 2 << 30}},
+                budget="{},0".format(6 << 30), channels=3) == 3
+
+
+def test_a_tool_asking_for_less_than_its_share_gets_what_it_asked(tools_dir, tmp_path):
+    """The point of asking. Its `wanted` is the real item count, read at run
+    time, and a run with two things to do opens two channels however much room
+    it was given -- which saves the process launches AND stops the cost table
+    learning a per-channel figure divided by a width nothing reached."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+
+    assert _ask(tools_dir, tmp_path, "Leaf", {"wanted": 2},
+                {"Leaf": {"vram_bytes": 2 << 30}},
+                budget="{},0".format(6 << 30), channels=3) == 2
+
+
+def test_a_tool_asking_for_nothing_in_particular_gets_what_it_can_afford(
+        tools_dir, tmp_path):
+    """Omitted or zero means "as many as I can afford", for a tool whose loop
+    has no count to give -- which is the case `width_from = false` describes."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+
+    assert _ask(tools_dir, tmp_path, "Leaf", {},
+                {"Leaf": {"vram_bytes": 2 << 30}},
+                budget="{},0".format(6 << 30), channels=3) == 3
+
+
+def test_a_tool_asking_with_no_room_accounted_for_gets_one(tools_dir, tmp_path):
+    """No `SADT_CHANNEL_BUDGET` is no server: `scripts/run_tool.py`, a test
+    harness, a tool driven straight from Python. It must not find a width
+    nobody reserved, so it gets the one width that is always affordable."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+
+    assert _ask(tools_dir, tmp_path, "Leaf", {"wanted": 10},
+                {"Leaf": {"vram_bytes": 2 << 30}}) == 1
+
+
+def test_a_tool_nothing_has_measured_is_offered_one_channel(tools_dir, tmp_path):
+    """The same rule admission applies at the top: an unknown cost is reserved
+    as if it were the whole machine, so there is room for exactly one of it."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+
+    assert _ask(tools_dir, tmp_path, "Leaf", {"wanted": 10}, {},
+                budget="{},0".format(64 << 30), channels=1) == 1
+
+
+def test_an_answer_never_exceeds_what_admission_reserved_against(
+        tools_dir, tmp_path):
+    """The cost table is a window and its maximum can fall when an old sample
+    drops out of it. The bytes were taken at the price of the day, so the
+    number they were taken for wins over an arithmetic working from newer,
+    cheaper prices."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+
+    assert _ask(tools_dir, tmp_path, "Leaf", {"wanted": 10},
+                {"Leaf": {"vram_bytes": 1 << 30}},
+                budget="{},0".format(6 << 30), channels=2) == 2
+
+
+def test_the_deployment_backstop_still_caps_an_answer(tools_dir, tmp_path):
+    """`SADT_MAX_CHANNELS` is the one number a deployment writes down, and it
+    only ever narrows. A tool asking is not a way around it."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+
+    assert _ask(tools_dir, tmp_path, "Leaf", {"wanted": 10},
+                {"Leaf": {"vram_bytes": 1 << 30}},
+                budget="{},0".format(16 << 30), channels=16, cap="4") == 4
+
+
+def test_a_nested_call_sizes_itself_from_its_inherited_share(tools_dir, tmp_path):
+    """The child's width is ITS cost against the room it was handed -- never
+    its parent's width, and never a number its parent computed.
+
+    The caller holds 12 GiB and opens four channels, so one of those channels
+    may spend 3 GiB; a leaf measured at 1 GiB takes three of them. Measured on
+    2026-09-18, the defect this replaced: the same ALI_CBCT asking for seven
+    landmarks got 7 channels standalone, 5 under an ASO holding 28 cores and 7
+    under an ASO holding 31."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+    make_tool(tools_dir, "Caller", ASK_CALLER)
+
+    assert _ask(tools_dir, tmp_path, "Caller", {"mine": 4, "theirs": 10},
+                {"Caller": {"vram_bytes": 3 << 30}, "Leaf": {"vram_bytes": 1 << 30}},
+                budget="{},0".format(12 << 30), channels=4) == [4, 3]
+
+
+def test_a_chain_cannot_multiply_what_the_root_was_admitted_for(
+        tools_dir, tmp_path):
+    """Four channels of the caller times three of the leaf is twelve, and
+    twelve channels of 1 GiB is exactly the 12 GiB the root holds. The bytes
+    are divided on the way down, so the product cannot exceed them."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+    make_tool(tools_dir, "Caller", ASK_CALLER)
+
+    own, theirs = _ask(
+        tools_dir, tmp_path, "Caller", {"mine": 4, "theirs": 10},
+        {"Caller": {"vram_bytes": 3 << 30}, "Leaf": {"vram_bytes": 1 << 30}},
+        budget="{},0".format(12 << 30), channels=4)
+    assert own * theirs * (1 << 30) <= 12 << 30
+
+
+def test_a_parent_that_asks_for_one_hands_its_child_everything(tools_dir, tmp_path):
+    """The grant it did not use costs its child nothing, and now exactly
+    nothing rather than approximately.
+
+    The caller was admitted at four channels and asks for one, so it is running
+    at one: it is blocked inside `sup.run` while the child works and there is
+    nothing to divide. Dividing by the four it ignored is the defect measured
+    on 2026-09-18 -- ASO granted five channels, opening one, its child's budget
+    divided by five anyway -- and what closes it here is that asking IS the
+    declaration. A tool that never asks is still divided by what it was
+    handed, because it never said otherwise."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+    make_tool(tools_dir, "Caller", ASK_CALLER)
+
+    assert _ask(tools_dir, tmp_path, "Caller", {"mine": 1, "theirs": 99},
+                {"Caller": {"vram_bytes": 3 << 30}, "Leaf": {"vram_bytes": 1 << 30}},
+                budget="{},0".format(12 << 30), channels=4) == [1, 12]
+
+
+def test_a_width_at_depth_never_divides_its_way_below_one(tools_dir, tmp_path):
+    """The floor that makes a deep chain safe rather than broken. The caller
+    holds seven bytes, opens eight channels, and the leaf still gets a channel
+    to run in -- over-committed by arithmetic nobody can avoid, and the
+    alternative is a chain that stops."""
+    make_tool(tools_dir, "Leaf", ASK_LEAF)
+    make_tool(tools_dir, "Caller", ASK_CALLER)
+
+    assert _ask(tools_dir, tmp_path, "Caller", {"mine": 8, "theirs": 8},
+                {"Caller": {"vram_bytes": 1}, "Leaf": {"vram_bytes": 1 << 30}},
+                budget="7,0", channels=8) == [7, 1]

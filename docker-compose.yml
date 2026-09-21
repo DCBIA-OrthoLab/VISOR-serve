@@ -102,6 +102,12 @@ services:
   #     docker compose --profile cpu up -d inference-cpu
   #
   # or let scripts/server_ctl.py pick between the two from what the host has.
+  # NOTE, and it is the one thing this service cannot do: CNE will not run
+  # here. It ships the CUDA build of llama-cpp-python, whose `libggml-cuda.so`
+  # names `libcuda.so.1` -- the installed DRIVER, which no wheel carries -- so
+  # `import llama_cpp` fails rather than a GPU call inside it. It answers 503
+  # naming the library; every other tool runs normally. The fix is one line of
+  # `tools/CNE/pyproject.toml`, the `whl/cpu` index, and a re-sync.
   inference-cpu:
     <<: *inference-base
     profiles: ["cpu"]
@@ -202,6 +208,7 @@ services:
       - API_TOKEN=${API_TOKEN:-dev-token}
       - DEVICE=${DEVICE:-cuda}
     volumes:
+      - sadt-cache:/var/cache/sadt
       # Read-only, and outside the image: an image gets copied around, a mount
       # does not.
       - ./DATA:/DATA:ro
@@ -233,3 +240,18 @@ services:
               count: all
               capabilities: [gpu]
     restart: unless-stopped
+
+volumes:
+  # SCHEMA_CACHE_DIR, which holds two things a replaced container must not lose.
+  #
+  # The schema cache is regenerable, but regenerating it means running
+  # describe.py once per tool with that tool's own interpreter -- minutes of
+  # startup before the first request is served.
+  #
+  # The cost table is not regenerable at all. It is what every run this
+  # deployment has ever done measured itself to need, and admission reads it:
+  # losing it puts every tool back to "unmeasured", which means every tool runs
+  # alone again until the table refills. A learned budget that forgets itself on
+  # `up --force-recreate` would be worse than useless, because it would forget
+  # silently.
+  sadt-cache:

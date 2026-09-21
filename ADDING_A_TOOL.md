@@ -50,9 +50,29 @@ def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
     landmarks = sup.run("ALI", input=scans, model=bundle, output_dir=sup.tmp / "ali")
 ```
 
-Five members, nothing more: `sup.run(tool, **params)` (blocking, returns what
-that tool's `run()` returned), `sup.out`, `sup.tmp`, `sup.progress(fraction,
-message)`, `sup.log(message)`.
+Six members, nothing more: `sup.run(tool, **params)` (blocking, returns what
+that tool's `run()` returned), `sup.out`, `sup.tmp`, `sup.channels(wanted)`,
+`sup.progress(fraction, message)`, `sup.log(message)`.
+
+- **`sup.channels(wanted)` is how a tool that parallelises asks how widely it
+  may.** `wanted` is the tool's OWN count of the things it is about to loop
+  over, taken at run time - the one moment it is knowable, and the one thing
+  the server cannot work out from the request for `ALI_IOS` (teeth, read from a
+  mesh's label array), `CLIC` (slices of a volume not yet opened), or the tools
+  taking two paired folders. The answer is what the share reserved for this run
+  can pay for, never below one and never above `wanted`.
+  - **Keep `num_workers` in the signature.** It is the width for a run with
+    nothing supervising it - a CLI call, `uv run`, `scripts/run_tool.py` - and
+    a tool that could only get a width from a supervisor would be unrunnable
+    outside a server. One line covers both:
+
+    ```python
+    workers = sup.channels(len(items)) if sup else min(num_workers, len(items))
+    ```
+
+  - **It grants a width; it does not declare one.** `progress.set_width(n)` is
+    still how a tool says how wide it actually is, per phase, and it is the only
+    one of the two the server reads back when it divides a run's measured peak.
 
 - **Never import a supervisor type.** It is duck-typed on purpose: a tool
   importing one would need a package shared with this repository, which is what

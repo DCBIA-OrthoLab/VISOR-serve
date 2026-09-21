@@ -31,6 +31,42 @@
 # not an error: a deployment file outliving one tool must not stop the others.
 
 # ---------------------------------------------------------------------------
+# batch: splitting a cohort into several runs
+# ---------------------------------------------------------------------------
+#
+# A folder of inputs is sent as several runs rather than one archive. HOW MUCH
+# goes in one of them is this server's business, not any tool's, so it is set
+# once at the top level and not per tool:
+#
+#     [batch]
+#     max_mb = 400       # whichever of the two binds first wins
+#     max_files = 25     # 0 on both turns batching off for this server
+#
+# Here as well as in the environment (BATCH_MAX_MB / BATCH_MAX_FILES) because
+# this file is MOUNTED: tuning the number costs no container recreate, so
+# nothing running is dropped to try a different value.
+#
+# WHICH argument holds the cohort is derived: the tool's one required `path`
+# argument. A tool with two of them pairs them per patient (AREG's t1/t2,
+# AutoCrop3D's scans/roi), and splitting one side without the other registers a
+# patient against somebody else's baseline - quietly, returning a plausible
+# wrong result. Those are excluded by the convention itself, and the two keys
+# below are the only ways past it:
+#
+# [tools.MyTool]
+# batch = false                      # never split a cohort for this tool
+# batch = { axis = "scans" }         # split on this argument, pairing and all
+#
+# `batch = false` is for a tool whose run is dominated by loading its model -
+# see [tools.CNE] in deployment.toml, which loads 4.4 GB per call. Naming an
+# `axis` is the opposite: a deliberate statement by someone who has decided how
+# the pairing survives the split.
+#
+# Per-tool caps exist too (`batch = { max_mb = 200 }`) and are the exception,
+# not the pattern. If a number is right for one tool it is usually right for
+# the server.
+
+# ---------------------------------------------------------------------------
 # timeout_seconds, and the one case where it is not about compute
 # ---------------------------------------------------------------------------
 #
@@ -56,3 +92,30 @@
 #
 # That is also why an orchestrator's timeout looks absurd next to its siblings':
 # it is not slower, it is waiting.
+
+# ---------------------------------------------------------------------------
+# width_from: which argument says how much there is to do
+# ---------------------------------------------------------------------------
+#
+# A tool that can process several things at once can never usefully open more
+# channels than it has things. One landmark does not need four workers: it
+# spends a process launch -- ~3 s measured for ALI_CBCT -- to do one landmark's
+# work, and the run is then MEASURED at a width it never reached, so the cost
+# table learns a per-channel figure too low to be safe.
+#
+# Absent, the batch axis is counted: the argument a cohort is already split on,
+# which for most tools is the same thing. AMASSS's channels are scans and its
+# axis is `scans`, so it declares nothing.
+#
+#     [tools.ALI_CBCT]
+#     width_from = "landmarks"   # its axis is `input`, a FOLDER of scans, but
+#                                # its channels are the landmarks in one scan
+#
+#     [tools.CLIC]
+#     width_from = false         # its channel is a slice of a volume, and how
+#                                # many there are is unknown until the volume
+#                                # has been read -- after admission decided
+#
+# There is deliberately no per-tool CAP to go with it. What bounds a width is
+# what it costs and what was asked for, both measured; a number written here
+# could only disagree with them.

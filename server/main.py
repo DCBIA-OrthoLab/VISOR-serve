@@ -21,14 +21,21 @@ from typing import Optional
 import anyio.to_thread
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from execution import dispatch
+from execution import admission, costs, dispatch
 from registry import facade
 from registry.facade import FacadeTool
 import file_utils
+import resources
 from wire import runs, transfer
 from base import (
     FILE_TYPES,
@@ -73,6 +80,20 @@ async def _reaper_loop() -> None:
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # Said out loud, once, before anything runs. A budget that did not take
+    # effect -- a variable set in the wrong file, a container limit nobody
+    # applied -- has no symptom other than a server that feels slow, so the
+    # numbers it decided on have to be readable in the log beside the ones it
+    # found. Resolved here rather than at import so the detection it does is
+    # part of starting the server, not of importing it.
+    for line in resources.banner(resources.allocation()).splitlines():
+        logger.info("%s", line)
+    # Said beside the budget, because the budget is only as good as these: a
+    # tool nobody has measured reserves everything, and a tool whose memory
+    # moves with the request is reserving the worst run anyone has seen rather
+    # than what this one will cost.
+    for line in costs.banner().splitlines():
+        logger.info("%s", line)
     async with anyio.create_task_group() as task_group:
         task_group.start_soon(_reaper_loop)
         try:
@@ -124,6 +145,18 @@ _UPLOADS_FIELD = "__uploads__"
 # gets exactly the response it always got.
 _RESULT_DELIVERY_HEADER = "X-Result-Delivery"
 _DELIVER_BY_REFERENCE = "reference"
+
+# Opts one run out of the blocking contract: the POST answers 202 as soon as the
+# inputs are staged, and the run reports through the event stream it already
+# has. Modelled on the header above, and opt-in for the same reason -- a client
+# that does not send it reaches byte-for-byte the behaviour it always had.
+#
+# What this fixes is not hypothetical. The Slicer client's POST read timeout is
+# 600 s and its ceiling is an hour, while the server is sized for cohorts that
+# legitimately take longer; and a disconnect never stopped a run, it only threw
+# away the answer, because nothing in Starlette cancels a worker thread.
+_RUN_DELIVERY_HEADER = "X-Run-Delivery"
+_RUN_DETACHED = "detached"
 
 # The run id, minted by the client with secrets.token_urlsafe(24) and sent on
 # the run it identifies. Optional in both directions: a client that sends none
@@ -330,6 +363,42 @@ def _output_roots(outputs: list, work_dir: str) -> set:
     return roots
 
 
+
+
+
+
+# A campaign is addressed BY NAME from a URL. One path segment, starting with
+# an alphanumeric and ending in the suffix the report writer uses: no
+# separator and no leading dot, which makes a traversal unrepresentable rather
+# than merely detected. `wire/transfer.py`'s ID_RE is the local precedent.
+#
+# Matched with `fullmatch`, not `match`: Python's `$` also matches before a
+# trailing newline, and a file name on Linux may contain one -- so an anchored
+# `match` would accept `b6-....json\n` as if it were the name beside it.
+_CAMPAIGN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.json")
+
+
+
+
+
+
+
+
+
+
+# NOT named `status`, `benchmarks` or anything else already bound at module
+# level: a handler shadowing an imported name breaks it for every line below
+# it -- a function called `status` here once took out every `status.HTTP_*` in
+# this module at import time.
+# Per-tool documentation. Unauthenticated like the other two pages: it
+# describes what a tool DOES and what it costs on this deployment, which is
+# what `GET /tools` already publishes in machine-readable form. A tool nobody
+# has written up answers 404 rather than an empty page -- a blank document
+# reads as "there is nothing to say" when the truth is "nobody wrote it".
+
+
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -353,6 +422,63 @@ def _extensions_of(spec) -> Optional[dict]:
             extensions = FILE_TYPES[name] if spec.accepts is None else spec.accepts
             per_type[name] = list(extensions) if extensions else None
     return per_type or None
+
+
+@app.get("/status", dependencies=[Depends(verify_token)])
+def server_status() -> dict:
+    # NOT named `status`: `fastapi.status` is imported in this module and a
+    # function of that name shadows it, so every `status.HTTP_*` below becomes
+    # an AttributeError at import time.
+    """What this server is doing, right now.
+
+    The budget said at startup what the machine has; this says what is being
+    spent of it. Without it a slow server is indistinguishable from a busy one,
+    and admission -- the whole point of which is to make a run WAIT -- is
+    invisible: a client sees `queued_gpu` and cannot tell whether it is behind
+    one job or twelve.
+
+    Bearer-protected, and deliberately narrower than `GET /runs/{id}`. That
+    endpoint answers to whoever holds a run's id, which is the client that
+    started it; this one lists every run to anyone holding the shared API
+    token, which on this deployment is every workstation. So no progress
+    MESSAGE appears here -- a message is free text written by a tool and can
+    name the file it is working on, which is a patient's. Phases and counts say
+    what the server is doing without saying whose data it is doing it to.
+    """
+    allocation = resources.allocation()
+    budget = admission.budget()
+    free_vram, total_vram = None, None
+    try:
+        total_vram, free_vram = resources.detect_vram_bytes()
+    except Exception:  # noqa: BLE001 - a status page must not fail on a probe
+        pass
+    learned = costs.known()
+    return {
+        "budget": {
+            "cpus": allocation.cpus,
+            "ram_bytes": allocation.ram_bytes,
+            "vram_bytes": allocation.vram_bytes,
+            "cpus_per_job": allocation.cpus_per_job,
+            "ram_per_job": allocation.ram_per_job,
+            "vram_per_job": allocation.vram_per_job,
+            "expected_clients": allocation.expected_clients,
+            "max_parallel_jobs": allocation.max_parallel_jobs,
+        },
+        "admission": budget.snapshot(),
+        "card": {"free_bytes": free_vram, "total_bytes": total_vram},
+        "runs": runs.active(),
+        "costs": {
+            name: {
+                "vram_bytes": cost.vram_bytes,
+                "ram_bytes": cost.ram_bytes,
+                "samples": cost.samples,
+                "vram_spread": round(cost.vram_spread, 3),
+                "ram_spread": round(cost.ram_spread, 3),
+                "input_dependent": cost.input_dependent,
+            }
+            for name, cost in learned.items() if cost
+        },
+    }
 
 
 @app.get("/tools")
@@ -441,6 +567,17 @@ def list_tools() -> list:
                 for arg_name, spec in tool.arguments.items()
             },
             "output_kind": tool.output_kind,
+            # How to split a folder of inputs into several runs:
+            # `{"axis": the argument to split, "max_mb": ..., "max_files": ...}`,
+            # whichever cap binds first. Advisory -- a client that ignores it
+            # sends the cohort whole, exactly as every client did before this
+            # existed, and every request is still a request.
+            #
+            # Omitted rather than null, like the argument-level hints above and
+            # for the same reason: tests/golden/tools_response.json pins the
+            # published shape byte for byte, and a tool that cannot be split
+            # must publish what it published before the field existed.
+            **({"batch": tool.batch} if tool.batch else {}),
         }
         for tool in TOOLS.values()
     ]
@@ -1056,7 +1193,7 @@ async def _as_resolved_path(spec, input_path: str, extension: str, work_dir: str
     return ResolvedPath(extracted, FOLDER_TYPE)
 
 
-def _registered_run(request: Request) -> Optional[str]:
+def _registered_run(request: Request, tool_name: str) -> Optional[str]:
     """Claim the run id the client sent, or None when it sent none.
 
     Called as the FIRST thing the handler does, before `await request.form()`,
@@ -1073,9 +1210,103 @@ def _registered_run(request: Request) -> Optional[str]:
     if not raw:
         return None
     try:
-        return runs.register(raw)
+        return runs.register(raw, tool=tool_name)
     except runs.RunError as exc:
         raise _run_error(exc)
+
+
+def _failure_message(exc: BaseException) -> str:
+    """What a detached run may say about its own failure.
+
+    The same rule the response body follows: a message the tool wrote to be
+    read by whoever sent the request travels, anything else is opaque. A
+    traceback can name a server-side path, and this one is going into a file a
+    client reads.
+    """
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+    if isinstance(exc, dispatch.ToolFailure):
+        if exc.error_type in TOOL_ERROR_STATUS:
+            return exc.message
+        return "Tool execution failed."
+    if isinstance(exc, (ToolArgumentError, ToolUnavailableError)):
+        return str(exc)
+    return "Tool execution failed."
+
+
+def _collectable(response) -> dict:
+    """The terminal event's payload: how to collect what the run produced."""
+    if isinstance(response, JSONResponse):
+        return json.loads(bytes(response.body).decode("utf-8"))
+    if isinstance(response, dict):
+        return dict(response)
+    return {}
+
+
+async def _detached_run(tool_name: str, request: Request, run_id: str) -> None:
+    """The whole run, after the 202 has already gone out.
+
+    The terminal event carries the `result_ref`, because the response that used
+    to carry it was sent minutes ago. Nothing else about the run changes: the
+    same staging, the same admission, the same progress events on the same
+    stream the client is already watching.
+
+    The run directory is deliberately NOT discarded here. The client has not
+    read the terminal event yet -- that is the whole point of writing one -- so
+    it expires the way an abandoned one does, on the idle TTL that every read
+    pushes back.
+    """
+    cleanup = BackgroundTasks()
+    token = runs.CURRENT_RUN.set(run_id)
+    try:
+        response = await _run_tool(tool_name, request, cleanup, detached=True)
+        runs.finish(run_id, runs.PHASE_DONE, result=_collectable(response))
+    except dispatch.RunCancelled:
+        runs.finish(run_id, runs.PHASE_CANCELLED)
+    except BaseException as exc:  # noqa: BLE001 - nobody is left to raise to
+        logger.warning("endpoint=/run/%s detached failure: %s", tool_name, exc)
+        runs.finish(run_id, runs.PHASE_FAILED, message=_failure_message(exc))
+    finally:
+        runs.CURRENT_RUN.reset(token)
+        try:
+            await cleanup()
+        except Exception:  # noqa: BLE001 - cleanup must not outlive its own failure
+            logger.exception("endpoint=/run/%s (detached cleanup)", tool_name)
+
+
+async def _detach(tool_name: str, request: Request, run_id, background_tasks):
+    """Accept the run, answer at once, and finish it after the response.
+
+    Two things are refused rather than half-supported. A detached run needs a
+    run id, because the event stream is the only channel it has left. And it
+    needs its file inputs to have arrived through `POST /uploads`, because a
+    multipart body is backed by a temporary file the framework closes when the
+    response ends -- which here is before the tool has read a byte of it. The
+    client already sends anything worth detaching that way.
+    """
+    if run_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"A detached run needs an {_RUN_ID_HEADER} header to report through.",
+        )
+    form = await request.form()
+    if any(isinstance(value, StarletteUploadFile) for _, value in form.multi_items()):
+        runs.discard(run_id)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "A detached run cannot take a file in the request body. Send it "
+                "through POST /uploads first and name it in __uploads__."
+            ),
+        )
+    runs.append(run_id, runs.PHASE_RECEIVED)
+    background_tasks.add_task(_detached_run, tool_name, request, run_id)
+    logger.info("endpoint=/run/%s status=202 detached", tool_name)
+    return JSONResponse(
+        {"run_id": run_id, "status": "accepted"},
+        status_code=status.HTTP_202_ACCEPTED,
+        background=background_tasks,
+    )
 
 
 @app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
@@ -1088,7 +1319,9 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     directory down afterwards. A client that sends no `X-Run-Id` takes the
     first branch and reaches byte-for-byte the behaviour it always had.
     """
-    run_id = _registered_run(request)
+    run_id = _registered_run(request, tool_name)
+    if request.headers.get(_RUN_DELIVERY_HEADER, "").lower() == _RUN_DETACHED:
+        return await _detach(tool_name, request, run_id, background_tasks)
     if run_id is None:
         return await _run_tool(tool_name, request, background_tasks)
 
@@ -1126,7 +1359,8 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     return response
 
 
-async def _run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks):
+async def _run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks,
+                    detached: bool = False):
     start_time = time.monotonic()
 
     try:
@@ -1470,7 +1704,10 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # streamed response deletes its file the moment the response ends, with
         # no dependency on the client, while a reference waits for a DELETE or
         # for the reaper. Parallel ranges buy nothing on a small result.
-        deliver_by_reference = (
+        # A detached run has no response left to stream into, so it always
+        # takes a reference -- the size floor below is about cleanup, and a
+        # detached run's cleanup is the reaper either way.
+        deliver_by_reference = detached or (
             request.headers.get(_RESULT_DELIVERY_HEADER, "").lower() == _DELIVER_BY_REFERENCE
             and os.path.getsize(result) >= _RESULT_REFERENCE_MIN_BYTES
         )
@@ -1485,6 +1722,14 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
                 # fail a run that has already done the expensive part. Falls
                 # through to streaming the file the way it always did.
                 logger.exception("endpoint=/run/%s (storing result by reference)", tool_name)
+        if detached and stored is None:
+            # Nothing to fall through to: the response went out as a 202 long
+            # ago, so a result that cannot be parked is a result nobody can
+            # ever collect. Better a failed run than a silent one.
+            raise ToolExecutionError(
+                f"Tool '{tool_name}' produced a result that could not be stored "
+                "for collection."
+            )
 
         background_tasks.add_task(shutil.rmtree, work_dir, ignore_errors=True)
         for output_root in output_roots:

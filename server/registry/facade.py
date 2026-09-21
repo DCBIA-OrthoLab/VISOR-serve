@@ -56,12 +56,14 @@ class FacadeTool(Tool):
     """
 
     def __init__(self, name: str, targets: dict, arguments: dict,
-                 output_kind: str, description: str = ""):
+                 output_kind: str, description: str = "",
+                 batch: Optional[dict] = None):
         self.name = name
         self.targets = dict(targets)
         self.arguments = arguments
         self.output_kind = output_kind
         self.description = description
+        self.batch = batch
         # A facade runs nothing itself, so it has no folder and no interpreter.
         self.folder = None
 
@@ -217,12 +219,20 @@ def compose(name: str, targets: dict, registry: dict) -> FacadeTool:
     kinds = {registry[target].output_kind for target in targets.values()}
     output_kind = kinds.pop() if len(kinds) == 1 else "files"
 
+    # A facade splits a cohort only where every mode splits it the same way,
+    # because the mode is picked at run time and the client splits before the
+    # run starts. ALI's two engines both take one required `input`, so ALI
+    # inherits their plan; AREG's take `t1` and `t2` and have none, so AREG has
+    # none either. Nothing to declare in deployment.toml for either case.
+    plans = [registry[target].batch for target in targets.values()]
+    batch = plans[0] if plans and all(plan == plans[0] for plan in plans) else None
+
     logger.info(
         "Facade '%s' composed over %s: %d argument(s)",
         name, ", ".join(f"{mode}={target}" for mode, target in targets.items()),
         len(arguments),
     )
-    return FacadeTool(name, targets, composed, output_kind)
+    return FacadeTool(name, targets, composed, output_kind, batch=batch)
 
 
 def build_facades(registry: dict, configured, for_tool, on_failure=None) -> dict:

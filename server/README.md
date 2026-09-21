@@ -23,12 +23,16 @@ written that way; see [`ADDING_A_TOOL.md`](../ADDING_A_TOOL.md).
 Requests are served **in parallel**: each tool execution runs in a worker
 thread (never on the event loop), so a long inference never blocks other
 requests - `/health`, `/tools` and other `/run` calls all stay responsive
-while a tool is working. `MAX_CONCURRENT_TOOLS` (default 4) caps how many run
-at once, and `MAX_CONCURRENT_GPU_JOBS` (default 1) caps how many of those may
-touch the card - **one counter across all tools**, since an `AMASSS` run and a
-`Crown_Seg` run want the same device. The HTTP call itself remains blocking
-request/response: the client sends a request and gets the result in the same
-response (no job queue / polling).
+while a tool is working. `MAX_CONCURRENT_TOOLS` (default 4) caps how many
+worker threads may be inside a run at once, and **admission decides the rest in
+bytes and cores** rather than in jobs - see "Who gets the card" below.
+
+The HTTP call is blocking request/response **by default**: the client sends a
+request and gets the result in the same response. A client that sends
+`X-Run-Delivery: detached` with its `X-Run-Id` is answered `202` as soon as its
+inputs are staged, and collects the result reference from the terminal event on
+`GET /runs/{id}/events`. Still no job queue, no broker and no polling loop: the
+run registry that already exists is what carries it.
 
 ## Where things live
 
@@ -658,15 +662,49 @@ produced by `SADT-VISOR`'s `scripts/run_tool.py` and faked in its tests.
   its parent, so it never queues for a slot the parent is already holding - 
   which is exactly the deadlock the in-process version had, where four
   concurrent `ASO` runs each waited on a fifth slot. The cost: nested work is
-  invisible to `MAX_CONCURRENT_GPU_JOBS`, so a deployment running several
-  supervised jobs at once has to size for more than one tool on the card.
+  invisible to admission as a JOB -- so the parent's reservation has to cover
+  both, which is why `runner._measurements` folds `own + worst child` into one
+  figure and the budget reserves against that.
 - Nested jobs live under `<job>/sup/NN_<tool>/` and are removed with the job.
 
 ### Who gets the card
 
-`MAX_CONCURRENT_GPU_JOBS` is **one counter across all tools** - the per-tool
-semaphores went with the tools that held them, and would cap nothing now that
-each tool is its own process anyway.
+**A budget in bytes and cores, not a count of jobs** (`execution/admission.py`).
+A count cannot describe a card: measured here, `ALI_CBCT` peaks at 0.25 GiB and
+`AMASSS` at 2.19 GiB on a 48 GiB device, so the old counter of one left about
+95% of it idle while everything queued behind it. It was also wrong in two
+directions - `threading.BoundedSemaphore` is per PROCESS, so `uvicorn
+--workers 2` quietly made two counters of one, and a supervised call never
+re-enters the server at all.
+
+What a run reserves is what it was **measured** to need. `runner.py` has written
+a peak per run since the subprocess path landed; `execution/costs.py` keeps it
+as a high-water mark per tool under `SCHEMA_CACHE_DIR`, and nothing is declared
+by hand anywhere. Three rules keep that safe:
+
+- a tool nothing has measured reserves the whole budget and **runs alone**, so
+  an empty table behaves exactly like the counter it replaced, and one run of
+  each tool is the whole bootstrap;
+- a demand larger than the budget **still runs**, alone, once the machine is
+  idle - a cap is a fairness target, never a refusal;
+- the card's **actually free** memory is checked too, because history cannot
+  know what another process on the host is holding.
+
+There is no job COUNTER above the budget any more. `MAX_CONCURRENT_GPU_JOBS`
+was the last one and it is gone: despite its name it capped every running job,
+so pinning it to 1 would have serialised a tabular prediction behind a
+segmentation -- exactly what the per-tool semaphores it replaced were removed
+for. What a run costs is a function of the width it was granted, and the budget
+is the whole policy.
+
+The budget itself comes from `resources.py`, which sizes the server to the
+machine it started on - reading the **cgroup limit before the kernel**, so a
+container's own `cpus:`/`memory:` are honoured and a Kubernetes pod needs no
+special case. `SADT_EXPECTED_CLIENTS` is what splits that budget per job, and it
+is a declaration rather than a detection: there is one shared API token and no
+client identity, so the server cannot tell ten workstations from one clicking
+ten times. The startup banner prints what was detected, what was decided, and
+which half came from a setting.
 
 **A run is assumed to want the GPU** unless it declares `device` and resolves
 it to a CPU value. The safe default is the strict one: a tool that quietly
@@ -1040,7 +1078,7 @@ that this port does not have, with no entry in its catalogs and no schema field
 to say so. It will need the supervisor too: it orchestrates both chains.
 
 The CBCT engine is elastix on the CPU; the IOS patch prediction is the GPU half
-and queues on `MAX_CONCURRENT_GPU_JOBS` like everything else. Both dependencies
+and is admitted on what it was measured to need, like everything else. Both dependencies
 are in that tool's own lockfile, not in `requirements.txt`.
 
 ## Testing

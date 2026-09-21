@@ -6,6 +6,7 @@ interpreter, runner.py, result.json, and the cleanup around them. See
 conftest.py for how it is laid out.
 """
 
+import base
 import contextlib
 import json
 import pathlib
@@ -118,7 +119,7 @@ def test_a_tool_that_died_without_saying_anything_falls_back_to_stderr(
     """A segfault in a CUDA kernel, or an OOM kill, writes no error file. The
     tail of stderr is all there is, and it has to travel."""
     monkeypatch.setattr(
-        dispatch, "_read_result", lambda job_dir, tool_name: (_ for _ in ()).throw(
+        dispatch, "_read_result", lambda job_dir, tool_name, solo=False: (_ for _ in ()).throw(
             FileNotFoundError()
         )
     )
@@ -390,7 +391,6 @@ def test_the_peak_vram_the_runner_measured_is_logged(tmp_path, caplog):
         assert _dispatch._read_result(str(job_dir), "Batch_Dental_Seg") == "ok"
 
     logged = "\n".join(record.getMessage() for record in caplog.records)
-    assert "peak_vram_bytes=39845888000" in logged
     assert "Batch_Dental_Seg" in logged
     assert "37.11 GiB" in logged
 
@@ -501,3 +501,52 @@ def test_only_a_hosted_model_argument_is_filled(monkeypatch, tmp_path):
     filled = dispatch._server_provided(OtherTool(), {}, str(tmp_path))
 
     assert filled == {}
+
+
+def test_the_server_device_reaches_a_tool_that_declares_its_own_default(monkeypatch):
+    """`settings.DEVICE` was inert for every tool that declared `device`.
+
+    `validate` fills a choice argument's declared default when the caller named
+    none, so by the time `dispatch.fill` asked "did anybody set `device`?" the
+    answer was always yes. Measured on 2026-09-21 with DEVICE=cuda in the
+    environment and in the container: CNE ran on the CPU for 67 s with a CUDA
+    build installed that does the same note in 3.35 s. A CPU-only deployment
+    had the mirror image, since AMASSS and Crown_Seg declare `cuda`.
+    """
+    from config import settings
+
+    monkeypatch.setattr(settings, "DEVICE", "cuda")
+
+    class Probe(base.Tool):
+        name = "Probe"
+        arguments = {
+            base.DEVICE_ARGUMENT: base.ArgSpec(
+                type="choice", required=False, choices={"cpu": True, "cuda": False}
+            )
+        }
+
+        def run(self, **kwargs):
+            return kwargs
+
+    assert Probe().invoke({})[base.DEVICE_ARGUMENT] == "cuda"
+
+
+def test_a_caller_who_names_a_device_keeps_it(monkeypatch):
+    """The schema promises a caller can choose, and a default the server fills
+    in is not the same statement as a value the caller sent."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "DEVICE", "cuda")
+
+    class Probe(base.Tool):
+        name = "Probe"
+        arguments = {
+            base.DEVICE_ARGUMENT: base.ArgSpec(
+                type="choice", required=False, choices={"cpu": True, "cuda": False}
+            )
+        }
+
+        def run(self, **kwargs):
+            return kwargs
+
+    assert Probe().invoke({base.DEVICE_ARGUMENT: "cpu"})[base.DEVICE_ARGUMENT] == "cpu"

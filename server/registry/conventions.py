@@ -18,11 +18,22 @@ weights from their laptop. See schema_tool's `selectable == "model"` branch.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from typing import Optional
+
 from . import deployment as deployment_module
 from .deployment import ToolDeployment
 
 # Suffixes that mean "the server hosts this, the caller names it".
 MODEL_NAMES = ("model", "reference")
+
+# The output directory every tool declares and no caller ever supplies: the
+# server fills it in with the job's own output/ and takes it out of the
+# published schema entirely (schema_tool imports this name from here). Written
+# down in this file because the rules below read the RAW schema, where it is
+# still a required `path` like any other -- which is exactly how a first version
+# of batch_axis_for came to nominate it as the argument to divide.
+OUTPUT_DIR_ARGUMENT = "output_dir"
 
 # Arguments a clinician is never asked: device placement, tiling, worker
 # counts, search budgets, mesh tuning. The tool still declares them and still
@@ -141,11 +152,86 @@ def is_model(argument_name: str) -> bool:
     return any(argument_name == name or argument_name.endswith("_" + name) for name in MODEL_NAMES)
 
 
-def derive(arguments: dict, declared: ToolDeployment) -> ToolDeployment:
+# --- splitting a cohort ----------------------------------------------------
+
+
+def batch_axis_for(arguments: dict) -> Optional[str]:
+    """The argument a cohort is split on, or None if this tool cannot be split.
+
+    The rule is "exactly one REQUIRED `path` argument", and the tools it
+    EXCLUDES are the reason it is written this way rather than "the first path
+    argument". A tool taking two required folders pairs them per patient --
+    AREG's `t1`/`t2`, AutoCrop3D's `scans`/`roi`, AutoMatrix's
+    `files`/`transforms`, GreedyReg's `t1`/`t2`. Splitting one of them without
+    splitting the other by the same key changes which scan is registered
+    against which, and that does not fail: it returns a plausible wrong result.
+
+    So a tool of that shape is never offered for batching by convention, and
+    the day a new one is added it is excluded without anyone having had to
+    notice. Naming its axis in deployment.toml stays possible and is then a
+    deliberate act, made by someone who has decided how the pairing survives.
+    """
+    required_paths = [
+        name
+        for name, declaration in arguments.items()
+        if isinstance(declaration, dict)
+        and declaration.get("type") == "path"
+        and declaration.get("required")
+        # Two required `path` arguments no caller ever sends a folder for, and
+        # both invisible in what GET /tools publishes. Counting them gets the
+        # answer wrong in BOTH directions, measured on the real tools: AMASSS
+        # reads as three required folders (scans, model, output_dir) and is
+        # excluded from batching altogether, while a tool whose only other path
+        # is optional reads as exactly one and has its OUTPUT DIRECTORY
+        # nominated as the thing to divide.
+        and name != OUTPUT_DIR_ARGUMENT
+        and not is_model(name)
+    ]
+    return required_paths[0] if len(required_paths) == 1 else None
+
+
+def batch_plan(arguments: dict, declared: ToolDeployment, defaults: tuple) -> Optional[dict]:
+    """How a client should split a cohort for this tool, or None to send it whole.
+
+    `defaults` is this server's `(max MB, max files)`. A tool may override
+    either -- the same escape hatch `max_upload_mb` and `timeout_seconds` have
+    -- but the normal case is that it does not, batching being a property of
+    the deployment and not of the tool.
+    """
+    if declared.batch_enabled is False:
+        return None
+    axis = declared.batch_axis or batch_axis_for(arguments)
+    if not axis:
+        return None
+
+    max_mb, max_files = defaults
+    if declared.batch_max_mb is not None:
+        max_mb = declared.batch_max_mb
+    if declared.batch_max_files is not None:
+        max_files = declared.batch_max_files
+    # Either number alone is a usable plan; both off is how a deployment turns
+    # batching off without editing a tool table.
+    if max_mb <= 0 and max_files <= 0:
+        return None
+    return {"axis": axis, "max_mb": max_mb, "max_files": max_files}
+
+
+def derive(arguments: dict, declared: ToolDeployment, batch_defaults: tuple) -> ToolDeployment:
     """`declared` (from deployment.toml) merged over these conventions.
 
     Anything stated explicitly wins, per argument, so an exception costs one
     line rather than restating everything the conventions already got right.
+
+    **Merged over, field by field, rather than rebuilt.** This used to
+    construct a fresh `ToolDeployment` from the three fields it computes, which
+    silently dropped every declared field it does not touch -- `width_from`,
+    `timeout_seconds`, `dispatch` and the raw `batch_*` declarations. That cost
+    nothing while the result was read only for `server_selectable` and `batch`,
+    and becomes a trap the moment anything reads the RESOLVED entry instead of
+    the declaration: CLIC's `width_from = false` and ALI_CBCT's
+    `width_from = "landmarks"` would vanish on the way through, and the two
+    tools that say most about their own width would be the two the server
+    stopped hearing.
     """
     selectable = {}
     for name, declaration in arguments.items():
@@ -162,9 +248,9 @@ def derive(arguments: dict, declared: ToolDeployment) -> ToolDeployment:
     hidden = {name for name in arguments if name in TECHNICAL}
     hidden.update(declared.hidden)
 
-    return ToolDeployment(
+    return replace(
+        declared,
         server_selectable=selectable,
-        max_upload_mb=declared.max_upload_mb,
-        data_dir=declared.data_dir,
         hidden=tuple(sorted(hidden)),
+        batch=batch_plan(arguments, declared, batch_defaults),
     )

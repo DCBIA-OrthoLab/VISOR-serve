@@ -851,8 +851,19 @@ def cmd_up(args) -> dict:
     url = args.url or url_for()
 
     if service == CPU_SERVICE:
+        # "Everything works, slowly" was true until CNE moved to the CUDA build
+        # of llama-cpp-python. That build's `libggml-cuda.so.0` names
+        # `libcuda.so.1` in DT_NEEDED, and the driver is shipped by no wheel --
+        # so on a machine with no driver it is `import llama_cpp` itself that
+        # fails, not a GPU call inside it. Every other tool still runs here.
+        #
+        # Said at startup rather than left in a README: the person reading this
+        # line is the one doing the install, and they are the only one who can
+        # act on it before a clinician meets a 503.
         log("Docker cannot reach a GPU (no nvidia runtime, no CDI device): starting the CPU "
-            "service. Everything works, slowly.")
+            "service. Every tool works, slowly -- except CNE, which needs an NVIDIA driver "
+            "to load at all and will answer 503. To run it here, point its "
+            "[tool.uv.sources] at the whl/cpu index and re-sync; see tools/CNE/README.md.")
 
     command = compose_base(service) + ["up", "-d"]
     if args.force_recreate:

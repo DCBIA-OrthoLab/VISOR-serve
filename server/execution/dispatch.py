@@ -37,6 +37,8 @@ import uuid
 from typing import Any, Optional
 
 import file_utils
+import resources
+from execution import admission, concurrency, costs
 from base import ToolUnavailableError
 from config import settings
 from registry.deployment import deployment_config
@@ -52,6 +54,11 @@ logger = logging.getLogger("inference_server")
 
 JOB_FILE = "job.json"
 RESULT_FILE = "result.json"
+# Where the runner said its VRAM figure came from. Stated here rather than
+# imported, exactly as RESULT_FILE is: runner.py is executed by a tool's
+# interpreter and this module never imports it.
+VRAM_SOURCE_KEY = "vram_source"
+VRAM_FROM_CARD = "card"
 # How long a TERMed process group gets before SIGKILL.
 _KILL_GRACE_SECONDS = 10.0
 
@@ -77,24 +84,12 @@ JOB_SUBDIRS = ("input", JOB_OUTPUT_DIRNAME)
 _STDERR_TAIL_BYTES = 8192
 
 
-# The GPU is one device and the tools no longer arbitrate for it themselves
-# (see settings.MAX_CONCURRENT_GPU_JOBS). Created lazily so the setting can be
-# monkeypatched in a test before the first run.
-_gpu_slots: Optional[threading.BoundedSemaphore] = None
-_gpu_lock = threading.Lock()
-
 # The argument a tool declares when it can be told where to run, and the values
 # that mean "not on the card".
-DEVICE_ARGUMENT = "device"
+# Defined in `base`, which owns the tool contract; imported so the two
+# cannot drift apart.
+from base import DEVICE_ARGUMENT  # noqa: E402  (kept beside its siblings)
 _CPU_DEVICES = ("cpu", "mps")
-
-
-def _gpu_semaphore() -> threading.BoundedSemaphore:
-    global _gpu_slots
-    with _gpu_lock:
-        if _gpu_slots is None:
-            _gpu_slots = threading.BoundedSemaphore(settings.MAX_CONCURRENT_GPU_JOBS)
-        return _gpu_slots
 
 
 def uses_the_gpu(tool, params: dict) -> bool:
@@ -170,26 +165,127 @@ def _raise_if_cancelled(run_id: Optional[str]) -> None:
         raise RunCancelled("The client cancelled this run.")
 
 
-@contextlib.contextmanager
-def _gpu_slot(run_id: Optional[str]):
-    """The card, waited for in a way a cancellation can interrupt.
+def _shapes(tool, params: dict) -> list:
+    """`(channels, cores)` to offer admission, widest first, one step at a time.
 
-    Without a run id this is the plain blocking acquire it has always been. With
-    one, the wait is broken into RUN_CANCEL_POLL_SECONDS slices so a client that
-    gives up on a queued run is not held until the slot it no longer wants frees
-    -- which, behind a multi-hour cohort, is the longest wait in the system.
+    The same run at every size it could be admitted at -- 8, 7, 6, ... not 8, 4,
+    2. Halving was arbitrary: a run that fits at three channels should be
+    admitted at three, not dropped to two because three was not on a ladder
+    somebody wrote by hand.
+
+    **The cores do not follow the channels.** They used to, and that made the
+    CPU bound a tool whose bottleneck is not the CPU: ALI_CBCT measures 28.1s on
+    seven cores and 29.4s on forty-two -- it does not scale with cores at all --
+    and the coupling still capped its channels at `cpus_per_job / 2`. What a
+    channel costs is MEMORY, which is what gets reserved; what it needs of the
+    CPU is a share of the threads the run already holds, and
+    `_thread_limits(cores, channels)` divides those. So every width asks for the
+    same cores -- the share the deployment says one job may hold -- and the two
+    axes narrow for their own reasons.
+
+    The two axes stop narrowing for different reasons, and the difference is
+    the safety property:
+
+    - **channels** cost memory, so their cost is reserved (`cost.at(channels)`)
+      and they narrow to one.
+    - **cores** cost only speed -- too few is slow, where too little memory is
+      dead -- so they keep narrowing past that, down to
+      `SADT_MIN_CPUS_PER_JOB`. That tail is what lets a CPU-bound cohort keep
+      starting runs long after the card stopped being the question.
+
+    Admission takes the first that fits, so no queue length is measured
+    anywhere: "the wide one does not fit" IS the congestion. The last shape is
+    the narrowest, so the list cannot run out.
     """
-    semaphore = _gpu_semaphore()
-    if run_id is None:
-        with semaphore:
-            yield
-        return
-    while not semaphore.acquire(timeout=settings.RUN_CANCEL_POLL_SECONDS):
-        _raise_if_cancelled(run_id)
+    widest = concurrency.ceiling(tool, params)
+    share = max(1, int(resources.allocation().cpus_per_job))
+    floor = max(1, min(share, int(settings.SADT_MIN_CPUS_PER_JOB)))
+
+    shapes, seen = [], set()
+    # Stops ABOVE one channel: the single-channel case belongs to the tail,
+    # which gives cores back one at a time from the full share. Running the
+    # ladder down to one first would put (1 channel, floor cores) ahead of
+    # (1 channel, every core free) -- a run admitted on two cores while ten
+    # were going spare, because the list stopped narrowing monotonically.
+    for channels in range(widest, 1, -1):
+        shapes.append((channels, share))
+    # Then one channel, giving cores back one at a time. A tool that declares
+    # no channel argument has `widest == 1` and this tail is the whole list --
+    # which is right: it is the only axis it has.
+    for cores in range(share, floor - 1, -1):
+        shapes.append((1, cores))
+
+    ordered = []
+    for shape in shapes:
+        if shape not in seen:
+            seen.add(shape)
+            ordered.append(shape)
+    return ordered
+
+
+def _demand_for(tool, params: dict, channels: int = 1, cores=None):
+    """What this run is expected to hold, from what the tool was measured to need.
+
+    Nobody declared any of it. `runner.py` has written a peak on every run since
+    the subprocess path landed and `costs.py` keeps it; a tool nothing has
+    measured reserves the whole budget and runs alone, so an empty table behaves
+    exactly like the job counter this replaces.
+    """
+    return admission.demand_for(
+        tool.name,
+        resources.allocation(),
+        costs.cost_of(tool.name),
+        uses_gpu=uses_the_gpu(tool, params),
+        channels=channels,
+        cpus=cores,
+    )
+
+
+def _log_grant(tool_name: str, cpus) -> None:
+    """Say so when a run is given more than its declared share.
+
+    A job that ran four times faster because the machine happened to be empty
+    is exactly what makes two timings of the same tool disagree, so the reason
+    belongs in the log beside them rather than being inferred afterwards.
+    """
+    share = resources.allocation().cpus_per_job
+    if cpus and int(cpus) > int(share):
+        logger.info("tool=%s granted %s cores (declared share %s; machine was idle)",
+                    tool_name, int(cpus), int(share))
+
+
+@contextlib.contextmanager
+def _admitted(candidates, run_id: Optional[str]):
+    """Room on this machine for this demand, waited for the way a cancel can break.
+
+    Every run passes through here, not only the ones heading for the card: a
+    CPU tool still holds cores and host memory, and those are what bind first
+    on the machine measured for this (28 physical cores and 125 GB against a
+    48 GiB card whose heaviest tool peaks at 2.19 GiB).
+
+    Takes the candidates rather than building them, because a retry after an
+    out-of-memory comes back here asking for MORE than the table says.
+
+    Yields the `admission.Grant`: what the admitted run may spend, how widely
+    it may spread, and whether it ever had the machine to itself. All three are
+    decided here rather than before, and for the same reason -- none of them is
+    knowable until it is known what else got in.
+    """
+    cancelled = (lambda: bool(run_id) and runs.is_cancelled(run_id))
+
+    def announce():
+        # Only when the run actually queues. Told on every run it would be
+        # noise; never told, a multi-minute wait for room is indistinguishable
+        # from a tool that is simply slow, which is the single most confusing
+        # thing a client can show.
+        runs.append(run_id, runs.PHASE_QUEUED_GPU)
+
     try:
-        yield
-    finally:
-        semaphore.release()
+        with admission.budget().reserve(candidates, on_wait=announce,
+                                        is_cancelled=cancelled) as granted:
+            yield granted
+    except admission.Cancelled as exc:
+        raise RunCancelled(str(exc))
 
 
 def _registered_folder(tool_name: str):
@@ -384,6 +480,63 @@ def _jsonable(value):
     )
 
 
+# The variables every scientific stack in these venvs reads to decide how many
+# threads to open. Set together, from one number, because a tool that honours
+# one and not another is a tool that still oversubscribes.
+_THREAD_VARIABLES = (
+    "OMP_NUM_THREADS",       # OpenMP: torch's CPU ops, scipy, SimpleITK
+    # Set for a deployment whose numpy links MKL. NONE of the tool virtualenvs
+    # on this machine do -- checked on 2026-09-18 across Surg_Mov_Pred,
+    # AutoMatrix, AutoCrop3D, GreedyReg and Crown_Seg, every one of which ships
+    # numpy's own `libscipy_openblas64_`. So OPENBLAS_NUM_THREADS is the line
+    # below that actually bites, and a curve measured here is a property of the
+    # tool AND its venv's BLAS build, not of the tool alone.
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+    # ITK runs its own thread pool, sized from the machine and NOT from
+    # OpenMP's variable -- so every SimpleITK resample and every compressed
+    # write was ignoring the cap above and taking one thread per logical core.
+    # It is the busiest CPU path in AMASSS, ASO, AutoCrop3D, AutoMatrix and
+    # Batch_Dental_Seg, which is to say in most of the catalogue.
+    "ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS",
+)
+
+
+def _thread_limits(cpus=None, channels: int = 1) -> dict:
+    """How many threads this job's process may open, as the environment says it.
+
+    **Without this every tool process believes it owns the machine.** Nothing
+    set these before, so each one defaulted to one thread per logical core --
+    56 on the host measured here -- and four concurrent tools meant 224 threads
+    fighting over 28 physical cores. That is not parallelism, it is context
+    switching, and it makes every one of the four slower than running them in
+    turn. Capping is therefore a PREREQUISITE for admitting more than one job
+    at a time, not a tuning knob to reach for afterwards.
+
+    Set unconditionally rather than only when absent: an OMP_NUM_THREADS
+    inherited from whatever started the container is exactly the accident this
+    exists to stop. An operator who wants a different number sets
+    SADT_CPU_PER_JOB, which is the knob built for it and which the startup
+    banner reports.
+
+    `cpus` is what admission granted this particular run: its declared share
+    when the machine is busy, more when it is not. Omitted, the declared share
+    is used -- so a caller outside the admission path still gets a cap rather
+    than the whole machine.
+
+    `channels` is how many of its own items the tool was granted permission to
+    process at once. The two MULTIPLY, so they have to be divided here or the
+    cap means nothing: eight channels each opening seven OpenMP threads is
+    fifty-six on a budget of seven. What a tool may open in total is `cpus`,
+    and each channel gets its share of that.
+    """
+    budget = int(cpus or resources.allocation().cpus_per_job)
+    threads = str(max(1, budget // max(1, int(channels or 1))))
+    return {name: threads for name in _THREAD_VARIABLES}
+
+
 def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = None,
                        progress_file: Optional[str] = None) -> dict:
     """The environment the tool process runs in.
@@ -395,6 +548,7 @@ def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = Non
     """
     environment = dict(os.environ)
     environment.pop("API_TOKEN", None)
+    environment.update(_thread_limits())
     if timeout:
         # An ABSOLUTE instant on the monotonic clock, not a duration: the clock's
         # origin is per-boot rather than per-process, so every level of a
@@ -421,6 +575,22 @@ def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = Non
             "SADT_API": settings.SADT_API,
             "SADT_JOB_ID": job_id,
             "SADT_JOB_DIR": job_dir,
+            # What a nested level needs to size ITSELF, since it cannot import
+            # a line of this package: where the learned costs are, and which
+            # argument each tool's width is counted from. Both are server
+            # knowledge that `runner.py` reads with nothing but `json`; it
+            # ships with the server and is injected by path, so the two are the
+            # same version by construction and there is no format to negotiate.
+            concurrency.COST_TABLE_ENV: costs.table_path(),
+            concurrency.WIDTH_AXIS_ENV: json.dumps(concurrency.width_axes(),
+                                                   sort_keys=True),
+            # Written from `settings` rather than left to be inherited: the
+            # setting may have come from `server/.env`, which pydantic reads
+            # without putting it in `os.environ`, so a deployment that capped
+            # its channels there would have had the cap silently not apply at
+            # depth.
+            concurrency.MAX_CHANNELS_ENV: str(
+                int(getattr(settings, "SADT_MAX_CHANNELS", 0) or 0)),
         }
     )
     return environment
@@ -600,8 +770,14 @@ def kill_process_group(pgid: int) -> None:
         pass
 
 
-def _read_result(job_dir: str, tool_name: str) -> Any:
+def _read_result(job_dir: str, tool_name: str, solo: bool = False) -> Any:
     """The value run() returned, out of result.json.
+
+    `solo` is what admission observed of this run: whether anything else held a
+    reservation while it lived. It decides nothing here except whether a
+    card-wide VRAM reading may be believed -- see `_keep_measurements`. It
+    defaults to False because a caller with no answer has no evidence the
+    machine was idle.
 
     A missing file after a zero exit code is its own failure: the runner writes
     the file last and atomically, so "exited fine but produced nothing" means
@@ -621,6 +797,11 @@ def _read_result(job_dir: str, tool_name: str) -> Any:
     if not isinstance(payload, dict):
         raise ToolExecutionError(f"Tool '{tool_name}': {RESULT_FILE} must be an object.")
 
+    # Kept BEFORE the error branch, so a run that failed still teaches the
+    # budget what it cost. An out-of-memory is the one measurement worth most
+    # and it is on exactly this path.
+    _keep_measurements(tool_name, payload, solo=solo)
+
     error = payload.get("error")
     if isinstance(error, dict):
         # The tool raised and named its exception class. Which one it was is
@@ -632,19 +813,154 @@ def _read_result(job_dir: str, tool_name: str) -> Any:
             f"Tool '{tool_name}': {RESULT_FILE} must be an object with a 'result' field."
         )
 
-    # The runner measures this on every run precisely so a VRAM budget can be
-    # set later from measurements rather than guesses -- but until now nothing
-    # read it back, so every measurement was written into a job directory and
-    # deleted with it. One log line is what makes the instrumentation exist.
-    # It is a number, not patient data.
-    peak = payload.get("peak_vram_bytes")
-    if isinstance(peak, int):
-        logger.info(
-            "tool=%s peak_vram_bytes=%d (%.2f GiB)",
-            tool_name, peak, peak / 1024 ** 3,
-        )
-
     return payload["result"]
+
+
+# Tools whose card-sourced VRAM has already been refused once in this process.
+# The refusal is a property of the LOAD rather than of the run, so a busy
+# afternoon would otherwise write the same line for every run of every tool;
+# once per tool is enough to tell an operator why a table stopped moving.
+_card_vram_refused: set = set()
+
+
+def _keep_measurements(tool_name: str, payload: dict, solo: bool = False) -> None:
+    """Fold this run's peaks into the cost table, and say so in the log.
+
+    The runner has measured every run since the subprocess path landed, and
+    until now this only logged the number -- so every measurement was written
+    into a job directory and deleted with it. Keeping them is what turns
+    admission from a job counter into a budget, with nothing declared anywhere
+    and nothing measured by hand.
+
+    **A card-sourced VRAM figure is only learned from a run that was alone.**
+    The runner reports `vram_source`: `torch` is the tool's own allocator and is
+    always believed, because concurrency cannot inflate what this process
+    itself allocated; `card` is the device's growth over the run, which on this
+    deployment is the only reading available at all (the driver answers
+    `--query-compute-apps` with nothing) and which counts every neighbour's
+    allocation as if it were this run's.
+
+    Measured this afternoon, ALI_CBCT alone and idle: 0.62 G at one channel,
+    7.80 G at seven, 16.74 G at fifteen -- 1.12 G per channel, flat and linear.
+    The table meanwhile held ~2.2 G for it, had held 5.66 G earlier the same
+    day, gave ASO 32.43 G per channel and reported a spread of x782 for
+    Crown_Seg. `costs.record` keeps the WORST of its window, so one contended
+    run poisons the figure for the twenty that follow: a 119-landmark request
+    opened 15 channels where 30 would have fitted. This was observed, not
+    feared.
+
+    RAM and cores are recorded either way. They are per-PROCESS readings --
+    `RUSAGE` and `/proc/<pid>/stat` over this run's own process group -- so a
+    neighbour cannot appear in them, and dropping them would throw away good
+    measurements to fix a bad one.
+
+    They are numbers, not patient data, which is why they may be logged at all.
+    """
+    vram = payload.get("peak_vram_bytes")
+    rss = payload.get("peak_rss_bytes")
+    vram = vram if isinstance(vram, int) else None
+    rss = rss if isinstance(rss, int) else None
+    if vram is None and rss is None:
+        return
+    channels = payload.get("channels")
+    channels = channels if isinstance(channels, int) and channels > 0 else 1
+    cores = payload.get("peak_cpu_cores")
+    cores = float(cores) if isinstance(cores, (int, float)) and cores > 0 else 0.0
+    # What this run reported, kept whatever the table ends up learning: the log
+    # line and the run's own event are the record of the RUN, and they must go
+    # on saying what it measured even when the budget declines to learn from it.
+    reported = vram
+    refused = (vram is not None
+               and payload.get(VRAM_SOURCE_KEY) == VRAM_FROM_CARD
+               and not solo)
+    if refused:
+        # Debug rather than a warning: it is the guard working, on a server
+        # busy enough for the reading to be worthless. Nothing is wrong, and
+        # the first run of a newly deployed tool is usually solo -- it arrives
+        # on a machine with no measurement for it, which is exactly the
+        # condition that makes it run alone -- so the common path still learns.
+        if tool_name not in _card_vram_refused:
+            _card_vram_refused.add(tool_name)
+            logger.debug(
+                "tool=%s VRAM not learned: %.2f GiB came from the card and this "
+                "run shared the machine; only a solo run teaches the table",
+                tool_name, vram / 1024 ** 3,
+            )
+        vram = None
+    logger.info(
+        "tool=%s peak_vram=%.2f GiB peak_rss=%.2f GiB peak_cpu=%.1f core(s) "
+        "over %d channel(s)",
+        tool_name,
+        (reported or 0) / 1024 ** 3,
+        (rss or 0) / 1024 ** 3,
+        cores,
+        channels,
+    )
+    # `vram_known=False` on a refusal, NOT a zero. Zero is "this tool costs the
+    # card nothing" and lets it share with anything; absence is "nobody knows",
+    # and a tool nobody knows runs alone until one solo run measures it.
+    costs.record(tool_name, vram, rss, channels=channels, cpu_cores=cores,
+                 vram_known=not refused)
+    # And on the run's own event stream, not only in the table. `costs` keeps a
+    # high-water mark per TOOL, which is what admission needs and what a reader
+    # of ONE run cannot use: six runs sharing a card make the card's trace line
+    # a peak up with every one of them and attribute it to none. This is the
+    # figure for this run.
+    runs.emit(runs.PHASE_RUNNING, measured={
+        "vram_bytes": reported or 0,
+        "ram_bytes": rss or 0,
+        "cpu_cores": cores,
+        "channels": channels,
+    })
+
+
+# What a tool calls an out-of-memory, by class NAME, there being no shared
+# exception type to catch across twenty-two virtualenvs. torch raises
+# `torch.cuda.OutOfMemoryError`, whose __name__ is the first of these; the
+# others are what the same condition is called elsewhere in the stack.
+_MEMORY_ERRORS = frozenset({
+    "OutOfMemoryError",
+    "CudaOutOfMemoryError",
+    "CUDAOutOfMemoryError",
+    "MemoryError",
+})
+
+# A process the kernel killed leaves this. 137 is what a shell reports for the
+# same thing (128 + SIGKILL), which is what arrives through a container runtime.
+_SIGKILL_CODES = (-9, 137)
+
+
+def _out_of_memory(exc: Exception, exit_code, job_dir: str) -> bool:
+    """Did this run die for want of memory, rather than of anything else?
+
+    Two shapes, and the second is the one worth the trouble. A tool that runs
+    out of VRAM raises, and names its exception class in result.json. A tool
+    that runs out of HOST memory is killed outright by the kernel, mid-statement,
+    and writes nothing at all -- so the only evidence is a SIGKILL with no
+    result file beside it.
+
+    A cancellation also kills the process, but it raises RunCancelled long
+    before this is reached, so a bare SIGKILL here is not one.
+    """
+    if isinstance(exc, ToolFailure):
+        return exc.error_type in _MEMORY_ERRORS
+    if isinstance(exc, ToolExecutionError) and exit_code in _SIGKILL_CODES:
+        return not os.path.exists(os.path.join(job_dir, RESULT_FILE))
+    return False
+
+
+def _reset_job(job_dir: str) -> None:
+    """Clear what the failed attempt left, so the retry reads its own result.
+
+    Both halves matter. A stale result.json would be read as this attempt's
+    answer, and a half-written output/ would be packaged into the archive
+    beside whatever the successful run produces.
+    """
+    with contextlib.suppress(OSError):
+        os.remove(os.path.join(job_dir, RESULT_FILE))
+    output = os.path.join(job_dir, JOB_OUTPUT_DIRNAME)
+    shutil.rmtree(output, ignore_errors=True)
+    os.makedirs(output, exist_ok=True)
 
 
 def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
@@ -677,31 +993,84 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None) -> Any:
             job_id, job_dir, timeout, runs.progress_file(run_id)
         )
 
-        if uses_the_gpu(tool, params):
-            # Announced before the wait, and only here: a multi-minute queue for
-            # the card is today indistinguishable from a tool that is running,
-            # which is the single most confusing thing a client can show.
-            runs.append(run_id, runs.PHASE_QUEUED_GPU)
-            # Held for the whole run, and released by leaving the block on any
-            # path. Blocking on purpose: the request already waits for the tool,
-            # and a queue is what a single card wants.
-            with _gpu_slot(run_id):
-                _raise_if_cancelled(run_id)
-                exit_code = _execute(command, job_dir, environment, timeout,
-                                     tool.name, run_id)
-        else:
-            exit_code = _execute(command, job_dir, environment, timeout,
-                                 tool.name, run_id)
-
-        if exit_code != 0:
-            # A tool that recorded WHICH exception it was gets to say so; the
-            # tail of stderr is the fallback for one that died without writing
-            # anything (a segfault in a CUDA kernel, an OOM kill).
-            _read_result(job_dir, tool.name)
-            raise ToolExecutionError(
-                f"Tool '{tool.name}' exited with code {exit_code}:\n{_stderr_tail(job_dir)}"
-            )
-        return _read_result(job_dir, tool.name)
+        # Every run passes through admission, not only the ones heading for the
+        # card. Held for the whole run and released by leaving the block on any
+        # path; blocking on purpose, because the request already waits for the
+        # tool and a queue is what a finite machine wants.
+        #
+        # Around it, the retry: a run that died for want of memory is started
+        # again with more room reserved, because the alternative is telling a
+        # clinician "failed" for what is the server's own misjudgement. Every
+        # OTHER failure raises on the first attempt -- a bad argument fails
+        # identically however many times it is tried.
+        attempt = 0
+        while True:
+            # The same run at several degrees of parallelism, widest first.
+            # Admission takes the widest that fits, so a busy machine narrows a
+            # run instead of making it wait -- and whatever it takes, the bytes
+            # it reserved are the bytes that degree actually costs.
+            candidates = [
+                (channels, admission.escalated(
+                    _demand_for(tool, params, channels, cores),
+                    attempt, settings.MEMORY_RETRY_GROWTH))
+                for channels, cores in _shapes(tool, params)
+            ]
+            exit_code = None
+            try:
+                with _admitted(candidates, run_id) as grant:
+                    cpu_grant, channels = grant
+                    _raise_if_cancelled(run_id)
+                    # Applied HERE rather than when the environment was built,
+                    # because neither number is knowable until the run has been
+                    # admitted: both depend on what else got in, which is the
+                    # whole point of granting them.
+                    _log_grant(tool.name, cpu_grant)
+                    granted = concurrency.granted(tool, channels)
+                    concurrency.log_grant(tool.name, granted)
+                    granted_environment = concurrency.child_budget(
+                        {**environment,
+                         **_thread_limits(cpu_grant, granted.channels)},
+                        granted,
+                    )
+                    exit_code = _execute(command, job_dir, granted_environment,
+                                         timeout, tool.name, run_id)
+                if exit_code != 0:
+                    # A tool that recorded WHICH exception it was gets to say
+                    # so; the tail of stderr is the fallback for one that died
+                    # without writing anything.
+                    _read_result(job_dir, tool.name, solo=grant.solo)
+                    raise ToolExecutionError(
+                        f"Tool '{tool.name}' exited with code {exit_code}:\n"
+                        f"{_stderr_tail(job_dir)}"
+                    )
+                # Read AFTER the reservation is released, so `grant.solo` is
+                # the answer for the run's whole life rather than for the
+                # instant it was admitted: a neighbour that arrived halfway
+                # through has already falsified it by now.
+                return _read_result(job_dir, tool.name, solo=grant.solo)
+            except (ToolFailure, ToolExecutionError) as exc:
+                if not _out_of_memory(exc, exit_code, job_dir):
+                    raise
+                if attempt >= settings.MEMORY_RETRIES:
+                    raise
+                # Already holding the whole machine. Nothing is left to take, so
+                # another attempt would ask for the same thing and die the same
+                # way, having spent the card to find out. Asked of the NARROWEST
+                # candidate -- the one-channel demand -- because that is what a
+                # retry would fall back to, and a wider one holding everything
+                # says nothing about whether a narrower one still fits.
+                if admission.holds_everything(candidates[-1][1], admission.budget()):
+                    raise
+                attempt += 1
+                logger.warning(
+                    "tool=%s out of memory; retrying with more room (attempt %d of %d)",
+                    tool.name, attempt + 1, settings.MEMORY_RETRIES + 1,
+                )
+                runs.append(
+                    run_id, runs.PHASE_QUEUED_GPU,
+                    message=f"out of memory; waiting for more room (try {attempt + 1})",
+                )
+                _reset_job(job_dir)
     except Exception:
         # No response will ever be streamed from this job, so nothing has to
         # survive: take the directory down now rather than leaving confidential
