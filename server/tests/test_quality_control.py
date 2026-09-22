@@ -784,3 +784,76 @@ def test_a_detached_stop_puts_its_result_where_a_watcher_can_reach_it():
     assert appended[0]["result"]["result_ref"]["result_id"] == "abc", (
         "a watcher cannot collect what the checkpoint produced"
     )
+
+
+TWO_FILES = """
+    def run(scans: Path, output_dir: Path, tag: str = "leaf", *, sup=None) -> Path:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "leaf.txt").write_text(tag + ":" + str(scans))
+        (output_dir / "heavy.bin").write_text("hundreds of megabytes, pretend")
+        return output_dir
+"""
+
+READS_BOTH = """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        produced = Path(sup.run("Leaf", scans=scans, tag="called"))
+        (output_dir / "seen.txt").write_text(
+            (produced / "leaf.txt").read_text() + "|" + (produced / "heavy.bin").read_text()
+        )
+        return output_dir
+"""
+
+
+def test_only_the_file_that_changed_has_to_come_back(tools_dir, tmp_path):
+    """A step is hundreds of megabytes and the landmark file a reader moved a
+    point in is eight kilobytes. Replacing the directory wholesale meant
+    uploading the hundreds of megabytes back, or losing them."""
+    make_tool(tools_dir, "Leaf", TWO_FILES)
+    make_tool(tools_dir, "Caller", READS_BOTH)
+    job = tmp_path / "job"
+    params = {"scans": str(tmp_path), "stop_after": ["Leaf"]}
+    run_job(tools_dir, "Caller", job, params)
+
+    staged = job / "resume" / "01_Leaf"
+    staged.mkdir(parents=True)
+    (staged / "leaf.txt").write_text("corrected by a human")
+
+    _completed, _result = _resume(tools_dir, "Caller", job, params)
+    seen = (job / "output" / "seen.txt").read_text()
+    assert seen.startswith("corrected by a human"), "the correction was ignored"
+    assert seen.endswith("hundreds of megabytes, pretend"), (
+        "the rest of the step was thrown away with the replacement"
+    )
+
+
+def test_a_correction_in_a_subfolder_lands_at_its_own_path(tools_dir, tmp_path):
+    make_tool(tools_dir, "Leaf", TWO_FILES)
+    make_tool(tools_dir, "Caller", READS_BOTH)
+    job = tmp_path / "job"
+    params = {"scans": str(tmp_path), "stop_after": ["Leaf"]}
+    run_job(tools_dir, "Caller", job, params)
+
+    nested = job / "resume" / "01_Leaf" / "deeper"
+    nested.mkdir(parents=True)
+    (nested / "extra.txt").write_text("added")
+
+    _resume(tools_dir, "Caller", job, params)
+    assert (job / "sup" / "01_Leaf" / "output" / "deeper" / "extra.txt").is_file()
+    assert (job / "sup" / "01_Leaf" / "output" / "leaf.txt").is_file()
+
+
+def test_the_staging_folder_is_not_left_behind(tools_dir, tmp_path):
+    """Or a second resume would lay the first one's corrections down again."""
+    make_tool(tools_dir, "Leaf", TWO_FILES)
+    make_tool(tools_dir, "Caller", READS_BOTH)
+    job = tmp_path / "job"
+    params = {"scans": str(tmp_path), "stop_after": ["Leaf"]}
+    run_job(tools_dir, "Caller", job, params)
+    staged = job / "resume" / "01_Leaf"
+    staged.mkdir(parents=True)
+    (staged / "leaf.txt").write_text("corrected")
+    _resume(tools_dir, "Caller", job, params)
+    assert not staged.exists()

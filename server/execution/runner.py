@@ -1949,24 +1949,46 @@ class _Supervisor:
             print("could not record {}: {}".format(tool, exc), file=sys.stderr)
 
     def _substitute(self, slot: str, nested_dir: str) -> None:
-        """Put what the reader corrected where the memo's answer points.
+        """Lay what the reader corrected OVER what the step produced.
 
         The files a reader edited came off THEIR disk, not this one, so a
         resume that trusted the server's copy would carry on with exactly the
-        data the reader stopped to reject. The server stages the replacements
-        under `resume/<slot>/` and they are moved over the slot's output --
-        the one place the memo's returned path can point at.
+        data the reader stopped to reject. The server stages them under
+        `resume/<slot>/` and they land on the slot's output -- the one place
+        the memo's returned path can point at.
+
+        **Laid over, not swapped in**, and that is what lets a client send
+        only what changed. A step of AMASSS is a segmentation of hundreds of
+        megabytes and the landmark file a reader moved a point in is eight
+        kilobytes; replacing the directory wholesale meant either uploading
+        the hundreds of megabytes back or losing everything that was not
+        sent. Each staged file replaces the one at its own relative path and
+        the rest of the step is left exactly as it was written.
+
+        A file the reader DELETED is not removed here. Nothing in the viewer
+        deletes one, and a client that sends a partial set cannot be told
+        apart from one that means "only these remain" -- so the safe reading
+        of an absent file is "unchanged", which is also the common one.
         """
         staged = os.path.join(self._job_dir, RESUME_DIRNAME, slot)
         if not os.path.isdir(staged):
             return
         produced = os.path.join(nested_dir, "output")
         try:
-            if os.path.isdir(produced):
-                shutil.rmtree(produced)
-            shutil.move(staged, produced)
-            print("resume: {} replaced with what came back".format(slot),
-                  file=sys.stderr)
+            os.makedirs(produced, exist_ok=True)
+            replaced = 0
+            for root, _directories, names in os.walk(staged):
+                relative = os.path.relpath(root, staged)
+                destination = (produced if relative == "."
+                               else os.path.join(produced, relative))
+                os.makedirs(destination, exist_ok=True)
+                for name in names:
+                    shutil.move(os.path.join(root, name),
+                                os.path.join(destination, name))
+                    replaced += 1
+            shutil.rmtree(staged, ignore_errors=True)
+            print("resume: {} file(s) of {} replaced with what came back".format(
+                replaced, slot), file=sys.stderr)
         except OSError as exc:
             raise RunnerError(
                 "Could not put the corrected files for '{}' in place: {}. The "
