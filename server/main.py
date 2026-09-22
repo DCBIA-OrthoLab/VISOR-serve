@@ -1446,6 +1446,61 @@ def _stage_corrections(tool, job_dir: str, form) -> list:
     return staged
 
 
+async def _tracked_run(run_id: str, label: str, background_tasks: BackgroundTasks,
+                       call):
+    """Run `call()` as `run_id`, writing the terminal event whichever way it ends.
+
+    Shared by `POST /run/{tool}` and `POST /runs/{id}/resume`, because a
+    resume IS a run: it queues for the machine, it can be cancelled, it can
+    fail, and it can stop again at a second checkpoint. Resume reached this
+    file without it and wrote no terminal event at all, so every resumed run
+    stayed `running / packaging` in the registry for ever -- visible on the
+    status page as work that finished hours ago and is somehow still going,
+    and never delivering a terminal event to a watcher.
+
+    A run that is PAUSED when `call` returns is deliberately left alone:
+    it has not finished, and its directory is what a resume looks the work
+    up through.
+    """
+    token = runs.CURRENT_RUN.set(run_id)
+    try:
+        response = await call()
+    except dispatch.RunCancelled:
+        runs.finish(run_id, runs.PHASE_CANCELLED)
+        runs.discard(run_id)
+        logger.info("endpoint=%s status=%d", label, CLIENT_CLOSED_REQUEST)
+        raise HTTPException(
+            status_code=CLIENT_CLOSED_REQUEST, detail="Run cancelled by the client."
+        )
+    except BaseException:
+        # Every failure path, the 404 for an unknown tool included -- the tool
+        # is resolved after the run is registered, so that one now has a
+        # directory to clean up like any other.
+        runs.finish(run_id, runs.PHASE_FAILED)
+        runs.discard(run_id)
+        raise
+    finally:
+        runs.CURRENT_RUN.reset(token)
+
+    if runs.paused_at(run_id) is not None:
+        # The run STOPPED where it was asked to. Not finished, so no terminal
+        # event; and above all not discarded -- the run directory is what
+        # `POST /runs/{id}/resume` looks the work up through, and taking it
+        # down here is what made the whole feature unreachable the first time
+        # it was tried end to end. It lives on the idle TTL, like an
+        # abandoned transfer, and every read pushes that back.
+        logger.info("endpoint=%s paused", label)
+        return response
+
+    runs.finish(run_id, runs.PHASE_DONE)
+    # Queued rather than done now, so the directory survives until the response
+    # has finished streaming -- which gives a watcher the whole download to
+    # collect the terminal event. Waiting out the TTL instead is not an option:
+    # a progress message is written by a tool and can name a file.
+    background_tasks.add_task(runs.discard, run_id)
+    return response
+
+
 @app.post("/runs/{run_id}/resume", dependencies=[Depends(verify_token)])
 async def resume_run(run_id: str, request: Request,
                      background_tasks: BackgroundTasks):
@@ -1488,14 +1543,13 @@ async def resume_run(run_id: str, request: Request,
     # is running must not be offered the same directory.
     await anyio.to_thread.run_sync(runs.clear_pause, run_id)
 
-    token = runs.CURRENT_RUN.set(run_id)
-    try:
+    async def carry_on():
         logger.info("endpoint=/runs/resume tool=%s after=%s",
                     tool_name, paused.get("stopped_after"))
         return await _run_tool(tool_name, request, background_tasks,
                                resume_from=job_dir)
-    finally:
-        runs.CURRENT_RUN.reset(token)
+
+    return await _tracked_run(run_id, "/runs/resume", background_tasks, carry_on)
 
 
 @app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
@@ -1514,48 +1568,15 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     if run_id is None:
         return await _run_tool(tool_name, request, background_tasks)
 
-    # Set here, read by dispatch in the worker thread anyio copies this context
-    # into. A run id is request scope, not tool input, so it travels the way
+    # The run id is read by dispatch in the worker thread anyio copies this
+    # context into. It is request scope, not tool input, so it travels the way
     # file_utils tracks scratch dirs rather than through Tool.invoke's
     # signature -- which every tool and both dispatch paths agree on.
-    token = runs.CURRENT_RUN.set(run_id)
-    try:
+    async def start():
         runs.emit(runs.PHASE_RECEIVED)
-        response = await _run_tool(tool_name, request, background_tasks)
-    except dispatch.RunCancelled:
-        runs.finish(run_id, runs.PHASE_CANCELLED)
-        runs.discard(run_id)
-        logger.info("endpoint=/run/%s status=%d", tool_name, CLIENT_CLOSED_REQUEST)
-        raise HTTPException(
-            status_code=CLIENT_CLOSED_REQUEST, detail="Run cancelled by the client."
-        )
-    except BaseException:
-        # Every failure path, the 404 for an unknown tool included -- the tool
-        # is resolved after the run is registered, so that one now has a
-        # directory to clean up like any other.
-        runs.finish(run_id, runs.PHASE_FAILED)
-        runs.discard(run_id)
-        raise
-    finally:
-        runs.CURRENT_RUN.reset(token)
+        return await _run_tool(tool_name, request, background_tasks)
 
-    if runs.paused_at(run_id) is not None:
-        # The run STOPPED where it was asked to. Not finished, so no terminal
-        # event; and above all not discarded -- the run directory is what
-        # `POST /runs/{id}/resume` looks the work up through, and taking it
-        # down here is what made the whole feature unreachable the first time
-        # it was tried end to end. It lives on the idle TTL, like an
-        # abandoned transfer, and every read pushes that back.
-        logger.info("endpoint=/run/%s paused", tool_name)
-        return response
-
-    runs.finish(run_id, runs.PHASE_DONE)
-    # Queued rather than done now, so the directory survives until the response
-    # has finished streaming -- which gives a watcher the whole download to
-    # collect the terminal event. Waiting out the TTL instead is not an option:
-    # a progress message is written by a tool and can name a file.
-    background_tasks.add_task(runs.discard, run_id)
-    return response
+    return await _tracked_run(run_id, f"/run/{tool_name}", background_tasks, start)
 
 
 async def _run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks,

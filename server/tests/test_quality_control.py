@@ -16,6 +16,8 @@ from pathlib import Path
 
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+import uuid
+
 import pytest
 
 from registry import schema_tool
@@ -635,6 +637,118 @@ def test_resuming_a_run_that_never_stopped_is_a_404():
     )
     assert response.status_code == 404
     assert "not stopped at a checkpoint" in response.json()["detail"]
+
+
+def _state_of(run_id):
+    from wire import runs
+    events = runs.read_events(run_id)
+    return events[-1].get("phase") if events else None
+
+
+def test_a_resumed_run_reaches_a_terminal_state(tmp_path):
+    """It did not, and nothing noticed for weeks. `resume_run` called
+    `_run_tool` directly and wrote no terminal event at all, so a resumed run
+    stayed `running / packaging` in the registry for ever -- eight of them on
+    the status page hours after the archives had been delivered, and never a
+    terminal event for a watcher waiting on one."""
+    import anyio, main
+    from wire import runs
+
+    run_id = runs.register(uuid.uuid4().hex, tool="ASO")
+
+    async def finished():
+        return "the archive"
+
+    answer = anyio.run(main._tracked_run, run_id, "/runs/resume",
+                       _Background(), finished)
+    assert answer == "the archive"
+    assert _state_of(run_id) == runs.PHASE_DONE
+
+
+def test_a_resume_that_stops_again_is_not_marked_finished(tmp_path):
+    """A second checkpoint is a PAUSE, not an ending: the run directory is
+    what the next resume looks the work up through."""
+    import anyio, main
+    from wire import runs
+
+    run_id = runs.register(uuid.uuid4().hex, tool="ASO")
+
+    async def stops_again():
+        runs.pause(run_id, str(tmp_path), "ALI_CBCT")
+        return "stopped"
+
+    anyio.run(main._tracked_run, run_id, "/runs/resume", _Background(), stops_again)
+    assert runs.paused_at(run_id) is not None
+    assert _state_of(run_id) != runs.PHASE_DONE
+
+
+def test_a_resume_that_fails_says_so_rather_than_running_for_ever(monkeypatch):
+    """The terminal event is asserted through a spy rather than by reading it
+    back: the failure path DISCARDS the run, so by the time the call returns
+    there is no directory left to read the event out of."""
+    import anyio, main
+    from wire import runs
+
+    run_id = runs.register(uuid.uuid4().hex, tool="ASO")
+    said = []
+    monkeypatch.setattr(runs, "finish",
+                        lambda rid, phase, **kw: said.append((rid, phase)))
+
+    async def blows_up():
+        raise RuntimeError("the tool died")
+
+    with pytest.raises(RuntimeError):
+        anyio.run(main._tracked_run, run_id, "/runs/resume", _Background(), blows_up)
+    assert said == [(run_id, runs.PHASE_FAILED)]
+
+
+def test_the_resume_endpoint_marks_the_run_finished(tmp_path, monkeypatch):
+    """The wiring, not the helper. The three tests above pass even when
+    `resume_run` bypasses `_tracked_run` entirely -- which is exactly the
+    shape the defect had, so only driving the endpoint pins it."""
+    from fastapi.testclient import TestClient
+    import main
+    from wire import runs
+
+    job = _ran(tmp_path, "01_ALI_CBCT")
+    with open(os.path.join(job, "job.json"), "w", encoding="utf-8") as handle:
+        json.dump({"tool": "Test_Tool"}, handle)
+    run_id = runs.register(uuid.uuid4().hex, tool="Test_Tool")
+    runs.pause(run_id, job, "ALI_CBCT")
+
+    async def carried_on(tool_name, request, background_tasks, resume_from=None):
+        assert resume_from == job
+        return {"carried": "on"}
+
+    monkeypatch.setattr(main, "_run_tool", carried_on)
+    # Through a spy, not by reading the event back: the TestClient runs the
+    # background tasks before it hands the response over, and one of them is
+    # the `discard` that takes the run directory down.
+    said = []
+    real_finish = runs.finish
+    monkeypatch.setattr(runs, "finish",
+                        lambda rid, phase, **kw: said.append((rid, phase)))
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/runs/{run_id}/resume",
+        headers={"Authorization": "Bearer " + main.settings.API_TOKEN},
+    )
+    assert response.status_code == 200
+    assert said == [(run_id, runs.PHASE_DONE)], (
+        "the resumed run never reached a terminal state"
+    )
+    real_finish(run_id, runs.PHASE_DONE)
+
+
+class _Background:
+    """Enough of BackgroundTasks to record what was queued."""
+
+    def __init__(self):
+        self.queued = []
+
+    def add_task(self, func, *args, **kwargs):
+        self.queued.append((func, args, kwargs))
 
 
 class _AnyTool:
