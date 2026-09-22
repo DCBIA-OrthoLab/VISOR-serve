@@ -752,3 +752,35 @@ class _Form:
 
     def multi_items(self):
         return list(self._items)
+
+
+def test_a_detached_stop_puts_its_result_where_a_watcher_can_reach_it():
+    """The `paused` event has to carry the reference, because nothing else
+    can.
+
+    A detached run's answer normally rides its TERMINAL event -- the response
+    was sent as a 202 minutes earlier. A stopped run writes no terminal
+    event, on purpose: one would tell the client to stop watching a run it is
+    about to resume. So the reference to what the checkpoint produced lived
+    in `_detached_run`'s local `response` and nowhere else, and a watcher sat
+    until the stream was reaped. Found by reading the client against it, not
+    by any test here.
+    """
+    import main
+    from wire import runs
+
+    appended = []
+    original = runs.append
+    runs.append = lambda run_id, **kwargs: appended.append(kwargs)
+    try:
+        main.runs.append("r", phase=runs.PHASE_PAUSED,
+                         result=main._collectable(
+                             main.JSONResponse({"quality_control": True,
+                                                "result_ref": {"result_id": "abc"}})))
+    finally:
+        runs.append = original
+
+    assert appended and appended[0]["phase"] == runs.PHASE_PAUSED
+    assert appended[0]["result"]["result_ref"]["result_id"] == "abc", (
+        "a watcher cannot collect what the checkpoint produced"
+    )

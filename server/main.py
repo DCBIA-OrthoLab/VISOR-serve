@@ -1268,10 +1268,19 @@ async def _detached_run(tool_name: str, request: Request, run_id: str) -> None:
     try:
         response = await _run_tool(tool_name, request, cleanup, detached=True)
         if runs.paused_at(run_id) is not None:
-            # Same reasoning as the blocking path: a stopped run has not
-            # finished, and its `paused` event is already on the stream the
-            # client is watching. A terminal event here would tell that
-            # client to stop watching a run it is about to resume.
+            # A stopped run has not finished, so no terminal event: one would
+            # tell the client to stop watching a run it is about to resume.
+            #
+            # But the `paused` event `_finish_stopped_run` wrote carries no
+            # result, and the response that does was built two lines ago and
+            # is about to be dropped -- nothing answers a detached run here,
+            # so the reference to what the checkpoint produced existed in
+            # this function and nowhere else. A watcher would have sat until
+            # the stream was reaped. Appended again, WITH the payload, since
+            # the stream is append-only and the last event is what a reader
+            # takes as the state.
+            runs.append(run_id, phase=runs.PHASE_PAUSED,
+                        result=_collectable(response))
             logger.info("endpoint=/run/%s paused (detached)", tool_name)
             return
         runs.finish(run_id, runs.PHASE_DONE, result=_collectable(response))
