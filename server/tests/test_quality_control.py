@@ -90,6 +90,108 @@ def test_the_argument_name_is_the_same_on_both_sides():
     server, so the two spellings are separate constants and have to agree."""
     from execution import runner
     assert runner.STOP_AFTER_ARGUMENT == schema_tool.STOP_AFTER_ARGUMENT
+    assert runner.STOP_PATH_SEPARATOR == schema_tool.STOP_PATH_SEPARATOR
+
+
+# ----------------------------------------------------------------------
+# A stop names a PATH, so a chain can offer what its callees offer
+# ----------------------------------------------------------------------
+
+def _catalogue(tmp_path, *schemas) -> dict:
+    """A registry of `SchemaTool`s, as `_build_registry` would hold them.
+
+    Built by hand rather than discovered: what is under test is the
+    composition over a registry, and a folder on disk per tool would only be
+    an elaborate way of writing the same `calls` lists.
+    """
+    from registry import _publish_transitive_stops
+
+    tools = {schema["name"]: _tool(tmp_path, **schema) for schema in schemas}
+    _publish_transitive_stops(tools)
+    return tools
+
+
+def test_a_chain_offers_the_checkpoints_of_the_tools_it_calls(tmp_path):
+    """`describe.py` sees one tool, so `AREG` can only ever declare `ASO`.
+    Composing `ASO/ALI_CBCT` out of that needs the sibling's schema, which is
+    known on the server and nowhere else."""
+    tools = _catalogue(
+        tmp_path,
+        {"name": "ALI_CBCT", "supervisor": True, "quality_controls": ["landmarks"]},
+        {"name": "ASO", "supervisor": True, "calls": ["ALI_CBCT"]},
+        {"name": "AMASSS"},
+        {"name": "AREG", "supervisor": True, "calls": ["ASO", "AMASSS"]},
+    )
+    assert list(tools["ASO"].arguments["stop_after"].choices) == [
+        "ALI_CBCT", "ALI_CBCT/landmarks",
+    ]
+    assert list(tools["AREG"].arguments["stop_after"].choices) == [
+        "ASO", "ASO/ALI_CBCT", "ASO/ALI_CBCT/landmarks", "AMASSS",
+    ], "a nested checkpoint is unreachable unless it is published"
+
+
+def test_a_tool_that_calls_nobody_is_offered_exactly_what_it_declares(tmp_path):
+    """The composition must not invent a box for a leaf, nor move the one a
+    leaf already had."""
+    tools = _catalogue(
+        tmp_path,
+        {"name": "AMASSS", "supervisor": True, "quality_controls": ["after the crop"]},
+        {"name": "Plain"},
+    )
+    assert list(tools["AMASSS"].arguments["stop_after"].choices) == ["after the crop"]
+    assert "stop_after" not in tools["Plain"].arguments
+
+
+def test_a_nested_checkpoint_is_an_option_a_caller_can_actually_send(tmp_path):
+    """The published vocabulary and the wire have to agree: a path that
+    `validate()` refuses is a check box that cannot be ticked."""
+    tools = _catalogue(
+        tmp_path,
+        {"name": "ALI_CBCT", "supervisor": True, "quality_controls": ["landmarks"]},
+        {"name": "ASO", "supervisor": True, "calls": ["ALI_CBCT"]},
+    )
+    cleaned = tools["ASO"].validate(
+        {"scans": str(tmp_path), "stop_after": "ALI_CBCT/landmarks"})
+    assert cleaned["stop_after"].selected == ("ALI_CBCT/landmarks",)
+
+
+def test_a_facade_publishes_the_nested_checkpoints_of_each_of_its_modes(tmp_path):
+    """A facade deep-copies its targets' arguments, so the transitive list has
+    to be composed BEFORE it is built -- otherwise the tools get the nested
+    checkpoints and the facade over them keeps the stale list."""
+    from registry import facade
+
+    tools = _catalogue(
+        tmp_path,
+        {"name": "ALI_CBCT", "supervisor": True, "quality_controls": ["landmarks"]},
+        {"name": "ALI_IOS", "supervisor": True, "quality_controls": ["teeth"]},
+        {"name": "ASO_CBCT", "supervisor": True, "calls": ["ALI_CBCT"]},
+        {"name": "ASO_IOS", "supervisor": True, "calls": ["ALI_IOS"]},
+    )
+    composed = facade.compose(
+        "ASO", {"CBCT": "ASO_CBCT", "IOS": "ASO_IOS"}, tools)
+    spec = composed.arguments["stop_after"]
+    assert list(spec.choices) == [
+        "ALI_CBCT", "ALI_CBCT/landmarks", "ALI_IOS", "ALI_IOS/teeth",
+    ]
+    assert spec.options_when == {"mode": {
+        "CBCT": ["ALI_CBCT", "ALI_CBCT/landmarks"],
+        "IOS": ["ALI_IOS", "ALI_IOS/teeth"],
+    }}, "a mode is offered the other engine's checkpoints"
+
+
+def test_a_cycle_is_walked_once_rather_than_for_ever(tmp_path):
+    """The registry refuses a cycle at RUN time, by name, with a message. At
+    startup the same cycle would be an infinite walk, and a server that hangs
+    on boot says nothing at all."""
+    tools = _catalogue(
+        tmp_path,
+        {"name": "A", "supervisor": True, "calls": ["B"]},
+        {"name": "B", "supervisor": True, "calls": ["A"]},
+        {"name": "Self", "supervisor": True, "calls": ["Self"]},
+    )
+    assert list(tools["A"].arguments["stop_after"].choices) == ["B", "B/A"]
+    assert list(tools["Self"].arguments["stop_after"].choices) == ["Self"]
 
 
 # ----------------------------------------------------------------------
@@ -211,6 +313,174 @@ def test_a_child_does_not_inherit_its_parent_s_stops(tools_dir, tmp_path):
     assert result["result"]["stopped_after"] == "Leaf"
     kept = tmp_path / "job" / "output" / "intermediate"
     assert list(kept.rglob("leaf.txt")), "the leaf stopped instead of finishing"
+
+
+# ----------------------------------------------------------------------
+# A stop inside a nested call
+# ----------------------------------------------------------------------
+
+# It writes down what it was armed with, which is the only way to see from
+# outside that a child got its own subset and not its parent's whole set.
+REPORTING = """
+    import os
+
+    def run(scans: Path, output_dir: Path) -> Path:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "armed.txt").write_text(os.environ.get("SADT_STOP_AFTER", ""))
+        return output_dir
+"""
+
+# Two callees, so an entry addressed to one must not reach the other.
+TWO_CALLS = """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Leaf", scans=scans)
+        sup.run("Other", scans=scans)
+        return output_dir
+"""
+
+# The top of a three-level chain. It writes AFTER the call, so a file that
+# exists is a run that carried on past a stop it should have unwound.
+CALLS_MID = """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        produced = sup.run("Mid", scans=scans)
+        (output_dir / "carried_on.txt").write_text(str(produced))
+        return output_dir
+"""
+
+
+def _armed(job: Path, *slots) -> str:
+    """What the tool in `slots` recorded of its own armed set."""
+    where = job
+    for slot in slots:
+        where = where / "sup" / slot
+    return (where / "output" / "armed.txt").read_text()
+
+
+def test_a_child_is_armed_only_with_what_is_addressed_to_it(tools_dir, tmp_path):
+    """`Leaf/inner` is for the Leaf call and `Other/elsewhere` for the other
+    one; a bare name is a place in the CALLER's own work and descends to
+    neither."""
+    make_tool(tools_dir, "Leaf", REPORTING)
+    make_tool(tools_dir, "Other", REPORTING)
+    make_tool(tools_dir, "Caller", TWO_CALLS)
+    job = tmp_path / "job"
+    completed, _result = run_job(
+        tools_dir, "Caller", job,
+        {"scans": str(tmp_path),
+         "stop_after": ["Leaf/inner", "Other/elsewhere", "Somewhere"]},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(_armed(job, "01_Leaf")) == ["inner"]
+    assert json.loads(_armed(job, "02_Other")) == ["elsewhere"]
+
+
+def test_a_child_with_nothing_addressed_to_it_inherits_none_of_its_parent_s(
+        tools_dir, tmp_path):
+    """The environment a child is handed is a COPY of the parent's, so the
+    parent's own armed set is there unless it is taken out. A name meant for
+    one callee would otherwise be offered to its sibling."""
+    make_tool(tools_dir, "Leaf", REPORTING)
+    make_tool(tools_dir, "Other", REPORTING)
+    make_tool(tools_dir, "Mid", TWO_CALLS)
+    make_tool(tools_dir, "Caller", CALLS_MID)
+    job = tmp_path / "job"
+    completed, _result = run_job(
+        tools_dir, "Caller", job,
+        {"scans": str(tmp_path), "stop_after": ["Mid/Leaf/inner"]},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(_armed(job, "01_Mid", "01_Leaf")) == ["inner"]
+    assert _armed(job, "01_Mid", "02_Other") == "", (
+        "the sibling was handed what Mid was armed with"
+    )
+
+
+def test_a_grandchild_s_stop_stops_the_whole_chain_and_says_where(
+        tools_dir, tmp_path):
+    """The delicate one. A stopped child exits 0 with a result.json exactly
+    like a finished one, so without recognising it the caller carries on with
+    a quality-control record where it expected the path its callee wrote."""
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Mid", CALLER)
+    make_tool(tools_dir, "Caller", CALLS_MID)
+    job = tmp_path / "job"
+    completed, result = run_job(
+        tools_dir, "Caller", job,
+        {"scans": str(tmp_path), "stop_after": ["Mid/Leaf"]},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert result["result"]["quality_control"] is True
+    assert result["result"]["stopped_after"] == "Mid/Leaf", (
+        "the root has to report the path that was armed, or nobody can arm it again"
+    )
+    assert not (job / "output" / "carried_on.txt").exists(), (
+        "the root consumed what the chain was stopped to let somebody look at"
+    )
+    kept = job / "output" / "intermediate"
+    assert list(kept.rglob("leaf.txt")), (
+        "what the grandchild produced never reached the reader"
+    )
+
+
+def test_a_bare_name_stops_the_level_that_armed_it_and_no_deeper(
+        tools_dir, tmp_path):
+    """Unchanged from the day a stop was a bare tool name: `Mid` is the
+    boundary after the Mid call, and Mid itself runs to the end."""
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Mid", CALLER)
+    make_tool(tools_dir, "Caller", CALLS_MID)
+    job = tmp_path / "job"
+    completed, result = run_job(
+        tools_dir, "Caller", job,
+        {"scans": str(tmp_path), "stop_after": ["Mid"]},
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert result["result"]["stopped_after"] == "Mid"
+    assert not (job / "output" / "carried_on.txt").exists()
+    assert (job / "sup" / "01_Mid" / "output" / "chained.txt").is_file(), (
+        "the bare name descended and stopped the callee too"
+    )
+
+
+def test_a_chain_nobody_armed_runs_to_the_end_untouched(tools_dir, tmp_path):
+    """The resting state, and the one that matters most: three levels, no
+    stop_after at all, nothing armed anywhere and nothing stopped."""
+    make_tool(tools_dir, "Leaf", REPORTING)
+    make_tool(tools_dir, "Other", REPORTING)
+    make_tool(tools_dir, "Mid", TWO_CALLS)
+    make_tool(tools_dir, "Caller", CALLS_MID)
+    job = tmp_path / "job"
+    completed, result = run_job(
+        tools_dir, "Caller", job, {"scans": str(tmp_path)})
+    assert completed.returncode == 0, completed.stderr
+    assert "quality_control" not in result["result"]
+    assert (job / "output" / "carried_on.txt").is_file()
+    assert _armed(job, "01_Mid", "01_Leaf") == ""
+    assert _armed(job, "01_Mid", "02_Other") == ""
+
+
+def test_a_grandchild_stop_is_picked_up_again_from_the_root(tools_dir, tmp_path):
+    """One run id, one resume. The root is the only level the server ever
+    paused, so carrying on is the root re-entering -- and the checkpoint it is
+    standing on is the only one disarmed."""
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Mid", CALLER)
+    make_tool(tools_dir, "Caller", CALLS_MID)
+    job = tmp_path / "job"
+    params = {"scans": str(tmp_path), "stop_after": ["Mid/Leaf"]}
+
+    _completed, result = run_job(tools_dir, "Caller", job, params)
+    assert result["result"]["stopped_after"] == "Mid/Leaf"
+
+    completed, result = _resume(tools_dir, "Caller", job, params)
+    assert completed.returncode == 0, completed.stderr
+    assert "quality_control" not in result["result"], "it stopped on the same breath"
+    assert (job / "output" / "carried_on.txt").is_file(), "the chain did not finish"
 
 
 # ----------------------------------------------------------------------

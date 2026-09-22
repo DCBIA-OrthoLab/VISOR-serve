@@ -396,17 +396,22 @@ def _keep_intermediate_spec(calls: tuple, layout: dict) -> ArgSpec:
 STOP_AFTER_ARGUMENT = "stop_after"
 STOP_AFTER_SECTION = "Quality control"
 
+# How a stop names a point INSIDE a nested call: `ASO/ALI_CBCT` is "in the ASO
+# call, after ALI_CBCT". Pinned equal to `execution.runner.STOP_PATH_SEPARATOR`
+# by a test -- that file is executed by a TOOL's interpreter and the two cannot
+# share a module.
+#
+# A separator rather than a bare name because a name is not enough to address
+# one: AREG and ASO both call ALI_CBCT, and "ALI_CBCT" cannot say which of the
+# two boundaries a reader meant.
+STOP_PATH_SEPARATOR = "/"
 
-def _stop_after_spec(calls: tuple, controls: tuple, layout: dict) -> ArgSpec:
-    """Where a run may be stopped so a reader can look before the rest is
-    built on it.
 
-    A MULTICHOICE, every option OFF: a run that was not asked to stop does
-    not stop, and that has to be the resting state of a server other people
-    are queueing on.
+def _own_stop_points(calls: tuple, controls: tuple) -> list:
+    """The points a tool provides ITSELF, in the order they are published.
 
-    Two kinds of option, offered together because a reader choosing where to
-    look does not care which mechanism provides the point:
+    Two kinds, offered together because a reader choosing where to look does
+    not care which mechanism provides the point:
 
     * every tool this one CALLS -- the boundary already exists, the callee
       has just written its output and nothing has consumed it yet;
@@ -415,11 +420,26 @@ def _stop_after_spec(calls: tuple, controls: tuple, layout: dict) -> ArgSpec:
       call boundary exists. AMASSS segmenting five structures has no callee
       and still has a moment worth stopping at.
 
+    What is NOT here is anything inside a call: a tool's schema is generated
+    from its own source by `describe.py`, which sees one tool and cannot know
+    what its callees offer. The registry composes that in once every sibling
+    is loaded -- see `publish_stops`.
+    """
+    return list(calls) + [name for name in controls if name not in calls]
+
+
+def _stop_after_spec(options, layout: dict) -> ArgSpec:
+    """Where a run may be stopped so a reader can look before the rest is
+    built on it.
+
+    A MULTICHOICE, every option OFF: a run that was not asked to stop does
+    not stop, and that has to be the resting state of a server other people
+    are queueing on.
+
     The order is the order they are listed in, not the order they happen in:
     a chain decides what to call from the data, so no static list can promise
     a sequence.
     """
-    options = list(calls) + [name for name in controls if name not in calls]
     return ArgSpec(
         type=MULTICHOICE_TYPE,
         required=False,
@@ -690,15 +710,18 @@ class SchemaTool(Tool):
         # in the order a caller decides them: where the run stops, what it
         # hands back, where that is written.
         self.quality_controls = tuple(schema.get("quality_controls") or ())
-        if self.calls or self.quality_controls:
+        # Kept so the registry can compose the transitive list over it once
+        # every sibling has loaded, and kept SEPARATE from what is published:
+        # these are the points this tool provides itself, and the published
+        # option list also names points inside the tools it calls.
+        self.stop_points = tuple(_own_stop_points(self.calls, self.quality_controls))
+        self._stop_after_layout = (schema.get("injected_layout") or {}).get(
+            STOP_AFTER_ARGUMENT) or {}
+        if self.stop_points:
             self.arguments = _ordered_with(
                 self.arguments,
                 STOP_AFTER_ARGUMENT,
-                _stop_after_spec(
-                    self.calls, self.quality_controls,
-                    (schema.get("injected_layout") or {}).get(
-                        STOP_AFTER_ARGUMENT) or {},
-                ),
+                _stop_after_spec(self.stop_points, self._stop_after_layout),
             )
         if self.calls:
             self.arguments = _ordered_with(
@@ -712,6 +735,25 @@ class SchemaTool(Tool):
             )
         self.output_kind = RETURN_KINDS.get(schema.get("returns"), DEFAULT_RETURN_KIND)
         self.source_hash = schema.get("source_hash", "")
+
+    def publish_stops(self, points) -> None:
+        """Offer `points` as this tool's checkpoints, nested ones included.
+
+        Called by the registry once every tool is loaded, because that is the
+        first moment the list can be known: `describe.py` runs against ONE
+        tool's source and reads `sup.run("ASO", ...)` as a name, so this side
+        is where `ASO` becomes `ASO` plus everything `ASO` can be stopped at.
+        Without it `AREG` offers `ASO` and never `ASO/ALI_CBCT`, and the
+        landmarks a clinician wants to judge are unreachable.
+
+        The spec is REPLACED rather than re-inserted: a dict keeps the position
+        of a key whose value changes, and that position is where the box lands
+        on the panel (see `_ordered_with`).
+        """
+        if STOP_AFTER_ARGUMENT not in self.arguments:
+            return
+        self.arguments[STOP_AFTER_ARGUMENT] = _stop_after_spec(
+            points, self._stop_after_layout)
 
     def invoke(self, args: dict) -> Any:
         """Validate, then run in the tool's own interpreter.

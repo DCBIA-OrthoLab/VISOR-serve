@@ -105,6 +105,28 @@ KEEP_INTERMEDIATE_ARGUMENT = "keep_intermediate"
 # file is run by a TOOL's interpreter and may not import the server.
 STOP_AFTER_ARGUMENT = "stop_after"
 
+# How a stop names a point inside a nested call: `ASO/ALI_CBCT` is "in the ASO
+# call, after ALI_CBCT". Pinned equal to
+# `registry.schema_tool.STOP_PATH_SEPARATOR` by a test, for the same reason.
+#
+# A bare name cannot address one: AREG and ASO both call ALI_CBCT, so
+# "ALI_CBCT" does not say which of the two boundaries a reader meant.
+STOP_PATH_SEPARATOR = "/"
+
+# The stops addressed to THIS level, handed down by the level above. In the
+# environment and not in `job.json`, because job.json is the REQUEST -- what a
+# caller asked the tool to compute -- and where a reader wants to look is not
+# part of it. It is also what a parent rewrites per child, which a file written
+# once before admission cannot be.
+STOPS_ENV = "SADT_STOP_AFTER"
+
+# What a stopped run's result carries, and the only thing that tells it from a
+# finished one: a run that stopped exits 0 and writes a result.json exactly
+# like a run that finished. Written by `main()` below and read one level up by
+# `_Supervisor._result`, which is what turns a child's stop into the parent's.
+QUALITY_CONTROL_KEY = "quality_control"
+STOPPED_AFTER_KEY = "stopped_after"
+
 # Set by the server when a paused run is picked up again. Its presence is the
 # whole difference between a first run and a resumed one: what a nested call
 # already produced is READ instead of recomputed.
@@ -896,7 +918,7 @@ def _record_stop(job_dir: str, name: str) -> None:
     """Write down which checkpoint this run is standing on."""
     try:
         with open(os.path.join(job_dir, STOPPED_FILE), "w", encoding="utf-8") as handle:
-            json.dump({"stopped_after": name}, handle)
+            json.dump({STOPPED_AFTER_KEY: name}, handle)
     except OSError as exc:
         # The run still stopped and still reported it; what is lost is the
         # ability to disarm this one checkpoint on the way back in, which a
@@ -907,7 +929,7 @@ def _record_stop(job_dir: str, name: str) -> None:
 def _stopped_at(job_dir: str) -> str:
     try:
         with open(os.path.join(job_dir, STOPPED_FILE), encoding="utf-8") as handle:
-            return str(json.load(handle).get("stopped_after") or "")
+            return str(json.load(handle).get(STOPPED_AFTER_KEY) or "")
     except (OSError, ValueError):
         return ""
 
@@ -1458,6 +1480,76 @@ def _wanted_steps(value) -> set:
     return set()
 
 
+def _stops_inside(stops, tool: str) -> set:
+    """The entries of `stops` that address a point INSIDE a call to `tool`,
+    with that call's own name taken off the front.
+
+    `{"ASO", "ASO/ALI_CBCT", "AMASSS"}` handed to the `ASO` child is
+    `{"ALI_CBCT"}`: the bare `ASO` is a boundary in THIS tool's work and fires
+    here when the call returns, `AMASSS` is addressed to a sibling, and only
+    the qualified one descends -- one level, with the prefix stripped, so the
+    child receives exactly the vocabulary its own schema published.
+
+    Written once because the arithmetic has two halves that must agree: this
+    strips a head, `_stop_path` puts one back, and a stop that descended under
+    one spelling has to come back up under the same one or the name the root
+    reports is not the name the caller armed.
+    """
+    below = set()
+    for entry in stops:
+        head, separator, rest = str(entry).partition(STOP_PATH_SEPARATOR)
+        if separator and rest and head == tool:
+            below.add(rest)
+    return below
+
+
+def _stop_path(tool: str, name: str) -> str:
+    """Where a child stopped, said from the parent's side: `ASO` + `ALI_CBCT`
+    -> `ASO/ALI_CBCT`.
+
+    The inverse of `_stops_inside`, and applied at every level on the way back
+    up, so a three-deep stop is re-qualified twice and the root reports the
+    whole path -- which is the one spelling a reader can arm again."""
+    return tool + STOP_PATH_SEPARATOR + name
+
+
+def _inherited_stops() -> set:
+    """What the level above armed in THIS level, or nothing for a root run.
+
+    JSON rather than a separator-joined list: a declared checkpoint is free
+    text out of the tool's own source ("after the crop"), so no delimiter is
+    safe to assume. Unreadable content is no stops at all -- a run that cannot
+    tell where it was asked to stop must finish, not stop somewhere arbitrary.
+    """
+    raw = os.environ.get(STOPS_ENV)
+    if not raw:
+        return set()
+    try:
+        entries = json.loads(raw)
+    except ValueError:
+        print("ignoring an unreadable {}".format(STOPS_ENV), file=sys.stderr)
+        return set()
+    if not isinstance(entries, list):
+        return set()
+    return {str(entry) for entry in entries}
+
+
+def _stopped_after(result):
+    """The checkpoint a result says it stopped at, or None for an ordinary one.
+
+    The one reader of the record `main()` writes below. A child that stopped
+    exits 0 with a result.json like any other, so this key is the entire
+    difference between a callee's answer and a callee that never produced one.
+
+    Both halves are required, the name included: a record with no name is one
+    nothing can re-qualify, and `ASO/` is not a checkpoint anybody can arm.
+    """
+    if not isinstance(result, dict) or not result.get(QUALITY_CONTROL_KEY):
+        return None
+    name = result.get(STOPPED_AFTER_KEY)
+    return name if isinstance(name, str) and name else None
+
+
 def _collect_supervised_outputs(job_dir: str, output_dir, wanted: set,
                                 move: bool = True) -> list:
     """Move what the WANTED supervised calls produced under `output_dir`.
@@ -1590,14 +1682,17 @@ class _Supervisor:
 
     def __init__(self, tools_dir: str, job_dir: str, depth: int, chain=(), job_id=None,
                  root=None, data_dir=None, tool=None, stops=()):
-        # Where the caller asked this run to stop: tool names it calls, and
-        # names it declared itself. Empty on every ordinary run, and empty is
-        # what makes `declareQualityControl` free to sprinkle through a tool.
+        # Where the caller asked this run to stop: tool names it calls, names
+        # it declared itself, and paths naming a point inside one of those
+        # calls. Empty on every ordinary run, and empty is what makes
+        # `declareQualityControl` free to sprinkle through a tool.
         #
-        # NOT inherited by a child. A stop is a place in THIS tool's work, and
-        # a name that means "after ALI" to a chain would mean nothing inside
-        # ALI -- worse, a child sharing the set could stop on a name its
-        # parent meant for a sibling.
+        # A child is handed only the entries addressed to IT, with its own
+        # name stripped (`_stops_inside`). Never the whole set: a bare name
+        # means a place in THIS tool's work, and a child sharing it would stop
+        # on a name its parent meant for a sibling -- LEAF_THAT_DECLARES in
+        # `test_quality_control.py` is exactly that trap, a callee declaring a
+        # checkpoint under the very name its caller armed.
         self._stops = frozenset(stops)
         self._resuming = bool(os.environ.get(RESUME_ENV))
         # Latched the moment a memo is missing or names another tool: the
@@ -1747,6 +1842,16 @@ class _Supervisor:
         else:
             environment[CHANNEL_BUDGET_ENV] = "{},{}".format(*budget)
         environment.pop(CHANNELS_ENV, None)
+        # One level, and only the entries addressed to this callee. POPPED
+        # rather than left alone when there are none: the environment is a
+        # copy of this process's, so a child of an armed parent would
+        # otherwise inherit the parent's own stops and answer to names that
+        # mean nothing inside it.
+        inside = _stops_inside(self._stops, tool)
+        if inside:
+            environment[STOPS_ENV] = json.dumps(sorted(inside))
+        else:
+            environment.pop(STOPS_ENV, None)
         # Raises when the budget is already spent, before starting anything.
         remaining = self._remaining_seconds()
         # SADT_TOOL_DIR points at the PARENT's folder; the callee derives its
@@ -2151,6 +2256,22 @@ class _Supervisor:
                 f"{error.get('type', 'Error')}: {error.get('message', '')}"
             )
         value = payload.get("result")
+
+        # A child that STOPPED exits 0 and writes a result.json exactly like
+        # one that finished, so without this the record travels on as if it
+        # were the callee's answer -- and the caller carries on with a
+        # quality-control dict where it expected the path its callee wrote.
+        # (It did not even get that far: the dict below turns every value into
+        # a Path, and `Path(True)` is a TypeError from inside the supervisor.)
+        #
+        # Re-raised rather than returned, and re-qualified with the callee's
+        # own name, so the stop unwinds every level the way it unwinds the one
+        # that raised it first. Only the ROOT ends up paused: one run id, one
+        # resume, and a `stopped_after` the caller can arm again verbatim.
+        stopped = _stopped_after(value)
+        if stopped is not None:
+            raise QualityControlStop(_stop_path(tool, stopped))
+
         if isinstance(value, str):
             return Path(value)
         if isinstance(value, dict):
@@ -2233,6 +2354,11 @@ def main(argv=None) -> int:
         # orchestrator.
         stops = _wanted_steps(params.pop(STOP_AFTER_ARGUMENT, None))
         stops = set() if stops is _ALL_STEPS else set(stops)
+        # A nested level is armed by its parent and never by job.json: a
+        # supervised call is not a request, so what arrives in `params` is
+        # what the CALLING TOOL passed and a reader's checkpoints are not
+        # among it. A root run has the variable unset and reads its own.
+        stops |= _inherited_stops()
         if os.environ.get(RESUME_ENV):
             # The checkpoint this run is standing on is the one it was told
             # to carry on past. Disarming only THAT one: a reader may have
@@ -2288,10 +2414,12 @@ def main(argv=None) -> int:
             produced = _collect_supervised_outputs(
                 job["job_dir"], where, _ALL_STEPS, move=False)
             _write_result(job["job_dir"], {
-                "stopped_after": stop.name,
+                STOPPED_AFTER_KEY: stop.name,
                 # Named so a client can tell this from a finished run without
-                # parsing prose. A run that completed has no such key.
-                "quality_control": True,
+                # parsing prose. A run that completed has no such key -- and
+                # the level above reads it back through `_stopped_after`,
+                # which is what makes a nested stop the whole chain's.
+                QUALITY_CONTROL_KEY: True,
                 "produced": [os.path.basename(path) for path in produced],
                 # The canonical shape for "what this run produced", which is
                 # what the server packs. A stopped run still has an answer --

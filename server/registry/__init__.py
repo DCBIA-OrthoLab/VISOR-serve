@@ -55,7 +55,7 @@ from base import Tool
 from config import settings
 from .deployment import deployment_config
 from .facade import build_facades
-from .schema_tool import SchemaTool, is_packaged, load_tool
+from .schema_tool import STOP_PATH_SEPARATOR, SchemaTool, is_packaged, load_tool
 
 # This module runs at import time, BEFORE main.py reaches its own
 # logging.basicConfig call: without this one, the INFO summary below would be
@@ -386,6 +386,56 @@ def _check_supervised_calls(registry: dict) -> None:
 
 
 
+def _stop_points(name: str, registry: dict, above: tuple = ()) -> list:
+    """Every point a run of `name` can be stopped at, nested ones included.
+
+    `describe.py` runs against ONE tool's source, so a schema can only ever
+    say `calls: ["ASO"]`. Composing `ASO/ALI_CBCT` out of that needs the
+    sibling's schema, which is known HERE and nowhere else -- so this is where
+    a boundary inside a callee becomes something a client can tick.
+
+    `above` is the calls already open on this branch, and a tool that appears
+    in it is not descended into. The registry refuses a cycle at RUN time, by
+    name, with a message (`_Supervisor.run`); at startup the same cycle would
+    be an infinite walk, and a server that hangs on boot says nothing at all.
+    No memo table: the catalogue is ~16 tools and the deepest real chain is
+    three levels (AREG -> ASO -> ALI_CBCT), so the walk is over before
+    memoising it would have paid for itself.
+    """
+    tool = registry.get(name)
+    if tool is None or name in above:
+        # An unresolved call name contributes nothing rather than raising:
+        # `_check_supervised_calls` is what refuses it, with a message naming
+        # the caller, and it runs whether or not this walk found the name.
+        return []
+
+    calls = set(getattr(tool, "calls", ()) or ())
+    deeper = above + (name,)
+    points = []
+    for point in getattr(tool, "stop_points", ()) or ():
+        points.append(point)
+        if point in calls:
+            points.extend(
+                point + STOP_PATH_SEPARATOR + inner
+                for inner in _stop_points(point, registry, deeper)
+            )
+    return points
+
+
+def _publish_transitive_stops(registry: dict) -> None:
+    """Give every tool the checkpoints of the tools it calls, not just its own.
+
+    Run BEFORE the facades are composed: a facade deep-copies its targets'
+    arguments, so the targets have to be final first or it publishes a list
+    that was already out of date when it was copied.
+    """
+    for name, tool in registry.items():
+        publish = getattr(tool, "publish_stops", None)
+        if publish is None:
+            continue
+        publish(_stop_points(name, registry))
+
+
 def _refuse_if_nothing_packaged_loaded(registry: dict) -> None:
     """Refuse to start when EVERY packaged tool on disk failed to load.
 
@@ -483,6 +533,10 @@ def _build_registry() -> dict:
         registry[instance.name] = instance
 
     _check_deployment_config(registry)
+
+    # Before the facades, which copy their targets' arguments: a stop list
+    # composed afterwards would reach the tools and not the facades over them.
+    _publish_transitive_stops(registry)
 
     # After the real tools and before the supervised-call check, so a facade's
     # targets are already registered and a `sup.run()` naming a facade is
