@@ -53,6 +53,32 @@ def test_the_tool_writes_into_its_own_job_directory(
     assert result["cwd"] == job_dir, "a relative path must land in the job dir, not the server tree"
 
 
+def test_a_resume_does_not_package_the_stopped_attempt_s_output(
+    probe_tool, probe_python, tracked_scratch_dirs
+):
+    """A run that STOPS copies each kept step into `output/intermediate/` for
+    the reader to download, and that copy is the step as it was BEFORE the
+    correction. A resume asked to keep no step rewrites none of it, so the
+    stopped attempt's snapshot was packaged as if it were the resumed run's
+    own -- the archive handing back the very landmarks the reader had just
+    replaced. Measured against a live ASO: the run oriented on Ba at 11.7
+    while `intermediate/` reported the 4.7 it had corrected away, which reads
+    as the correction having been silently ignored.
+    """
+    result = dispatch.dispatch(probe_tool, {"a": 1, "b": 1})
+    job_dir = os.path.dirname(os.path.dirname(result["outputs"]["probe"]))
+    stale = os.path.join(job_dir, "output", "intermediate", "01_Leaf")
+    os.makedirs(stale)
+    with open(os.path.join(stale, "lm.mrk.json"), "w") as handle:
+        handle.write("the landmarks the reader corrected away")
+
+    dispatch.dispatch(probe_tool, {"a": 1, "b": 1}, resume_from=job_dir)
+
+    assert not os.path.exists(stale), (
+        "the resumed run packaged the stopped attempt's intermediate copy"
+    )
+
+
 def test_the_job_environment_carries_the_three_declared_variables(
     probe_tool, probe_python, tracked_scratch_dirs
 ):

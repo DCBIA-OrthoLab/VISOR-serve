@@ -1036,6 +1036,16 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None,
             # the SAME request carrying on -- the inputs it was staged with
             # are in that directory and nowhere else now.
             job_path = os.path.join(job_dir, JOB_FILE)
+            # And the stopped attempt's own output goes, for exactly the
+            # reason a retry's does. It holds the `intermediate/` copies made
+            # for the READER to download, and `_collect` rewrites only the
+            # steps this run is asked to keep -- so a resume that keeps none
+            # packaged the stopped attempt's snapshot instead of its own, and
+            # the archive handed back the landmarks the reader had just
+            # CORRECTED AWAY. Measured: the run oriented on Ba at 11.7 while
+            # `intermediate/` reported the 4.7 it replaced, which reads as the
+            # correction having been silently ignored.
+            _reset_job(job_dir)
         else:
             params = _server_provided(tool, params, job_dir)
             job_path = _write_job_file(job_dir, job_id, tool.name, params)
