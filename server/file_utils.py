@@ -33,6 +33,17 @@ def track_scratch_dirs() -> list:
     return created
 
 
+def tracked_scratch_dirs() -> list:
+    """What this request has staged so far, as a copy.
+
+    Read-only, unlike `track_scratch_dirs`, which STARTS a new recording and
+    would throw away the request's own list if a caller mistook it for a
+    getter.
+    """
+    tracked = _scratch_dirs.get()
+    return list(tracked) if tracked else []
+
+
 def register_scratch_dir(directory: str) -> str:
     """Record an already-created directory for the same cleanup; returns it.
 

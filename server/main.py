@@ -2047,20 +2047,31 @@ async def _finish_stopped_run(tool, tool_name: str, start_time: float,
     """
     outputs = file_utils.output_paths(record)
     reference = None
+    # The archive is built in a directory of its OWN, never in the request's
+    # work dir. That work dir is where an uploaded folder was unpacked, and
+    # deleting it left the resume with no inputs: the tool ran again, was
+    # handed the same paths, and answered "Path not found". It never showed
+    # in testing because a hosted test file lives in `DATA/` and belongs to
+    # no request -- so every upload, which is every clinical use, was broken
+    # and every test passed.
     if outputs:
-        if work_dir is None:
-            work_dir = tempfile.mkdtemp(dir=settings.TEMP_DIR)
+        packing = tempfile.mkdtemp(dir=settings.TEMP_DIR)
         archive = await anyio.to_thread.run_sync(
             file_utils.make_zip, outputs,
-            os.path.join(work_dir, f"{tool_name}_stopped.zip"),
+            os.path.join(packing, f"{tool_name}_stopped.zip"),
         )
         stored = await anyio.to_thread.run_sync(
             transfer.store_result, str(archive), "application/zip"
         )
         reference = stored.as_reference()
-        background_tasks.add_task(shutil.rmtree, work_dir, ignore_errors=True)
-    for directory in list(scratch_dirs):
-        background_tasks.add_task(shutil.rmtree, directory, ignore_errors=True)
+        background_tasks.add_task(shutil.rmtree, packing, ignore_errors=True)
+    # What the run still needs is handed to the pause record instead of being
+    # deleted here; `runs.discard` takes it when the run finally ends, and the
+    # reaper takes it from a reader who never came back.
+    runs.keep_while_paused(
+        runs.CURRENT_RUN.get(None),
+        [directory for directory in ([work_dir] if work_dir else [])
+         + list(scratch_dirs)])
 
     # Last, so the phase a watcher reads is where the run actually is: the
     # zip is built and the reference is parked, and from here it waits.

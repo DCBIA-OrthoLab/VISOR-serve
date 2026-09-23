@@ -219,6 +219,12 @@ def discard(run_id: str) -> None:
     task, where raising would be worse than the leak the reaper would catch."""
     if not _scratch.is_valid_id(run_id or ""):
         return
+    # What a paused run was holding on to goes with it. This is the only
+    # place that knows: the request that staged those directories handed
+    # them over rather than deleting them, precisely so a resume could use
+    # them, and nothing else is told when that resume finally ends.
+    for directory in (paused_at(run_id) or {}).get("keep") or ():
+        shutil.rmtree(directory, ignore_errors=True)
     shutil.rmtree(os.path.join(_runs_root(), run_id), ignore_errors=True)
 
 
@@ -646,14 +652,23 @@ def get_pgid(run_id: str) -> Optional[int]:
 PAUSED_FILE = "paused.json"
 
 
-def pause(run_id: str, job_dir: str, stopped_after: str) -> None:
-    """Record that this run stopped, and where its work is.
+def pause(run_id: str, job_dir: str, stopped_after: str, keep=()) -> None:
+    """Record that this run stopped, where its work is, and what it still needs.
 
     The job directory is what a resume reads: the memo each supervised call
     left behind, and the outputs a reader is about to correct. Written here
     rather than held in a module global for the same reason the process group
     is -- the POST that resumes may be served by a different `uvicorn
     --workers` process, which holds nothing.
+
+    `keep` is the staged INPUTS. A request deletes everything it staged once
+    its response has streamed, which is right for confidential imaging and
+    wrong for exactly this case: the resume runs the tool again and hands it
+    the same inputs, so deleting them left the run unable to carry on.
+
+    It never showed up in testing because a hosted test file resolves to a
+    path in `DATA/` that no request owns; every UPLOAD, which is every
+    clinical use, lost its input the moment the run paused.
     """
     try:
         directory = run_directory(run_id)
@@ -661,12 +676,34 @@ def pause(run_id: str, job_dir: str, stopped_after: str) -> None:
         return
     try:
         with open(os.path.join(directory, PAUSED_FILE), "w", encoding="utf-8") as handle:
-            json.dump({"job_dir": job_dir, "stopped_after": stopped_after}, handle)
+            json.dump({"job_dir": job_dir, "stopped_after": stopped_after,
+                       "keep": [str(entry) for entry in keep or ()]}, handle)
     except OSError as exc:
         logger.warning("could not record the pause for run %s: %s", run_id, exc)
         return
     touch(directory)
     append(run_id, phase=PHASE_PAUSED)
+
+
+def keep_while_paused(run_id, directories) -> None:
+    """Add `directories` to what a paused run is holding on to.
+
+    Called after the pause was recorded, because what the REQUEST staged is
+    only fully known once its response is being built. Silent for a run that
+    is not paused: a finished run has nothing to hold.
+    """
+    record = paused_at(run_id) if run_id else None
+    if record is None:
+        return
+    keep = list(record.get("keep") or ())
+    keep.extend(str(entry) for entry in directories or () if entry and entry not in keep)
+    record["keep"] = keep
+    try:
+        directory = run_directory(run_id)
+        with open(os.path.join(directory, PAUSED_FILE), "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+    except (RunError, OSError) as exc:
+        logger.warning("Could not record what run %s is keeping: %s", run_id, exc)
 
 
 def paused_at(run_id: str) -> Optional[dict]:

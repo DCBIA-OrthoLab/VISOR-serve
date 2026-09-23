@@ -1065,7 +1065,15 @@ def _kept_if_paused(result, run_id, job_dir: str, tool_name: str):
                        tool_name)
         return result
     file_utils.forget_scratch_dir(job_dir)
-    runs.pause(run_id, job_dir, str(result.get("stopped_after") or ""))
+    # Everything this request staged, so the resume still has the inputs it
+    # was given. `forget_scratch_dir` below stops the request deleting them;
+    # `runs.discard` takes them when the run finally ends, and the reaper
+    # takes them from a reader who never came back.
+    keep = [directory for directory in file_utils.tracked_scratch_dirs()
+            if directory != job_dir]
+    runs.pause(run_id, job_dir, str(result.get("stopped_after") or ""), keep=keep)
+    for directory in keep:
+        file_utils.forget_scratch_dir(directory)
     return result
 
 

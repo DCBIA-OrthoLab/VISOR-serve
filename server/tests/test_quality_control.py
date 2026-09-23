@@ -1284,3 +1284,78 @@ def test_anything_uncertain_replays_the_whole_cohort(tmp_path, tool, keep, why):
     assert not os.path.isfile(os.path.join(job, dispatch.REPLAY_JOB_FILE)), (
         "a refused narrowing must leave no half-written request behind"
     )
+
+
+# ---------------------------------------------------------------------------
+# What a paused run has to hold on to
+# ---------------------------------------------------------------------------
+
+def test_a_paused_run_keeps_the_inputs_it_was_given(tmp_path):
+    """A request deletes everything it staged once its response has streamed.
+    That is right for confidential imaging and wrong for exactly one case: a
+    resume runs the tool AGAIN and hands it the same inputs.
+
+    It never showed in testing because every test used a hosted test file,
+    which resolves to a path in `DATA/` that no request owns. Every UPLOAD --
+    which is every clinical use -- lost its input the moment the run paused,
+    and the resume answered `Path not found`.
+    """
+    from wire import runs
+
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "patient.nii.gz").write_text("a scan")
+    job = tmp_path / "job"
+    job.mkdir()
+    run_id = runs.register(uuid.uuid4().hex, tool="ASO")
+    runs.pause(run_id, str(job), "ALI_CBCT", keep=[str(staged)])
+
+    assert runs.paused_at(run_id)["keep"] == [str(staged)]
+    assert staged.is_dir(), "the inputs a resume needs were deleted"
+
+
+def test_what_a_paused_run_kept_goes_when_the_run_does(tmp_path):
+    """Bounded like everything else here: the run ends, or the reaper takes
+    it from a reader who never came back."""
+    from wire import runs
+
+    staged = tmp_path / "staged"
+    staged.mkdir()
+    (staged / "patient.nii.gz").write_text("a scan")
+    job = tmp_path / "job"
+    job.mkdir()
+    run_id = runs.register(uuid.uuid4().hex, tool="ASO")
+    runs.pause(run_id, str(job), "ALI_CBCT", keep=[str(staged)])
+
+    runs.discard(run_id)
+
+    assert not staged.exists(), "a finished run left a patient's scan behind"
+
+
+def test_more_can_be_kept_once_the_response_is_built(tmp_path):
+    """What the REQUEST staged is only fully known when its answer is packed,
+    which is after the pause was recorded."""
+    from wire import runs
+
+    first, second = tmp_path / "one", tmp_path / "two"
+    first.mkdir()
+    second.mkdir()
+    job = tmp_path / "job"
+    job.mkdir()
+    run_id = runs.register(uuid.uuid4().hex, tool="ASO")
+    runs.pause(run_id, str(job), "ALI_CBCT", keep=[str(first)])
+
+    runs.keep_while_paused(run_id, [str(second), str(first)])
+
+    assert runs.paused_at(run_id)["keep"] == [str(first), str(second)], (
+        "the same directory must not be recorded twice"
+    )
+
+
+def test_keeping_something_for_a_run_that_is_not_paused_is_silent(tmp_path):
+    """A finished run has nothing to hold, and raising here would turn a
+    tidy-up into a failed request."""
+    from wire import runs
+
+    runs.keep_while_paused(uuid.uuid4().hex, [str(tmp_path)])
+    runs.keep_while_paused(None, [str(tmp_path)])
