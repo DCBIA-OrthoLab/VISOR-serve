@@ -137,20 +137,25 @@ client                          server
   |------------------------------>|  replay for the 3; the other 37 untouched
 ```
 
-### Open questions in that leg
+### How the patients are narrowed
 
-- **What narrows the input.** The local module builds a temp folder holding
-  only the flagged patients' files, tree preserved, and points the step at it.
-  On the server the input is already staged in `<job>/input`; narrowing it
-  means either a second staged folder or a per-patient filter the tool honours.
-  Undecided.
-- **How a patient is identified.** The flag is per patient; the server knows
-  files. The local module derives a patient id from the file name
-  (`patientIdFromFileName`) and normalises it, because four naming conventions
-  coexist. That logic exists in VISU's index and would have to be agreed on.
-- **What "the memo after it" means across a chain.** Dropping `01_ALI_CBCT`'s
-  memo is clear. Dropping everything after it, when "after" spans two levels
-  of nesting, is not yet written down.
+**No temporary folder, and no manifest.** The client sends back the corrected
+files for the flagged patients and nothing else; the server reads WHICH
+patients from the files it was given, and replays for those. There is nothing
+to keep in step between the two sides, because there is only one list and it
+is the one that travelled.
+
+What that leaves to settle, and it is the part that can go wrong in silence:
+
+- **How a patient is identified from a file name.** The local module derives an
+  id and normalises it, because four naming conventions coexist
+  (`Pat_0002_lm_Pred.mrk.json` is patient `Pat_0002`). VISU's index already
+  does this on the client. If the two sides disagree, the wrong patient is
+  replayed and nothing says so. They have to share one rule, and it has to be
+  tested against all four conventions.
+- **What "the steps after it" means across a chain.** Dropping the memo of
+  `01_ALI_CBCT` is clear. Dropping everything after it, when "after" spans two
+  levels of nesting, is not yet written down.
 
 ## State
 
@@ -165,7 +170,7 @@ client                          server
 | only the changed files travel back | done |
 | corrections for a step a callee made | done |
 | VISU: review, flag, lock, save, continue | done |
-| **a stop declaring what may be edited there** | to build |
+| a stop declaring what may be edited there (`view`/`landmarks`/`registration`) | declared; not yet read by the server |
 | **rewind to an earlier stop for flagged patients** | to build |
 | no served tool declares `declareQualityControl` yet | open |
 | a reader who repoints the folder sends everything | open |
