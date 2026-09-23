@@ -99,7 +99,13 @@ width_from = false
 # schema is composed from the three at startup, so changing one of them changes
 # what this offers, with nothing to keep in sync.
 [tools.AREG]
-dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "CBCT to IOS" = "AREG_IOSCBCT" }
+# "IOS to CBCT", and not the reverse: that is the wording the published
+# extension puts in front of clinicians -- AREG.ui's own CbInputType offers
+# "CBCT to CBCT", "IOS to IOS", "IOS to CBCT" -- and it is also the direction
+# of the operation, an intraoral surface being moved onto a CBCT. The mode
+# name travels on the wire, so a saved request holding the old spelling has
+# to be re-made; nothing else reads it.
+dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "IOS to CBCT" = "AREG_IOSCBCT" }
 
 [tools.ASO]
 # `landmark_model` is no longer a bundle this tool HOSTS. It names the weights
