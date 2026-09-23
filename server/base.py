@@ -303,6 +303,11 @@ class ArgSpec:
     # description covers all of them at once. The words are the tool's, exactly
     # as `groups`' names are: this server knows the key and never a landmark.
     option_help: Optional[dict] = None
+    # `{option: what a reader may do there}` -- "view", "landmarks",
+    # "registration". Only `stop_after` carries it, and only so a panel can
+    # tell a checkpoint a reader may come BACK to from one they may only look
+    # at. Presentation in the sense the others are: `validate()` ignores it.
+    option_kind: Optional[dict] = None
 
     # How few options a "multichoice" may be left with. Absent means none is a
     # meaningful answer -- ALI's empty `landmarks` says "let the regions decide"

@@ -55,7 +55,7 @@ from base import Tool
 from config import settings
 from .deployment import deployment_config
 from .facade import build_facades
-from .schema_tool import STOP_PATH_SEPARATOR, SchemaTool, is_packaged, load_tool
+from .schema_tool import REVIEW_VIEW, STOP_PATH_SEPARATOR, SchemaTool, is_packaged, load_tool
 
 # This module runs at import time, BEFORE main.py reaches its own
 # logging.basicConfig call: without this one, the INFO summary below would be
@@ -422,6 +422,38 @@ def _stop_points(name: str, registry: dict, above: tuple = ()) -> list:
     return points
 
 
+def _stop_kinds(name: str, registry: dict, points) -> dict:
+    """`{stop point: what a reader may do there}`, for one tool's points.
+
+    Two sources, and they answer different questions:
+
+    * a point a tool DECLARED mid-run said its own kind on the spot;
+    * a point that is a CALL carries none -- the boundary is "the callee has
+      just written its output" and the caller did not write it. So the kind is
+      read off the CALLEE, which is the tool that knows: ALI produces
+      landmarks wherever it is called from.
+
+    A qualified point (`ASO/ALI_CBCT`) is answered by its LAST segment, for
+    the same reason: what sits there was written by the tool that segment
+    names.
+
+    Anything unresolved is `view`, the conservative answer -- a reader is
+    never offered a way back to a checkpoint no tool said was editable.
+    """
+    tool = registry.get(name)
+    declared = dict(getattr(tool, "checkpoint_kinds", {}) or {}) if tool else {}
+    kinds = {}
+    for point in points:
+        last = point.rsplit(STOP_PATH_SEPARATOR, 1)[-1]
+        if point in declared:
+            kinds[point] = declared[point]
+            continue
+        callee = registry.get(last)
+        kinds[point] = getattr(callee, "review_kind", REVIEW_VIEW) if callee else (
+            declared.get(last, REVIEW_VIEW))
+    return kinds
+
+
 def _publish_transitive_stops(registry: dict) -> None:
     """Give every tool the checkpoints of the tools it calls, not just its own.
 
@@ -433,7 +465,8 @@ def _publish_transitive_stops(registry: dict) -> None:
         publish = getattr(tool, "publish_stops", None)
         if publish is None:
             continue
-        publish(_stop_points(name, registry))
+        points = _stop_points(name, registry)
+        publish(points, _stop_kinds(name, registry, points))
 
 
 def _refuse_if_nothing_packaged_loaded(registry: dict) -> None:

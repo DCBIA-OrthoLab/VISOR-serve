@@ -564,6 +564,7 @@ def list_tools() -> list:
                     # tool that names none of its options publishes exactly what
                     # it published before this field existed.
                     **({"option_help": spec.option_help} if spec.option_help else {}),
+                    **({"option_kind": spec.option_kind} if spec.option_kind else {}),
                     # Same shape again: omitted rather than null, because an
                     # empty multichoice is a meaningful answer everywhere it is
                     # not declared, and saying so on every argument of every

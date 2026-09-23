@@ -845,6 +845,50 @@ def test_a_correction_is_staged_where_the_resume_reads_it(tmp_path):
     assert landed.read_bytes() == b"corrected"
 
 
+def test_a_stop_says_what_a_reader_may_do_there(tools_dir):
+    """Which is what decides whether a reader can come BACK to it.
+
+    A stop that is a CALL carries no kind of its own: the boundary is "the
+    callee has just written its output", and the caller did not write it. So
+    the kind is read off the CALLEE -- ALI produces landmarks wherever it is
+    called from -- and a qualified point is answered by its last segment.
+    """
+    from registry import _stop_kinds
+
+    class _Tool:
+        def __init__(self, kind="view", declared=None):
+            self.review_kind = kind
+            self.checkpoint_kinds = declared or {}
+
+    registry = {
+        "ASO": _Tool(declared={"after the crop": "registration"}),
+        "ALI_CBCT": _Tool("landmarks"),
+        "Crown_Seg": _Tool(),
+    }
+    kinds = _stop_kinds("ASO", registry,
+                        ["ALI_CBCT", "ASO/ALI_CBCT", "Crown_Seg", "after the crop"])
+
+    assert kinds["ALI_CBCT"] == "landmarks", "read off the tool that wrote it"
+    assert kinds["ASO/ALI_CBCT"] == "landmarks", "answered by its last segment"
+    assert kinds["Crown_Seg"] == "view", "a tool that says nothing is not a way back"
+    assert kinds["after the crop"] == "registration", "declared on the spot"
+
+
+def test_a_checkpoint_list_from_an_older_generator_still_loads(tmp_path):
+    """The schema is the seam between two repositories. `quality_controls`
+    used to be a list of names and is now a list of {name, kind}; a server
+    that refused the first shape would refuse every tool built before the
+    change."""
+    from registry.schema_tool import _declared_checkpoints
+
+    kinds, names = _declared_checkpoints(["landmarks"])
+    assert names == ("landmarks",) and kinds == {"landmarks": "view"}
+
+    kinds, names = _declared_checkpoints(
+        [{"name": "landmarks", "kind": "landmarks"}])
+    assert names == ("landmarks",) and kinds == {"landmarks": "landmarks"}
+
+
 def test_a_correction_for_a_callee_s_own_step_is_staged_where_that_callee_reads(tmp_path):
     """A chain nests, and so do the staging directories.
 
