@@ -1334,7 +1334,11 @@ async def _detach(tool_name: str, request: Request, run_id, background_tasks):
 
 # One directory per slot, named as the slot is (`01_ALI_CBCT`). The runner
 # moves each over that slot's output before answering from its memo.
-_RESUME_SLOT = re.compile(r"^[0-9]{2}_[A-Za-z0-9_-]{1,64}$")
+_RESUME_STEP = r"[0-9]{2}_[A-Za-z0-9_-]{1,64}"
+# One step, or a path through nested ones: `01_ALI_CBCT`, or `01_ASO/01_ALI_CBCT`
+# for a step a CALLEE made. Bounded at four levels because the name comes over
+# HTTP and becomes a directory, and a chain that deep does not exist.
+_RESUME_SLOT = re.compile(r"^%s(?:/%s){0,3}$" % (_RESUME_STEP, _RESUME_STEP))
 
 
 def _suffixes_of(name: str) -> set:
@@ -1355,7 +1359,7 @@ def _suffixes_of(name: str) -> set:
     return found
 
 
-def _checked_correction(job_dir: str, slot: str, filename: str) -> None:
+def _checked_correction(step_dir: str, slot: str, filename: str) -> None:
     """Refuse a correction that is not the kind of thing that went out.
 
     NOT `settings.ALLOWED_EXTENSIONS`: that is the whitelist for a tool's
@@ -1368,9 +1372,12 @@ def _checked_correction(job_dir: str, slot: str, filename: str) -> None:
     on disk a few directories away: a reader sends back what they were
     given. A `.zip` is always allowed -- a folder has no other way to
     travel.
+
+    `step_dir` is the step's own directory, resolved by the caller: a step
+    of a CALLEE is not under `<job>/sup` but under its own caller's, and
+    building the path here would only work for the first level.
     """
-    produced = os.path.join(job_dir, dispatch.SUP_DIRNAME, slot,
-                            dispatch.JOB_OUTPUT_DIRNAME)
+    produced = os.path.join(step_dir, dispatch.JOB_OUTPUT_DIRNAME)
     allowed = {".zip"}
     for _root, _directories, names in os.walk(produced):
         for name in names:
@@ -1395,12 +1402,44 @@ def _stage_corrections(tool, job_dir: str, form) -> list:
     it, the same discipline every id in `wire/` follows: it arrives over HTTP
     and it becomes a directory.
     """
-    # What the run actually has. A correction for a step that never ran is a
-    # typo, and a typo that is silently accepted is a resume the reader
-    # believes carries their work and does not.
-    steps = sorted(
-        name for name in os.listdir(os.path.join(job_dir, dispatch.SUP_DIRNAME))
-    ) if os.path.isdir(os.path.join(job_dir, dispatch.SUP_DIRNAME)) else []
+    def _located(slot: str):
+        """Where a step's own output is, and where its correction is staged.
+
+        A chain nests: the root supervisor works in `<job>`, and the one
+        inside `01_Mid` works in `<job>/sup/01_Mid`. Each stages what came
+        back for its OWN calls in `<its job dir>/resume/<step>`, so a
+        correction for `01_Mid/01_Leaf` belongs in
+        `<job>/sup/01_Mid/resume/01_Leaf` -- which is exactly where the
+        supervisor that re-runs Mid will look for it.
+
+        Returns None for a path no step of this run answers to.
+        """
+        here = job_dir
+        steps = slot.split("/")
+        for step in steps[:-1]:
+            here = os.path.join(here, dispatch.SUP_DIRNAME, step)
+            if not os.path.isdir(here):
+                return None
+        produced = os.path.join(here, dispatch.SUP_DIRNAME, steps[-1])
+        if not os.path.isdir(produced):
+            return None
+        return produced, os.path.join(here, dispatch.RESUME_DIRNAME, steps[-1])
+
+    def _ran() -> list:
+        """Every step of this run, nested ones written as a path."""
+        found = []
+
+        def walk(directory: str, prefix: str) -> None:
+            root = os.path.join(directory, dispatch.SUP_DIRNAME)
+            if not os.path.isdir(root):
+                return
+            for name in sorted(os.listdir(root)):
+                path = prefix + name
+                found.append(path)
+                walk(os.path.join(root, name), path + "/")
+
+        walk(job_dir, "")
+        return found
 
     staged = []
     for slot, value in form.multi_items():
@@ -1412,15 +1451,20 @@ def _stage_corrections(tool, job_dir: str, form) -> list:
                 detail=(f"'{slot}' is not a step of that run. Name a correction "
                         "after the folder it came back in, such as 01_ALI_CBCT."),
             )
-        if slot not in steps:
+        located = _located(slot)
+        if located is None:
+            # A correction for a step that never ran is a typo, and a typo
+            # silently accepted is a resume the reader believes carries their
+            # work and does not.
+            ran = _ran()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(f"That run has no step '{slot}'. It ran: "
-                        f"{', '.join(steps) or 'nothing'}."),
+                        f"{', '.join(ran) or 'nothing'}."),
             )
-        _checked_correction(job_dir, slot, value.filename or "")
+        produced, destination = located
+        _checked_correction(produced, slot, value.filename or "")
 
-        destination = os.path.join(job_dir, dispatch.RESUME_DIRNAME, slot)
         shutil.rmtree(destination, ignore_errors=True)
         os.makedirs(destination, exist_ok=True)
         name = os.path.basename(value.filename or slot)

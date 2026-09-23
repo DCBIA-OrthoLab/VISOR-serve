@@ -845,6 +845,60 @@ def test_a_correction_is_staged_where_the_resume_reads_it(tmp_path):
     assert landed.read_bytes() == b"corrected"
 
 
+def test_a_correction_for_a_callee_s_own_step_is_staged_where_that_callee_reads(tmp_path):
+    """A chain nests, and so do the staging directories.
+
+    The root supervisor works in `<job>` and stages what came back for its
+    own calls in `<job>/resume/<step>`. The one inside `01_Mid` works in
+    `<job>/sup/01_Mid` and looks in `<job>/sup/01_Mid/resume/<step>`. So a
+    correction for a step MID made has to land there, not under the root --
+    and before this it could not be sent at all: the slot pattern refused a
+    path, and only the first level was listed as a step of the run.
+    """
+    import main
+    job = _ran(tmp_path, "01_Mid")
+    nested = tmp_path / "sup" / "01_Mid" / "sup" / "01_Leaf" / "output"
+    nested.mkdir(parents=True)
+    (nested / "points.mrk.json").write_text("what the reader was given")
+
+    staged = main._stage_corrections(
+        _AnyTool(), job,
+        _Form([("01_Mid/01_Leaf", _Upload("points.mrk.json"))]))
+
+    assert staged == ["01_Mid/01_Leaf"]
+    landed = tmp_path / "sup" / "01_Mid" / "resume" / "01_Leaf" / "points.mrk.json"
+    assert landed.read_bytes() == b"corrected", (
+        "the correction did not land where the supervisor that re-runs Mid looks"
+    )
+
+
+def test_a_step_no_callee_ever_ran_is_refused(tmp_path):
+    """And the message says what the run DID run, nested steps included, so a
+    reader who mistyped one can see the name they meant."""
+    import main
+    job = _ran(tmp_path, "01_Mid")
+    with pytest.raises(main.HTTPException) as refusal:
+        main._stage_corrections(
+            _AnyTool(), job,
+            _Form([("01_Mid/01_Absent", _Upload("points.mrk.json"))]))
+    assert refusal.value.status_code == 400
+    assert "01_Mid" in refusal.value.detail
+
+
+def test_a_slot_path_deeper_than_a_chain_goes_is_refused(tmp_path):
+    """The name arrives over HTTP and becomes a directory, so it is bounded
+    before any path is built from it -- the discipline every id in `wire/`
+    follows."""
+    import main
+    job = _ran(tmp_path, "01_Mid")
+    with pytest.raises(main.HTTPException) as refusal:
+        main._stage_corrections(
+            _AnyTool(), job,
+            _Form([("01_A/01_B/01_C/01_D/01_E", _Upload("points.mrk.json"))]))
+    assert refusal.value.status_code == 400
+    assert "is not a step of that run" in refusal.value.detail
+
+
 def test_a_scalar_field_is_not_mistaken_for_a_correction(tmp_path):
     import main
     assert main._stage_corrections(
