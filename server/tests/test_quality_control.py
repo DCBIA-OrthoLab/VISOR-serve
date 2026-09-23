@@ -845,6 +845,80 @@ def test_a_correction_is_staged_where_the_resume_reads_it(tmp_path):
     assert landed.read_bytes() == b"corrected"
 
 
+def test_two_armed_checkpoints_both_clear_and_the_run_finishes(tools_dir, tmp_path):
+    """A reader may arm two, and carrying on past the first must still stop
+    at the second -- and then FINISH.
+
+    A resume disarmed only the checkpoint it was standing on, so the first
+    one stayed armed: its memo hit raised the stop again and the run bounced
+    between them. Measured before the fix: Leaf, Other, Leaf, for ever, and a
+    reader who ticked two boxes could never complete a run.
+    """
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Other", LEAF)
+    make_tool(tools_dir, "Mid", TWO_CALLS)
+    job = tmp_path / "job"
+    scans = tmp_path / "in"
+    scans.mkdir()
+    params = {"scans": str(scans), "stop_after": ["Leaf", "Other"]}
+
+    _done, first = run_job(tools_dir, "Mid", job, params)
+    assert first["result"]["stopped_after"] == "Leaf"
+    _done, second = _resume(tools_dir, "Mid", job, params)
+    assert second["result"]["stopped_after"] == "Other"
+    _done, third = _resume(tools_dir, "Mid", job, params)
+    assert "stopped_after" not in third["result"], (
+        "the run went back to a checkpoint it had already cleared"
+    )
+
+
+def test_going_back_arms_a_checkpoint_the_run_already_cleared(tools_dir, tmp_path):
+    """Which is the whole of what a rewind is.
+
+    Nothing is re-run to get there and no memo is dropped: the step's result
+    is on disk and is exactly what the reader asked to look at again.
+    """
+    from execution import runner
+
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Other", LEAF)
+    make_tool(tools_dir, "Mid", TWO_CALLS)
+    job = tmp_path / "job"
+    scans = tmp_path / "in"
+    scans.mkdir()
+    params = {"scans": str(scans), "stop_after": ["Leaf", "Other"]}
+
+    run_job(tools_dir, "Mid", job, params)
+    _resume(tools_dir, "Mid", job, params)          # now standing on Other
+
+    assert runner.rewind_to(str(job), "Leaf") is True
+    _done, again = _resume(tools_dir, "Mid", job, params)
+    assert again["result"]["stopped_after"] == "Leaf", (
+        "the reader was not taken back to the step they asked for"
+    )
+    assert (job / "sup" / "01_Leaf" / "output" / "leaf.txt").is_file(), (
+        "the result the reader was sent back to LOOK at was thrown away"
+    )
+
+
+def test_going_back_somewhere_the_run_never_was_is_refused(tools_dir, tmp_path):
+    """A silent no-op would leave a reader waiting at a checkpoint that will
+    never come."""
+    from execution import runner
+
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Other", LEAF)
+    make_tool(tools_dir, "Mid", TWO_CALLS)
+    job = tmp_path / "job"
+    scans = tmp_path / "in"
+    scans.mkdir()
+    run_job(tools_dir, "Mid", job,
+            {"scans": str(scans), "stop_after": ["Leaf"]})
+
+    assert runner.rewind_to(str(job), "Other") is False
+    assert runner.rewind_to(str(job), "Leaf") is True
+
+
 def test_a_stop_says_what_a_reader_may_do_there(tools_dir):
     """Which is what decides whether a reader can come BACK to it.
 

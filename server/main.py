@@ -31,7 +31,10 @@ from fastapi.responses import (
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from execution import admission, costs, dispatch
+# `runner` is executed BY a tool's interpreter and must never import this
+# server -- but the other direction is safe and is what lets the rewind
+# edit the same record the runner wrote. It is standard library only.
+from execution import admission, costs, dispatch, runner
 from registry import facade
 from registry.facade import FacadeTool
 import file_utils
@@ -1544,6 +1547,52 @@ async def _tracked_run(run_id: str, label: str, background_tasks: BackgroundTask
     # a progress message is written by a tool and can name a file.
     background_tasks.add_task(runs.discard, run_id)
     return response
+
+
+@app.post("/runs/{run_id}/rewind", dependencies=[Depends(verify_token)])
+async def rewind_run(run_id: str, request: Request,
+                     background_tasks: BackgroundTasks):
+    """Send a stopped run BACK to a checkpoint it already went past.
+
+    A reader looking at a bad orientation cannot fix it where they are: the
+    orientation was computed from landmarks decided two steps back. So they
+    ask to return to the last stop where something can actually be changed,
+    and this arms that checkpoint again.
+
+    Nothing is re-run to get there and no memo is dropped. The step's result
+    is on disk, which is precisely what the reader wants to look at; the run
+    re-enters its tool, every call answers from what it recorded, and the
+    checkpoint fires again the moment that step is reached. A GPU pass to
+    reproduce a file that is already there would be paid for nothing.
+
+    `to` is a step the run was stopped at, named as it was published --
+    `ALI_CBCT`, or `ASO/ALI_CBCT` for one inside a callee.
+    """
+    paused = await anyio.to_thread.run_sync(runs.paused_at, run_id)
+    if paused is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(f"Run '{run_id}' is not stopped at a checkpoint. A run that "
+                    "finished, failed or expired cannot be sent back."),
+        )
+    form = await request.form()
+    target = (form.get("to") or "").strip()
+    if not target:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Name the step to go back to, as 'to'.",
+        )
+    job_dir = paused["job_dir"]
+    if not await anyio.to_thread.run_sync(runner.rewind_to, job_dir, target):
+        # Asking to return somewhere the run has not been. Refused rather
+        # than ignored: a silent no-op leaves a reader waiting at a
+        # checkpoint that will never come.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(f"This run never stopped at '{target}', so there is "
+                    "nothing to go back to."),
+        )
+    return await resume_run(run_id, request, background_tasks)
 
 
 @app.post("/runs/{run_id}/resume", dependencies=[Depends(verify_token)])

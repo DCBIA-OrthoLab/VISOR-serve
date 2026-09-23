@@ -126,6 +126,9 @@ STOPS_ENV = "SADT_STOP_AFTER"
 # `_Supervisor._result`, which is what turns a child's stop into the parent's.
 QUALITY_CONTROL_KEY = "quality_control"
 STOPPED_AFTER_KEY = "stopped_after"
+# Every checkpoint the run already went past, so a resume disarms all of them
+# and not only the last. See `_record_stop`.
+PASSED_STOPS_KEY = "passed_stops"
 
 # Set by the server when a paused run is picked up again. Its presence is the
 # whole difference between a first run and a resumed one: what a nested call
@@ -915,10 +918,23 @@ def _measurements() -> dict:
 
 
 def _record_stop(job_dir: str, name: str) -> None:
-    """Write down which checkpoint this run is standing on."""
+    """Write down which checkpoint this run is standing on, and the ones behind.
+
+    CUMULATIVE, and that is the whole of it. A resume disarms what the run
+    already went past, and reading only the LAST one meant a reader who armed
+    two checkpoints could never finish: stop at the first, carry on, stop at
+    the second, carry on -- and the first was still armed, so its memo hit
+    raised the stop again. Measured on two armed stops: Leaf, Other, Leaf,
+    for ever.
+
+    The list is also what a REWIND edits: taking a name back out of it arms
+    that checkpoint again, which is exactly "go back to this step".
+    """
     try:
+        passed = [entry for entry in _passed_stops(job_dir) if entry != name]
+        passed.append(name)
         with open(os.path.join(job_dir, STOPPED_FILE), "w", encoding="utf-8") as handle:
-            json.dump({STOPPED_AFTER_KEY: name}, handle)
+            json.dump({STOPPED_AFTER_KEY: name, PASSED_STOPS_KEY: passed}, handle)
     except OSError as exc:
         # The run still stopped and still reported it; what is lost is the
         # ability to disarm this one checkpoint on the way back in, which a
@@ -932,6 +948,54 @@ def _stopped_at(job_dir: str) -> str:
             return str(json.load(handle).get(STOPPED_AFTER_KEY) or "")
     except (OSError, ValueError):
         return ""
+
+
+def _passed_stops(job_dir: str) -> list:
+    """Every checkpoint this run already went past, oldest first.
+
+    Falls back to the single name for a job stopped by an older runner, so a
+    run in flight when this server was updated still resumes.
+    """
+    try:
+        with open(os.path.join(job_dir, STOPPED_FILE), encoding="utf-8") as handle:
+            recorded = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    passed = recorded.get(PASSED_STOPS_KEY)
+    if isinstance(passed, list):
+        return [str(entry) for entry in passed if entry]
+    single = recorded.get(STOPPED_AFTER_KEY)
+    return [str(single)] if single else []
+
+
+def rewind_to(job_dir: str, name: str) -> bool:
+    """Arm `name` again, and everything the run passed after it.
+
+    The inverse of `_record_stop`, and the whole of what going BACK is. A
+    resume disarms what the run already went past; taking a name back out of
+    that list -- with everything after it -- means the next resume stops
+    there again, with that step's output intact for a reader to correct.
+
+    Nothing is deleted and no memo is touched. The step's own result is what
+    the reader is being sent back to LOOK at: re-running it would throw away
+    the thing they wanted to see, and would cost a GPU pass to produce a
+    result that is already on disk.
+
+    False when the run never went past `name` -- which is a caller asking to
+    return somewhere it has not been, and a silent no-op would leave a reader
+    waiting for a checkpoint that will not come.
+    """
+    passed = _passed_stops(job_dir)
+    if name not in passed:
+        return False
+    kept = passed[:passed.index(name)]
+    try:
+        with open(os.path.join(job_dir, STOPPED_FILE), "w", encoding="utf-8") as handle:
+            json.dump({STOPPED_AFTER_KEY: kept[-1] if kept else "",
+                       PASSED_STOPS_KEY: kept}, handle)
+    except OSError:
+        return False
+    return True
 
 
 def _write_result(job_dir: str, result) -> None:
@@ -2386,7 +2450,7 @@ def main(argv=None) -> int:
             # to carry on past. Disarming only THAT one: a reader may have
             # armed two, and continuing past the first must still stop at the
             # second.
-            stops.discard(_stopped_at(job["job_dir"]))
+            stops.difference_update(_passed_stops(job["job_dir"]))
         if _takes(run, OUTPUT_DIR_ARGUMENT) and OUTPUT_DIR_ARGUMENT not in params:
             # A supervised call arrives without one: the supervisor drops what
             # the caller passed, for the same reason the server strips it from
