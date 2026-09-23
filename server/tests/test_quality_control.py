@@ -1143,3 +1143,144 @@ def test_the_staging_folder_is_not_left_behind(tools_dir, tmp_path):
     (staged / "leaf.txt").write_text("corrected")
     _resume(tools_dir, "Caller", job, params)
     assert not staged.exists()
+
+
+# ---------------------------------------------------------------------------
+# Replaying only the cases a reader marked
+# ---------------------------------------------------------------------------
+
+def test_the_rewind_endpoint_narrows_from_what_came_back(tmp_path, monkeypatch):
+    """The endpoint, not its parts.
+
+    Every piece below was covered on its own and the wiring between them was
+    not: `_located_step` returns a PAIR and the endpoint read it as a path,
+    which no unit test could see and every real rewind died on.
+    """
+    from fastapi.testclient import TestClient
+    import main
+    from execution import dispatch, runner
+    from wire import runs
+
+    job = tmp_path / "job"
+    step = job / "sup" / "01_ALI_CBCT" / "output"
+    step.mkdir(parents=True)
+    (step / "p1_lm_Pred.mrk.json").write_text("{}")
+    with open(step / "run_report.json", "w", encoding="utf-8") as handle:
+        json.dump({"cases": {"p1.nii.gz": {"input": "p1.nii.gz",
+                                           "produced": ["p1_lm_Pred.mrk.json"]}}},
+                  handle)
+    cohort = tmp_path / "cohort"
+    cohort.mkdir()
+    for name in ("p1.nii.gz", "p2.nii.gz"):
+        (cohort / name).write_text(name)
+    with open(job / dispatch.JOB_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"job_id": "j", "tool": "Test_Tool", "job_dir": str(job),
+                   "params": {"scans": str(cohort)}}, handle)
+    runner._record_stop(str(job), "ALI_CBCT")
+
+    run_id = runs.register(uuid.uuid4().hex, tool="Test_Tool")
+    runs.pause(run_id, str(job), "ALI_CBCT")
+
+    narrowed = []
+    monkeypatch.setattr(dispatch, "narrow_to_cases",
+                        lambda job_dir, tool, keep: narrowed.extend(keep) or "")
+
+    async def carried_on(tool_name, request, background_tasks, resume_from=None):
+        return {"carried": "on"}
+
+    monkeypatch.setattr(main, "_run_tool", carried_on)
+    monkeypatch.setattr(runs, "finish", lambda rid, phase, **kw: None)
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/runs/{run_id}/rewind",
+        headers={"Authorization": "Bearer " + main.settings.API_TOKEN},
+        data={"to": "ALI_CBCT"},
+        files={"01_ALI_CBCT": ("p1_lm_Pred.mrk.json", b"corrected")},
+    )
+
+    assert response.status_code == 200, response.text
+    assert narrowed == ["p1.nii.gz"], (
+        "the case the corrected file belongs to, read out of the step's report"
+    )
+
+
+class _NarrowingTool:
+    name = "Narrows"
+    arguments: dict = {}
+
+    def __init__(self, case_input="scans"):
+        self.case_input = case_input
+
+
+def _job_with_cohort(tmp_path, names):
+    """A job directory whose request points at a folder of cases."""
+    from execution import dispatch
+    cohort = tmp_path / "cohort"
+    cohort.mkdir()
+    for name in names:
+        (cohort / name).write_text(name)
+    job = tmp_path / "job"
+    job.mkdir()
+    with open(job / dispatch.JOB_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"job_id": "j", "tool": "Narrows", "job_dir": str(job),
+                   "params": {"scans": str(cohort)}}, handle)
+    return str(job), cohort
+
+
+def test_only_the_marked_cases_are_handed_to_the_replay(tmp_path):
+    """A reader who marked three of forty wants three done again, and the
+    other thirty-seven left with the results they already have."""
+    from execution import dispatch
+    job, _cohort = _job_with_cohort(
+        tmp_path, ["a.nii.gz", "b.nii.gz", "c.nii.gz"])
+
+    written = dispatch.narrow_to_cases(job, _NarrowingTool(), ["a.nii.gz", "c.nii.gz"])
+
+    assert written
+    with open(written, encoding="utf-8") as handle:
+        narrowed = json.load(handle)["params"]["scans"]
+    assert sorted(os.listdir(narrowed)) == ["a.nii.gz", "c.nii.gz"]
+
+
+def test_the_request_itself_is_never_rewritten(tmp_path):
+    """`job.json` is what the reader asked for. Asking for three of forty is
+    not a change to that, and the next resume must still see the cohort."""
+    from execution import dispatch
+    job, cohort = _job_with_cohort(tmp_path, ["a.nii.gz", "b.nii.gz"])
+
+    dispatch.narrow_to_cases(job, _NarrowingTool(), ["a.nii.gz"])
+
+    with open(os.path.join(job, dispatch.JOB_FILE), encoding="utf-8") as handle:
+        assert json.load(handle)["params"]["scans"] == str(cohort)
+
+
+def test_the_narrowed_inputs_are_links_not_copies(tmp_path):
+    """A cohort is gigabytes and this is one filesystem."""
+    from execution import dispatch
+    job, cohort = _job_with_cohort(tmp_path, ["a.nii.gz"])
+
+    written = dispatch.narrow_to_cases(job, _NarrowingTool(), ["a.nii.gz"])
+    with open(written, encoding="utf-8") as handle:
+        narrowed = json.load(handle)["params"]["scans"]
+    assert (os.stat(os.path.join(narrowed, "a.nii.gz")).st_ino
+            == os.stat(str(cohort / "a.nii.gz")).st_ino)
+
+
+@pytest.mark.parametrize("tool, keep, why", [
+    (_NarrowingTool(case_input=""), ["a.nii.gz"], "the tool declares no case argument"),
+    (_NarrowingTool(), [], "nothing was marked"),
+    (_NarrowingTool(), ["absent.nii.gz"], "a case the request does not hold"),
+    (_NarrowingTool(case_input="nowhere"), ["a.nii.gz"], "an argument that is not there"),
+])
+def test_anything_uncertain_replays_the_whole_cohort(tmp_path, tool, keep, why):
+    """Which is slower and never wrong. Narrowing on a guess would silently
+    drop patients from a clinician's run, so every doubt fails towards doing
+    MORE work."""
+    from execution import dispatch
+    job, _cohort = _job_with_cohort(tmp_path, ["a.nii.gz", "b.nii.gz"])
+
+    assert dispatch.narrow_to_cases(job, tool, keep) == "", why
+    assert not os.path.isfile(os.path.join(job, dispatch.REPLAY_JOB_FILE)), (
+        "a refused narrowing must leave no half-written request behind"
+    )

@@ -34,7 +34,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 # `runner` is executed BY a tool's interpreter and must never import this
 # server -- but the other direction is safe and is what lets the rewind
 # edit the same record the runner wrote. It is standard library only.
-from execution import admission, costs, dispatch, runner
+from execution import admission, costs, dispatch, reports, runner
 from registry import facade
 from registry.facade import FacadeTool
 import file_utils
@@ -1394,6 +1394,45 @@ def _checked_correction(step_dir: str, slot: str, filename: str) -> None:
         )
 
 
+def _located_step(job_dir: str, slot: str):
+    """Where a step's own output is, and where its correction is staged.
+
+    A chain nests: the root supervisor works in `<job>`, and the one inside
+    `01_Mid` works in `<job>/sup/01_Mid`. Each stages what came back for its
+    OWN calls in `<its job dir>/resume/<step>`, so a correction for
+    `01_Mid/01_Leaf` belongs in `<job>/sup/01_Mid/resume/01_Leaf` -- which is
+    exactly where the supervisor that re-runs Mid will look for it.
+
+    At module scope rather than inside the staging, because the rewind reads
+    the same two places to work out which cases came back.
+
+    Returns `(step directory, staging directory)`, or None for a path no step
+    of this run answers to.
+    """
+    here = job_dir
+    steps = slot.split("/")
+    for step in steps[:-1]:
+        here = os.path.join(here, dispatch.SUP_DIRNAME, step)
+        if not os.path.isdir(here):
+            return None
+    produced = os.path.join(here, dispatch.SUP_DIRNAME, steps[-1])
+    if not os.path.isdir(produced):
+        return None
+    return produced, os.path.join(here, dispatch.RESUME_DIRNAME, steps[-1])
+
+
+def _staged_files(job_dir: str, slot: str) -> list:
+    """Every file a reader sent back for `slot`, at any depth."""
+    located = _located_step(job_dir, slot)
+    if located is None:
+        return []
+    _produced, staged = located
+    found = []
+    for root, _directories, names in os.walk(staged):
+        found.extend(os.path.join(root, name) for name in sorted(names))
+    return found
+
+
 def _stage_corrections(tool, job_dir: str, form) -> list:
     """Put what a reader sends back where the resumed run will read it.
 
@@ -1406,29 +1445,6 @@ def _stage_corrections(tool, job_dir: str, form) -> list:
     it, the same discipline every id in `wire/` follows: it arrives over HTTP
     and it becomes a directory.
     """
-    def _located(slot: str):
-        """Where a step's own output is, and where its correction is staged.
-
-        A chain nests: the root supervisor works in `<job>`, and the one
-        inside `01_Mid` works in `<job>/sup/01_Mid`. Each stages what came
-        back for its OWN calls in `<its job dir>/resume/<step>`, so a
-        correction for `01_Mid/01_Leaf` belongs in
-        `<job>/sup/01_Mid/resume/01_Leaf` -- which is exactly where the
-        supervisor that re-runs Mid will look for it.
-
-        Returns None for a path no step of this run answers to.
-        """
-        here = job_dir
-        steps = slot.split("/")
-        for step in steps[:-1]:
-            here = os.path.join(here, dispatch.SUP_DIRNAME, step)
-            if not os.path.isdir(here):
-                return None
-        produced = os.path.join(here, dispatch.SUP_DIRNAME, steps[-1])
-        if not os.path.isdir(produced):
-            return None
-        return produced, os.path.join(here, dispatch.RESUME_DIRNAME, steps[-1])
-
     def _ran() -> list:
         """Every step of this run, nested ones written as a path."""
         found = []
@@ -1455,7 +1471,7 @@ def _stage_corrections(tool, job_dir: str, form) -> list:
                 detail=(f"'{slot}' is not a step of that run. Name a correction "
                         "after the folder it came back in, such as 01_ALI_CBCT."),
             )
-        located = _located(slot)
+        located = _located_step(job_dir, slot)
         if located is None:
             # A correction for a step that never ran is a typo, and a typo
             # silently accepted is a resume the reader believes carries their
@@ -1549,6 +1565,26 @@ async def _tracked_run(run_id: str, label: str, background_tasks: BackgroundTask
     return response
 
 
+def _tool_of(job_dir: str):
+    """The tool a stopped run was started for, from the job file it was given.
+
+    Read back rather than passed in: the request is on disk and is the one
+    thing about a paused run that cannot have drifted.
+    """
+    try:
+        with open(os.path.join(job_dir, dispatch.JOB_FILE), encoding="utf-8") as handle:
+            name = json.load(handle)["tool"]
+    except (OSError, ValueError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="The work this run stopped in is no longer on the server.",
+        )
+    try:
+        return get_tool(name)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
 @app.post("/runs/{run_id}/rewind", dependencies=[Depends(verify_token)])
 async def rewind_run(run_id: str, request: Request,
                      background_tasks: BackgroundTasks):
@@ -1583,6 +1619,24 @@ async def rewind_run(run_id: str, request: Request,
             detail="Name the step to go back to, as 'to'.",
         )
     job_dir = paused["job_dir"]
+    staged = _stage_corrections(_tool_of(job_dir), job_dir, form)
+    # Which cases the reader sent back, read out of the step's own report --
+    # the tool stated which of its files belong to which case, so nothing is
+    # deduced from a file name here. A step that reported nothing narrows
+    # nothing, and the replay is the whole cohort: slower, never wrong.
+    marked = []
+    for slot in staged:
+        located = _located_step(job_dir, slot)
+        if located is None:
+            continue
+        step_dir, _staging = located
+        report = reports.read(os.path.join(step_dir, dispatch.JOB_OUTPUT_DIRNAME))
+        marked.extend(name for name in reports.cases_of(
+            report, _staged_files(job_dir, slot)) if name not in marked)
+    if marked:
+        await anyio.to_thread.run_sync(
+            dispatch.narrow_to_cases, job_dir, _tool_of(job_dir), marked)
+
     if not await anyio.to_thread.run_sync(runner.rewind_to, job_dir, target):
         # Asking to return somewhere the run has not been. Refused rather
         # than ignored: a silent no-op leaves a reader waiting at a
@@ -1592,12 +1646,14 @@ async def rewind_run(run_id: str, request: Request,
             detail=(f"This run never stopped at '{target}', so there is "
                     "nothing to go back to."),
         )
-    return await resume_run(run_id, request, background_tasks)
+    return await resume_run(run_id, request, background_tasks,
+                            already_staged=True)
 
 
 @app.post("/runs/{run_id}/resume", dependencies=[Depends(verify_token)])
 async def resume_run(run_id: str, request: Request,
-                     background_tasks: BackgroundTasks):
+                     background_tasks: BackgroundTasks,
+                     already_staged: bool = False):
     """Tell a run that stopped at a checkpoint to carry on.
 
     The request may carry corrections: one file field per step, named after
@@ -1631,7 +1687,11 @@ async def resume_run(run_id: str, request: Request,
         tool = get_tool(tool_name)
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    _stage_corrections(tool, job_dir, await request.form())
+    if not already_staged:
+        # A rewind stages before it narrows, and the upload's handles are
+        # read once: staging the same form twice would find every file empty
+        # and refuse the correction the reader just made.
+        _stage_corrections(tool, job_dir, await request.form())
     # Cleared BEFORE the run, not after: it is standing on this checkpoint
     # right up until it moves, and a second resume arriving while the first
     # is running must not be offered the same directory.

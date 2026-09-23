@@ -757,6 +757,10 @@ class SchemaTool(Tool):
         # its own, and the caller did not write what is sitting there. The
         # registry reads it off the callee -- see `_stop_kinds`.
         self.review_kind = schema.get("review_kind") or REVIEW_VIEW
+        # Which argument holds one entry per case, so a replay can hand this
+        # tool a subset of them. "" means it cannot be narrowed, and a replay
+        # then runs the whole cohort -- slower, never wrong.
+        self.case_input = schema.get("case_input") or ""
         # Kept so the registry can compose the transitive list over it once
         # every sibling has loaded, and kept SEPARATE from what is published:
         # these are the points this tool provides itself, and the published

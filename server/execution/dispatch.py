@@ -949,6 +949,73 @@ def _out_of_memory(exc: Exception, exit_code, job_dir: str) -> bool:
     return False
 
 
+# Where a narrowed replay's request and inputs live. Beside the original,
+# never over it: `job.json` is the REQUEST and a reader asking for three
+# patients of forty has not changed what they asked for.
+REPLAY_DIRNAME = "replay"
+REPLAY_JOB_FILE = "job.replay.json"
+
+
+def narrow_to_cases(job_dir: str, tool, keep) -> str:
+    """A job file feeding `tool` only the inputs of `keep`, or "".
+
+    A reader who marked three patients of forty wants those three done again
+    and the other thirty-seven left with the results they already have.
+    Doing that means handing the tool fewer inputs -- and WHICH argument to
+    narrow is the tool's to say (`case_input` in its schema), because it is
+    `input` here, `scans` there, and a registration tool has two.
+
+    "" whenever anything is not certain: no declaration, nothing to keep, an
+    argument that is not a directory, or a wanted name that is not in it.
+    The caller then replays everything, which is slower and never wrong --
+    and the alternative, narrowing on a guess, silently drops patients from a
+    clinician's run.
+
+    Hardlinked, not copied: a cohort is gigabytes and this is the same
+    filesystem, so the narrowed folder costs directory entries.
+    """
+    named = getattr(tool, "case_input", "") or ""
+    wanted = [name for name in (keep or ()) if name]
+    if not named or not wanted:
+        return ""
+    try:
+        with open(os.path.join(job_dir, JOB_FILE), encoding="utf-8") as handle:
+            job = json.load(handle)
+    except (OSError, ValueError):
+        return ""
+    source = (job.get("params") or {}).get(named)
+    if not isinstance(source, str) or not os.path.isdir(source):
+        return ""
+
+    destination = os.path.join(job_dir, REPLAY_DIRNAME, named)
+    shutil.rmtree(destination, ignore_errors=True)
+    kept = 0
+    for relative in wanted:
+        origin = os.path.join(source, relative)
+        if not os.path.isfile(origin):
+            # A case named something that is not a file under this argument:
+            # the report and the request disagree, and narrowing on half an
+            # agreement would drop the rest.
+            logger.info("Not narrowing %s: %r is not under %s",
+                        getattr(tool, "name", "?"), relative, named)
+            shutil.rmtree(destination, ignore_errors=True)
+            return ""
+        landing = os.path.join(destination, relative)
+        os.makedirs(os.path.dirname(landing), exist_ok=True)
+        try:
+            os.link(origin, landing)
+        except OSError:
+            shutil.copy2(origin, landing)
+        kept += 1
+
+    job["params"] = dict(job.get("params") or {}, **{named: destination})
+    replay = os.path.join(job_dir, REPLAY_JOB_FILE)
+    with open(replay, "w", encoding="utf-8") as handle:
+        json.dump(job, handle)
+    logger.info("Replaying %s over %d of its cases", getattr(tool, "name", "?"), kept)
+    return replay
+
+
 def _reset_job(job_dir: str) -> None:
     """Clear what the failed attempt left, so the retry reads its own result.
 
@@ -1035,7 +1102,13 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None,
             # from `params` would be rewriting the request, and a resume is
             # the SAME request carrying on -- the inputs it was staged with
             # are in that directory and nowhere else now.
-            job_path = os.path.join(job_dir, JOB_FILE)
+            # The narrowed one when a replay prepared it, and the request
+            # itself otherwise. `job.json` is never rewritten: a reader who
+            # asked for three patients of forty did not change what they
+            # asked for, and the next resume must still see the whole cohort.
+            narrowed = os.path.join(job_dir, REPLAY_JOB_FILE)
+            job_path = narrowed if os.path.isfile(narrowed) else os.path.join(
+                job_dir, JOB_FILE)
             # And the stopped attempt's own output goes, for exactly the
             # reason a retry's does. It holds the `intermediate/` copies made
             # for the READER to download, and `_collect` rewrites only the
