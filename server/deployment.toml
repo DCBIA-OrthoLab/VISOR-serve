@@ -93,6 +93,25 @@ data_dir = "ALI"
 # single-mesh run at one channel and leave the teeth to run one at a time.
 width_from = false
 
+[tools.AMASSS]
+# Its channels are the STRUCTURES predicted within one scan, not the scans --
+# the same shape as ALI_CBCT above, and the batch axis (`scans`, a folder of
+# them) is the wrong thing to count for exactly the same reason. One nnUNet
+# call is a third inference and two thirds preprocessing on a single core, so
+# a run leaves the card idle most of its own length; overlapping the
+# structures is what fills that, and it is worth doing on ONE patient.
+#
+# Counted from `structures`, which is a multichoice, so `_count` reads the
+# TICKED options: the default five bound the ladder at five, and a clinician
+# asking for the mandible alone reserves for one. The request narrows the
+# reservation without anybody declaring a number.
+#
+# Without this line the ladder is bounded by the scans in the request, which
+# on the ordinary single-patient run is one -- so the tool asked for five
+# structures and was answered one, and the card stayed at 2.4 GiB while the
+# run took as long as it always had.
+width_from = "structures"
+
 # AREG became three tools when it was split, one per modality, because the
 # engines cannot share a virtualenv. This publishes the name callers already
 # have -- every Slicer module names `AREG` -- as a choice between them. The
