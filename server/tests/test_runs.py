@@ -476,6 +476,78 @@ def test_an_abandoned_run_expires(run_id):
     assert not os.path.isdir(directory)
 
 
+def _paused(run_id, tmp_path):
+    """A run stopped at a checkpoint, holding a job directory and a staged
+    cohort -- which is what every real pause holds."""
+    job = tmp_path / "job"
+    cohort = tmp_path / "staged-cohort"
+    job.mkdir()
+    cohort.mkdir()
+    (cohort / "Pat_01.nii.gz").write_text("patient data")
+    runs.pause(run_id, str(job), "ALI_CBCT", keep=[str(cohort)])
+    return job, cohort
+
+
+def test_a_review_is_not_cut_short_by_the_timer_that_bounds_a_lost_client(
+        run_id, tmp_path):
+    """Nothing touches a paused run while a clinician reads a cohort -- the
+    client's only timer during a review draws its own panel. So the fifteen
+    minutes that bound a vanished client would expire a review that is going
+    perfectly well, and the resume would answer 404 with the work still there.
+    """
+    directory = os.path.join(settings.TEMP_DIR, "runs", run_id)
+    _paused(run_id, tmp_path)
+    _age(directory, settings.RUN_TTL_SECONDS + 60)
+
+    runs.reap_expired()
+
+    assert runs.paused_at(run_id) is not None, "a 16-minute review lost its run"
+
+
+def test_a_reader_who_never_comes_back_still_costs_this_machine_nothing(
+        run_id, tmp_path):
+    """Longer, never unbounded: the run is holding a staged cohort of patient
+    data for as long as it lives."""
+    directory = os.path.join(settings.TEMP_DIR, "runs", run_id)
+    _paused(run_id, tmp_path)
+    _age(directory, settings.PAUSED_RUN_TTL_SECONDS + 60)
+
+    assert runs.reap_expired() >= 1
+    assert not os.path.isdir(directory)
+
+
+def test_an_expiring_run_takes_the_cohort_it_was_holding_with_it(
+        run_id, tmp_path):
+    """The defect this closes, measured before the fix: the run directory
+    gone, the staged cohort still on disk, and nothing left in this server
+    that knew its name -- so no later sweep could ever find it.
+
+    A pause hands those directories over precisely so the REQUEST does not
+    delete them, and the only record of where they are is the file inside the
+    run directory a generic sweep deletes first.
+    """
+    job, cohort = _paused(run_id, tmp_path)
+    _age(os.path.join(settings.TEMP_DIR, "runs", run_id),
+         settings.PAUSED_RUN_TTL_SECONDS + 60)
+
+    runs.reap_expired()
+
+    assert not cohort.exists(), "patient data left with nothing pointing at it"
+    assert not job.exists()
+
+
+def test_a_run_that_is_not_paused_keeps_the_shorter_idle_bound(run_id):
+    """The longer bound is for a run waiting on a PERSON, and is not a
+    general loosening: a client that vanished mid-POST still expires in
+    minutes, which is what that timer is for."""
+    directory = os.path.join(settings.TEMP_DIR, "runs", run_id)
+    _age(directory, settings.RUN_TTL_SECONDS + 60)
+
+    runs.reap_expired()
+
+    assert not os.path.isdir(directory)
+
+
 def test_the_run_reaper_runs_on_the_same_timer_as_the_transfer_one():
     """The hole this closes: a client that vanished mid-POST leaves a run
     directory nothing else will ever remove, and an idle server is exactly

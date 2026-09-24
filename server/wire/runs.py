@@ -239,17 +239,78 @@ def discard(run_id: str) -> None:
 touch = _scratch.touch
 
 
+def _kept_by(directory: str) -> list:
+    """Every directory a paused run is holding, read off its own record.
+
+    By PATH rather than by run id, because this is what the reaper has: it is
+    deleting a directory whose id it is about to forget. Both halves are
+    returned -- the job directory the resume would have read, and the inputs
+    the request staged for it -- since nothing else in this server is told
+    they exist.
+    """
+    try:
+        with open(os.path.join(directory, PAUSED_FILE), encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(record, dict):
+        return []
+    held = [record.get("job_dir")]
+    held.extend(record.get("keep") or ())
+    return [str(entry) for entry in held if entry]
+
+
+def _ttl_of(directory: str) -> float:
+    """How long this run may sit idle: longer while somebody is reading it."""
+    if os.path.exists(os.path.join(directory, PAUSED_FILE)):
+        return settings.PAUSED_RUN_TTL_SECONDS
+    return settings.RUN_TTL_SECONDS
+
+
 def reap_expired(now: Optional[float] = None) -> int:
-    """Delete run directories untouched for RUN_TTL_SECONDS.
+    """Delete run directories that have gone idle, and what they were holding.
 
     The normal path removes a run with its request, so this is the safety net
     for the one that never got there: a client that vanished mid-POST, a worker
     killed between the terminal event and the cleanup. It matters because a
     progress message is written by a tool and can name a file.
+
+    **It has to release what a paused run kept, and this is the only place
+    that can.** A run stopped at a checkpoint hands its job directory and its
+    staged inputs to `pause()` precisely so the request does NOT delete them,
+    and the only record of where they are is the file inside the run
+    directory. Deleting that directory first -- which is what a generic
+    sweep does -- left a staged cohort of patient data on disk with nothing
+    left in the server that knew its name. Measured: the run gone, the
+    cohort still there, and no second sweep that would ever find it.
+
+    A paused run is also given longer to be idle, because what it is waiting
+    for is a person reading a cohort and nothing touches it meanwhile.
     """
-    return _scratch.reap(
-        (_runs_root(),), settings.RUN_TTL_SECONDS, "run", now
-    )
+    deadline_now = time.time() if now is None else now
+    removed = 0
+    root = _runs_root()
+    try:
+        entries = os.listdir(root)
+    except FileNotFoundError:
+        return 0
+    for entry in entries:
+        directory = os.path.join(root, entry)
+        try:
+            if os.path.getmtime(directory) > deadline_now - _ttl_of(directory):
+                continue
+        except OSError:
+            # Gone between listdir and getmtime: another worker won.
+            continue
+        for held in _kept_by(directory):
+            shutil.rmtree(held, ignore_errors=True)
+        # ignore_errors: every uvicorn worker runs its own reaper, so losing
+        # the race to delete the same directory is expected.
+        shutil.rmtree(directory, ignore_errors=True)
+        removed += 1
+    if removed:
+        logger.info("run reaper removed %d expired directory(ies)", removed)
+    return removed
 
 
 # ----------------------------------------------------------------------

@@ -261,6 +261,14 @@ class Settings(BaseSettings):
     # removes a run with its request; this bounds the one whose client vanished
     # mid-POST, and a progress message can name a file.
     RUN_TTL_SECONDS: int = 900
+    # The same, for a run stopped at a quality-control checkpoint. Longer
+    # because what it is idle for is a PERSON: nothing touches a paused run
+    # while a clinician reads a cohort, so the fifteen minutes that bound a
+    # vanished client would expire a review that is going perfectly well, and
+    # the resume would answer 404. Bounded rather than exempt: a reader who
+    # never comes back must still cost this machine nothing by the end of the
+    # day, the run holding a staged cohort of patient data the whole time.
+    PAUSED_RUN_TTL_SECONDS: int = 14400
     # How often GET /runs/{id}/events tails the file. Small because it is the
     # latency a clinician sees on a progress bar, and cheap because it is one
     # read of the bytes appended since the last poll.
