@@ -94,7 +94,21 @@ def test_a_traversing_testfile_name_is_refused(name):
     assert "root:" not in response.text
 
 
-@pytest.mark.parametrize("bad", ["../x", "..", "/abs", "a b", "a;b", "a$(id)b", "x" * 200])
+# A bare ".." is the one value here an HTTP CLIENT resolves away before it
+# travels: RFC 3986 says `/uploads/..` is `/`, and httpx, requests and every
+# browser apply it. So that case never reaches the route at all -- and since
+# `GET /` became the status page it now answers 200 rather than 404.
+#
+# Listed apart rather than dropped, and asserted differently rather than by
+# widening the tuple: the security property is "no path was built from the
+# string", and for this value the reason is stronger than the pattern check --
+# the string was gone before the server saw it. Widening the status tuple would
+# have hidden which of the two reasons applied.
+_RESOLVED_AWAY_BY_THE_CLIENT = ".."
+_MALFORMED_IDS = ["../x", "/abs", "a b", "a;b", "a$(id)b", "x" * 200]
+
+
+@pytest.mark.parametrize("bad", _MALFORMED_IDS)
 def test_a_malformed_upload_id_never_builds_a_path(bad, tmp_path):
     """Ids are matched against a strict pattern BEFORE a path is built.
 
@@ -111,7 +125,25 @@ def test_a_malformed_upload_id_never_builds_a_path(bad, tmp_path):
     assert witness.read_text() == "untouched"
 
 
-@pytest.mark.parametrize("bad", ["../x", "..", "/abs", "a;b"])
+@pytest.mark.parametrize("route", ["/uploads/", "/results/"])
+def test_a_bare_dotdot_never_reaches_the_route_at_all(route, tmp_path):
+    """It resolves to `/` in the client, so the id endpoint is never entered.
+
+    What is asserted is the security property and not the status code: the
+    request went somewhere that is not this route, and nothing outside the
+    transfer root was touched. The code itself is incidental -- it is 404 here
+    because `/` serves nothing, and a deployment that mounts something there
+    would answer 200 without the traversal having got any further.
+    """
+    witness = tmp_path / "witness"
+    witness.write_text("untouched")
+    response = client.get(f"{route}{_RESOLVED_AWAY_BY_THE_CLIENT}", headers=AUTH)
+    assert response.status_code == 404
+    assert "root:" not in response.text
+    assert witness.read_text() == "untouched"
+
+
+@pytest.mark.parametrize("bad", ["../x", "/abs", "a;b"])
 def test_a_malformed_result_id_never_builds_a_path(bad):
     assert client.get(f"/results/{bad}", headers=AUTH).status_code in (400, 404)
 

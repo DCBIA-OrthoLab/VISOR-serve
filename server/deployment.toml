@@ -33,11 +33,65 @@ data_dir = "AREG"
 # The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
 # this each looks for DATA/<its own name>/ and falls back to the run-together
 # spelling (ALICBCT), which was never going to exist.
+# ALI_CBCT searches a scan's landmarks in parallel PROCESSES, and two is as
+# wide as this deployment lets it go.
+#
+# Measured on the reference scan's 119 landmarks, real bundle, RTX 6000 Ada:
+#
+#   width  budget   search   found   card       card busy
+#       1    15 s   353.8 s     114   0.78 GiB        24 %
+#       2    15 s   210.1 s     114   1.55 GiB        76 %
+#       4    15 s   169.1 s     113   3.10 GiB        74 %
+#       4    60 s   192.3 s     115   3.10 GiB        72 %
+#
+# Two is free: 1.68x for a byte-identical markups file, on a card that goes
+# from a quarter busy to three quarters. Four is faster still but drops C4 --
+# the landmark this codebase already documents as the one that leaves the field
+# of view and respawns -- because `search_seconds` is a per-agent WALL CLOCK
+# and four agents time-slicing one card each run slower than one does. Raising
+# the budget to 60 s restores it, which is the fix, but the budget is the
+# CALLER's argument and a deployment must not silently redefine it.
+#
+# Threads were tried first and refused: the same widths were SLOWER at every
+# step (23.6 s -> 37.3 s on eight landmarks) and lost 32 of 119, because an
+# agent's step is microseconds of kernel around a lot of Python and the GIL
+# serialises the walk. Processes do not share a GIL, which is the whole
+# difference -- and the reason this is capped at two rather than refused.
+#
+# Raise it to 4 the day `search_seconds` scales with the width inside the
+# engine. Not before: a clinician cannot tell "this scan is hard" from "this
+# run was too wide", and that confusion is exactly what the run report exists
+# to prevent.
 [tools.ALI_CBCT]
 data_dir = "ALI"
+# Its channels are the LANDMARKS searched within one scan, not the scans -- so
+# the batch axis (`input`, a folder of them) is the wrong thing to count, and
+# this says so. One landmark then gets one worker instead of two, which saves
+# the ~3 s a second process costs to launch and does one landmark's work.
+#
+# **This is now the bound on the RESERVATION only, not on the width.** ALI_CBCT
+# asks for its width (`sup.channels`), because the count that matters is what
+# the bundle has weights for crossed with what was requested, and that is
+# knowable only at run time. Two cases show the difference, both run here on
+# 2026-09-18 against the real tool through the real runner: a request naming
+# seven landmarks counts seven, reserves seven and is answered seven; a request
+# naming a REGION counts nothing -- `landmarks` is empty and the regions decide
+# -- so the ladder is bounded only by what is affordable, while the tool is
+# answered the five its bundle actually has. The line stays because the
+# reservation is taken before anyone can ask, and a width nothing bounds is
+# paid for in memory nobody uses; see `execution/concurrency.py`'s header for
+# what that cost on AMASSS.
+width_from = "landmarks"
 
 [tools.ALI_IOS]
 data_dir = "ALI"
+# Its channels are the TEETH of one mesh -- "the loop is mesh-outer,
+# tooth-inner, and `num_workers` widens the INNER one", in the engine's own
+# words -- and how many teeth a mesh carries is read from its label array at
+# run time, which is after admission has decided. So there is nothing in the
+# request to count: the batch axis (`input`, a folder of meshes) would bound a
+# single-mesh run at one channel and leave the teeth to run one at a time.
+width_from = false
 
 # AREG became three tools when it was split, one per modality, because the
 # engines cannot share a virtualenv. This publishes the name callers already
@@ -90,3 +144,21 @@ server_selectable = { reference = "none" }
 # convention -- it is the patient's own other timepoint, not a bundle -- but it
 # is a surface a caller may well want to pick from the server.
 server_selectable = { surfaces = "testfile", reference = "testfile" }
+
+[tools.CNE]
+# The one tool whose run is dominated by loading its model: a 4.4 GB quantised
+# GGUF, once per call. Notes are kilobytes, so a cohort of them is never a
+# transfer problem -- splitting it into five batches would be five loads of
+# 4.4 GB bought with nothing. This is the input to the batching decision that
+# is genuinely the tool's rather than this machine's, which is why the server
+# cannot derive it and it is written down here.
+batch = false
+
+
+# CLIC's channel is a SLICE of a volume, and how many slices there are is not
+# known until the volume has been read -- which is after admission has decided.
+# `false` says so, rather than letting the batch axis count its scans and bound
+# the slice batch by the cohort size, which would be a different number
+# entirely.
+[tools.CLIC]
+width_from = false

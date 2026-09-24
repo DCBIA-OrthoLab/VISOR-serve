@@ -476,6 +476,78 @@ def test_an_abandoned_run_expires(run_id):
     assert not os.path.isdir(directory)
 
 
+def _paused(run_id, tmp_path):
+    """A run stopped at a checkpoint, holding a job directory and a staged
+    cohort -- which is what every real pause holds."""
+    job = tmp_path / "job"
+    cohort = tmp_path / "staged-cohort"
+    job.mkdir()
+    cohort.mkdir()
+    (cohort / "Pat_01.nii.gz").write_text("patient data")
+    runs.pause(run_id, str(job), "ALI_CBCT", keep=[str(cohort)])
+    return job, cohort
+
+
+def test_a_review_is_not_cut_short_by_the_timer_that_bounds_a_lost_client(
+        run_id, tmp_path):
+    """Nothing touches a paused run while a clinician reads a cohort -- the
+    client's only timer during a review draws its own panel. So the fifteen
+    minutes that bound a vanished client would expire a review that is going
+    perfectly well, and the resume would answer 404 with the work still there.
+    """
+    directory = os.path.join(settings.TEMP_DIR, "runs", run_id)
+    _paused(run_id, tmp_path)
+    _age(directory, settings.RUN_TTL_SECONDS + 60)
+
+    runs.reap_expired()
+
+    assert runs.paused_at(run_id) is not None, "a 16-minute review lost its run"
+
+
+def test_a_reader_who_never_comes_back_still_costs_this_machine_nothing(
+        run_id, tmp_path):
+    """Longer, never unbounded: the run is holding a staged cohort of patient
+    data for as long as it lives."""
+    directory = os.path.join(settings.TEMP_DIR, "runs", run_id)
+    _paused(run_id, tmp_path)
+    _age(directory, settings.PAUSED_RUN_TTL_SECONDS + 60)
+
+    assert runs.reap_expired() >= 1
+    assert not os.path.isdir(directory)
+
+
+def test_an_expiring_run_takes_the_cohort_it_was_holding_with_it(
+        run_id, tmp_path):
+    """The defect this closes, measured before the fix: the run directory
+    gone, the staged cohort still on disk, and nothing left in this server
+    that knew its name -- so no later sweep could ever find it.
+
+    A pause hands those directories over precisely so the REQUEST does not
+    delete them, and the only record of where they are is the file inside the
+    run directory a generic sweep deletes first.
+    """
+    job, cohort = _paused(run_id, tmp_path)
+    _age(os.path.join(settings.TEMP_DIR, "runs", run_id),
+         settings.PAUSED_RUN_TTL_SECONDS + 60)
+
+    runs.reap_expired()
+
+    assert not cohort.exists(), "patient data left with nothing pointing at it"
+    assert not job.exists()
+
+
+def test_a_run_that_is_not_paused_keeps_the_shorter_idle_bound(run_id):
+    """The longer bound is for a run waiting on a PERSON, and is not a
+    general loosening: a client that vanished mid-POST still expires in
+    minutes, which is what that timer is for."""
+    directory = os.path.join(settings.TEMP_DIR, "runs", run_id)
+    _age(directory, settings.RUN_TTL_SECONDS + 60)
+
+    runs.reap_expired()
+
+    assert not os.path.isdir(directory)
+
+
 def test_the_run_reaper_runs_on_the_same_timer_as_the_transfer_one():
     """The hole this closes: a client that vanished mid-POST leaves a run
     directory nothing else will ever remove, and an idle server is exactly
@@ -750,7 +822,7 @@ def test_the_gpu_queue_is_announced_only_when_the_run_wants_the_card(
     that is running, which is the most confusing thing a panel can show. A
     tabular prediction that never queues must not claim it did."""
     monkeypatch.setattr(dispatch, "_execute", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(dispatch, "_read_result", lambda *args: "ok")
+    monkeypatch.setattr(dispatch, "_read_result", lambda *args, **kwargs: "ok")
     monkeypatch.setattr(settings, "DEVICE", "cpu")
 
     class CpuTool(Tool):
@@ -770,8 +842,12 @@ def test_the_gpu_queue_is_announced_only_when_the_run_wants_the_card(
     finally:
         runs.CURRENT_RUN.reset(token)
 
-    assert with_card == [runs.PHASE_QUEUED_GPU]
-    assert both == [runs.PHASE_QUEUED_GPU], "a CPU run queued for a card it never wanted"
+    # Stronger than it used to be. The phase was announced before the wait, so
+    # a run that was admitted instantly still claimed to have queued; it is now
+    # emitted only when the run actually had to wait for room, and neither of
+    # these did.
+    assert with_card == []
+    assert both == [], "a run that never waited said it was queueing"
 
 
 def test_a_tool_is_told_where_to_report_its_progress(run_id):
@@ -793,3 +869,110 @@ def test_a_run_nobody_is_watching_carries_no_progress_file(monkeypatch):
     environment = dispatch._child_environment("job1", "/jobs/job1", None, None)
 
     assert runs.PROGRESS_FILE_ENV not in environment
+
+
+def test_a_nested_marker_names_the_tool_it_called(run_id):
+    """The supervisor's marker is what makes a chain visible.
+
+    ASO drives ALI_CBCT for most of its wall clock, and before this the only
+    trace was a depth-0 log MESSAGE -- which anything reading a run's events
+    drops, messages being free text a tool wrote. Measured on the campaign's
+    two chain arms: 56 events across seven runs, every one at depth 0.
+    """
+    directory = os.path.join(settings.TEMP_DIR, "runs", run_id)
+    path = os.path.join(directory, runs.EVENTS_FILE)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"depth": 1, "tool": "ALI_CBCT"}) + "\n")
+
+    event = runs.read_events(run_id)[-1]
+
+    assert event["depth"] == 1
+    assert event["tool"] == "ALI_CBCT"
+    # Still a tool's line, so still the server's vocabulary for the rest of it:
+    # a marker says WHICH tool and HOW DEEP, never what phase the run is in.
+    assert event["phase"] == runs.PHASE_RUNNING
+
+
+def test_a_tool_name_that_is_not_an_identifier_is_dropped_whole(run_id):
+    """This field travels where a message does not.
+
+    The benchmark payload drops messages precisely because a tool writes them
+    and its free text may name a patient's file; it keeps `tool` so a chain's
+    bar can say which tool ran. That trade only holds while the field cannot
+    BE free text -- so anything unlike a tool folder's name is dropped rather
+    than truncated, a truncated file name being still a file name.
+    """
+    directory = os.path.join(settings.TEMP_DIR, "runs", run_id)
+    path = os.path.join(directory, runs.EVENTS_FILE)
+    refused = [
+        "/DATA/ALI/testfiles/patient_0042.nii.gz",
+        "ALI_CBCT on patient_0042",
+        "../../etc/passwd",
+        "A" * 65,
+        "",
+        None,
+        {"tool": "ALI_CBCT"},
+    ]
+    with open(path, "a", encoding="utf-8") as handle:
+        for name in refused:
+            handle.write(json.dumps({"depth": 1, "tool": name}) + "\n")
+
+    events = runs.read_events(run_id)[-len(refused):]
+
+    assert [event.get("tool") for event in events] == [None] * len(refused)
+    # Dropped, not the run: a marker nobody can read is still a nested call.
+    assert all(event["depth"] == 1 for event in events)
+
+
+def test_a_run_reports_what_it_itself_cost(run_id):
+    """Per-RUN, where the cost table is per-TOOL.
+
+    With six runs sharing one card, a trace of the card lines a peak up with
+    every run that could have caused it and attributes it to none. This is the
+    figure for one run, which is what a reader of one run can actually use.
+    """
+    runs.append(run_id, runs.PHASE_RUNNING, measured={
+        "vram_bytes": 1 << 30, "ram_bytes": 2 << 30,
+        "cpu_cores": 3.5, "channels": 4})
+
+    event = runs.read_events(run_id)[-1]
+
+    assert event["measured"] == {"vram_bytes": 1 << 30, "ram_bytes": 2 << 30,
+                                 "cpu_cores": 3.5, "channels": 4}
+
+
+def test_a_measurement_a_tool_wrote_itself_is_refused(run_id):
+    """A tool able to write its own cost could tell the budget it is free.
+
+    Same rule as `phase` and `result`: only a record this server wrote may
+    carry one, and a tool appends to the very same file.
+    """
+    directory = os.path.join(settings.TEMP_DIR, "runs", run_id)
+    with open(os.path.join(directory, runs.EVENTS_FILE), "a", encoding="utf-8") as h:
+        h.write(json.dumps({"measured": {"vram_bytes": 0, "ram_bytes": 0}}) + "\n")
+
+    assert "measured" not in runs.read_events(run_id)[-1]
+
+
+def test_a_measurement_carries_four_numbers_and_nothing_else(run_id):
+    """Whitelisted rather than passed through: this rides an event a browser
+    renders, so the shape is stated rather than inherited from a caller."""
+    runs.append(run_id, runs.PHASE_RUNNING, measured={
+        "vram_bytes": 1 << 30,
+        "scan": "/DATA/ALI/testfiles/patient_0042.nii.gz",
+        "ram_bytes": float("inf"),
+        "cpu_cores": -1,
+        "channels": True,
+    })
+
+    measured = runs.read_events(run_id)[-1]["measured"]
+
+    # The one usable number survives; an infinity, a negative, a bool dressed
+    # as an int and a path are each dropped rather than clamped.
+    assert measured == {"vram_bytes": 1 << 30}
+
+
+def test_nothing_measurable_is_not_an_empty_measurement(run_id):
+    """"Not measured" and "measured as empty" must not render the same."""
+    runs.append(run_id, runs.PHASE_RUNNING, measured={"scan": "patient.nii.gz"})
+    assert "measured" not in runs.read_events(run_id)[-1]

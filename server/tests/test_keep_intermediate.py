@@ -70,8 +70,8 @@ def test_the_steps_keep_the_order_the_chain_declares_them_in(tmp_path):
 
 def test_the_box_sits_just_above_the_outputs(tmp_path):
     """Section order IS argument order, so where it lands in the dict is where
-    the box lands on the panel. What a run returns is read together: the steps
-    to keep, then where everything is written."""
+    the box lands on the panel. What a run returns is read together: where it
+    stops, the steps to keep, then where everything is written."""
     tool = _tool(
         tmp_path,
         supervisor=True,
@@ -82,7 +82,9 @@ def test_the_box_sits_just_above_the_outputs(tmp_path):
         },
     )
 
-    assert list(tool.arguments) == ["scans", "keep_intermediate", "output_suffix"]
+    assert list(tool.arguments) == [
+        "scans", "stop_after", "keep_intermediate", "output_suffix",
+    ]
 
 
 def test_a_tool_naming_no_output_argument_still_gets_it_last(tmp_path):

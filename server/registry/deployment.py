@@ -61,7 +61,12 @@ CONFIG_AHEAD_MARKER = "DEPLOYMENT-CONFIG-AHEAD-OF-SERVER"
 
 
 _TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden",
-              "timeout_seconds", "dispatch")
+              "timeout_seconds", "dispatch", "batch", "width_from")
+
+# What a [tools.X] `batch` table may say. `axis` names the argument a cohort is
+# split on when the convention cannot derive it; the two caps override this
+# server's own numbers for this tool alone.
+_BATCH_KEYS = ("axis", "max_mb", "max_files")
 
 
 class DeploymentConfigError(Exception):
@@ -148,16 +153,148 @@ class ToolDeployment:
     # every fast tool that hangs holds a slot until then.
     timeout_seconds: Optional[float] = None
 
+    # --- splitting a cohort, as deployment.toml declared it ---------------
+    #
+    # `batch = false` on a tool whose model load is what a run costs. CNE holds
+    # a 4.4 GB GGUF and loads it once per call: splitting a cohort of notes into
+    # five batches is five loads of 4.4 GB to save nothing, the notes themselves
+    # being kilobytes. The server cannot see that from a schema -- what a tool
+    # pays to start is the one input to this decision that is genuinely the
+    # tool's -- so it is declared.
+    batch_enabled: Optional[bool] = None
+    # `batch = { axis = "scans" }` where the convention derives none. See
+    # conventions.batch_axis_for for what declaring this takes responsibility
+    # for: a tool with two required folders pairs them per patient.
+    batch_axis: Optional[str] = None
+    # Overrides of this server's own caps, for this tool alone. Normally unset:
+    # how much this deployment sends at once is the deployment's business, not
+    # the tool's, which is the whole reason the numbers live in config.py.
+    batch_max_mb: Optional[int] = None
+    batch_max_files: Optional[int] = None
+
+    # The argument whose ITEM COUNT bounds how many channels this tool can use.
+    #
+    # A tool that can process several things at once can never usefully open
+    # more channels than it has things: one landmark does not need four
+    # workers, and giving it four spends a process launch -- measured at ~3 s
+    # for ALI_CBCT -- to do one landmark's work. Worse, the run is then
+    # measured at a width it never reached, and the cost table learns a
+    # per-channel figure that is too low.
+    #
+    # Absent, the batch axis is used -- the argument a cohort is already split
+    # on, which for most tools is the same thing: AMASSS's channels are scans
+    # and its axis is `scans`. Declared, it overrides that, which is for the
+    # tools whose channel is a SUB-item: ALI_CBCT's axis is `input` (a folder
+    # of scans) but its channels are the landmarks searched within one scan.
+    #
+    # `false` opts out entirely, for a tool whose width cannot be counted from
+    # the request at all. CLIC is the case: its channel is a slice of a volume,
+    # and how many slices there are is not known until the volume has been
+    # read, which is after admission has decided.
+    width_from: Optional[object] = None
+
+    # The RESOLVED plan a client is handed -- `{axis, max_mb, max_files}`, or
+    # None for a cohort that travels whole. Filled by conventions.derive, never
+    # read from the file: the fields above are what was declared, this is what
+    # those declarations came to once the conventions and the server's numbers
+    # had their say.
+    batch: Optional[dict] = None
+
 
 _NOTHING_DECLARED = ToolDeployment()
 
 
 class DeploymentConfig:
-    def __init__(self, tools: dict):
+    """What this deployment says about each tool: the file, and the conventions.
+
+    Two maps, deliberately not one. `_tools` is what `deployment.toml`
+    DECLARED, and the startup checks read exactly that: a `[tools.X]` naming a
+    tool this server does not serve is dead config, which only means anything
+    while "configured" means "written in the file". `_resolved` is what those
+    declarations came to once `conventions.derive` had merged them over the
+    conventions, and it is filled by the registry as each tool loads.
+
+    Keeping the resolution HERE is what lets the run path read it without
+    knowing what a tool is. `execution/concurrency.py` needs one derived field
+    -- the batch axis, which bounds how many channels a run may open -- and its
+    only import from this package is this module: a leaf that imports tomllib
+    and `config` and nothing else. The alternative was to reach the derived
+    deployment through the `Tool` that carries it, which puts the tool registry
+    (and with it schema loading, facades and every tool folder) on the import
+    path of a module admission calls on every run, to read one string.
+    """
+
+    def __init__(self, tools: dict, batch: Optional[dict] = None):
         self._tools = tools
+        self._batch = batch or {}
+        # {tool name: the ToolDeployment conventions.derive settled on}. Empty
+        # until the registry loads a tool, which is why every read of it falls
+        # back to the declaration.
+        self._resolved: dict = {}
 
     def for_tool(self, tool_name: str) -> ToolDeployment:
+        """What the FILE declared for this tool, before any convention ran."""
         return self._tools.get(tool_name, _NOTHING_DECLARED)
+
+    def record_resolved(self, tool_name: str, deployment: ToolDeployment) -> None:
+        """Keep what the conventions made of this tool's declaration.
+
+        Called once per tool by `schema_tool.load_tool`, which is the only
+        place the derived object exists: it derives, hands the result to the
+        `Tool`, and -- until this existed -- dropped it. Anything else asking
+        this config about a derived field therefore got the raw declaration and
+        could not tell, which is precisely how the batch axis came to bound no
+        tool's width for as long as that rule existed.
+
+        The last write for a name wins, so a rediscovery always leaves the
+        newest answer. The one case where that is not the registry's own rule
+        is two catalogues carrying the same tool name: the registry serves the
+        first and refuses the second, while this keeps the second's. Nothing is
+        served from it either way -- a duplicate name is a startup failure,
+        named in the banner and in FAILED_TOOLS -- and the declarations that
+        actually decide a width (`width_from`) are keyed by name, so they are
+        the same for both.
+        """
+        self._resolved[tool_name] = deployment
+
+    def resolved(self, tool_name: str) -> ToolDeployment:
+        """What this deployment came to for this tool: the file AND the conventions.
+
+        The declaration is the fallback, not a second lookup: `derive` merges
+        over it, so a resolved entry carries every declared field unchanged.
+        A tool nothing resolved -- an imported one, whose ArgSpecs the
+        conventions never ran on, or a facade, which runs nothing itself --
+        falls back to what the file said about it, which for both is the whole
+        of what this server knows.
+        """
+        return self._resolved.get(tool_name) or self.for_tool(tool_name)
+
+    @property
+    def known_tools(self) -> tuple:
+        """Every tool this config can answer for, declared or resolved.
+
+        Distinct from `configured_tools`, and the difference is the point: the
+        startup checks want the FILE's entries, while anything reading a
+        derived field wants every tool the registry resolved -- which is most
+        of the catalogue, none of it written in the file.
+        """
+        return tuple(sorted(set(self._tools) | set(self._resolved)))
+
+    @property
+    def batch_defaults(self) -> tuple:
+        """`(max MB, max files)` this server asks a client to split a cohort on.
+
+        Here as well as in config.py because this file is MOUNTED while the
+        settings come from the environment: changing the number in the
+        environment costs a container recreate, which drops whatever was
+        running. This is the knob to turn while looking for the right value.
+        """
+        max_mb = self._batch.get("max_mb")
+        max_files = self._batch.get("max_files")
+        return (
+            settings.BATCH_MAX_MB if max_mb is None else max_mb,
+            settings.BATCH_MAX_FILES if max_files is None else max_files,
+        )
 
     @property
     def configured_tools(self) -> tuple:
@@ -259,6 +396,17 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
             f"{where}: 'timeout_seconds' must be a non-negative number (0 means no limit)."
         )
 
+    bound = table.get("width_from")
+    if bound is not None and not (
+        bound is False or (isinstance(bound, str) and bound.strip())
+    ):
+        raise DeploymentConfigError(
+            f"{where}: 'width_from' must name an argument, or be false to say "
+            f"this tool's width cannot be counted from the request."
+        )
+
+    batch_enabled, batch_axis, batch_max_mb, batch_max_files = _batch_declaration(where, table)
+
     return ToolDeployment(
         server_selectable=dict(selectable),
         max_upload_mb=limit,
@@ -266,6 +414,59 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
         dispatch=dict(dispatch or {}),
         hidden=tuple(hidden),
         timeout_seconds=float(timeout) if timeout is not None else None,
+        width_from=bound,
+        batch_enabled=batch_enabled,
+        batch_axis=batch_axis,
+        batch_max_mb=batch_max_mb,
+        batch_max_files=batch_max_files,
+    )
+
+
+def _positive_cap(where: str, key: str, value) -> Optional[int]:
+    """A batch cap: a non-negative integer, 0 meaning "this one does not bind"."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise DeploymentConfigError(
+            f"{where}: '{key}' must be a non-negative integer (0 means no limit on this axis)."
+        )
+    return value
+
+
+def _batch_declaration(where: str, table: dict) -> tuple:
+    """`batch` on a [tools.X] table, as the four things it can say.
+
+    Two spellings, because the two things an operator wants to say are of
+    different kinds: `batch = false` turns batching off for this tool, and
+    `batch = { ... }` configures it. A bare `true` is accepted and means
+    "nothing more than the conventions already decided" -- so that writing it
+    down, to record that someone looked, costs nothing.
+    """
+    declared = table.get("batch")
+    if declared is None:
+        return (None, None, None, None)
+    if isinstance(declared, bool):
+        return (declared, None, None, None)
+    if not isinstance(declared, dict):
+        raise DeploymentConfigError(
+            f"{where}: 'batch' must be false, or a table of "
+            f"{{{', '.join(_BATCH_KEYS)}}}."
+        )
+
+    unknown = sorted(set(declared) - set(_BATCH_KEYS))
+    if unknown:
+        raise _unknown_value(where, f"unknown batch key(s) {unknown}", _BATCH_KEYS)
+
+    axis = declared.get("axis")
+    if axis is not None and (not isinstance(axis, str) or not axis.strip()):
+        raise DeploymentConfigError(
+            f"{where}: batch 'axis' must name the argument a cohort is split on."
+        )
+    return (
+        None,
+        axis,
+        _positive_cap(where, "batch.max_mb", declared.get("max_mb")),
+        _positive_cap(where, "batch.max_files", declared.get("max_files")),
     )
 
 
@@ -282,17 +483,28 @@ def load(path: Optional[str] = None) -> DeploymentConfig:
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise DeploymentConfigError(f"Cannot read {path}: {exc}")
 
-    unknown = sorted(set(document) - {"tools"})
+    unknown = sorted(set(document) - {"tools", "batch"})
     if unknown:
-        raise DeploymentConfigError(f"{path}: unknown top-level table(s) {unknown}. Expected [tools].")
+        raise DeploymentConfigError(
+            f"{path}: unknown top-level table(s) {unknown}. Expected [tools] or [batch]."
+        )
 
     tools = document.get("tools", {})
     if not isinstance(tools, dict):
         raise DeploymentConfigError(f"{path}: [tools] must be a table of tool name -> settings.")
 
+    batch = document.get("batch", {})
+    if not isinstance(batch, dict):
+        raise DeploymentConfigError(f"{path}: [batch] must be a table of max_mb / max_files.")
+    unknown = sorted(set(batch) - {"max_mb", "max_files"})
+    if unknown:
+        raise _unknown_value(f"{path}, [batch]", f"unknown key(s) {unknown}", ("max_mb", "max_files"))
+    for key in ("max_mb", "max_files"):
+        _positive_cap(f"{path}, [batch]", key, batch.get(key))
+
     configured = {name: _tool_deployment(name, table) for name, table in tools.items()}
     logger.info("Deployment config: %d tool(s) configured (%s)", len(configured), path)
-    return DeploymentConfig(configured)
+    return DeploymentConfig(configured, batch)
 
 
 deployment_config: DeploymentConfig = load()

@@ -752,15 +752,27 @@ tools:
   # =========================================================================
   GreedyReg:
     testfiles:
-      # AREG's own two-timepoint cohort: T1 and T2 of the same patients, which
-      # is exactly what this tool pairs. Reused rather than duplicated -- AREG
-      # declares the same archive. Renamed on the way in: `AREG_test_scans`
-      # says whose archive it was, not what it holds, and the name is what a
-      # user reads in the dropdown.
-      - name: AREG_test_scans.zip
+      # AREG's two-timepoint CBCT cohort, the same archive AREG stages as
+      # `CBCT_FullyAuto`. Reused rather than duplicated; renamed on the way in,
+      # because `FullyAuto` says which of AREG's modes it was for, not what it
+      # holds, and the name is what a user reads in the dropdown.
+      #
+      # This pointed at `AREG_test_scans.zip` until a coverage run tried it.
+      # That archive is AREG's IOS cohort -- two `.vtk` arch surfaces, 3.7 MB --
+      # and this tool registers CBCT VOLUMES, so it saw no scan in either
+      # folder and answered "No patient appears in both the T1 and the T2
+      # folder" with zero on each side. The dropdown offered exactly one test
+      # file and it could only ever 422, which is how a tool ends up with
+      # staged test data nobody has ever successfully run it on. The name
+      # `CBCT_T1_T2_pair` was right all along; the archive under it was not.
+      #
+      # An install that already fetched the wrong one keeps it: fetch_data.py
+      # skips a `dest` that exists, which is what makes re-running it a resume.
+      # Delete DATA/GreedyReg/testfiles/CBCT_T1_T2_pair and fetch again.
+      - name: FullyAuto.zip
         dest: CBCT_T1_T2_pair
-        url: https://github.com/HUTIN1/AREG/releases/download/v1.0.0/AREG_test_scans.zip
-        size: 3700969
+        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/FullyAuto.zip
+        size: 352211664
         extract: true
 
   # =========================================================================

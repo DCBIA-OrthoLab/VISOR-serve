@@ -14,11 +14,26 @@ the server core, no new route, no manual registration list to keep in sync.
 **The data is confidential medical imaging.** Confidentiality and transport security
 (TLS, auth, temp-file cleanup) are first-class requirements.
 
-The HTTP contract is **blocking request/response** (the client gets its result in
-the same response), but the server itself executes tools **in parallel**: each
-`tool.invoke` runs in a worker thread, capped by `MAX_CONCURRENT_TOOLS` (see
-`config.py`), so a long inference never freezes the event loop or other requests.
-Do **not** add Celery/Redis/async job queues yet.
+The HTTP contract is **blocking request/response by default**: a client that
+sends no `X-Run-Delivery` header gets its result in the same response, byte for
+byte as it always has. A client that sends `X-Run-Delivery: detached` is
+answered `202` as soon as its inputs are staged and collects the result from the
+event stream it is already watching.
+
+**Why that was worth changing.** The blocking contract did not do what it looked
+like it did. Nothing in Starlette cancels a worker thread, and the tool
+subprocess is started with `start_new_session=True`, so a client that
+disconnected never stopped the run -- it only threw away the answer, after the
+GPU had been spent on it. Meanwhile the Slicer client's own POST read timeout is
+600 s, with a ceiling of an hour, against a server whose own documentation sizes
+runs in hours; and the reverse proxy `SECURITY.md` recommends would cut every
+request at nginx's default 60 s. The detached path is the same run with the
+answer made collectable.
+
+Still **no Celery, no Redis, no broker, no database**. The run registry
+(`wire/runs.py`) already keeps per-run state on disk, with a capability id, a
+TTL and a reaper; a second piece of infrastructure holding job metadata for
+confidential imaging would buy nothing it does not already have.
 
 ## Core design: a `Tool` base class
 
@@ -151,7 +166,15 @@ on that side:
   GradCAM attribution onto the surface. Pinned to shapeaxi 1.x: the published
   checkpoints predate the 2.0 network signature.
 - `CNE` - structured extraction from free-text clinical notes, with a local
-  quantised GGUF model. The only tool whose weights are an LLM.
+  quantised GGUF model. The only tool whose weights are an LLM, and the only
+  one that will not run on `inference-cpu`: its CUDA build of
+  llama-cpp-python links `libcuda.so.1`, which belongs to the installed
+  driver and to no wheel, so `import llama_cpp` itself fails there and the
+  tool answers 503 naming it. One line of its `pyproject.toml` (the
+  `whl/cpu` index) and a re-sync puts it back on the CPU at 1/12th the
+  speed. It was CPU-only until 2026-09-21, when the measurement that had
+  rejected CUDA turned out to have compared two llama.cpp VERSIONS rather
+  than two backends.
 
 Two in-process tools stay in this repository, and only these two. They are the
 demonstration of the `Tool`/`ArgSpec` path, not clinical tools:
@@ -445,13 +468,21 @@ dependency on when the next request arrives.
   - **uploads and results** - `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
     `UPLOAD_CHUNK_MB`, `TRANSFER_TTL_SECONDS`, `TRANSFER_SWEEP_SECONDS`,
     `RESULT_REFERENCE_MIN_MB`, `ZIP_COMPRESSLEVEL`, `ALLOWED_EXTENSIONS`.
-- **`MAX_CONCURRENT_GPU_JOBS` is one counter ACROSS tools.** The per-tool
-  semaphores went with the tools that held them: a packaged tool is its own
-  process, so an in-process semaphore would cap nothing, and an AMASSS run and
-  a `Crown_Seg` run want the same card. A run is **assumed** to want the GPU
-  unless it declares `device` and resolves it to a CPU value - the safe default
-  is the strict one, because a tool that quietly imports torch without
-  declaring `device` would otherwise never queue at all.
+- **Admission is a resource budget, not a counter** (`execution/admission.py`).
+  `MAX_CONCURRENT_GPU_JOBS` survives only as a hard ceiling above it and
+  defaults to 0, meaning "the budget decides". What a run reserves is what it
+  was MEASURED to need: `runner.py` has written a peak per run since the
+  subprocess path landed, and `execution/costs.py` keeps it as a high-water
+  mark per tool. Nothing is declared and nothing is measured by hand.
+  A tool nothing has measured reserves the whole budget and runs alone, so an
+  empty table behaves exactly like the counter it replaced. A run is still
+  **assumed** to want the GPU unless it declares `device` and resolves it to a
+  CPU value.
+- **The server sizes itself to the machine** (`resources.py`), reading the
+  cgroup limit before the kernel, so a container's own `cpus:`/`memory:` are
+  honoured and a Kubernetes pod needs no special case. Every job is told how
+  many threads it may open; without that each one defaulted to one per logical
+  core and four concurrent tools meant 224 threads on 28 physical ones.
 - **Every setting goes through `config.Settings`** - nothing reads `os.getenv`
   directly, so the whole configuration stays discoverable in one file and
   documented in `.env.example`. A *tool* now reads no setting at all: what used
@@ -525,21 +556,794 @@ Provide a small, generic client mirroring the server:
 - No temp files left behind.
 
 ## Out of scope for this iteration (do not implement)
-- Job queue / Celery / Redis / async polling. The contract stays blocking
-  request/response.
-- Scaling across machines, and a database.
-- **VRAM budgeting.** `MAX_CONCURRENT_GPU_JOBS` is a job counter, not a memory
-  one, and a supervised chain is invisible to it (a nested call is a subprocess
-  of its parent, not a new admission). `runner.py` records
-  `peak_vram_bytes` per run precisely so a real budget can later be set from
-  measurements rather than guesses - that instrumentation is in, the policy is
-  not.
+- A message broker, a database, or a task framework (Celery, Redis, RQ). The
+  run registry already does what they would be brought in for.
+- Scaling across machines. `execution/admission.py` is deliberately one
+  implementation behind one seam, so that move is a swap rather than a rewrite,
+  but nothing here coordinates two of anything.
+- Per-client identity and quotas. There is one shared API token and no
+  principal anywhere, so the server cannot tell ten workstations from one
+  clicking ten times; `SADT_EXPECTED_CLIENTS` is a declaration, not a
+  detection.
 
 Already implemented, despite earlier versions of this list: real GPU inference,
 out-of-process execution, and in-process parallelism (tool runs execute
 concurrently in worker threads, capped by `MAX_CONCURRENT_TOOLS`).
 
 ## Changelog
+
+### 2026-09-21 - Three tools faster, a model with an intercept, and three regressions of my own
+
+**The cost model has an intercept.** It priced a run as `per_channel x width`,
+purely proportional, and measurement says that is not the shape:
+
+    AMASSS    5291 / 6371 / 7587 MiB at widths 1 / 2 / 3   ->  4143 fixed + 1148 each
+    ALI_IOS   1930 / 2516 / 3342 / 4886 at 1 / 2 / 4 / 8   ->  1613 fixed +  452 each
+
+Two tools with nothing in common -- a 3D nnUNet and a 2D UNet over multi-view
+rendering -- both **78 % fixed**, because the fixed part is the CUDA context and
+the resident model, which every GPU tool has. `fixed + marginal x width`, fitted
+per resource from the window's own points: the slope is the secant between the
+narrowest and widest width recorded, then the whole line is SCALED to cover
+every run. A tool seen at one width is not split at all, and at width 1 that is
+identically the old arithmetic. `AMASSS` at width 3 goes 15873 -> **7587** MiB,
+`ALI_IOS` at width 8 goes 15440 -> **5226**: one concurrent run becomes three,
+four become fourteen.
+
+An additive clamp was written first and killed by the real table: `CLIC` at
+widths 1/4/9/39/45 has one run 8 % above its secant, which the additive form
+reads as 1.7 GiB of context and prices one channel at 2266 MiB against the 654
+it was measured at. Scaling spreads the same 12 % over both parameters.
+
+**`Cost.vram_spread` was measuring the wrong thing.** Against a proportional
+model, a tool with a large intercept looks like a tool whose memory depends on
+its request -- `AMASSS` x1.43 and `ALI_IOS` x3.16, both falsely flagged
+`input_dependent`. Measured against the fit they are **x1.01 and x1.07**. The
+banner was right about the number and wrong about the cause.
+
+**`AMASSS` 76.8 s -> 35.6 s, and 23.6 s of that was work nnUNet throws away.**
+`resampling_fn_seg` resamples the nonzero mask `crop_to_nonzero` invents two
+lines earlier; normalisation consumes it BEFORE the resample, and the only
+reader afterwards is behind `if folder_with_segs_from_prev_stage is not None`,
+the cascade path these bundles do not use. Skipping it is **Dice 1.00000000,
+zero differing voxels** on all five structures -- the cervical vertebra, which
+moves for everything else, does not move. For contrast `resample_data`, the one
+the GPU swap was built for at the cost of Dice 0.978, is **0.7 s**. Found by
+profiling INSIDE a phase the earlier work had only profiled around.
+`Batch_Dental_Seg` had the identical defect: 20.2 -> 15.3 s.
+
+**Both nnUNet tools were non-reproducible, before any of this.**
+`nnUNetPredictor.__init__` sets `cudnn.benchmark = True`, and autotuning picks a
+convolution by TIMING candidates -- so the same scan re-ran to a different mask
+depending on how busy the card was. Seven runs of an untouched
+`Batch_Dental_Seg` gave **three different masks**, 205-265 voxels apart, and a
+three-scan cohort differed from itself. Off, five runs are byte-identical. It
+costs Dice 0.99992 (AMASSS) and 0.99993 (Batch_Dental_Seg) against a GPU
+resampling already shipped at 0.991 -- roughly 130x smaller -- and buys a
+property neither tool had.
+
+**`ALI_IOS` 23.0 s -> 8.2 s, from two fixes that move nothing.** The mask
+projection made **~22 device round trips per predicted pixel** (264,925 at
+12,042), and every view was rasterized TWICE because `MeshRenderer.forward`
+discards the fragments it computed. 69 landmarks of 69 at **0.000 mm**. Its
+channels were then measured and **removed**: width 8 slower than width 1 for
+3 GiB more card, all four widths hashing identically -- correct threading, not
+worth having. Two hazards documented for anyone threading pytorch3d: its
+cameras STORE the pose they are called with, and `torch.inverse` on CUDA is not
+thread-safe on its first call.
+
+**`ALI_IOS` is not deterministic, and was not before us.** One landmark,
+`UR7CL`, lands on either of two adjacent vertices **0.151 mm apart** between two
+runs of untouched code. Not cuDNN -- `benchmark` is already False there.
+Probably a depth tie between coplanar faces in pytorch3d's coarse rasterizer.
+The consequence for anyone testing this tool: a markups digest is not a gate it
+can pass.
+
+**`CNE` runs on the card, and the measurement that had forbidden it was
+confounded.** The README rejected CUDA because the extraction differed -- 44/42
+fields, 43/24 -- but the CPU side was `llama-cpp-python` 0.3.35 and the CUDA
+side **0.3.19**, two llama.cpp versions rather than two backends. That index now
+serves 0.3.35 as a `py3-none` wheel. At equal version: **46/46 fields, same set,
+one differing value** on each TMJ note -- a reordered list and a paraphrased
+date -- and **12.3x to 15.0x**, 9.5 -> 117 tokens/s. Three controls reframe it
+further: two wheels of the same version BOTH on the CPU disagree more than
+CPU-vs-GPU (the cu124 build has AVX512/AMX, the cpu index stops at AVX2), and
+batch order already changes an extraction on the shipped CPU build, since
+llama.cpp reuses the KV prefix. The reproducibility the CPU build was kept for
+was never a property it had. It does need an NVIDIA driver to `import` at all,
+so `inference-cpu` loses CNE and now says so at startup.
+
+**Three regressions, all mine, all found by the bench and not by the tests.**
+
+- **`settings.DEVICE` reached no tool at all.** `validate` fills a choice
+  argument's declared default, so `dispatch.fill`'s "only if absent" never
+  fired. Measured: `DEVICE=cuda` in the environment and CNE on the CPU for 67 s
+  with a CUDA build installed. A CPU deployment had the mirror image, since
+  `AMASSS` and `Crown_Seg` declare `cuda`. Filled before `validate` now, where
+  what the CALLER asked for and what the server wants both exist.
+- **The solo guard made the budget forget.** Refusing a card reading from a
+  contended run was right and fixed ASO's 32 GiB -- but the refusal was written
+  as a `null` into the same 20-run window as the measurements, so twenty
+  concurrent runs left nineteen nulls and a tool that had been measured 93 times
+  knew nothing. It then reserved `whole_machine` and ran strictly alone: E2,
+  twenty clients, **140 s -> 549.8 s, mean concurrency exactly 1.00**, holding
+  93.78 GiB of host and 33.65 GiB of card for a run costing 0.83. The window now
+  forgets by RESOURCE, and a zero no longer outranks a card the tool was seen to
+  take. E2 back to **130.4 s, mean 5.4**.
+- **The thread grant costs `CNE` 41 %** (47.4 -> 67.1 s), capping it at the
+  declared share where its measured optimum is 28. The sweep that justified it
+  measured five tools ALONE and excluded CNE. Still open.
+
+**And the bench was measuring things that were not happening.** `Crown_Seg`'s
+13.4 s was a **pass-through** -- the hosted mesh already carries a
+`PredictedID`, so with the default `skip_segmented` the network never ran; the
+real figure is **64.7 s**, and the table held it at `vram 0` with
+`vram_known: true`, which admission reads as *measured to cost nothing* and lets
+share the card with anything. Three load arms were in the same state, in a
+second tool table nobody had updated. **`GreedyReg` had never run at all**,
+reporting `skipped -- no data` about files deleted four days earlier; pointed at
+real data it exceeds its own 600 s timeout on two 241-megavoxel volumes. A
+reduction is now DECLARED per case rather than left in prose.
+
+**Also**: a failed run still writes to the cost table (`DOCShapeAXI` holds 3 MiB
+from a run that never built a network; a timed-out `GreedyReg` wrote 37.3 GiB),
+and `MKL_NUM_THREADS` is a no-op here -- none of the five tool virtualenvs links
+MKL.
+
+**`GET /doc/{tool}`**, French prose in an English module, one entry per tool:
+what it does to a scan, what it costs on THIS machine, and where it refuses.
+Each phase is drawn as a bar whose width is its share of the run and whose fill
+is how busy the card was in it -- so `AMASSS`'s longest bar, `preprocess`, is
+visibly empty and its only full one, `predict`, is a quarter of the run.
+
+**Tests:** 895 server (+35), 219 harness (+16), and each tool's own.
+
+### 2026-09-21 - A busy afternoon made the budget forget what a tool costs
+
+Arm E2 -- twenty clients of `ALI_CBCT` -- measured **131 s** at 14:57 and
+**542 s** at 22:13 the same day, strictly serial: mean concurrency 1.00, each
+run taking the 27 s it takes alone, one ending as the next began. Nothing had
+got slower. Admission had stopped letting a second run in.
+
+**`816a4f3` is innocent**, and the timing correlation that pointed at it was a
+coincidence. On one code state, one machine, one afternoon: the same arm runs
+**140.0 s at mean 5.3** from a healthy cost table and **549.8 s at mean 1.0**
+from a poisoned one. The variable is the table, not the code, and no bisect was
+needed to say so -- holding the code and moving the table reproduces both
+numbers on demand.
+
+**What admission was short of: nothing.** Sampled once a second off
+`GET /status` for the whole serial arm, 525 of 533 samples read
+
+    running=1  waiting=19  cpus_held=4  ram_held=93.78 GiB  vram_held=33.65 GiB
+
+the WHOLE budget, held for a run measured at 0.83 GiB of card, on a card that
+never went past 3.6 GiB of the 33.7 it had. That vector is
+`admission.whole_machine` -- the demand of a tool nothing has ever measured.
+`ALI_CBCT` had been measured 93 times and had forgotten every one of them.
+
+**How it forgot, and it takes one arm.** A card reading is believed only from a
+run that was ALONE (`dispatch._keep_measurements`): this deployment's driver
+answers `--query-compute-apps` with nothing, so the only VRAM figure available
+is the whole card's growth, which counts every neighbour's allocation as if it
+were this run's. A contended run's reading is refused and written into the
+window as a null -- **the same twenty-run window the measurements live in**, so
+the refusals displace them. Twenty concurrent runs are twenty refusals into a
+window of twenty. Measured on 2026-09-21: one E2 arm left **19 nulls and one
+zero**. `Cost.vram_known` then reads False, `demand_for` returns the whole
+budget, and `_would_fit` refuses every second run for ever after.
+
+**And `ALI_CBCT` was not special, it was merely first.** Read off this
+deployment's table the same day: `ASO` held 12 nulls in a window of 15, three
+contended runs from losing an 8.02 GiB reservation; `Crown_Seg` held 12 nulls
+and 7 zeroes in a window of 20, so **one** of its twenty runs was still a
+measurement. Every tool heavy enough to be worth reserving for is the one most
+often run against a busy server, which is exactly the tool this erases.
+
+- **`costs._trim`: the window forgets by RESOURCE, not by run.** RAM and cores
+  come back from every run and are kept over the last `COST_WINDOW` of them;
+  the card figure is kept over the last `COST_WINDOW` runs that actually
+  measured one. It still forgets an outlier, because an outlier is a
+  MEASUREMENT and a windowful of measurements still displaces it -- what no
+  longer displaces it is a run that measured nothing. Bounded at twice the
+  window, an entry being kept for at most one reason beyond being recent.
+- **`costs._vram_window`: a zero does not outrank a card the tool was seen to
+  take.** The same arm wrote two hard zeroes, and they priced `ALI_CBCT` -- 
+  0.62 GiB a channel -- at **nothing**, which is the opposite failure and the
+  more dangerous one: a GPU tool reserving no card at all, stacking onto a
+  device the server believes is empty. A GPU run whose card reading came back
+  as no growth did not discover the tool stopped using the card; it failed to
+  measure it, the card having grown by nothing because a neighbour freed as
+  much as this run allocated. A zero is dropped once the tool has ever read the
+  card; a tool that has ONLY ever read zero keeps all of them, so a tabular
+  tool goes on costing the card nothing and sharing it with anything.
+
+**Measured end to end, three consecutive 20-client arms under the fix**, where
+the second of them is the one that used to collapse:
+
+| arm | wall | mean running | peak VRAM | card figure after |
+|---|---|---|---|---|
+| before, healthy table | 140.0 s | 5.3 | 16.9 GiB | **erased** (19 nulls, one zero) |
+| before, poisoned table | **549.8 s** | **1.0** | 3.6 GiB | relearned, width 1 only |
+| after, arm 1 | 136.5 s | 5.4 | 22.0 GiB | kept (21 readings) |
+| after, arm 2 | 138.9 s | 5.4 | 22.2 GiB | kept |
+| after, arm 3 | 143.2 s | 5.1 | 19.2 GiB | kept |
+| after, in the b8 campaign | 130.4 s | 5.4 | 19.5 GiB | kept |
+
+The campaign row is the one that matters most, because it is E2 where E2
+actually lives: after A1 through E1 have each left their own refusals in the
+table. `ASO` came out of it holding 18 nulls in a window of 22 and its 8.02 GiB
+reservation intact, `Crown_Seg` 7 zeroes and its 2.67 GiB; under the old rule
+both would have been erased, as `ALI_CBCT` was.
+
+**It costs `816a4f3`'s problem nothing**, that commit staying exactly as it is:
+the thread grant is still the declared share, `Surg_Mov_Pred` still runs on 8
+threads rather than 34, and `CNE` still pays the 47.4 s -> 67.1 s that cap costs
+it. This defect was never in the same mechanism -- one decides what a run may
+OPEN, the other what the table REMEMBERS -- which is why the numbers moved
+together without being connected.
+
+**Found while measuring, and not fixed:**
+
+- **A run is priced ONCE, before it queues, and twenty runs arriving together
+  all freeze the same reading.** The first serial run relearned a true card
+  figure the moment it finished, and it reached none of the nineteen already
+  waiting, because `dispatch` builds their candidate list from
+  `costs.cost_of()` at staging time and `Budget.reserve` holds that list for
+  the whole wait. That is why the WHOLE arm serialised rather than just its
+  first run, and why the next arm was fine -- E3, six clients, ran in 43 s
+  ninety seconds later. Repricing a candidate on each wake would need
+  `reserve` to take a callable rather than a list.
+- **An unmeasured tool is admitted on the NARROWEST shape**, which is worse
+  than it was before the budget existed. The idle-machine escape in
+  `_widest_that_fits` is `last_resort`-only, so a tool nothing has measured
+  lands on the final candidate: one channel and `SADT_MIN_CPUS_PER_JOB` cores,
+  the `cpus_held=4` above, against its declared share of 7. It cannot climb out
+  either, because every reading it then records is a width-1 reading, so it
+  never learns what it would cost wider. For a MEASURED demand the rule is
+  right and documented; for an unmeasured one every candidate is the same size
+  and the narrowest is chosen by accident of list order.
+- **A run that reports no VRAM figure at all is recorded as a measured zero.**
+  `runner` omits `peak_vram_bytes` entirely when nothing could read it, and
+  `record` turns that absence into a hard 0 -- the exact confusion
+  `Cost.vram_known` exists to prevent. `_vram_window` now neutralises it for
+  any tool that has ever read the card, but a GPU tool whose every reading was
+  zero is still indistinguishable from a tabular one. The discriminator that
+  would work is not published: `uses_the_gpu` answers True for `AutoCrop3D`,
+  `AutoMatrix`, `GreedyReg` and `Surg_Mov_Pred`, all of which legitimately read
+  zero, while the runner's own `_touched_torch()` -- already the gate on
+  whether the card fallback is offered at all -- would separate them exactly.
+- **Cores have not bought channels since `_shapes` decoupled them**, so
+  restoring the elastic CPU grant would not restore any width. `_shapes` offers
+  every width the same cores and `concurrency.granted` reads none, its
+  docstring saying "No cores anywhere". A wider grant today changes
+  `_thread_limits` and nothing else; "13 cores is what let it place 7 channels"
+  describes the version before that.
+
+**Tests:** 893 server tests (+4), no GPU, no weights and no network.
+
+### 2026-09-18 - Occupancy is not utility: the thread grant stops following the cost table
+
+`Surg_Mov_Pred` was being handed **34 threads** and running a third slower for
+them. The elastic grant that would be blamed for that was already gone -- it
+was removed the same morning, measured -- and the number came back anyway
+through the fix that replaced it. That is the finding: the replacement is the
+same mistake wearing the cost table's clothes.
+
+**How 34 was arrived at.** `demand_for` folds a tool's MEASURED cores into its
+reservation (`max(share, cpu_cores x 1.3)`), which was a real fix: ALI_CBCT at
+eight channels filled 51.7 of 56 cores while admission believed it had let in a
+ten-core job. `Budget.reserve` then handed the same number to `_cpu_grant`, so
+what a run HOLDS also became what it may OPEN. `Surg_Mov_Pred` had 26.11
+recorded cores, so 34 threads, so it occupied 26 again -- **a fixed point, and
+one nothing in the loop could discover was the wrong one.** A spinning OpenBLAS
+pool is occupancy: `runner._Sampler._sample_cores` divides CPU ticks by elapsed
+time, and a thread spin-waiting on a barrier burns ticks exactly as useful work
+does.
+
+**Measured, best of three, each tool alone, through its own virtualenv, calling
+`run()` with no server and no admission in the way** (seconds, 28 physical
+cores / 56 logical):
+
+| threads | 1 | 4 | 8 | 10 | 14 | 28 | 34 | 42 | 56 |
+|---|---|---|---|---|---|---|---|---|---|
+| `Surg_Mov_Pred` | 4.60 | **4.45** | 4.45 | 4.51 | 4.75 | 5.32 | 5.82 | 6.21 | 7.80 |
+| `AutoMatrix` | 9.44 | 7.83 | 7.43 | 7.33 | 7.23 | 7.13 | 7.13 | **7.03** | 7.18 |
+| `AutoCrop3D` | 1.02 | 1.07 | 1.02 | 1.02 | 1.02 | 1.07 | 1.07 | 1.02 | 1.07 |
+| `Crown_Seg` | 54.53 | 54.33 | 55.29 | 54.30 | 55.59 | 54.70 | -- | 54.99 | 55.03 |
+| `GreedyReg` | -- | -- | 599 | -- | -- | 581 | -- | -- | 589 |
+
+**Three shapes, not one**, which is why the answer is a cap and not a global
+number moved up or down:
+
+- **One tool degrades.** `Surg_Mov_Pred` is worst-of-catalogue precisely because
+  its work is 112 sequential unpicklings over small matrices, where a BLAS pool
+  costs more in synchronisation than it saves. At the 34 it was granted, 1.31x
+  its own best; at 56, 1.75x.
+- **One scales, and is the entire price of the rule.** `AutoMatrix` improves to
+  about fourteen threads and never degrades: capping it at the declared share of
+  ten costs **4.1%** (7.33 s against 7.03 s).
+- **Three are indifferent.** `AutoCrop3D`, `Crown_Seg` and `GreedyReg` are flat
+  to within repeat noise across a 56x range -- startup and I/O, the card, and a
+  search that does not thread. `GreedyReg` is the strongest case: ten real
+  minutes of compute, and 8 threads and 56 finish within 3% of each other.
+
+**The fix is a split, not a new number.** `Demand` grows `threads` beside
+`cpus`. `cpus` keeps the measured occupancy -- it is what a neighbour cannot
+have, and measuring it fixed a real hole. `threads` is the declared per-job
+share, narrowed with the candidate when admission narrows a run to fit it in,
+and never raised by anything. `Grant` reads `threads`. The loop then unwinds
+from below on its own: granted ten, `Surg_Mov_Pred` occupies four to eight, and
+its reservation falls to the share within one cost window.
+
+**Why not the two other shapes of answer.** `sup.channels(wanted)` is the model
+this ought to follow, and cannot: a channel's cost is MEMORY, reserved before
+the process starts, so a tool may safely be asked at run time how many it
+wants. A thread pool is sized from the environment at first use, before a line
+of tool code runs, and cannot be retuned from outside the process. And the
+server cannot LEARN a knee by watching: it sees one thread count per run, two
+runs are two different cohorts, and the one signal it does have -- occupancy --
+is exactly the signal that cannot tell the cases apart, `Surg_Mov_Pred`
+occupying 26 of its 34 while getting slower. A per-tool declaration would put
+the number back inside the tool, which cannot see the machine.
+
+**What the measurement contradicted.**
+
+- **`MKL_NUM_THREADS` is a no-op here.** The comment beside it said MKL "is what
+  numpy links here"; none of the five virtualenvs link it. Every one ships
+  numpy's own `libscipy_openblas64_`, so `OPENBLAS_NUM_THREADS` is the variable
+  that bites, and a curve is a property of the tool AND its venv's BLAS build.
+- **`GreedyReg` was suspected of hitting its own 600 s per-pair bound** at every
+  thread count, since 598.71 s and 589.17 s both sit against
+  `CASE_TIMEOUT_SECONDS = 600`. Its report says otherwise: one patient, one
+  registered, zero failed, 580.78 s. The tool is simply that slow on this pair,
+  and the timeout has never fired here.
+- **`Crown_Seg` is 54 s, not the 13 s it is remembered as.** The difference is
+  `skip_segmented`: the hosted test mesh already carries a `PredictedID` array,
+  so the default copies it through and the network never runs.
+
+**Tests:** 863 server (+3 net: four added, one replaced -- "a run is granted
+what it reserved" was the claim that had to change).
+
+### 2026-09-18 - Measured to the limit, and three tools got faster without moving a voxel
+
+**The cost table was poisoning itself under concurrency.** Admission divides
+the budget by what a channel was MEASURED to cost, and this machine's driver
+answers nothing to `nvidia-smi --query-compute-apps`, so `runner.py` falls back
+to the CARD's growth since the run started. With six runs in flight that is
+everybody's allocation attributed to each of them, and `cost_of` keeps the
+WORST of the window -- so one contended run governs for twenty afterwards.
+Measured, the same afternoon, before and after:
+
+| tool | poisoned | true |
+|---|---|---|
+| `ASO` | 32.43 G/channel | **4.59** |
+| `Crown_Seg` | 2.29, spread x782 | **0.00** |
+| `ALI_CBCT` | 1.72 | **1.15** |
+
+`runner` now says where a figure came from (`vram_source`: torch or card), the
+`Budget` knows whether a run was ever ALONE -- a run admitted while nothing
+else runs starts solo, and the moment a second reservation is taken every live
+grant loses it, permanently -- and `_keep_measurements` refuses a card-sourced
+figure from a run that was not. A torch figure is always trusted: it is the
+process's own allocation and concurrency cannot inflate it. Visible working on
+the first campaign after it: `ALI_CBCT 1.15 G, 3 measurements kept, 17
+refused`, and the three kept are exactly the solo ones.
+
+Two things the implementation contradicted. **A chain launders a card reading
+into a torch one** -- ASO's own interpreter allocates nothing, so its whole
+figure IS its child's card reading, and it would have been trusted
+unconditionally; a chain now reports the weakest source it is built from, which
+is why ASO was the tool sitting at 32 G. And **"record RAM but not VRAM"
+collides with "never record a zero"**: recording RAM creates the entry, and
+`int(vram or 0)` then reads as *measured, costs the card nothing*, which is the
+opposite admission from *unknown*. The window slot is `null` now, and
+`Cost.vram_known` carries it.
+
+**The batch axis had never fired, for any tool.** `conventions.derive` computed
+it, filled `ToolDeployment.batch`, handed the result to the `Tool` and dropped
+it; `concurrency.width_axis` reads `deployment_config`, which only ever held
+the DECLARATION. So `items_in` returned `None` for everything except the two
+tools with an explicit `width_from`, and a width nothing bounds is a width
+bounded only by affordability -- **and reserved all the same**:
+
+    AMASSS   19.1 GiB per channel   x 3 channels granted for ONE scan
+             = 57.3 GiB of a 93.8 GiB budget, so ONE run fitted where four had
+
+Six concurrent AMASSS went 143 s -> 275 s, and a single run was **79 s
+throughout, unchanged**, which is why the coverage pass never saw it and why
+this hid. Bounding the width brought it back to **153.8 s**. Repairing the
+table is what triggered it: truer costs mean more affordable channels, and
+every extra channel was 19 GiB reserved for nothing. `derive` was also silently
+dropping `width_from`, `timeout_seconds` and `dispatch` on the way through --
+harmless while nothing read the resolved entry, fatal the moment anything did.
+
+**Three tools got faster, and in two of them parallelism is not what paid.**
+
+- **`AMASSS` 76 s -> 48 s.** Its card is idle **78 % of a run** -- `preprocess`
+  is 29.2 s of a 62.8 s loop at 1.8 % GPU and exactly one core -- so structures
+  overlap two at a time. But at width 2 every structure DIFFERED from width 1,
+  and not reproducibly: `nnUNetPredictor.__init__` sets
+  `cudnn.benchmark = True`, and autotuning picks a convolution by TIMING
+  candidates, so contention changes the algorithm and the rounding. Turning it
+  off restores determinism and keeps the win. It costs **Dice 0.99992** on the
+  cervical vertebra against the shipped configuration -- roughly 270x smaller
+  than the 0.978 GPU resampling already cost on the same structure -- and buys
+  a property that would otherwise be lost: the output stops depending on how
+  busy the card was.
+- **`ALI_IOS` 23.0 s -> 8.2 s**, from two fixes that move nothing: the mask
+  projection was **~22 device round trips per predicted pixel** (264,925 at
+  12,042 pixels), and every view was **rasterized twice** because
+  `MeshRenderer.forward` throws away the fragments it computed. 69 landmarks of
+  69 at **0.000 mm**. Its channels were then measured and **removed** -- width
+  8 slower than width 1 for 3 GiB more card, all four widths hashing
+  identically, so the threading was correct and simply not worth having.
+- **`AutoMatrix`, `AutoCrop3D`, `GreedyReg`** migrated to the ask. They take
+  two PAIRED folders, so no axis is derivable and none ever will be; they were
+  the three sitting on the unbounded-width trap with nothing the server could
+  do about it.
+
+**Two hazards for anyone threading pytorch3d**, both found before shipping:
+its cameras STORE the pose they are called with, so two units interleaving read
+one item's mask out of another's geometry -- no exception, no log line, the
+report saying the landmark was found; and `torch.inverse` on CUDA is not
+thread-safe on its FIRST call (MAGMA's `call_once`).
+
+**The limit-test bench** (`H` arms). Six arms that push until admission, the
+card or the host budget is the binding constraint. **59 runs at concurrencies
+the budget could not satisfy: zero failures, zero refusals**, and **0 failures
+in 1,957 unauthenticated `/health` polls, worst latency 7.8 ms**, while nine
+runs queued behind three. The out-of-memory retry was exercised deliberately
+for the first time -- a tool SIGKILLed 45 s in is indistinguishable from the
+kernel's OOM killer, and the run announced itself, went back to `queued_gpu`,
+was re-admitted and finished. And the starvation arm answered **backwards**:
+the fair pass did not merely let small jobs through, it let them go FIRST, and
+the single heavy AMASSS waited 15 s behind six `Crown_Seg`.
+
+The arm built to make the CARD refuse someone never reached it, and why is the
+finding: **this card cannot be exhausted through admission without first
+exhausting host RAM.** It binds only for a tool whose `vram/ram` ratio exceeds
+the budget's (0.36 here) -- ASO 0.84, Batch_Dental_Seg 0.52, ALI_CBCT 0.51 are
+card-bound; AMASSS 0.13 and CLIC 0.29 are not.
+
+**Found while doing it: `campaign_report` could not produce a report at all.**
+`load_probe.render` unpacked `nested_of` as a 3-tuple, which it stopped being
+when a nested call started carrying the tool's name -- so any campaign holding
+a CHAIN crashed the whole report. The tests covered `campaign_report` and not
+`render`.
+
+**Open, and now measured on two tools of opposite shape: the cost model has no
+intercept.** `AMASSS` is ~75 % fixed cost and `ALI_IOS` is 78 %, because the
+fixed part is the CUDA context and the resident model, which every GPU tool
+has. Under `per_channel x width`, declaring the honest width teaches a
+per-channel cost that UNDER-reserves the next narrow run -- AMASSS would teach
+3185 MiB against 5291 needed -- so the only safe move the model leaves a tool
+is to under-declare its width and over-reserve. AMASSS declares 1 while running
+2 and holds ~4 GiB more than it needs. It wants `fixed + marginal x width`,
+with the intercept measured at width 1.
+
+**Tests:** 860 server (+5), 203 harness (+35), and each tool's own.
+
+### 2026-09-18 - The tool says how many items it has, because nothing else can
+
+The server worked out how wide a run could go by counting the request from the
+OUTSIDE, before the run: `concurrency.width_axis`, `items_in`, `_count`,
+`width_axes()`, `runner._items_here` (a verbatim second copy of `_count`),
+`SADT_WIDTH_AXIS` and the `width_from` lines in `deployment.toml` all exist to
+answer a question the tool answers for free at run time -- and for several tools
+they cannot answer it at all. `ALI_IOS`'s unit is a tooth, read out of a mesh's
+label array during the run; `CLIC`'s is a slice of a volume it has not opened;
+`AutoCrop3D`, `AutoMatrix` and `GreedyReg` take two paired folders where
+splitting either alone re-pairs patients. Those tools carry `width_from = false`,
+which means "no bound but affordability" -- and an unbounded width is RESERVED
+all the same.
+
+**`sup.channels(wanted)`**, beside `sup.run` and `sup.progress`, and a sixth
+member of the frozen interface. `wanted` is the tool's own count, in the unit
+the tool loops over, taken at the one moment it is knowable. It is in
+`runner.py` and nowhere else on purpose: that file ships with the SERVER and is
+injected by path, so there is one implementation at one version and nothing is
+copied into a tool's venv -- against `progress.py`, which exists thirteen times
+under `tools/*/src/` and is thirteen edits the day one of them must change.
+
+**The share IS the reservation, which is what makes an answer safe this late.**
+Admission cannot wait for the tool, so it reserves a share of the machine --
+fair-then-greedy, exactly as `admission._widest_that_fits` already did -- and
+`SADT_CHANNEL_BUDGET` carries it down in bytes. `sup.channels(wanted)` answers
+`min(wanted, share / measured per-channel cost)`, floor one, capped by what
+admission reserved against and by `SADT_MAX_CHANNELS`. Nothing can be
+over-committed because every channel the answer permits was paid for before the
+process existed. **The cost, stated rather than hidden: a run that opens one
+channel still holds its share** for its whole life.
+
+**So `items_in`/`width_axis`/`_count` STAY**, as the bound on the ladder, which
+is the only place a request's size can still narrow what gets RESERVED. Measured
+on this machine today, on AMASSS, whose channels are its scans: 19.1 GiB per
+channel against a 93.8 GiB host budget, granted 3 channels for a request holding
+ONE scan -- 57.3 GiB held, so one run fitted where four had. Six concurrent
+AMASSS 143 s -> 275 s, ten 158 s -> 425 s, with a single run unchanged at 79 s
+throughout, which is why nothing caught it: the whole cost is in what a run
+stops OTHER runs from doing. Bounding by the real item count brought six
+concurrent back to 153.8 s. What DOES become deletable is the runner-side
+duplication -- `_channels_for`, `_affordable_here`, `_items_here`,
+`_capped_here`, `WIDTH_AXIS_ENV`, `width_axes()` and `_grant_channels` itself --
+the day no served tool declaring a channel argument leaves `sup.channels()`
+uncalled. Nothing is deleted in this pass: both paths coexist so tools migrate
+one at a time.
+
+**`progress.set_width()` is not subsumed, and the reason is the direction of the
+error.** `sup.channels()` grants a PERMISSION, before the work; `set_width()`
+declares a MEASUREMENT, where the width is actually in force. The server divides
+a run's peak by the NARROWEST width declared, and a tool has phases of different
+widths -- AMASSS reads its cohort four at a time, runs nnUNet one structure at a
+time, then assembles four at a time, and its peak is in the serial middle. A
+permission that declared itself would put a wide width in force during a serial
+phase and teach a per-channel cost that is too low, which is the direction that
+ends in an out-of-memory. Forgetting to declare reads as one channel and
+over-reserves. So they sit beside each other and only the declaration is read.
+
+**Two defects found while doing it, both in the code being replaced:**
+
+- **The channel budget was divided twice.** `concurrency.granted` wrote one
+  channel's worth into `SADT_CHANNEL_BUDGET` and `runner._child_channel_budget`
+  divided that by the grant again, so a tool measured at 3 GiB a channel and
+  admitted at four handed its child 0.75 GiB where both sides' comments said 3.
+  Invisible because `test_supervisor.py` builds that variable by hand, and the
+  hand-built value was the intended one. The variable now carries the run's own
+  undivided room and the division happens once, in the supervisor.
+- **At depth 2 and below it divided by nothing.** The divisor was `SADT_CHANNELS`,
+  which the supervisor deliberately REMOVES from a child's environment, so a
+  grandchild inherited its parent's whole room. The divisor is what the level is
+  running at now -- what `sup.channels()` answered, or what it was handed if it
+  never asked -- which exists at every depth.
+- And a caller-named `num_workers` **bypassed admission's narrowing**: `ceiling`
+  honoured it, `_grant_channels` left it alone, and the tool got the caller's
+  number even when the run was admitted at one channel. A tool that asks cannot,
+  because the caller's number bounds the ladder and therefore the share.
+
+**Proved on `ALI_CBCT`**, against the real tool in its own virtualenv through
+the real runner: asking with seven landmarks and a seven-channel share is
+answered 7, 2 and 1 as the share narrows, and a REGION-only request -- where
+`width_from = "landmarks"` counts nothing at all -- is answered the five its
+bundle actually has. With no supervisor it is the plain `num_workers` clamp it
+always was, which is how the tool is run from a CLI.
+
+**Tests:** 855 server tests (+12), plus 4 in `ALI_CBCT` (83, +4).
+
+### 2026-09-18 - The ceiling moves from the host to the card, and a chain stops being invisible
+
+**`ALI_CBCT` kept its volume in host RAM, and it cost cores rather than time.**
+The premise this started from was wrong and is worth writing down, because
+reading it the wrong way would mislead whoever optimises the next tool: the
+per-step work is NOT a CPU crop around a microsecond forward. Measured with
+CUDA syncs at every phase boundary, ~150 steps per landmark:
+
+| step | ms/step | share |
+|---|---|---|
+| SpatialCrop + ScaleIntensity + cast + host->device | 1.2 | 7% |
+| **DenseNet forward** | **15.2** | **92%** |
+| argmax | 0.06 | 0.3% |
+
+The transforms are 4% of the wall clock and **essentially all of the host CPU**:
+a 262 144-element torch op enters the intra-op pool (28 threads here) and
+libgomp keeps them spinning after a 0.6 ms parallel region, so one worker
+occupied ~10 of 56 cores to do 0.6 ms of arithmetic. `num_workers` multiplied
+it, which is why a width of 8 was SLOWER than a width of 1.
+
+The fix is one line -- `.to(device=self.device, dtype=...)` in
+`environment.load_images` -- and on the card there is no host op, so the pool
+is never entered:
+
+| | width | wall | host cores | GPU mean | card GiB |
+|---|---|---|---|---|---|
+| before | 1 | 399.6s | 8.96 | 23.4% | 1.272 |
+| before | 8 | **445.9s** | 50.72 | 38.3% | 23.188 |
+| after | 4 | 152.1s | 3.71 | 85.9% | 4.586 |
+| after | 8 | **137.8s** | 6.89 | 85.1% | 9.169 |
+
+**One sha256 across all seven runs**, before and after, every width, with the
+same four landmarks failing everywhere. 80 crops compared host-against-card
+element for element: max absolute difference 0.
+
+Two consequences beyond the speed. The cost model became **linear** -- 1.147
+GiB per channel at every width, against 1.272 or 0.781 depending on width
+before, because the old path allocated a fresh device tensor per step per
+worker and thrashed the allocator under contention -- so the server dividing a
+peak by the narrowest reported width now gets an exact figure rather than a
+width-dependent one. And the per-channel card cost is now **scan-dependent**,
+the volume living there; the high-water mark plus margin plus retry already
+handles that, and the linearity makes the division better behaved than before.
+
+`torch.set_num_threads(1)` was measured as the alternative and rejected: it
+buys the same one core for no card memory, but a CPU forward is 31.6 ms on 28
+threads against 143.9 ms on one, so it would cost a cardless deployment 4.6x.
+
+**A nested call now declares itself.** ASO drives ALI_CBCT for two thirds of
+its wall clock and nothing reading a run's events could see it: measured on the
+two chain arms, **56 events across seven runs, every one at depth 0**. The
+child reports nothing of its own, and the parent's only trace was a depth-0 log
+MESSAGE -- which anything reading a run drops, a message being free text a tool
+wrote that can name a patient's file. `Supervisor._run_nested` brackets every
+`sup.run()` with a marker at the CHILD's depth carrying the tool's name.
+
+- **Two markers, not a duration**, because the close is written on the failure
+  path too: a nested call that raised still occupied its parent for as long as
+  it ran, and a bar that only appears when a chain succeeds lies about exactly
+  the runs worth looking at.
+- **The name is its own field, never a message.** It travels where a message
+  does not, so it is validated against `[A-Za-z0-9_-]{1,64}` and DROPPED whole
+  rather than truncated -- a truncated file name is still a file name.
+- **Paired by name, not grouped by depth.** AREG drives AMASSS, then ASO, then
+  Crown_Seg, all at depth 1; collapsing a depth would draw one bar across the
+  gaps between them.
+- The marker opens after `_remaining_seconds()`, not beside the log line above
+  it: everything between them can raise, and an open with no close is a span
+  with no end.
+
+**A run reports what IT cost, the table being per tool.** `runner.py` has
+measured a peak per run since the subprocess path landed and `costs.py` folds
+it into a high-water mark per TOOL -- which is what admission needs and what a
+reader of one run cannot use, six runs sharing a card making the card's trace
+line a peak up with every one of them and attribute it to none. It now rides
+the run's own event stream as `{vram_bytes, ram_bytes, cpu_cores, channels}`,
+server-sourced only and whitelisted to those four numbers: a tool able to write
+its own cost could tell the budget it is free.
+
+**`GET /benchmarks/view`**, a page drawing every run of a campaign on one time
+axis -- phases as a Gantt, the card's VRAM trace on the same x-scale, nested
+calls inside their parent's `running` span, and each arm's setup line printed
+so the arm can be reproduced from it. Self-contained, no CDN and no external
+font: this server runs on networks with no internet. Each arm carries its own
+capture DATE, because `campaign_report.load` keeps the newest record per arm id
+-- so an arm that failed in the latest campaign silently keeps the one before
+it, measured on other code against another cost table, and seventeen rows would
+otherwise read as one campaign.
+
+**The campaign could not exercise a channel at all.** Every arm sent a single
+scan, and the server bounds a tool's width by the items its request holds, so
+one scan is one channel and thirteen arms had been measuring admission alone.
+Four cohort arms were added over 6-scan hardlinked fixtures (95 MB on disk, not
+570), F4 being F1 with `batch_size=1` so the pair reads as a controlled
+comparison rather than two numbers from different afternoons.
+
+**Found and not yet decided:** `CLIC` opened **33 channels for 16.44 GiB**,
+half the card, on a cohort of six -- while the agent that batched it measured
+its knee at 4, with 8 and 16 buying nothing and 16 slower. That is the argument
+for a per-tool ceiling that was missing when `max_workers` was removed as an
+invented number: a MEASURED ceiling means something, a guessed one does not.
+
+**Tests:** 759 server (+79), 141 harness, 77 ALI_CBCT.
+
+### 2026-09-17 - A run may spend what nobody else wants, and a chain may not multiply it
+
+The budget decided how many RUNS share the machine and then held every one of
+them to its declared share, whatever else was happening. `SADT_EXPECTED_CLIENTS`
+is a declaration made before anyone connected, so one clinician alone on a
+56-core server ran on seven cores while forty-nine sat idle. **Measured on this
+machine: `Surg_Mov_Pred` 174s -> 9.7s**, an 18x speedup from nothing but being
+allowed to use the cores that were already free.
+
+- **`admission.Budget._cpu_grant`**, decided at admission, once, at spawn.
+  `max(cpus_per_job, cpus // (running + waiting))`: alone, a run gets the whole
+  CPU budget; at six, exactly its declared share, so a busy machine behaves as
+  it always did. **Cores only** -- they are the one resource here that
+  over-subscribes safely, since the kernel time-slices and a job with too many
+  threads gets slower rather than killed. Over-committing VRAM or RAM is an
+  out-of-memory in somebody's cohort. Queued runs count as sharers, or a run
+  admitted with five waiting behind it would open every core and hand them back
+  one at a time. It is decided ONCE because a BLAS pool cannot be retuned from
+  outside the process -- and need not be, that being exactly what the kernel
+  handles.
+- **`ITK_GLOBAL_DEFAULT_NUMBER_OF_THREADS` was never capped.** ITK runs its own
+  pool, sized from the machine and NOT from OpenMP's variable, so every
+  SimpleITK resample and every compressed write in AMASSS, ASO, AutoCrop3D,
+  AutoMatrix and Batch_Dental_Seg -- most of the catalogue's CPU time -- ignored
+  the thread budget entirely and took one thread per logical core. Found by an
+  agent parallelising a tool, not by the tests.
+
+**`execution/concurrency.py`: what one run may do with the share it was given.**
+A tool declares it CAN process several of its own items at once (`num_workers`
+or `batch_size`, both already in `conventions.TECHNICAL`, so hidden from a
+clinician with no configuration); the server fills in the number, exactly as it
+already fills in `device` and `output_dir`. A default written into a tool is
+either too small on an idle server or too large on a busy one, permanently,
+because the tool cannot see the machine.
+
+- **Tied to the supervisor, and that is the point.** A nested call is a
+  subprocess of its parent and never re-enters admission, so nothing between the
+  levels divides anything: ASO opening six channels, each calling ALI_CBCT which
+  opens eight, is forty-eight channels on a machine that admitted one job. The
+  grant is a BUDGET divided on the way down -- what this level got, split by
+  what it opened -- carried in `SADT_CHANNEL_BUDGET`. The floor of one is what
+  stops a deep chain reaching zero.
+- **Channels and threads MULTIPLY**, so `_thread_limits` divides: eight channels
+  each opening seven OpenMP threads is fifty-six on a budget of seven.
+- **`SADT_MAX_CHANNELS = 8`**, and `max_workers` per tool in `deployment.toml`
+  narrows it further; nothing widens it. Eight rather than "as many cores as
+  there are" because the resource a channel costs is not a core -- a channel of
+  AMASSS holds a decompressed volume, and the cost table only learns that AFTER
+  the run that took it.
+- **Carried in the environment, not in `job.json`**: the job file is what the
+  CALLER asked for and is written before admission; the grant is what the
+  machine gave and is not knowable until after it. Keeping them apart is what
+  lets a retry re-grant without rewriting the request.
+- A capability nobody declared is not one the server may assume. Opening several
+  channels inside a loop that shares a temporary file corrupts its own outputs,
+  silently -- which is exactly what AutoCrop3D's fixed `padded.nii.gz` name
+  would have done.
+
+**`GET /status`, and `benchmarks/live.py` over it.** Admission's whole job is to
+make a run WAIT, and a waiting run was invisible: a client saw `queued_gpu` and
+could not tell whether it was behind one job or twelve; an operator saw a slow
+server and could not tell it from a busy one. Deliberately NARROWER than
+`GET /runs/{id}`: that endpoint answers to whoever holds a run's id, which is
+the client that started it, while this lists every run to anyone holding the
+shared API token -- every workstation in the clinic. **So no progress message
+appears here.** A message is free text a tool wrote and can name the file it is
+working on, which is a patient's. `wire/runs.py` also records the tool a run is
+for, so a run that failed before emitting anything is no longer a bare id.
+
+**A tool's memory is now known to depend on the request, or known not to.**
+Admission reserves one figure per tool, which is only sound while that figure is
+a property of the tool. `Cost.vram_spread` is the window's worst over its
+smallest, and past 1.5x the startup banner says so by name. Nothing refuses such
+a tool -- the window's MAXIMUM is reserved, so the estimate stays conservative
+-- but the difference between a reservation that is exact and one that is a bet
+was invisible in the single number the table printed. 1.5 rather than tighter
+because two runs of an identical request already differ by a few percent
+(allocator behaviour, a different cuDNN algorithm for the same shapes), and a
+threshold that fires on everything says nothing. Zeroes are absence of a
+measurement, not a measurement of zero, or every tabular tool would report an
+infinite spread.
+
+**Measured, against `ALI_CBCT`, because the question was asked:** its memory does
+NOT move with the selection. One landmark and all four regions (58 agents) both
+peak at **0.26 GiB VRAM and 2.21 GiB RAM**, while the time goes 26.5s -> 476s.
+The agents run in sequence, one network resident at a time.
+
+**Found while measuring, and not fixed:**
+
+- **A hung tool holds its reservation for ever.** `TOOL_TIMEOUT_SECONDS`
+  defaults to 0, so a `GreedyReg` whose own 600s timeout fired kept its
+  admission slot, a worker thread, the HTTP request and its job directory --
+  with patient data in it -- twenty minutes later. With six clients and a budget
+  divided six ways, one hung job takes a sixth of the machine permanently.
+  `deployment.toml` already has a per-tool `timeout_seconds`, so the mechanism
+  exists and the default is what is missing; a stall watchdog (kill a run that
+  has written no progress for N minutes) would suit a cohort better than any
+  wall-clock limit.
+- **`subprocess.run(timeout=)` kills ONE PID, not the process group**, and the
+  `wait()` after the kill is unbounded against a process in uninterruptible
+  sleep. So a tool's own internal timeout does not bound what it started. The
+  SERVER does this correctly (`start_new_session` plus `killpg`); tools that
+  shell out do not. Demonstrated by an agent with a surviving grandchild.
+- **A `SIGKILL` from an operator is indistinguishable from a host
+  out-of-memory** and is retried, by design (`_out_of_memory` reads a `-9` with
+  no `result.json` as the only evidence an OOM leaves). Killing a stuck job
+  therefore restarts it; restart the container instead.
+
+**`scripts/data-manifest.yml`: GreedyReg's test file was the wrong modality.** It
+staged `AREG_test_scans.zip` -- two intraoral `.vtk` surfaces, 3.7 MB -- as
+`CBCT_T1_T2_pair`, and GreedyReg registers CBCT VOLUMES. It saw no scan in
+either folder and answered "No patient appears in both", so the one test file
+the dropdown offered could only ever 422 and the tool had never been run end to
+end here. Now `FullyAuto.zip`, the cohort AREG already stages. An install that
+fetched the wrong one keeps it: `fetch_data.py` skips a `dest` that exists,
+which is what makes re-running it a resume.
+
+**Benchmarks.** `benchmarks/coverage.py` runs every tool once against real data
+-- 14 of 16 pass, and it is also what fills the cost table for the whole
+catalogue, which is the difference between a server that can run six jobs at
+once and one that cannot run two. `benchmarks/load_probe.py` reconstructs each
+run from the server's own events (`transfer -> received -> staging ->
+queued_gpu -> running -> packaging -> fetch`) driven by the REAL Slicer client,
+and `campaign_report.py` computes a speedup against the coverage pass's
+uncontended figure rather than the arm's own fastest run -- which overstated it
+5.4x against a true 3.1x on six concurrent AMASSS, every run in that arm being
+contended.
+
+**Tests:** 680 server tests (+43), no GPU, no weights and no network.
+
 
 ### 2026-08-12 - Read the other repository; seven ways nothing would have worked
 

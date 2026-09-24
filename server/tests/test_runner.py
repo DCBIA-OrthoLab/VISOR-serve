@@ -83,11 +83,14 @@ def test_a_raising_tool_records_which_failure_it_was(probe_python, probe_name, t
 
     with open(os.path.join(os.path.dirname(job_path), "result.json")) as handle:
         recorded = json.load(handle)
-    assert recorded == {
-        "error": {"type": "RuntimeError", "message": "_dispatch_probe was asked to fail"}
+    assert recorded["error"] == {
+        "type": "RuntimeError", "message": "_dispatch_probe was asked to fail"
     }
     # And never a result: the two are mutually exclusive.
     assert "result" not in recorded
+    # The measurements travel with a failure too. An out-of-memory is the most
+    # informative run a budget can learn from, and it used to record nothing.
+    assert recorded["peak_rss_bytes"] > 0
 
 
 def test_an_unknown_tool_names_what_it_tried(probe_python, tmp_path):

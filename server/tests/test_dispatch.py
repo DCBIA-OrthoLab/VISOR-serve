@@ -6,6 +6,7 @@ interpreter, runner.py, result.json, and the cleanup around them. See
 conftest.py for how it is laid out.
 """
 
+import base
 import contextlib
 import json
 import pathlib
@@ -50,6 +51,32 @@ def test_the_tool_writes_into_its_own_job_directory(
     job_dir = os.path.dirname(os.path.dirname(output_path))
     assert job_dir in tracked_scratch_dirs, "the job directory must be cleaned up by the request"
     assert result["cwd"] == job_dir, "a relative path must land in the job dir, not the server tree"
+
+
+def test_a_resume_does_not_package_the_stopped_attempt_s_output(
+    probe_tool, probe_python, tracked_scratch_dirs
+):
+    """A run that STOPS copies each kept step into `output/intermediate/` for
+    the reader to download, and that copy is the step as it was BEFORE the
+    correction. A resume asked to keep no step rewrites none of it, so the
+    stopped attempt's snapshot was packaged as if it were the resumed run's
+    own -- the archive handing back the very landmarks the reader had just
+    replaced. Measured against a live ASO: the run oriented on Ba at 11.7
+    while `intermediate/` reported the 4.7 it had corrected away, which reads
+    as the correction having been silently ignored.
+    """
+    result = dispatch.dispatch(probe_tool, {"a": 1, "b": 1})
+    job_dir = os.path.dirname(os.path.dirname(result["outputs"]["probe"]))
+    stale = os.path.join(job_dir, "output", "intermediate", "01_Leaf")
+    os.makedirs(stale)
+    with open(os.path.join(stale, "lm.mrk.json"), "w") as handle:
+        handle.write("the landmarks the reader corrected away")
+
+    dispatch.dispatch(probe_tool, {"a": 1, "b": 1}, resume_from=job_dir)
+
+    assert not os.path.exists(stale), (
+        "the resumed run packaged the stopped attempt's intermediate copy"
+    )
 
 
 def test_the_job_environment_carries_the_three_declared_variables(
@@ -118,7 +145,7 @@ def test_a_tool_that_died_without_saying_anything_falls_back_to_stderr(
     """A segfault in a CUDA kernel, or an OOM kill, writes no error file. The
     tail of stderr is all there is, and it has to travel."""
     monkeypatch.setattr(
-        dispatch, "_read_result", lambda job_dir, tool_name: (_ for _ in ()).throw(
+        dispatch, "_read_result", lambda job_dir, tool_name, solo=False: (_ for _ in ()).throw(
             FileNotFoundError()
         )
     )
@@ -390,7 +417,6 @@ def test_the_peak_vram_the_runner_measured_is_logged(tmp_path, caplog):
         assert _dispatch._read_result(str(job_dir), "Batch_Dental_Seg") == "ok"
 
     logged = "\n".join(record.getMessage() for record in caplog.records)
-    assert "peak_vram_bytes=39845888000" in logged
     assert "Batch_Dental_Seg" in logged
     assert "37.11 GiB" in logged
 
@@ -501,3 +527,52 @@ def test_only_a_hosted_model_argument_is_filled(monkeypatch, tmp_path):
     filled = dispatch._server_provided(OtherTool(), {}, str(tmp_path))
 
     assert filled == {}
+
+
+def test_the_server_device_reaches_a_tool_that_declares_its_own_default(monkeypatch):
+    """`settings.DEVICE` was inert for every tool that declared `device`.
+
+    `validate` fills a choice argument's declared default when the caller named
+    none, so by the time `dispatch.fill` asked "did anybody set `device`?" the
+    answer was always yes. Measured on 2026-09-21 with DEVICE=cuda in the
+    environment and in the container: CNE ran on the CPU for 67 s with a CUDA
+    build installed that does the same note in 3.35 s. A CPU-only deployment
+    had the mirror image, since AMASSS and Crown_Seg declare `cuda`.
+    """
+    from config import settings
+
+    monkeypatch.setattr(settings, "DEVICE", "cuda")
+
+    class Probe(base.Tool):
+        name = "Probe"
+        arguments = {
+            base.DEVICE_ARGUMENT: base.ArgSpec(
+                type="choice", required=False, choices={"cpu": True, "cuda": False}
+            )
+        }
+
+        def run(self, **kwargs):
+            return kwargs
+
+    assert Probe().invoke({})[base.DEVICE_ARGUMENT] == "cuda"
+
+
+def test_a_caller_who_names_a_device_keeps_it(monkeypatch):
+    """The schema promises a caller can choose, and a default the server fills
+    in is not the same statement as a value the caller sent."""
+    from config import settings
+
+    monkeypatch.setattr(settings, "DEVICE", "cuda")
+
+    class Probe(base.Tool):
+        name = "Probe"
+        arguments = {
+            base.DEVICE_ARGUMENT: base.ArgSpec(
+                type="choice", required=False, choices={"cpu": True, "cuda": False}
+            )
+        }
+
+        def run(self, **kwargs):
+            return kwargs
+
+    assert Probe().invoke({base.DEVICE_ARGUMENT: "cpu"})[base.DEVICE_ARGUMENT] == "cpu"

@@ -33,6 +33,17 @@ def track_scratch_dirs() -> list:
     return created
 
 
+def tracked_scratch_dirs() -> list:
+    """What this request has staged so far, as a copy.
+
+    Read-only, unlike `track_scratch_dirs`, which STARTS a new recording and
+    would throw away the request's own list if a caller mistook it for a
+    getter.
+    """
+    tracked = _scratch_dirs.get()
+    return list(tracked) if tracked else []
+
+
 def register_scratch_dir(directory: str) -> str:
     """Record an already-created directory for the same cleanup; returns it.
 
@@ -44,6 +55,19 @@ def register_scratch_dir(directory: str) -> str:
     if tracked is not None:  # None when a tool is called outside a request
         tracked.append(directory)
     return directory
+
+
+def forget_scratch_dir(directory: str) -> None:
+    """Stop tracking a directory, so the request's cleanup leaves it alone.
+
+    For the one thing that has to outlive its request: a run stopped at a
+    quality-control checkpoint keeps its job directory, because picking it up
+    again means reading what its calls already produced. Everything else the
+    request made is still removed.
+    """
+    tracked = _scratch_dirs.get()
+    if tracked is not None and directory in tracked:
+        tracked.remove(directory)
 
 
 def make_scratch_dir(prefix: str = "tool_") -> str:

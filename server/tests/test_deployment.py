@@ -29,6 +29,10 @@ from registry.deployment import DeploymentConfig, DeploymentConfigError, ToolDep
 client = TestClient(main.app)
 AUTH = {"Authorization": "Bearer test-token"}
 
+# This server's (max MB, max files) for splitting a cohort, which derive()
+# resolves a tool's batch plan against. See test_batching.py.
+BATCH_DEFAULTS = (settings.BATCH_MAX_MB, settings.BATCH_MAX_FILES)
+
 
 def _write(tmp_path, text: str) -> str:
     path = tmp_path / "deployment.toml"
@@ -241,11 +245,58 @@ def test_a_deployment_can_opt_an_argument_out_of_a_naming_convention():
         server_selectable={"reference": deployment.SERVER_SELECTABLE_NONE}
     )
 
-    merged = conventions.derive(arguments, declared)
+    merged = conventions.derive(arguments, declared, BATCH_DEFAULTS)
 
     assert "reference" not in merged.server_selectable
     # Untouched: an exception costs one line rather than restating the rest.
     assert merged.server_selectable["scans"] == "testfile"
+
+
+def test_deriving_a_deployment_carries_every_declared_field_through():
+    """`derive` used to build a fresh ToolDeployment out of the three fields it
+    computes, which dropped every declared field it does not touch. Harmless
+    while the result was read for `server_selectable` and `batch` only, and a
+    trap the moment anything reads the RESOLVED entry instead of the
+    declaration -- CLIC's `width_from = false` and ALI_CBCT's
+    `width_from = "landmarks"` would be the first two things lost.
+    """
+    declared = deployment.ToolDeployment(
+        width_from=False, timeout_seconds=900.0, max_upload_mb=500, data_dir="ALI",
+    )
+
+    merged = conventions.derive({"scans": {"type": "path"}}, declared, BATCH_DEFAULTS)
+
+    assert merged.width_from is False
+    assert merged.timeout_seconds == 900.0
+    assert merged.max_upload_mb == 500
+    assert merged.data_dir == "ALI"
+
+
+def test_a_resolved_deployment_is_what_the_registry_settled_on():
+    """The conventions decide most of what a deployment says about a tool, and
+    until this existed the result reached nothing but the `Tool` object: the
+    run path asked this config for a derived field and got the raw declaration,
+    silently. `for_tool` still answers for the FILE, because the startup checks
+    ask it what was written down.
+    """
+    config = DeploymentConfig({"Cohort_Tool": ToolDeployment(data_dir="Cohort")})
+    resolved = ToolDeployment(data_dir="Cohort", batch={"axis": "scans"})
+
+    config.record_resolved("Cohort_Tool", resolved)
+
+    assert config.resolved("Cohort_Tool").batch == {"axis": "scans"}
+    assert config.for_tool("Cohort_Tool").batch is None
+    assert config.known_tools == ("Cohort_Tool",)
+
+
+def test_a_tool_nothing_resolved_falls_back_to_what_the_file_declared():
+    """An imported tool, whose ArgSpecs the conventions never ran on, and a
+    facade, which runs nothing itself. For both, the declaration is the whole
+    of what this server knows."""
+    config = DeploymentConfig({"Imported": ToolDeployment(width_from="landmarks")})
+
+    assert config.resolved("Imported").width_from == "landmarks"
+    assert config.resolved("Never_Heard_Of_It") == ToolDeployment()
 
 
 # ----------------------------------------------------------------------

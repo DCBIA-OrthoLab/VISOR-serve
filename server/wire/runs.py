@@ -43,6 +43,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import time
 from typing import List, Optional
@@ -54,6 +55,11 @@ logger = logging.getLogger("inference_server.runs")
 
 
 EVENTS_FILE = "events.jsonl"
+# The tool a run is for, written once at registration. Not in the event stream
+# because the events are a tool's own output and this is the server's fact, and
+# because a run that failed before emitting anything would otherwise be a bare
+# id nobody could place.
+META_FILE = "meta.json"
 PGID_FILE = "pgid"
 CANCEL_FILE = "cancel"
 
@@ -72,12 +78,17 @@ PHASE_PACKAGING = "packaging"
 PHASE_DONE = "done"
 PHASE_FAILED = "failed"
 PHASE_CANCELLED = "cancelled"
+PHASE_PAUSED = "paused"
 
 STATE_PENDING = "pending"
 STATE_RUNNING = "running"
 STATE_DONE = "done"
 STATE_FAILED = "failed"
 STATE_CANCELLED = "cancelled"
+# A run that stopped where it was asked to, and can be told to carry on.
+# NOT terminal: the client is expected to come back, and the reaper's idle
+# timeout is what bounds how long that is worth waiting for.
+STATE_PAUSED = "paused"
 
 TERMINAL_STATES = (STATE_DONE, STATE_FAILED, STATE_CANCELLED)
 
@@ -94,6 +105,7 @@ _STATE_OF_PHASE = {
     PHASE_DONE: STATE_DONE,
     PHASE_FAILED: STATE_FAILED,
     PHASE_CANCELLED: STATE_CANCELLED,
+    PHASE_PAUSED: STATE_PAUSED,
 }
 
 # A progress message is free text written by a tool, so it is bounded here
@@ -101,6 +113,9 @@ _STATE_OF_PHASE = {
 # keeps a record comfortably under PIPE_BUF, which is what makes concurrent
 # appends atomic.
 MAX_MESSAGE_CHARS = 200
+# What a tool folder may be called, which is what a nested marker may name.
+# Deliberately narrow: see `_clean_tool_name`.
+_TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 # One file, two kinds of writer: this server, and the tool process (plus every
 # supervised level below it). The server marks its own records, and only a
@@ -160,7 +175,7 @@ def run_directory(run_id: str) -> str:
     return path
 
 
-def register(run_id: str) -> str:
+def register(run_id: str, tool: Optional[str] = None) -> str:
     """Claim an id and open its directory. Returns the id.
 
     Called as the FIRST thing `POST /run` does, before `await request.form()`,
@@ -187,6 +202,13 @@ def register(run_id: str) -> str:
     # SADT_PROGRESS_FILE would otherwise litter whatever it points at.
     with open(os.path.join(directory, EVENTS_FILE), "wb"):
         pass
+    if tool:
+        # Best effort: a run whose name could not be written is still a run.
+        try:
+            with open(os.path.join(directory, META_FILE), "w", encoding="utf-8") as handle:
+                json.dump({"tool": str(tool)[:100], "at": time.time()}, handle)
+        except OSError:
+            pass
     reap_expired()
     return run_id
 
@@ -197,6 +219,12 @@ def discard(run_id: str) -> None:
     task, where raising would be worse than the leak the reaper would catch."""
     if not _scratch.is_valid_id(run_id or ""):
         return
+    # What a paused run was holding on to goes with it. This is the only
+    # place that knows: the request that staged those directories handed
+    # them over rather than deleting them, precisely so a resume could use
+    # them, and nothing else is told when that resume finally ends.
+    for directory in (paused_at(run_id) or {}).get("keep") or ():
+        shutil.rmtree(directory, ignore_errors=True)
     shutil.rmtree(os.path.join(_runs_root(), run_id), ignore_errors=True)
 
 
@@ -211,22 +239,127 @@ def discard(run_id: str) -> None:
 touch = _scratch.touch
 
 
+def _kept_by(directory: str) -> list:
+    """Every directory a paused run is holding, read off its own record.
+
+    By PATH rather than by run id, because this is what the reaper has: it is
+    deleting a directory whose id it is about to forget. Both halves are
+    returned -- the job directory the resume would have read, and the inputs
+    the request staged for it -- since nothing else in this server is told
+    they exist.
+    """
+    try:
+        with open(os.path.join(directory, PAUSED_FILE), encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(record, dict):
+        return []
+    held = [record.get("job_dir")]
+    held.extend(record.get("keep") or ())
+    return [str(entry) for entry in held if entry]
+
+
+def _ttl_of(directory: str) -> float:
+    """How long this run may sit idle: longer while somebody is reading it."""
+    if os.path.exists(os.path.join(directory, PAUSED_FILE)):
+        return settings.PAUSED_RUN_TTL_SECONDS
+    return settings.RUN_TTL_SECONDS
+
+
 def reap_expired(now: Optional[float] = None) -> int:
-    """Delete run directories untouched for RUN_TTL_SECONDS.
+    """Delete run directories that have gone idle, and what they were holding.
 
     The normal path removes a run with its request, so this is the safety net
     for the one that never got there: a client that vanished mid-POST, a worker
     killed between the terminal event and the cleanup. It matters because a
     progress message is written by a tool and can name a file.
+
+    **It has to release what a paused run kept, and this is the only place
+    that can.** A run stopped at a checkpoint hands its job directory and its
+    staged inputs to `pause()` precisely so the request does NOT delete them,
+    and the only record of where they are is the file inside the run
+    directory. Deleting that directory first -- which is what a generic
+    sweep does -- left a staged cohort of patient data on disk with nothing
+    left in the server that knew its name. Measured: the run gone, the
+    cohort still there, and no second sweep that would ever find it.
+
+    A paused run is also given longer to be idle, because what it is waiting
+    for is a person reading a cohort and nothing touches it meanwhile.
     """
-    return _scratch.reap(
-        (_runs_root(),), settings.RUN_TTL_SECONDS, "run", now
-    )
+    deadline_now = time.time() if now is None else now
+    removed = 0
+    root = _runs_root()
+    try:
+        entries = os.listdir(root)
+    except FileNotFoundError:
+        return 0
+    for entry in entries:
+        directory = os.path.join(root, entry)
+        try:
+            if os.path.getmtime(directory) > deadline_now - _ttl_of(directory):
+                continue
+        except OSError:
+            # Gone between listdir and getmtime: another worker won.
+            continue
+        for held in _kept_by(directory):
+            shutil.rmtree(held, ignore_errors=True)
+        # ignore_errors: every uvicorn worker runs its own reaper, so losing
+        # the race to delete the same directory is expected.
+        shutil.rmtree(directory, ignore_errors=True)
+        removed += 1
+    if removed:
+        logger.info("run reaper removed %d expired directory(ies)", removed)
+    return removed
 
 
 # ----------------------------------------------------------------------
 # Writing an event
 # ----------------------------------------------------------------------
+
+# What a run may report about its own cost, and nothing else may ride this
+# field. Each is a plain number the server itself measured.
+_MEASURED_FIELDS = ("vram_bytes", "ram_bytes", "cpu_cores", "channels")
+
+
+def _clean_measured(measured) -> Optional[dict]:
+    """A run's own cost, reduced to four numbers, or None.
+
+    Whitelisted rather than passed through: this rides an event the client
+    reads and a browser renders, so the shape is stated here instead of being
+    whatever a caller happened to build. A field that is not a finite number
+    is dropped, and an object with nothing left is None rather than `{}` --
+    "not measured" and "measured as empty" must not render the same.
+    """
+    if not isinstance(measured, dict):
+        return None
+    kept = {}
+    for name in _MEASURED_FIELDS:
+        value = measured.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if math.isnan(value) or math.isinf(value) or value < 0:
+            continue
+        kept[name] = value
+    return kept or None
+
+
+def _clean_tool_name(name) -> str:
+    """A nested call's tool name, or "" -- and it is checked, not merely bounded.
+
+    This field travels further than a message does: the benchmark payload drops
+    messages precisely because a tool writes them and a tool's free text may
+    name a patient's file, while it keeps this so a chain's bar can say WHICH
+    tool the parent called. That only holds while the field cannot be free
+    text, so anything that is not a plain identifier is dropped rather than
+    truncated -- a truncated file name is still a file name.
+
+    The pattern is what a tool folder may be called (`registry` discovers
+    `<TOOLS_DIR>/<name>/`), so a real name always survives it.
+    """
+    text = "" if name is None else str(name)
+    return text if _TOOL_NAME.fullmatch(text) else ""
+
 
 def _clean_message(message) -> str:
     """A message is free text from a tool. Bounded, and stripped of the one
@@ -276,27 +409,44 @@ def _append_record(directory: str, record: dict) -> None:
 
 
 def append(run_id: str, phase: str, fraction=None, message: str = "",
-           depth: int = 0) -> None:
-    """Record one server-side phase. Silent for a run that no longer exists."""
+           depth: int = 0, result=None, measured=None) -> None:
+    """Record one server-side phase. Silent for a run that no longer exists.
+
+    `result` rides the TERMINAL event of a detached run: the response to the
+    POST was a 202 minutes earlier, so the event stream is the only place left
+    to hand the client its `result_ref`.
+
+    `measured` is what THIS run actually cost -- its VRAM and RSS peaks, the
+    channels it opened and the cores it burned. The figures existed already:
+    `runner.py` has measured every run since the subprocess path landed and
+    `execution/costs.py` folds them into a per-TOOL high-water mark. What was
+    missing was per-RUN attribution: with six runs on one card, a trace of the
+    whole card lines a peak up with the runs that could have caused it and
+    attributes it to none of them. They are numbers, never patient data, which
+    is why they may travel at all.
+    """
     try:
         directory = run_directory(run_id)
     except RunError:
         return
-    _append_record(
-        directory,
-        {
-            _SOURCE_KEY: _SERVER_SOURCE,
-            "at": time.time(),
-            "state": _STATE_OF_PHASE.get(phase, STATE_RUNNING),
-            "phase": phase,
-            "fraction": _clean_fraction(fraction),
-            "message": _clean_message(message),
-            "depth": depth,
-        },
-    )
+    record = {
+        _SOURCE_KEY: _SERVER_SOURCE,
+        "at": time.time(),
+        "state": _STATE_OF_PHASE.get(phase, STATE_RUNNING),
+        "phase": phase,
+        "fraction": _clean_fraction(fraction),
+        "message": _clean_message(message),
+        "depth": depth,
+    }
+    if result is not None:
+        record["result"] = result
+    if measured is not None:
+        record["measured"] = measured
+    _append_record(directory, record)
 
 
-def emit(phase: str, fraction=None, message: str = "", depth: int = 0) -> None:
+def emit(phase: str, fraction=None, message: str = "", depth: int = 0,
+         measured=None) -> None:
     """`append` for the run this request belongs to, and a no-op when there is
     none.
 
@@ -307,13 +457,13 @@ def emit(phase: str, fraction=None, message: str = "", depth: int = 0) -> None:
     run_id = CURRENT_RUN.get()
     if run_id is None:
         return
-    append(run_id, phase, fraction, message, depth)
+    append(run_id, phase, fraction, message, depth, measured=measured)
 
 
-def finish(run_id: str, phase: str, message: str = "") -> None:
+def finish(run_id: str, phase: str, message: str = "", result=None) -> None:
     """The terminal event. Written before the directory is discarded, so a
     watcher that polls once more sees how the run ended."""
-    append(run_id, phase, None, message)
+    append(run_id, phase, None, message, result=result)
 
 
 # ----------------------------------------------------------------------
@@ -359,7 +509,7 @@ def _normalised(raw: dict, seq: int, seen_at: float) -> dict:
     if depth < 0 or depth > _MAX_DEPTH:
         depth = 0
 
-    return {
+    event = {
         "seq": seq,
         "at": at,
         "state": state,
@@ -368,6 +518,25 @@ def _normalised(raw: dict, seq: int, seen_at: float) -> dict:
         "message": _clean_message(raw.get("message")),
         "depth": depth,
     }
+    # The supervisor's marker for a nested call, at the CHILD's depth. Unlike
+    # a phase this MAY come from a tool's own process -- the supervisor runs
+    # inside one -- so it is guarded by what it is allowed to look like
+    # instead of by who wrote it.
+    nested = _clean_tool_name(raw.get("tool"))
+    if nested:
+        event["tool"] = nested
+    # Only ever from the server, and for the same reason a phase is: a TOOL
+    # appends to this same file, and a tool able to write its own `result`
+    # could hand the client a pointer to somebody else's bytes.
+    if raw.get(_SOURCE_KEY) == _SERVER_SOURCE and isinstance(raw.get("result"), dict):
+        event["result"] = raw["result"]
+    # Server-sourced for the same reason, and for a sharper one: a tool able to
+    # write its own cost could tell the budget it is free.
+    if raw.get(_SOURCE_KEY) == _SERVER_SOURCE:
+        measured = _clean_measured(raw.get("measured"))
+        if measured:
+            event["measured"] = measured
+    return event
 
 
 class EventReader:
@@ -539,6 +708,96 @@ def get_pgid(run_id: str) -> Optional[int]:
     return pgid if pgid > 1 else None
 
 
+# Where a paused run's job directory is recorded, beside its events. One
+# line, because that is all a resume needs to find everything else.
+PAUSED_FILE = "paused.json"
+
+
+def pause(run_id: str, job_dir: str, stopped_after: str, keep=()) -> None:
+    """Record that this run stopped, where its work is, and what it still needs.
+
+    The job directory is what a resume reads: the memo each supervised call
+    left behind, and the outputs a reader is about to correct. Written here
+    rather than held in a module global for the same reason the process group
+    is -- the POST that resumes may be served by a different `uvicorn
+    --workers` process, which holds nothing.
+
+    `keep` is the staged INPUTS. A request deletes everything it staged once
+    its response has streamed, which is right for confidential imaging and
+    wrong for exactly this case: the resume runs the tool again and hands it
+    the same inputs, so deleting them left the run unable to carry on.
+
+    It never showed up in testing because a hosted test file resolves to a
+    path in `DATA/` that no request owns; every UPLOAD, which is every
+    clinical use, lost its input the moment the run paused.
+    """
+    try:
+        directory = run_directory(run_id)
+    except RunError:
+        return
+    try:
+        with open(os.path.join(directory, PAUSED_FILE), "w", encoding="utf-8") as handle:
+            json.dump({"job_dir": job_dir, "stopped_after": stopped_after,
+                       "keep": [str(entry) for entry in keep or ()]}, handle)
+    except OSError as exc:
+        logger.warning("could not record the pause for run %s: %s", run_id, exc)
+        return
+    touch(directory)
+    append(run_id, phase=PHASE_PAUSED)
+
+
+def keep_while_paused(run_id, directories) -> None:
+    """Add `directories` to what a paused run is holding on to.
+
+    Called after the pause was recorded, because what the REQUEST staged is
+    only fully known once its response is being built. Silent for a run that
+    is not paused: a finished run has nothing to hold.
+    """
+    record = paused_at(run_id) if run_id else None
+    if record is None:
+        return
+    keep = list(record.get("keep") or ())
+    keep.extend(str(entry) for entry in directories or () if entry and entry not in keep)
+    record["keep"] = keep
+    try:
+        directory = run_directory(run_id)
+        with open(os.path.join(directory, PAUSED_FILE), "w", encoding="utf-8") as handle:
+            json.dump(record, handle)
+    except (RunError, OSError) as exc:
+        logger.warning("Could not record what run %s is keeping: %s", run_id, exc)
+
+
+def paused_at(run_id: str) -> Optional[dict]:
+    """`{"job_dir": ..., "stopped_after": ...}` for a paused run, or None."""
+    try:
+        directory = run_directory(run_id)
+    except RunError:
+        return None
+    try:
+        with open(os.path.join(directory, PAUSED_FILE), encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    job_dir = record.get("job_dir")
+    if not job_dir or not os.path.isdir(job_dir):
+        # The directory went with the reaper, or the server was restarted on
+        # a fresh TEMP_DIR. A resume cannot be offered for work that is gone.
+        return None
+    return record
+
+
+def clear_pause(run_id: str) -> None:
+    """Forget the pause, once the run has been told to carry on."""
+    try:
+        directory = run_directory(run_id)
+    except RunError:
+        return
+    try:
+        os.remove(os.path.join(directory, PAUSED_FILE))
+    except OSError:
+        pass
+
+
 def request_cancel(run_id: str) -> Optional[int]:
     """Write the cancel marker; hand back the process group to signal, if one
     has been recorded yet.
@@ -583,3 +842,60 @@ def progress_file(run_id: Optional[str]) -> Optional[str]:
     except RunError:
         return None
     return os.path.abspath(os.path.join(directory, EVENTS_FILE))
+
+
+def active(limit: int = 500) -> list:
+    """Every run the registry still holds, newest first, without its events.
+
+    For an operator looking at a live server: what is on it, how far along, and
+    how long it has been there. `snapshot` answers that for ONE run to whoever
+    holds its id; this answers it for all of them, so it is deliberately
+    narrower than `snapshot` is.
+
+    **No message, ever.** A progress message is free text written by a tool and
+    can name the file it is working on, which is a patient's. `snapshot`
+    carries it because a caller holding a run id is the client that started
+    that run; a listing is read by anyone holding the shared API token, which
+    on this deployment is every workstation. The phase says what it is doing;
+    the message would say whose data it is doing it to.
+    """
+    root = _runs_root()
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not _scratch.is_valid_id(name):
+            continue
+        directory = os.path.join(root, name)
+        events_path = os.path.join(directory, EVENTS_FILE)
+        try:
+            started_at = os.path.getctime(directory)
+            updated_at = os.path.getmtime(events_path)
+        except OSError:
+            continue
+        latest = None
+        try:
+            events = EventReader(directory).read()
+            latest = events[-1] if events else None
+        except Exception:  # noqa: BLE001 - a listing must not fail on one bad run
+            pass
+        tool = None
+        try:
+            with open(os.path.join(directory, META_FILE), encoding="utf-8") as handle:
+                tool = (json.load(handle) or {}).get("tool")
+        except (OSError, ValueError):
+            pass
+        found.append({
+            "run_id": name,
+            "tool": tool,
+            "state": latest["state"] if latest else STATE_PENDING,
+            "phase": latest["phase"] if latest else PHASE_RECEIVED,
+            "fraction": latest["fraction"] if latest else None,
+            "depth": latest["depth"] if latest else 0,
+            "started_at": started_at,
+            "updated_at": updated_at,
+        })
+    found.sort(key=lambda entry: entry["started_at"], reverse=True)
+    return found[:limit]

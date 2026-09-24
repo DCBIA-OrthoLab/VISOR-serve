@@ -303,6 +303,11 @@ class ArgSpec:
     # description covers all of them at once. The words are the tool's, exactly
     # as `groups`' names are: this server knows the key and never a landmark.
     option_help: Optional[dict] = None
+    # `{option: what a reader may do there}` -- "view", "landmarks",
+    # "registration". Only `stop_after` carries it, and only so a panel can
+    # tell a checkpoint a reader may come BACK to from one they may only look
+    # at. Presentation in the sense the others are: `validate()` ignores it.
+    option_kind: Optional[dict] = None
 
     # How few options a "multichoice" may be left with. Absent means none is a
     # meaningful answer -- ALI's empty `landmarks` says "let the regions decide"
@@ -376,6 +381,13 @@ class ArgSpec:
     # run() as None instead of its declared default.
 
 
+# The argument every GPU-capable tool declares, named here rather than in
+# `execution/dispatch` because it belongs to the TOOL contract: this module is
+# the one thing every tool imports, and two spellings of it in two files is a
+# drift waiting to happen.
+DEVICE_ARGUMENT = "device"
+
+
 class ToolArgumentError(Exception):
     """Raised when arguments passed to a tool don't match its declared schema."""
 
@@ -404,6 +416,11 @@ class Tool(ABC):
     # "files"               -> run() returns a list of paths, or one directory
     #                          path; main.py zips them and streams the archive
     output_kind: str = "text"
+    # {axis, max_mb, max_files}: how a client splits a cohort of inputs into
+    # several runs, or None to send it in one. Set by the registry from the
+    # schema and deployment.toml; an in-process tool declares none, and the
+    # two demos have no folder argument to split anyway.
+    batch: Optional[dict] = None
 
     def check_schema(self) -> None:
         """Reject an invalid `arguments` declaration. Called by registry.py at
@@ -851,6 +868,28 @@ class Tool(ABC):
         SADT_DISPATCH_MODE the run goes to, it gets arguments that already
         match the declared schema, and a bad request costs no process at all.
         """
+        # BEFORE validate, and that is the whole of the fix.
+        #
+        # `validate` fills a choice argument's declared default when the caller
+        # named none -- so by the time `dispatch.fill` asks "did anybody set
+        # `device`?", the answer is always yes and `settings.DEVICE` never
+        # reached a single tool that declares one. Measured on 2026-09-21:
+        # DEVICE=cuda in the environment and in the container, and CNE ran on
+        # the CPU for 67 s with a CUDA build installed that does the same note
+        # in 3.35 s. A CPU-only deployment had the mirror image -- AMASSS and
+        # Crown_Seg declare `cuda` and would have been asked for it.
+        #
+        # Here both facts exist at once: `args` is what the CALLER asked for,
+        # and a tool's default is only a default. A caller who names a device
+        # keeps it, which is what the schema promises.
+        from config import settings as _settings
+        if (
+            DEVICE_ARGUMENT in self.arguments
+            and DEVICE_ARGUMENT not in args
+            and _settings.DEVICE
+        ):
+            args = {**args, DEVICE_ARGUMENT: _settings.DEVICE}
+
         cleaned = self.validate(args)
         # Imported here rather than at module level, and this is worth keeping:
         # base.py is the ONE server module every tool imports, and it depends on

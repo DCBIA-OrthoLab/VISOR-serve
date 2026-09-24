@@ -21,14 +21,24 @@ from typing import Optional
 import anyio.to_thread
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    Response,
+    StreamingResponse,
+)
 from pydantic import BaseModel
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from execution import dispatch
+# `runner` is executed BY a tool's interpreter and must never import this
+# server -- but the other direction is safe and is what lets the rewind
+# edit the same record the runner wrote. It is standard library only.
+from execution import admission, costs, dispatch, reports, runner
 from registry import facade
 from registry.facade import FacadeTool
 import file_utils
+import resources
 from wire import runs, transfer
 from base import (
     FILE_TYPES,
@@ -73,6 +83,20 @@ async def _reaper_loop() -> None:
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # Said out loud, once, before anything runs. A budget that did not take
+    # effect -- a variable set in the wrong file, a container limit nobody
+    # applied -- has no symptom other than a server that feels slow, so the
+    # numbers it decided on have to be readable in the log beside the ones it
+    # found. Resolved here rather than at import so the detection it does is
+    # part of starting the server, not of importing it.
+    for line in resources.banner(resources.allocation()).splitlines():
+        logger.info("%s", line)
+    # Said beside the budget, because the budget is only as good as these: a
+    # tool nobody has measured reserves everything, and a tool whose memory
+    # moves with the request is reserving the worst run anyone has seen rather
+    # than what this one will cost.
+    for line in costs.banner().splitlines():
+        logger.info("%s", line)
     async with anyio.create_task_group() as task_group:
         task_group.start_soon(_reaper_loop)
         try:
@@ -124,6 +148,18 @@ _UPLOADS_FIELD = "__uploads__"
 # gets exactly the response it always got.
 _RESULT_DELIVERY_HEADER = "X-Result-Delivery"
 _DELIVER_BY_REFERENCE = "reference"
+
+# Opts one run out of the blocking contract: the POST answers 202 as soon as the
+# inputs are staged, and the run reports through the event stream it already
+# has. Modelled on the header above, and opt-in for the same reason -- a client
+# that does not send it reaches byte-for-byte the behaviour it always had.
+#
+# What this fixes is not hypothetical. The Slicer client's POST read timeout is
+# 600 s and its ceiling is an hour, while the server is sized for cohorts that
+# legitimately take longer; and a disconnect never stopped a run, it only threw
+# away the answer, because nothing in Starlette cancels a worker thread.
+_RUN_DELIVERY_HEADER = "X-Run-Delivery"
+_RUN_DETACHED = "detached"
 
 # The run id, minted by the client with secrets.token_urlsafe(24) and sent on
 # the run it identifies. Optional in both directions: a client that sends none
@@ -285,9 +321,16 @@ def _media_type_of(path: str) -> str:
     return media_type
 
 
-def _human_bytes(size: int) -> str:
+def _human_bytes(size) -> str:
     """Byte count in the largest unit that keeps it readable. Logged alongside
-    the exact figure, never instead of it."""
+    the exact figure, never instead of it.
+
+    An absent count reads as absent rather than raising: this is a log line,
+    and a log line must never be what takes a finished run down. It already
+    did once -- a resume carries no input bytes and passed None through.
+    """
+    if size is None:
+        return "-"
     value = float(size)
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024 or unit == "TB":
@@ -330,6 +373,42 @@ def _output_roots(outputs: list, work_dir: str) -> set:
     return roots
 
 
+
+
+
+
+# A campaign is addressed BY NAME from a URL. One path segment, starting with
+# an alphanumeric and ending in the suffix the report writer uses: no
+# separator and no leading dot, which makes a traversal unrepresentable rather
+# than merely detected. `wire/transfer.py`'s ID_RE is the local precedent.
+#
+# Matched with `fullmatch`, not `match`: Python's `$` also matches before a
+# trailing newline, and a file name on Linux may contain one -- so an anchored
+# `match` would accept `b6-....json\n` as if it were the name beside it.
+_CAMPAIGN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.json")
+
+
+
+
+
+
+
+
+
+
+# NOT named `status`, `benchmarks` or anything else already bound at module
+# level: a handler shadowing an imported name breaks it for every line below
+# it -- a function called `status` here once took out every `status.HTTP_*` in
+# this module at import time.
+# Per-tool documentation. Unauthenticated like the other two pages: it
+# describes what a tool DOES and what it costs on this deployment, which is
+# what `GET /tools` already publishes in machine-readable form. A tool nobody
+# has written up answers 404 rather than an empty page -- a blank document
+# reads as "there is nothing to say" when the truth is "nobody wrote it".
+
+
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -353,6 +432,63 @@ def _extensions_of(spec) -> Optional[dict]:
             extensions = FILE_TYPES[name] if spec.accepts is None else spec.accepts
             per_type[name] = list(extensions) if extensions else None
     return per_type or None
+
+
+@app.get("/status", dependencies=[Depends(verify_token)])
+def server_status() -> dict:
+    # NOT named `status`: `fastapi.status` is imported in this module and a
+    # function of that name shadows it, so every `status.HTTP_*` below becomes
+    # an AttributeError at import time.
+    """What this server is doing, right now.
+
+    The budget said at startup what the machine has; this says what is being
+    spent of it. Without it a slow server is indistinguishable from a busy one,
+    and admission -- the whole point of which is to make a run WAIT -- is
+    invisible: a client sees `queued_gpu` and cannot tell whether it is behind
+    one job or twelve.
+
+    Bearer-protected, and deliberately narrower than `GET /runs/{id}`. That
+    endpoint answers to whoever holds a run's id, which is the client that
+    started it; this one lists every run to anyone holding the shared API
+    token, which on this deployment is every workstation. So no progress
+    MESSAGE appears here -- a message is free text written by a tool and can
+    name the file it is working on, which is a patient's. Phases and counts say
+    what the server is doing without saying whose data it is doing it to.
+    """
+    allocation = resources.allocation()
+    budget = admission.budget()
+    free_vram, total_vram = None, None
+    try:
+        total_vram, free_vram = resources.detect_vram_bytes()
+    except Exception:  # noqa: BLE001 - a status page must not fail on a probe
+        pass
+    learned = costs.known()
+    return {
+        "budget": {
+            "cpus": allocation.cpus,
+            "ram_bytes": allocation.ram_bytes,
+            "vram_bytes": allocation.vram_bytes,
+            "cpus_per_job": allocation.cpus_per_job,
+            "ram_per_job": allocation.ram_per_job,
+            "vram_per_job": allocation.vram_per_job,
+            "expected_clients": allocation.expected_clients,
+            "max_parallel_jobs": allocation.max_parallel_jobs,
+        },
+        "admission": budget.snapshot(),
+        "card": {"free_bytes": free_vram, "total_bytes": total_vram},
+        "runs": runs.active(),
+        "costs": {
+            name: {
+                "vram_bytes": cost.vram_bytes,
+                "ram_bytes": cost.ram_bytes,
+                "samples": cost.samples,
+                "vram_spread": round(cost.vram_spread, 3),
+                "ram_spread": round(cost.ram_spread, 3),
+                "input_dependent": cost.input_dependent,
+            }
+            for name, cost in learned.items() if cost
+        },
+    }
 
 
 @app.get("/tools")
@@ -431,6 +567,7 @@ def list_tools() -> list:
                     # tool that names none of its options publishes exactly what
                     # it published before this field existed.
                     **({"option_help": spec.option_help} if spec.option_help else {}),
+                    **({"option_kind": spec.option_kind} if spec.option_kind else {}),
                     # Same shape again: omitted rather than null, because an
                     # empty multichoice is a meaningful answer everywhere it is
                     # not declared, and saying so on every argument of every
@@ -441,6 +578,17 @@ def list_tools() -> list:
                 for arg_name, spec in tool.arguments.items()
             },
             "output_kind": tool.output_kind,
+            # How to split a folder of inputs into several runs:
+            # `{"axis": the argument to split, "max_mb": ..., "max_files": ...}`,
+            # whichever cap binds first. Advisory -- a client that ignores it
+            # sends the cohort whole, exactly as every client did before this
+            # existed, and every request is still a request.
+            #
+            # Omitted rather than null, like the argument-level hints above and
+            # for the same reason: tests/golden/tools_response.json pins the
+            # published shape byte for byte, and a tool that cannot be split
+            # must publish what it published before the field existed.
+            **({"batch": tool.batch} if tool.batch else {}),
         }
         for tool in TOOLS.values()
     ]
@@ -1056,7 +1204,7 @@ async def _as_resolved_path(spec, input_path: str, extension: str, work_dir: str
     return ResolvedPath(extracted, FOLDER_TYPE)
 
 
-def _registered_run(request: Request) -> Optional[str]:
+def _registered_run(request: Request, tool_name: str) -> Optional[str]:
     """Claim the run id the client sent, or None when it sent none.
 
     Called as the FIRST thing the handler does, before `await request.form()`,
@@ -1073,37 +1221,318 @@ def _registered_run(request: Request) -> Optional[str]:
     if not raw:
         return None
     try:
-        return runs.register(raw)
+        return runs.register(raw, tool=tool_name)
     except runs.RunError as exc:
         raise _run_error(exc)
 
 
-@app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
-async def run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks):
-    """The run, with its progress recorded when the client asked for it.
+def _failure_message(exc: BaseException) -> str:
+    """What a detached run may say about its own failure.
 
-    Everything the run actually does is in `_run_tool`; this is only the shell
-    that owns the run directory -- registering it before anything is read,
-    writing the terminal event whichever way the run ends, and taking the
-    directory down afterwards. A client that sends no `X-Run-Id` takes the
-    first branch and reaches byte-for-byte the behaviour it always had.
+    The same rule the response body follows: a message the tool wrote to be
+    read by whoever sent the request travels, anything else is opaque. A
+    traceback can name a server-side path, and this one is going into a file a
+    client reads.
     """
-    run_id = _registered_run(request)
-    if run_id is None:
-        return await _run_tool(tool_name, request, background_tasks)
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+    if isinstance(exc, dispatch.ToolFailure):
+        if exc.error_type in TOOL_ERROR_STATUS:
+            return exc.message
+        return "Tool execution failed."
+    if isinstance(exc, (ToolArgumentError, ToolUnavailableError)):
+        return str(exc)
+    return "Tool execution failed."
 
-    # Set here, read by dispatch in the worker thread anyio copies this context
-    # into. A run id is request scope, not tool input, so it travels the way
-    # file_utils tracks scratch dirs rather than through Tool.invoke's
-    # signature -- which every tool and both dispatch paths agree on.
+
+def _collectable(response) -> dict:
+    """The terminal event's payload: how to collect what the run produced."""
+    if isinstance(response, JSONResponse):
+        return json.loads(bytes(response.body).decode("utf-8"))
+    if isinstance(response, dict):
+        return dict(response)
+    return {}
+
+
+async def _detached_run(tool_name: str, request: Request, run_id: str) -> None:
+    """The whole run, after the 202 has already gone out.
+
+    The terminal event carries the `result_ref`, because the response that used
+    to carry it was sent minutes ago. Nothing else about the run changes: the
+    same staging, the same admission, the same progress events on the same
+    stream the client is already watching.
+
+    The run directory is deliberately NOT discarded here. The client has not
+    read the terminal event yet -- that is the whole point of writing one -- so
+    it expires the way an abandoned one does, on the idle TTL that every read
+    pushes back.
+    """
+    cleanup = BackgroundTasks()
     token = runs.CURRENT_RUN.set(run_id)
     try:
-        runs.emit(runs.PHASE_RECEIVED)
-        response = await _run_tool(tool_name, request, background_tasks)
+        response = await _run_tool(tool_name, request, cleanup, detached=True)
+        if runs.paused_at(run_id) is not None:
+            # A stopped run has not finished, so no terminal event: one would
+            # tell the client to stop watching a run it is about to resume.
+            #
+            # But the `paused` event `_finish_stopped_run` wrote carries no
+            # result, and the response that does was built two lines ago and
+            # is about to be dropped -- nothing answers a detached run here,
+            # so the reference to what the checkpoint produced existed in
+            # this function and nowhere else. A watcher would have sat until
+            # the stream was reaped. Appended again, WITH the payload, since
+            # the stream is append-only and the last event is what a reader
+            # takes as the state.
+            runs.append(run_id, phase=runs.PHASE_PAUSED,
+                        result=_collectable(response))
+            logger.info("endpoint=/run/%s paused (detached)", tool_name)
+            return
+        runs.finish(run_id, runs.PHASE_DONE, result=_collectable(response))
+    except dispatch.RunCancelled:
+        runs.finish(run_id, runs.PHASE_CANCELLED)
+    except BaseException as exc:  # noqa: BLE001 - nobody is left to raise to
+        logger.warning("endpoint=/run/%s detached failure: %s", tool_name, exc)
+        runs.finish(run_id, runs.PHASE_FAILED, message=_failure_message(exc))
+    finally:
+        runs.CURRENT_RUN.reset(token)
+        try:
+            await cleanup()
+        except Exception:  # noqa: BLE001 - cleanup must not outlive its own failure
+            logger.exception("endpoint=/run/%s (detached cleanup)", tool_name)
+
+
+async def _detach(tool_name: str, request: Request, run_id, background_tasks):
+    """Accept the run, answer at once, and finish it after the response.
+
+    Two things are refused rather than half-supported. A detached run needs a
+    run id, because the event stream is the only channel it has left. And it
+    needs its file inputs to have arrived through `POST /uploads`, because a
+    multipart body is backed by a temporary file the framework closes when the
+    response ends -- which here is before the tool has read a byte of it. The
+    client already sends anything worth detaching that way.
+    """
+    if run_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"A detached run needs an {_RUN_ID_HEADER} header to report through.",
+        )
+    form = await request.form()
+    if any(isinstance(value, StarletteUploadFile) for _, value in form.multi_items()):
+        runs.discard(run_id)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "A detached run cannot take a file in the request body. Send it "
+                "through POST /uploads first and name it in __uploads__."
+            ),
+        )
+    runs.append(run_id, runs.PHASE_RECEIVED)
+    background_tasks.add_task(_detached_run, tool_name, request, run_id)
+    logger.info("endpoint=/run/%s status=202 detached", tool_name)
+    return JSONResponse(
+        {"run_id": run_id, "status": "accepted"},
+        status_code=status.HTTP_202_ACCEPTED,
+        background=background_tasks,
+    )
+
+
+# One directory per slot, named as the slot is (`01_ALI_CBCT`). The runner
+# moves each over that slot's output before answering from its memo.
+_RESUME_STEP = r"[0-9]{2}_[A-Za-z0-9_-]{1,64}"
+# One step, or a path through nested ones: `01_ALI_CBCT`, or `01_ASO/01_ALI_CBCT`
+# for a step a CALLEE made. Bounded at four levels because the name comes over
+# HTTP and becomes a directory, and a chain that deep does not exist.
+_RESUME_SLOT = re.compile(r"^%s(?:/%s){0,3}$" % (_RESUME_STEP, _RESUME_STEP))
+
+
+def _suffixes_of(name: str) -> set:
+    """`{".json", ".mrk.json"}` for `points.mrk.json`.
+
+    Both, because this ecosystem's extensions are compound half the time --
+    `.nii.gz`, `.nrrd.gz`, `.mrk.json` -- and the single form alone would
+    tell a reader to send a `.json` when what came out was a `.mrk.json`.
+    Derived from the real file rather than from a table, so a tool that
+    starts writing something else needs no edit here.
+    """
+    parts = name.lower().split(".")
+    found = set()
+    if len(parts) >= 2:
+        found.add("." + parts[-1])
+    if len(parts) >= 3:
+        found.add("." + ".".join(parts[-2:]))
+    return found
+
+
+def _checked_correction(step_dir: str, slot: str, filename: str) -> None:
+    """Refuse a correction that is not the kind of thing that went out.
+
+    NOT `settings.ALLOWED_EXTENSIONS`: that is the whitelist for a tool's
+    INPUTS, and a correction replaces a step's OUTPUT -- landmarks, a
+    labelled mesh, a transform. On this deployment the input list is
+    `('.nii', '.nii.gz')`, so reusing it refused the very `.mrk.json` the
+    reader had just been handed.
+
+    What it is compared against instead is that step's own output, which is
+    on disk a few directories away: a reader sends back what they were
+    given. A `.zip` is always allowed -- a folder has no other way to
+    travel.
+
+    `step_dir` is the step's own directory, resolved by the caller: a step
+    of a CALLEE is not under `<job>/sup` but under its own caller's, and
+    building the path here would only work for the first level.
+    """
+    produced = os.path.join(step_dir, dispatch.JOB_OUTPUT_DIRNAME)
+    allowed = {".zip"}
+    for _root, _directories, names in os.walk(produced):
+        for name in names:
+            allowed.update(_suffixes_of(name))
+    if _matched_extension(filename, tuple(sorted(allowed))) is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(f"'{filename}' is not what step '{slot}' produced. Send one "
+                    f"of {tuple(sorted(allowed))}, or a .zip of the folder."),
+        )
+
+
+def _located_step(job_dir: str, slot: str):
+    """Where a step's own output is, and where its correction is staged.
+
+    A chain nests: the root supervisor works in `<job>`, and the one inside
+    `01_Mid` works in `<job>/sup/01_Mid`. Each stages what came back for its
+    OWN calls in `<its job dir>/resume/<step>`, so a correction for
+    `01_Mid/01_Leaf` belongs in `<job>/sup/01_Mid/resume/01_Leaf` -- which is
+    exactly where the supervisor that re-runs Mid will look for it.
+
+    At module scope rather than inside the staging, because the rewind reads
+    the same two places to work out which cases came back.
+
+    Returns `(step directory, staging directory)`, or None for a path no step
+    of this run answers to.
+    """
+    here = job_dir
+    steps = slot.split("/")
+    for step in steps[:-1]:
+        here = os.path.join(here, dispatch.SUP_DIRNAME, step)
+        if not os.path.isdir(here):
+            return None
+    produced = os.path.join(here, dispatch.SUP_DIRNAME, steps[-1])
+    if not os.path.isdir(produced):
+        return None
+    return produced, os.path.join(here, dispatch.RESUME_DIRNAME, steps[-1])
+
+
+def _staged_files(job_dir: str, slot: str) -> list:
+    """Every file a reader sent back for `slot`, at any depth."""
+    located = _located_step(job_dir, slot)
+    if located is None:
+        return []
+    _produced, staged = located
+    found = []
+    for root, _directories, names in os.walk(staged):
+        found.extend(os.path.join(root, name) for name in sorted(names))
+    return found
+
+
+def _stage_corrections(tool, job_dir: str, form) -> list:
+    """Put what a reader sends back where the resumed run will read it.
+
+    The files came off THEIR disk: a resume that trusted the server's copy
+    would carry on with exactly the data they stopped to reject. A `.zip` is
+    unpacked -- a folder has no other way to travel -- and anything else is
+    written as the single file it is.
+
+    The slot name is matched against a pattern BEFORE any path is built from
+    it, the same discipline every id in `wire/` follows: it arrives over HTTP
+    and it becomes a directory.
+    """
+    def _ran() -> list:
+        """Every step of this run, nested ones written as a path."""
+        found = []
+
+        def walk(directory: str, prefix: str) -> None:
+            root = os.path.join(directory, dispatch.SUP_DIRNAME)
+            if not os.path.isdir(root):
+                return
+            for name in sorted(os.listdir(root)):
+                path = prefix + name
+                found.append(path)
+                walk(os.path.join(root, name), path + "/")
+
+        walk(job_dir, "")
+        return found
+
+    staged = []
+    for slot, value in form.multi_items():
+        if not isinstance(value, StarletteUploadFile):
+            continue
+        if not _RESUME_SLOT.match(slot):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(f"'{slot}' is not a step of that run. Name a correction "
+                        "after the folder it came back in, such as 01_ALI_CBCT."),
+            )
+        located = _located_step(job_dir, slot)
+        if located is None:
+            # A correction for a step that never ran is a typo, and a typo
+            # silently accepted is a resume the reader believes carries their
+            # work and does not.
+            ran = _ran()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(f"That run has no step '{slot}'. It ran: "
+                        f"{', '.join(ran) or 'nothing'}."),
+            )
+        produced, destination = located
+        _checked_correction(produced, slot, value.filename or "")
+
+        shutil.rmtree(destination, ignore_errors=True)
+        os.makedirs(destination, exist_ok=True)
+        name = os.path.basename(value.filename or slot)
+        landed = os.path.join(destination, name)
+        with open(landed, "wb") as handle:
+            shutil.copyfileobj(value.file, handle)
+        if landed.lower().endswith(".zip"):
+            # Untrusted: `extract_zip` refuses zip slip, symlink members and
+            # anything over MAX_EXTRACTED_MB before a byte is written.
+            file_utils.extract_zip(landed, destination)
+            os.remove(landed)
+        if not any(os.scandir(destination)):
+            # An empty replacement would put NOTHING where the step's output
+            # was, and the chain would carry on with an empty folder rather
+            # than with the reader's correction. Refused: the reader meant to
+            # send something.
+            shutil.rmtree(destination, ignore_errors=True)
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"The correction sent for '{slot}' is empty.",
+            )
+        staged.append(slot)
+    return staged
+
+
+async def _tracked_run(run_id: str, label: str, background_tasks: BackgroundTasks,
+                       call):
+    """Run `call()` as `run_id`, writing the terminal event whichever way it ends.
+
+    Shared by `POST /run/{tool}` and `POST /runs/{id}/resume`, because a
+    resume IS a run: it queues for the machine, it can be cancelled, it can
+    fail, and it can stop again at a second checkpoint. Resume reached this
+    file without it and wrote no terminal event at all, so every resumed run
+    stayed `running / packaging` in the registry for ever -- visible on the
+    status page as work that finished hours ago and is somehow still going,
+    and never delivering a terminal event to a watcher.
+
+    A run that is PAUSED when `call` returns is deliberately left alone:
+    it has not finished, and its directory is what a resume looks the work
+    up through.
+    """
+    token = runs.CURRENT_RUN.set(run_id)
+    try:
+        response = await call()
     except dispatch.RunCancelled:
         runs.finish(run_id, runs.PHASE_CANCELLED)
         runs.discard(run_id)
-        logger.info("endpoint=/run/%s status=%d", tool_name, CLIENT_CLOSED_REQUEST)
+        logger.info("endpoint=%s status=%d", label, CLIENT_CLOSED_REQUEST)
         raise HTTPException(
             status_code=CLIENT_CLOSED_REQUEST, detail="Run cancelled by the client."
         )
@@ -1117,6 +1546,16 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     finally:
         runs.CURRENT_RUN.reset(token)
 
+    if runs.paused_at(run_id) is not None:
+        # The run STOPPED where it was asked to. Not finished, so no terminal
+        # event; and above all not discarded -- the run directory is what
+        # `POST /runs/{id}/resume` looks the work up through, and taking it
+        # down here is what made the whole feature unreachable the first time
+        # it was tried end to end. It lives on the idle TTL, like an
+        # abandoned transfer, and every read pushes that back.
+        logger.info("endpoint=%s paused", label)
+        return response
+
     runs.finish(run_id, runs.PHASE_DONE)
     # Queued rather than done now, so the directory survives until the response
     # has finished streaming -- which gives a watcher the whole download to
@@ -1126,13 +1565,205 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     return response
 
 
-async def _run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks):
+def _tool_of(job_dir: str):
+    """The tool a stopped run was started for, from the job file it was given.
+
+    Read back rather than passed in: the request is on disk and is the one
+    thing about a paused run that cannot have drifted.
+    """
+    try:
+        with open(os.path.join(job_dir, dispatch.JOB_FILE), encoding="utf-8") as handle:
+            name = json.load(handle)["tool"]
+    except (OSError, ValueError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="The work this run stopped in is no longer on the server.",
+        )
+    try:
+        return get_tool(name)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+@app.post("/runs/{run_id}/rewind", dependencies=[Depends(verify_token)])
+async def rewind_run(run_id: str, request: Request,
+                     background_tasks: BackgroundTasks):
+    """Send a stopped run BACK to a checkpoint it already went past.
+
+    A reader looking at a bad orientation cannot fix it where they are: the
+    orientation was computed from landmarks decided two steps back. So they
+    ask to return to the last stop where something can actually be changed,
+    and this arms that checkpoint again.
+
+    Nothing is re-run to get there and no memo is dropped. The step's result
+    is on disk, which is precisely what the reader wants to look at; the run
+    re-enters its tool, every call answers from what it recorded, and the
+    checkpoint fires again the moment that step is reached. A GPU pass to
+    reproduce a file that is already there would be paid for nothing.
+
+    `to` is a step the run was stopped at, named as it was published --
+    `ALI_CBCT`, or `ASO/ALI_CBCT` for one inside a callee.
+    """
+    paused = await anyio.to_thread.run_sync(runs.paused_at, run_id)
+    if paused is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(f"Run '{run_id}' is not stopped at a checkpoint. A run that "
+                    "finished, failed or expired cannot be sent back."),
+        )
+    form = await request.form()
+    target = (form.get("to") or "").strip()
+    if not target:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Name the step to go back to, as 'to'.",
+        )
+    job_dir = paused["job_dir"]
+    staged = _stage_corrections(_tool_of(job_dir), job_dir, form)
+    # Which cases the reader sent back, read out of the step's own report --
+    # the tool stated which of its files belong to which case, so nothing is
+    # deduced from a file name here. A step that reported nothing narrows
+    # nothing, and the replay is the whole cohort: slower, never wrong.
+    marked = []
+    for slot in staged:
+        located = _located_step(job_dir, slot)
+        if located is None:
+            continue
+        step_dir, _staging = located
+        report = reports.read(os.path.join(step_dir, dispatch.JOB_OUTPUT_DIRNAME))
+        marked.extend(name for name in reports.cases_of(
+            report, _staged_files(job_dir, slot)) if name not in marked)
+    if marked:
+        await anyio.to_thread.run_sync(
+            dispatch.narrow_to_cases, job_dir, _tool_of(job_dir), marked)
+
+    if not await anyio.to_thread.run_sync(runner.rewind_to, job_dir, target):
+        # Asking to return somewhere the run has not been. Refused rather
+        # than ignored: a silent no-op leaves a reader waiting at a
+        # checkpoint that will never come.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(f"This run never stopped at '{target}', so there is "
+                    "nothing to go back to."),
+        )
+    return await resume_run(run_id, request, background_tasks,
+                            already_staged=True)
+
+
+@app.post("/runs/{run_id}/resume", dependencies=[Depends(verify_token)])
+async def resume_run(run_id: str, request: Request,
+                     background_tasks: BackgroundTasks,
+                     already_staged: bool = False):
+    """Tell a run that stopped at a checkpoint to carry on.
+
+    The request may carry corrections: one file field per step, named after
+    the folder that step came back in. They are staged and the run re-enters
+    its tool from the top -- nothing preserves a Python stack across a
+    process that exited -- with every call it already made answering from
+    what it recorded instead of running again.
+
+    It queues for the machine like any other run, because it IS one: the work
+    left to do is real work, and a resumed cohort must not jump a clinician
+    who has been waiting.
+    """
+    paused = await anyio.to_thread.run_sync(runs.paused_at, run_id)
+    if paused is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(f"Run '{run_id}' is not stopped at a checkpoint. A run that "
+                    "finished, failed or expired cannot be carried on."),
+        )
+    job_dir = paused["job_dir"]
+    try:
+        with open(os.path.join(job_dir, dispatch.JOB_FILE), encoding="utf-8") as handle:
+            tool_name = json.load(handle)["tool"]
+    except (OSError, ValueError, KeyError):
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="The work this run stopped in is no longer on the server.",
+        )
+
+    try:
+        tool = get_tool(tool_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if not already_staged:
+        # A rewind stages before it narrows, and the upload's handles are
+        # read once: staging the same form twice would find every file empty
+        # and refuse the correction the reader just made.
+        _stage_corrections(tool, job_dir, await request.form())
+    # Cleared BEFORE the run, not after: it is standing on this checkpoint
+    # right up until it moves, and a second resume arriving while the first
+    # is running must not be offered the same directory.
+    await anyio.to_thread.run_sync(runs.clear_pause, run_id)
+
+    async def carry_on():
+        logger.info("endpoint=/runs/resume tool=%s after=%s",
+                    tool_name, paused.get("stopped_after"))
+        return await _run_tool(tool_name, request, background_tasks,
+                               resume_from=job_dir)
+
+    return await _tracked_run(run_id, "/runs/resume", background_tasks, carry_on)
+
+
+@app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
+async def run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks):
+    """The run, with its progress recorded when the client asked for it.
+
+    Everything the run actually does is in `_run_tool`; this is only the shell
+    that owns the run directory -- registering it before anything is read,
+    writing the terminal event whichever way the run ends, and taking the
+    directory down afterwards. A client that sends no `X-Run-Id` takes the
+    first branch and reaches byte-for-byte the behaviour it always had.
+    """
+    run_id = _registered_run(request, tool_name)
+    if request.headers.get(_RUN_DELIVERY_HEADER, "").lower() == _RUN_DETACHED:
+        return await _detach(tool_name, request, run_id, background_tasks)
+    if run_id is None:
+        return await _run_tool(tool_name, request, background_tasks)
+
+    # The run id is read by dispatch in the worker thread anyio copies this
+    # context into. It is request scope, not tool input, so it travels the way
+    # file_utils tracks scratch dirs rather than through Tool.invoke's
+    # signature -- which every tool and both dispatch paths agree on.
+    async def start():
+        runs.emit(runs.PHASE_RECEIVED)
+        return await _run_tool(tool_name, request, background_tasks)
+
+    return await _tracked_run(run_id, f"/run/{tool_name}", background_tasks, start)
+
+
+async def _run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks,
+                    detached: bool = False, resume_from: Optional[str] = None):
+    """`resume_from` is the job directory of a run that STOPPED at a
+    checkpoint. Everything after the tool has run is identical -- the same
+    packing, the same delivery, the same cleanup -- which is the whole reason
+    a resume comes through here rather than through a second endpoint that
+    would have to learn all of it again. What it skips is the front half:
+    there is no form to read and no argument to validate, because a resume is
+    the same request carrying on and its inputs are already staged.
+    """
     start_time = time.monotonic()
 
     try:
         tool = get_tool(tool_name)
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    if resume_from:
+        return await _finish_run(
+            tool, tool_name, start_time, background_tasks, detached,
+            # Zero, not None: a resume carries no input bytes -- its inputs
+            # were staged by the run it is picking up -- and the log line
+            # wants a number.
+            size=0,
+            work_dir=None, scratch_dirs=file_utils.track_scratch_dirs(),
+            result=await anyio.to_thread.run_sync(
+                functools.partial(dispatch.dispatch, tool, {},
+                                  resume_from=resume_from),
+                limiter=_get_tool_limiter(),
+            ),
+        )
 
     # Generic argument collection: whatever scalar fields and/or files the
     # caller sends, whichever tool it targets. Each uploaded file is matched to
@@ -1394,10 +2025,107 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             if resolved.is_temporary and os.path.exists(resolved.path):
                 os.remove(resolved.path)
 
+    return await _finish_run(
+        tool, tool_name, start_time, background_tasks, detached, work_dir,
+        scratch_dirs, result, size,
+        wants_reference=(
+            request.headers.get(_RESULT_DELIVERY_HEADER, "").lower()
+            == _DELIVER_BY_REFERENCE
+        ),
+    )
+
+
+async def _finish_stopped_run(tool, tool_name: str, start_time: float,
+                              background_tasks: BackgroundTasks, work_dir,
+                              scratch_dirs, record: dict, size):
+    """Deliver a run that stopped at a checkpoint.
+
+    What goes back is the record -- which checkpoint, and what was produced
+    -- with the files themselves parked as a result reference. The job
+    directory stays where it is: it is what a resume reads, and packing is a
+    copy out of it rather than a move.
+    """
+    outputs = file_utils.output_paths(record)
+    reference = None
+    # The archive is built in a directory of its OWN, never in the request's
+    # work dir. That work dir is where an uploaded folder was unpacked, and
+    # deleting it left the resume with no inputs: the tool ran again, was
+    # handed the same paths, and answered "Path not found". It never showed
+    # in testing because a hosted test file lives in `DATA/` and belongs to
+    # no request -- so every upload, which is every clinical use, was broken
+    # and every test passed.
+    if outputs:
+        packing = tempfile.mkdtemp(dir=settings.TEMP_DIR)
+        archive = await anyio.to_thread.run_sync(
+            file_utils.make_zip, outputs,
+            os.path.join(packing, f"{tool_name}_stopped.zip"),
+        )
+        stored = await anyio.to_thread.run_sync(
+            transfer.store_result, str(archive), "application/zip"
+        )
+        reference = stored.as_reference()
+        background_tasks.add_task(shutil.rmtree, packing, ignore_errors=True)
+    # What the run still needs is handed to the pause record instead of being
+    # deleted here; `runs.discard` takes it when the run finally ends, and the
+    # reaper takes it from a reader who never came back.
+    runs.keep_while_paused(
+        runs.CURRENT_RUN.get(None),
+        [directory for directory in ([work_dir] if work_dir else [])
+         + list(scratch_dirs)])
+
+    # Last, so the phase a watcher reads is where the run actually is: the
+    # zip is built and the reference is parked, and from here it waits.
+    runs.emit(runs.PHASE_PAUSED)
+    _log_served(tool_name, start_time, size, None)
+    return JSONResponse(
+        {
+            "quality_control": True,
+            "stopped_after": record.get("stopped_after"),
+            "produced": record.get("produced") or [],
+            "result_ref": reference,
+        },
+        background=background_tasks,
+    )
+
+
+async def _finish_run(tool, tool_name: str, start_time: float,
+                      background_tasks: BackgroundTasks, detached: bool,
+                      work_dir, scratch_dirs, result, size=None,
+                      wants_reference: bool = False):
+    """Turn what a tool returned into what the caller receives.
+
+    Split out of `_run_tool` so a RESUME reaches it too. Everything here is
+    about the answer and nothing about the request, which is exactly the half
+    the two paths share: the same packing, the same reference delivery, the
+    same background cleanup. A second endpoint would have had to learn all of
+    it again, and would have drifted.
+
+    `size` is how many bytes the request carried IN, logged beside what goes
+    out. A resume carried none: its inputs were staged by the run it is
+    picking up.
+    """
     # The tool has returned; what is left is building the response. For a cohort
     # that is a multi-GB archive and minutes of it, so it is a phase of its own
     # rather than a gap between the last progress message and the download.
-    runs.emit(runs.PHASE_PACKAGING)
+    stopped = isinstance(result, dict) and result.get("quality_control")
+    if not stopped:
+        # Not for a stopped run: `packaging` would be appended AFTER the
+        # `paused` event dispatch already wrote, and the latest phase is what
+        # a watcher reads as the state. The run would report itself as
+        # running, packaging, for as long as it sat there waiting to be
+        # picked up.
+        runs.emit(runs.PHASE_PACKAGING)
+
+    if stopped:
+        # A run that STOPPED has an answer of a different shape: not the
+        # tool's declared output, which it never got to produce, but
+        # everything the chain got through plus the name of the checkpoint it
+        # is standing on. Delivered as JSON with a reference rather than as
+        # the archive alone, because the client needs both -- the files to
+        # look at, and the fact that this run can be told to carry on.
+        return await _finish_stopped_run(tool, tool_name, start_time,
+                                         background_tasks, work_dir,
+                                         scratch_dirs, result, size)
 
     if tool.output_kind in ("file", "segmentation", "files"):
         # `result` is a path to the output file the tool wrote -- or, for
@@ -1470,8 +2198,11 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # streamed response deletes its file the moment the response ends, with
         # no dependency on the client, while a reference waits for a DELETE or
         # for the reaper. Parallel ranges buy nothing on a small result.
-        deliver_by_reference = (
-            request.headers.get(_RESULT_DELIVERY_HEADER, "").lower() == _DELIVER_BY_REFERENCE
+        # A detached run has no response left to stream into, so it always
+        # takes a reference -- the size floor below is about cleanup, and a
+        # detached run's cleanup is the reaper either way.
+        deliver_by_reference = detached or (
+            wants_reference
             and os.path.getsize(result) >= _RESULT_REFERENCE_MIN_BYTES
         )
         stored = None
@@ -1485,6 +2216,14 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
                 # fail a run that has already done the expensive part. Falls
                 # through to streaming the file the way it always did.
                 logger.exception("endpoint=/run/%s (storing result by reference)", tool_name)
+        if detached and stored is None:
+            # Nothing to fall through to: the response went out as a 202 long
+            # ago, so a result that cannot be parked is a result nobody can
+            # ever collect. Better a failed run than a silent one.
+            raise ToolExecutionError(
+                f"Tool '{tool_name}' produced a result that could not be stored "
+                "for collection."
+            )
 
         background_tasks.add_task(shutil.rmtree, work_dir, ignore_errors=True)
         for output_root in output_roots:
@@ -1510,6 +2249,10 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         background_tasks.add_task(shutil.rmtree, directory, ignore_errors=True)
     _log_served(tool_name, start_time, size, None)
     return {"result": result}
+
+
+
+
 
 
 if __name__ == "__main__":
