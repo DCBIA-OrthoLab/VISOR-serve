@@ -507,6 +507,12 @@ def list_tools() -> list:
                     "required": spec.required,
                     "description": spec.description,
                     "server_selectable": spec.server_selectable,
+                    # Which subfolder of the tool's hosted files this argument
+                    # draws from, when a deployment scoped it. The client picks
+                    # its list out of `scoped` with this; without it published,
+                    # the scoped lists are sent and nobody can tell which is
+                    # whose.
+                    "selectable_scope": spec.selectable_scope,
                     # For "choice"/"multichoice": the options to render, each
                     # with its initial state. null for every other type.
                     "choices": spec.choices,
