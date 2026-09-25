@@ -19,6 +19,13 @@
 # selected by name answers 404 for a folder that was never going to exist.
 [tools.AREG_CBCT]
 data_dir = "AREG"
+# `t1_masks` is the clinician's OWN segmentations of their own patients. The
+# convention reads a file argument as "offer what the server hosts for this
+# tool too", which put a dropdown of AREG's reference test files in front of a
+# field where picking one would register a patient against somebody else's
+# masks. Nothing on this server is a plausible answer here, so the field stops
+# offering any.
+server_selectable = { t1_masks = "none" }
 
 [tools.AREG_IOS]
 data_dir = "AREG"
