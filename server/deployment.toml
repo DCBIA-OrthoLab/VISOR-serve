@@ -25,7 +25,14 @@ data_dir = "AREG"
 # field where picking one would register a patient against somebody else's
 # masks. Nothing on this server is a plausible answer here, so the field stops
 # offering any.
-server_selectable = { t1_masks = "none" }
+# And `segmentation_model` opts out too, for the reason [tools.ASO] gives
+# below about its own: the convention fills an unnamed model argument with
+# DATA/<tool>/models/ -- the FOLDER -- and AREG passed that straight to AMASSS,
+# which answered "No nnUNet model found in 'models'". The folder is not a
+# bundle. Left empty, the tool resolves the AMASSS bundle itself
+# (dispatch._own_segmentation), which is the one answer there was ever going
+# to be.
+server_selectable = { t1_masks = "none", segmentation_model = "none" }
 
 [tools.AREG_IOS]
 data_dir = "AREG"
