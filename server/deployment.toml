@@ -36,12 +36,15 @@ data_dir = "AREG"
 # volumes; the intraoral cohorts staged beside them for the other two engines
 # cannot be a baseline, and offering them put a folder of `.vtk` one click away
 # from a CBCT picker.
-server_selectable = { t1_masks = "none", segmentation_model = "none", t1 = "testfile:CBCT", t2 = "testfile:CBCT" }
+server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:CBCT", t2 = "testfile:CBCT" }
 
 [tools.AREG_IOS]
 data_dir = "AREG"
 # The intraoral cohorts, for the same reason AREG_CBCT takes only the CBCT ones.
-server_selectable = { t1 = "testfile:IOS", t2 = "testfile:IOS" }
+# `crown_model` opts out here too: a name has to mean ONE thing across the
+# engines the AREG facade composes, and IOSCBCT having opted its own out is
+# what made the facade refuse to publish at all.
+server_selectable = { t1 = "testfile:IOS", t2 = "testfile:IOS", crown_model = "none" }
 
 # Orchestrates four tools and computes almost nothing itself; see the rule in
 # deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
