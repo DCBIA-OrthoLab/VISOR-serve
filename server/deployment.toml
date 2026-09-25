@@ -32,10 +32,16 @@ data_dir = "AREG"
 # bundle. Left empty, the tool resolves the AMASSS bundle itself
 # (dispatch._own_segmentation), which is the one answer there was ever going
 # to be.
-server_selectable = { t1_masks = "none", segmentation_model = "none" }
+# `t1`/`t2` draw from DATA/AREG/testfiles/CBCT/ only. This tool registers
+# volumes; the intraoral cohorts staged beside them for the other two engines
+# cannot be a baseline, and offering them put a folder of `.vtk` one click away
+# from a CBCT picker.
+server_selectable = { t1_masks = "none", segmentation_model = "none", t1 = "testfile:CBCT", t2 = "testfile:CBCT" }
 
 [tools.AREG_IOS]
 data_dir = "AREG"
+# The intraoral cohorts, for the same reason AREG_CBCT takes only the CBCT ones.
+server_selectable = { t1 = "testfile:IOS", t2 = "testfile:IOS" }
 
 # Orchestrates four tools and computes almost nothing itself; see the rule in
 # deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
@@ -43,6 +49,10 @@ data_dir = "AREG"
 # global default applies while the chain is still being measured.
 [tools.AREG_IOSCBCT]
 data_dir = "AREG"
+# Its cohorts hold BOTH modalities -- a patient's intraoral scans and their
+# CBCT, which is the pairing this engine registers -- so all four inputs draw
+# from the one folder staged for it.
+server_selectable = { ios = "testfile:IOSCBCT", cbct = "testfile:IOSCBCT", ios_landmarks = "testfile:IOSCBCT", cbct_landmarks = "testfile:IOSCBCT" }
 
 # The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
 # this each looks for DATA/<its own name>/ and falls back to the run-together
