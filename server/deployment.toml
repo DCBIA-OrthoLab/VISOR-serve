@@ -52,7 +52,13 @@ data_dir = "AREG"
 # Its cohorts hold BOTH modalities -- a patient's intraoral scans and their
 # CBCT, which is the pairing this engine registers -- so all four inputs draw
 # from the one folder staged for it.
-server_selectable = { ios = "testfile:IOSCBCT", cbct = "testfile:IOSCBCT", ios_landmarks = "testfile:IOSCBCT", cbct_landmarks = "testfile:IOSCBCT" }
+# The four model arguments opt OUT of the hosted-model convention, which fills
+# an unnamed one with DATA/<tool>/models/ -- the FOLDER, which is not a bundle
+# and is what AMASSS refused with "No nnUNet model found in 'models'". Left
+# genuinely empty, each callee resolves its own weights (Crown_Seg, ALI_IOS and
+# ALI_CBCT all can), and the orientation reference is resolved by this engine,
+# there being one frame the rest of the chain expects.
+server_selectable = { ios = "testfile:IOSCBCT", cbct = "testfile:IOSCBCT", ios_landmarks = "testfile:IOSCBCT", cbct_landmarks = "testfile:IOSCBCT", crown_model = "none", ios_landmark_model = "none", landmark_model = "none", cbct_reference = "none" }
 
 # The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
 # this each looks for DATA/<its own name>/ and falls back to the run-together
