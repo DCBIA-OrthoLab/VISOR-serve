@@ -1,0 +1,499 @@
+<!doctype html>
+<html lang="fr">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Le moteur parallele &mdash; VRAM, RAM et channels</title>
+<style>
+:root {
+  --bg:#f6f6f4; --panel:#fffffe; --edge:#e2e1dc; --ink:#1d1e1b;
+  --soft:#6b6d66; --faint:#93958d; --sunk:#efeeea;
+  --accent:#2f6b55; --warn:#c9821f; --alert:#a2543a;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",sans-serif;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#17181a; --panel:#1f2023; --edge:#32343a; --ink:#e8e8e4;
+  --soft:#a0a29b; --faint:#74766f; --sunk:#26282c;
+  --accent:#4e9c7c; --warn:#d89a3f; --alert:#d08a6c; }}
+:root[data-theme="dark"]{
+  --bg:#17181a; --panel:#1f2023; --edge:#32343a; --ink:#e8e8e4;
+  --soft:#a0a29b; --faint:#74766f; --sunk:#26282c;
+  --accent:#4e9c7c; --warn:#d89a3f; --alert:#d08a6c; }
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font:15px/1.65 var(--sans);margin:0;
+     padding:26px clamp(16px,4vw,48px) 96px}
+.wrap{max-width:88ch;margin:0 auto}
+header{border-bottom:1px solid var(--edge);padding-bottom:14px;margin-bottom:26px}
+h1{font-size:22px;margin:0 0 4px;font-weight:600;letter-spacing:-.01em}
+h2{font-size:17px;margin:38px 0 10px;font-weight:600;letter-spacing:-.01em}
+h3{font-size:14px;margin:22px 0 6px;font-weight:600;color:var(--soft)}
+.sub{color:var(--soft);font-size:14px}
+.crumb{font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:var(--faint);
+       margin-bottom:6px}
+p{margin:0 0 12px}
+code,pre{font-family:var(--mono)}
+code{background:var(--sunk);padding:1px 5px;border-radius:3px;font-size:13px}
+pre{background:var(--panel);border:1px solid var(--edge);border-radius:6px;
+    padding:14px 16px;overflow-x:auto;font-size:13px;line-height:1.55;margin:0 0 16px}
+pre code{background:none;padding:0;font-size:inherit}
+table{border-collapse:collapse;width:100%;margin:0 0 16px;font-size:13.5px}
+th,td{text-align:left;padding:6px 10px;border-bottom:1px solid var(--edge)}
+th{color:var(--soft);font-weight:600;font-size:12px;letter-spacing:.03em;
+   text-transform:uppercase}
+td.n,th.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+figure{margin:0 0 20px}
+figcaption{color:var(--soft);font-size:12.5px;margin-top:6px}
+svg{max-width:100%;height:auto;display:block}
+.note{border-left:3px solid var(--accent);background:var(--panel);padding:10px 14px;
+      margin:0 0 16px;border-radius:0 5px 5px 0}
+.warn{border-left-color:var(--warn)}
+.alert{border-left-color:var(--alert)}
+.src{font-family:var(--mono);font-size:12px;color:var(--faint)}
+.scroll{overflow-x:auto}
+ul{margin:0 0 14px;padding-left:20px} li{margin-bottom:5px}
+strong{font-weight:600}
+</style>
+<div class="wrap">
+<header>
+  <div class="crumb">VISOR-serve &middot; docs</div>
+  <h1>Le moteur parallele : VRAM, RAM et channels</h1>
+  <div class="sub">Comment un run obtient de la memoire, qui decide quoi, et ou.
+     Exemple deroule : AMASSS.</div>
+</header>
+
+<p>Ce document explique le chemin complet entre <em>&laquo; un clinicien clique
+Apply &raquo;</em> et <em>&laquo; cinq modeles nnUNet tournent de front sur la
+carte &raquo;</em>. Les chiffres cites sont ceux mesures sur la machine de
+developpement le 25 septembre 2026 ; ils changent avec la machine, la mecanique
+non.</p>
+
+<h2>1. Deux coupes, deux raisons</h2>
+
+<p>Le travail est divise <strong>deux fois</strong>, a deux endroits, pour deux
+raisons qui n'ont rien a voir. Les confondre est l'erreur qui rend tout le
+mecanisme inerte.</p>
+
+<figure>
+<svg viewBox="0 0 760 300" role="img" aria-label="Les deux coupes">
+  <g font-family="var(--mono)" font-size="12" fill="currentColor">
+    <rect x="10" y="14" width="330" height="128" rx="6" fill="var(--panel)"
+          stroke="var(--edge)"/>
+    <text x="24" y="36" font-size="11" fill="var(--faint)">COUPE 1 &mdash; LE CLIENT (Slicer)</text>
+    <text x="24" y="56" font-size="12.5">critere : la TAILLE DU TRANSFERT</text>
+    <rect x="24" y="68" width="300" height="24" rx="3" fill="var(--sunk)"/>
+    <text x="32" y="85">cohort_6/ &mdash; 6 patients &mdash; 564 MB</text>
+    <path d="M174,96 L174,104" stroke="currentColor"/>
+    <path d="M170,104 L178,104 L174,111 z" fill="currentColor"/>
+    <rect x="24" y="112" width="196" height="22" rx="3" fill="var(--sunk)"/>
+    <text x="32" y="127">batch_01 &mdash; 4 patients</text>
+    <rect x="228" y="112" width="96" height="22" rx="3" fill="var(--sunk)"/>
+    <text x="236" y="127">batch_02 &mdash; 2</text>
+
+    <rect x="420" y="14" width="330" height="128" rx="6" fill="var(--panel)"
+          stroke="var(--edge)"/>
+    <text x="434" y="36" font-size="11" fill="var(--faint)">COUPE 2 &mdash; LE TOOL (AMASSS)</text>
+    <text x="434" y="56" font-size="12.5">critere : LA MEMOIRE DE LA CARTE</text>
+    <rect x="434" y="68" width="300" height="24" rx="3" fill="var(--sunk)"/>
+    <text x="442" y="85">1 patient &mdash; 5 structures</text>
+    <path d="M584,96 L584,104" stroke="currentColor"/>
+    <path d="M580,104 L588,104 L584,111 z" fill="currentColor"/>
+    <g>
+      <rect x="434" y="112" width="56" height="22" rx="3" fill="var(--sunk)"/>
+      <text x="442" y="127" font-size="11">MAND</text>
+      <rect x="494" y="112" width="52" height="22" rx="3" fill="var(--sunk)"/>
+      <text x="502" y="127" font-size="11">MAX</text>
+      <rect x="550" y="112" width="46" height="22" rx="3" fill="var(--sunk)"/>
+      <text x="558" y="127" font-size="11">CB</text>
+      <rect x="600" y="112" width="46" height="22" rx="3" fill="var(--sunk)"/>
+      <text x="608" y="127" font-size="11">CV</text>
+      <rect x="650" y="112" width="56" height="22" rx="3" fill="var(--sunk)"/>
+      <text x="658" y="127" font-size="11">UAW</text>
+    </g>
+    <path d="M344,78 L406,78" stroke="var(--accent)" stroke-width="1.5"/>
+    <path d="M406,74 L406,82 L414,78 z" fill="var(--accent)"/>
+    <text x="352" y="70" font-size="10.5" fill="var(--accent)">1 lot = 1 POST /run</text>
+
+    <text x="24" y="184" font-size="12.5" fill="var(--soft)">L'unite est une ENTREE DE PREMIER NIVEAU :</text>
+    <text x="24" y="204" font-size="12.5" fill="var(--soft)">un fichier, ou un dossier entier, jamais ouvert.</text>
+    <text x="24" y="224" font-size="12.5" fill="var(--soft)">Un dossier DICOM de 300 coupes compte pour UN.</text>
+    <text x="434" y="184" font-size="12.5" fill="var(--soft)">L'unite est ce sur quoi le tool BOUCLE :</text>
+    <text x="434" y="204" font-size="12.5" fill="var(--soft)">structures pour AMASSS, landmarks pour ALI_CBCT,</text>
+    <text x="434" y="224" font-size="12.5" fill="var(--soft)">dents pour ALI_IOS.</text>
+  </g>
+</svg>
+<figcaption>Coupe 1 : une histoire de reseau. Coupe 2 : une histoire de carte.
+  Elles sont independantes.</figcaption>
+</figure>
+
+<div class="note alert">
+<p><strong>Le piege, vecu.</strong> Le plafond de la coupe 2 etait compte sur
+l'axe de la coupe 1 (<code>scans</code>). Sur le cas courant &mdash; un seul
+patient &mdash; cela donnait <code>1</code>, et AMASSS demandait cinq structures
+pour s'en voir accorder une. La carte restait a 2,4&nbsp;GiB et le run durait ce
+qu'il avait toujours dure.</p>
+</div>
+
+<h2>2. Deux declarations allument le mecanisme</h2>
+
+<p>Rien de tout ceci ne s'applique a un tool qui ne le demande pas. Une capacite
+que personne n'a declaree n'est pas une capacite que le serveur peut supposer :
+ouvrir plusieurs channels dans une boucle qui partage un fichier temporaire
+corrompt ses propres sorties, en silence.</p>
+
+<table>
+<tr><th>Ce qui est declare</th><th>Ou</th><th>Effet</th></tr>
+<tr>
+  <td><code>num_workers</code> (ou <code>batch_size</code>)<br>
+      <span class="src">dans la signature de run()</span></td>
+  <td class="src">tools/AMASSS/src/sadt_amasss/__init__.py</td>
+  <td>Allume le module <code>concurrency</code>. Sans lui : aucune place
+      reservee, <code>SADT_CHANNEL_BUDGET</code> jamais pose, et
+      <code>sup.channels()</code> repond <code>1</code> <em>avant tout
+      calcul</em>.</td>
+</tr>
+<tr>
+  <td><code>width_from = "structures"</code></td>
+  <td class="src">server/deployment.toml</td>
+  <td>Dit quel argument compter. Par defaut c'est l'axe des lots
+      (<code>scans</code>), ce qui est faux des que les channels d'un tool ne
+      sont pas ses scans.</td>
+</tr>
+</table>
+
+<pre><code># server/execution/concurrency.py:145
+CHANNEL_ARGUMENTS = ("num_workers", "batch_size")
+
+# server/execution/concurrency.py:415  --  ceiling()
+argument = channel_argument(tool)
+if argument is None:
+    return 1                       # le mecanisme est inerte pour ce tool</code></pre>
+
+<p><code>num_workers</code> est dans la table <code>TECHNICAL</code> des
+conventions : le serveur le remplit et il n'est <strong>jamais</strong> rendu
+sur un panneau de clinicien.</p>
+
+<h2>3. Le budget de la machine</h2>
+
+<p>Le serveur se dimensionne a la machine, en lisant la limite cgroup avant le
+noyau &mdash; les <code>cpus:</code> et <code>memory:</code> d'un conteneur sont
+donc honores et un pod Kubernetes ne demande aucun cas particulier.</p>
+
+<pre><code># server/resources.py:292
+share = SADT_RESOURCE_SHARE          # 0.75 par defaut
+vram  = _budget_for(SADT_VRAM_BUDGET, vram_<strong>free</strong>, share)</code></pre>
+
+<div class="note">
+<p><strong>Contre ce qui est LIBRE, pas contre ce que la carte contient.</strong>
+La part existe pour laisser de la place, et elle ne peut pas liberer une memoire
+qu'un autre process a deja prise.</p>
+</div>
+
+<table>
+<tr><th>Ressource</th><th class="n">Budget</th><th>Detail</th></tr>
+<tr><td>VRAM</td><td class="n">32,0 GiB</td><td>75&nbsp;% du libre sur une carte de 48</td></tr>
+<tr><td>RAM</td><td class="n">93,8 GiB</td><td></td></tr>
+<tr><td>CPU</td><td class="n">42</td><td>part par job : 10</td></tr>
+</table>
+
+<h2>4. Le cout d'un tool : une DROITE, pas un maximum</h2>
+
+<p>C'est le coeur du sujet. Un cout n'est pas un nombre, c'est
+<code>fixe + marginal &times; largeur</code>.</p>
+
+<pre><code># server/execution/costs.py:404
+def _predict(one, marginal, widths, channels):
+    if widths &gt;= 2:                           # l'ordonnee a ete MESUREE
+        return one + marginal * (channels - 1)
+    return max(one, marginal * channels)      # un seul point : le pire des deux</code></pre>
+
+<p>La partie fixe, c'est le <strong>contexte CUDA et le modele resident</strong>,
+que tout tool GPU paie une fois. Le marginal, c'est le plan de travail de chaque
+channel supplementaire. Mesure sur deux tools de formes opposees &mdash; un
+nnUNet 3D et un UNet 2D sur rendu multi-vues, rien en commun &mdash; les deux
+sont a environ <strong>trois quarts fixes</strong>.</p>
+
+<h3>Avec un seul point, on ne peut pas separer les deux</h3>
+
+<p>Un point admet deux lectures : le pic entier est admissible comme
+<em>fixe</em>, et il est admissible comme <em>w channels de marginal</em>. Avec
+un point il n'y a rien pour trancher, donc le modele prend <strong>la pire des
+deux reponses</strong> &mdash; plat en dessous de w, proportionnel au-dessus.
+Deviner l'une des deux est la facon dont une reservation devient trop petite,
+dans un sens ou dans l'autre.</p>
+
+<h3>AMASSS, mesure sur cette machine</h3>
+
+<p>La fenetre des huit derniers runs, telle qu'elle est sur le disque :</p>
+
+<div class="scroll">
+<table>
+<tr><th class="n">largeur</th><th class="n">VRAM lue (GiB)</th>
+    <th class="n">RAM lue (GiB)</th><th class="n">coeurs</th><th></th></tr>
+<tr><td class="n">1</td><td class="n">2,41</td><td class="n">4,75</td><td class="n">1,14</td><td></td></tr>
+<tr><td class="n">1</td><td class="n">2,41</td><td class="n">4,74</td><td class="n">1,42</td><td></td></tr>
+<tr><td class="n">1</td><td class="n">2,41</td><td class="n">5,12</td><td class="n">1,41</td><td></td></tr>
+<tr><td class="n">1</td><td class="n">2,41</td><td class="n">5,09</td><td class="n">1,51</td><td></td></tr>
+<tr><td class="n">1</td><td class="n">2,41</td><td class="n">5,11</td><td class="n">1,42</td><td></td></tr>
+<tr><td class="n">1</td><td class="n">2,41</td><td class="n">10,30</td><td class="n">1,51</td><td></td></tr>
+<tr><td class="n">1</td><td class="n">2,00</td><td class="n">4,80</td><td class="n">1,41</td><td></td></tr>
+<tr><td class="n">4</td><td class="n">1,75</td><td class="n">3,43</td><td class="n">1,01</td>
+    <td class="src">le premier run large</td></tr>
+</table>
+</div>
+
+<p>Huit points, <strong>deux largeurs distinctes</strong> : l'ordonnee devient
+mesurable, et la droite ajustee est</p>
+
+<table>
+<tr><th></th><th class="n">un channel</th><th class="n">chaque channel en plus</th>
+    <th class="n">part fixe</th></tr>
+<tr><td>VRAM</td><td class="n">2,41 GiB</td><td class="n">1,53 GiB</td><td class="n">0,88 GiB (36&nbsp;%)</td></tr>
+<tr><td>RAM</td><td class="n">10,30 GiB</td><td class="n">1,14 GiB</td><td class="n">9,16 GiB (89&nbsp;%)</td></tr>
+</table>
+
+<figure>
+<svg viewBox="0 0 700 260" role="img" aria-label="La droite de cout RAM">
+  <g font-family="var(--mono)" font-size="11" fill="currentColor">
+    <line x1="70" y1="210" x2="660" y2="210" stroke="var(--edge)"/>
+    <line x1="70" y1="30" x2="70" y2="210" stroke="var(--edge)"/>
+    <text x="70" y="232" fill="var(--soft)">1</text>
+    <text x="188" y="232" fill="var(--soft)">2</text>
+    <text x="306" y="232" fill="var(--soft)">3</text>
+    <text x="424" y="232" fill="var(--soft)">4</text>
+    <text x="542" y="232" fill="var(--soft)">5</text>
+    <text x="330" y="250" fill="var(--soft)">largeur (channels)</text>
+    <text x="14" y="36" fill="var(--soft)">GiB</text>
+    <text x="30" y="214" fill="var(--soft)">0</text>
+    <text x="24" y="130" fill="var(--soft)">10</text>
+    <text x="24" y="50" fill="var(--soft)">20</text>
+
+    <rect x="70" y="137" width="590" height="73" fill="var(--sunk)" opacity=".7"/>
+    <text x="82" y="176" fill="var(--soft)" font-size="11.5">partie FIXE : 9,16 GiB &mdash; payee une seule fois</text>
+
+    <polyline points="70,128 188,118 306,109 424,100 542,91"
+              fill="none" stroke="var(--accent)" stroke-width="2"/>
+    <circle cx="70" cy="128" r="4" fill="var(--accent)"/>
+    <circle cx="424" cy="100" r="4" fill="var(--accent)"/>
+    <text x="440" y="96" fill="var(--accent)" font-size="11">mesure a 4</text>
+    <text x="82" y="148" fill="var(--accent)" font-size="11">mesure a 1</text>
+
+    <polyline points="70,128 209,30" fill="none" stroke="var(--alert)"
+              stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="226" y="46" fill="var(--alert)" font-size="11">ce que le modele supposait</text>
+    <text x="226" y="62" fill="var(--alert)" font-size="11">avec un seul point (proportionnel)</text>
+  </g>
+</svg>
+<figcaption>RAM d'AMASSS. Avec un point, le modele devait supposer le
+  proportionnel (pointille) : cinq channels auraient ete reserves a 51&nbsp;GiB.
+  Avec deux largeurs, la droite reelle donne 14,8.</figcaption>
+</figure>
+
+<div class="note warn">
+<p><strong>La droite est ensuite mise a l'echelle jusqu'a couvrir chaque run
+enregistre.</strong> Elle ne peut jamais passer sous un run qui a deja eu lieu,
+a aucune largeur de la fenetre. C'est la direction que protegeait l'ancien
+maximum par channel, et celle qui finit en out-of-memory.</p>
+</div>
+
+<h2>5. La reservation</h2>
+
+<pre><code># server/execution/admission.py:97  --  demand_for()
+cost = cost.at(channels)                        # la droite, a cette largeur
+vram = int(cost.vram_bytes * SAFETY_MARGIN)     # SAFETY_MARGIN = 1.3
+ram  = int(cost.ram_bytes  * SAFETY_MARGIN)</code></pre>
+
+<p>Pour AMASSS sur cette machine, une fois la droite connue :</p>
+
+<div class="scroll">
+<table>
+<tr><th class="n">largeur</th><th class="n">cout VRAM</th><th class="n">cout RAM</th>
+    <th class="n">reserve VRAM</th><th class="n">reserve RAM</th><th>tient ?</th></tr>
+<tr><td class="n">1</td><td class="n">2,41</td><td class="n">10,30</td>
+    <td class="n">3,13</td><td class="n">13,39</td><td>oui</td></tr>
+<tr><td class="n">2</td><td class="n">3,94</td><td class="n">11,44</td>
+    <td class="n">5,12</td><td class="n">14,87</td><td>oui</td></tr>
+<tr><td class="n">3</td><td class="n">5,47</td><td class="n">12,58</td>
+    <td class="n">7,11</td><td class="n">16,35</td><td>oui</td></tr>
+<tr><td class="n">4</td><td class="n">7,00</td><td class="n">13,71</td>
+    <td class="n">9,10</td><td class="n">17,83</td><td>oui</td></tr>
+<tr><td class="n">5</td><td class="n">8,53</td><td class="n">14,85</td>
+    <td class="n">11,09</td><td class="n">19,30</td><td>oui</td></tr>
+<tr><td class="n">8</td><td class="n">13,13</td><td class="n">18,26</td>
+    <td class="n">17,07</td><td class="n">23,74</td><td>oui</td></tr>
+</table>
+</div>
+
+<div class="note">
+<p><strong>La VRAM n'est pas la contrainte ici.</strong> A largeur 5 :
+11,1&nbsp;GiB reserves sur 32. Ce qui bornera d'abord, c'est le nombre de runs
+<em>concurrents</em> en RAM &mdash; 19,3&nbsp;GiB chacun sur 93,8, soit quatre
+runs. Le &laquo;&nbsp;3,1&nbsp;G&nbsp;&raquo; qu'affiche le dashboard est la
+reservation a largeur 1 : <code>2,41 &times; 1,3</code>.</p>
+</div>
+
+<h2>6. Est-ce que ca tient ?</h2>
+
+<pre><code># server/execution/admission.py:295  --  _would_fit()
+share = max(1, int(among))       # ce run PLUS tout ce qui attend derriere
+if demand.cpus       * share + held_cpus &gt; budget.cpus:       return False
+if demand.ram_bytes  * share + held_ram  &gt; budget.ram_bytes:  return False
+if demand.vram_bytes * share + held_vram &gt; budget.vram_bytes: return False</code></pre>
+
+<p>Deux passes, et l'ordre est la politique :</p>
+<ul>
+<li><strong>Equitable.</strong> Cette forme tiendrait-elle encore si chaque run
+deja en attente prenait la meme ? Une tete de file qui prend la forme la plus
+large qui passe laisse quarante runs derriere elle sans rien.</li>
+<li><strong>Gourmande.</strong> Si personne n'attend, la plus large qui
+tient.</li>
+</ul>
+
+<p>L'echelle descend depuis le plafond : <code>5 &rarr; 4 &rarr; 3 &rarr; 2
+&rarr; 1</code>. La premiere qui passe est celle qui est reservee, et son nombre
+de channels est ecrit dans l'environnement du fils :
+<code>SADT_CHANNELS</code> et <code>SADT_CHANNEL_BUDGET</code>.</p>
+
+<h2>7. Le tool demande &mdash; en items, jamais en octets</h2>
+
+<pre><code># tools/AMASSS/src/sadt_amasss/pipeline.py
+width = _channels_for(sup, len(models), num_workers)   # &laquo; j'ai 5 structures &raquo;
+
+# server/execution/runner.py:2134  --  _Supervisor.channels()
+room = _channel_budget()
+if room is None:
+    return _record_width(1)          # aucun serveur autour de ce run
+answer = _channels_affordable(tool, room)
+answer = min(answer, wanted, int(SADT_CHANNELS), SADT_MAX_CHANNELS)
+return max(1, answer)</code></pre>
+
+<div class="note">
+<p><strong>Le tool ne dit jamais un nombre d'octets.</strong> Il ne peut pas le
+savoir : cela depend du scan, des poids, de la version de torch. Il dit
+<em>combien de choses il a a faire</em>, et le serveur convertit avec ce que ce
+tool a <em>coute</em> aux runs precedents.</p>
+<p>Et l'argent etait deja mis de cote a l'etape 5. <code>sup.channels()</code>
+ne fait que repartir une place <strong>deja obtenue</strong> &mdash; c'est ce qui
+rend sur de repondre aussi tard : rien ne peut etre sur-engage.</p>
+</div>
+
+<div class="note warn">
+<p><strong>Le prix de ce marche, ecrit plutot que cache :</strong> un run qui
+n'ouvre qu'un channel garde sa part entiere toute sa vie. Demander cinq et n'en
+ouvrir qu'un immobilise la place des cinq.</p>
+</div>
+
+<h2>8. Le tool declare ce qu'il a VRAIMENT ouvert</h2>
+
+<p>Deux phrases differentes, et les confondre est dangereux dans un sens
+precis :</p>
+
+<table>
+<tr><th></th><th><code>sup.channels()</code></th><th><code>progress.set_width()</code></th></tr>
+<tr><td>C'est</td><td>une PERMISSION</td><td>une MESURE</td></tr>
+<tr><td>Quand</td><td>avant le travail</td><td>la ou la largeur est en vigueur</td></tr>
+<tr><td>Lu par</td><td>le tool</td><td>la table de couts</td></tr>
+</table>
+
+<pre><code># tools/AMASSS/src/sadt_amasss/pipeline.py
+progress.set_width(width)                    # autour de l'inference SEULEMENT
+with futures.ThreadPoolExecutor(max_workers=width) as pool:
+    ...                                      # 1 structure = 1 modele resident
+progress.set_width(None)                     # les phases serielles ne declarent rien</code></pre>
+
+<p>Le serveur garde la largeur <strong>la plus etroite</strong> qu'on lui a
+dite, et divise le pic du run par elle. Un enregistrement <em>sans</em> largeur
+est <strong>ignore</strong>, pas lu comme 1 &mdash; c'est ce qui permet a un tool
+de declarer la largeur de la phase qui en a une, et de se taire pendant les
+phases serielles autour.</p>
+
+<p>AMASSS lit sa cohorte en serie, predit ses structures de front, puis assemble
+en serie. Declarer la permission pendant les phases serielles mettrait une
+largeur elevee en vigueur la ou le pic se produit, et enseignerait un cout par
+channel trop bas : la direction qui finit en out-of-memory.</p>
+
+<h2>9. La boucle</h2>
+
+<figure>
+<svg viewBox="0 0 700 180" role="img" aria-label="La boucle de retroaction">
+  <g font-family="var(--mono)" font-size="11.5" fill="currentColor">
+    <rect x="20" y="60" width="130" height="46" rx="5" fill="var(--panel)" stroke="var(--edge)"/>
+    <text x="38" y="81">la table</text><text x="38" y="97">dit le cout</text>
+    <rect x="200" y="60" width="130" height="46" rx="5" fill="var(--panel)" stroke="var(--edge)"/>
+    <text x="218" y="81">admission</text><text x="218" y="97">reserve</text>
+    <rect x="380" y="60" width="130" height="46" rx="5" fill="var(--panel)" stroke="var(--edge)"/>
+    <text x="398" y="81">le tool ouvre</text><text x="398" y="97">et declare</text>
+    <rect x="550" y="60" width="130" height="46" rx="5" fill="var(--panel)" stroke="var(--edge)"/>
+    <text x="568" y="81">le pic est</text><text x="568" y="97">mesure</text>
+    <path d="M152,83 L188,83" stroke="var(--accent)" stroke-width="1.5"/><path d="M188,79 L188,87 L196,83 z" fill="var(--accent)"/>
+    <path d="M332,83 L368,83" stroke="var(--accent)" stroke-width="1.5"/><path d="M368,79 L368,87 L376,83 z" fill="var(--accent)"/>
+    <path d="M512,83 L538,83" stroke="var(--accent)" stroke-width="1.5"/><path d="M538,79 L538,87 L546,83 z" fill="var(--accent)"/>
+    <path d="M615,110 L615,140 L85,140 L85,117" fill="none" stroke="var(--accent)"
+          stroke-width="1.5"/>
+    <path d="M81,117 L89,117 L85,109 z" fill="var(--accent)"/>
+    <text x="300" y="158" fill="var(--accent)">divise par la largeur DECLAREE</text>
+  </g>
+</svg>
+<figcaption>Rien n'est declare a la main : le cout d'un tool est ce que ses
+  propres runs ont coute.</figcaption>
+</figure>
+
+<p>Consequence pratique : <strong>le premier run large est sur-reserve</strong>,
+parce que la table n'a qu'une colonne de points et doit supposer le
+proportionnel. Apres lui, l'ajustement a deux largeurs et la reservation devient
+juste. C'est exactement ce que montre la fenetre d'AMASSS ci-dessus.</p>
+
+<h2>10. Deux pieges que les octets ne portent pas</h2>
+
+<div class="note alert">
+<p><strong>Zero a deux sens opposes.</strong> Un tool mesure a
+<code>vram = 0</code> ne coute rien a la carte et peut la partager avec
+n'importe quoi. Un tool dont <em>toutes</em> les lectures ont ete refusees
+&mdash; parce qu'elles venaient de runs contendus &mdash; ne sait
+<strong>rien</strong>, et reserver zero pour lui empilerait des runs sur une
+carte que le serveur croit vide. Les octets ne portent pas cette difference ;
+le drapeau <code>vram_known</code> si, et un tool inconnu tourne seul jusqu'a ce
+qu'une lecture soit crue.</p>
+</div>
+
+<div class="note alert">
+<p><strong>Une lecture de carte venue d'un run contendu est refusee.</strong> Sur
+un pilote qui ne repond rien a <code>--query-compute-apps</code>, le seul
+chiffre disponible est la croissance de la carte entiere &mdash; ce qui compte
+l'allocation de chaque voisin comme si elle appartenait a ce run. Le refus est
+ecrit comme <code>null</code>, et la fenetre <em>oublie par ressource</em> pour
+que vingt refus ne chassent pas vingt mesures.</p>
+</div>
+
+<h2>Ou est chaque decision</h2>
+
+<table>
+<tr><th>Decision</th><th>Fichier</th></tr>
+<tr><td>Decouper la cohorte en lots</td>
+    <td class="src">ServerToolsCore/ServerToolsCoreLib/slicer_io.py:206</td></tr>
+<tr><td>Combien de lots en vol</td>
+    <td class="src">ServerToolsCore/ServerToolsCoreLib/config.py:39</td></tr>
+<tr><td>Le mecanisme est-il allume</td>
+    <td class="src">server/execution/concurrency.py:145</td></tr>
+<tr><td>Quel argument compter</td>
+    <td class="src">server/execution/concurrency.py:310 &middot; server/deployment.toml</td></tr>
+<tr><td>Le plafond de l'echelle</td>
+    <td class="src">server/execution/concurrency.py:415</td></tr>
+<tr><td>La droite de cout</td>
+    <td class="src">server/execution/costs.py:404 (_predict) &middot; :429 (_fit)</td></tr>
+<tr><td>Ce qui est reserve</td>
+    <td class="src">server/execution/admission.py:97</td></tr>
+<tr><td>Est-ce que ca tient</td>
+    <td class="src">server/execution/admission.py:295</td></tr>
+<tr><td>Ce que le tool obtient</td>
+    <td class="src">server/execution/runner.py:2134</td></tr>
+<tr><td>Le budget de la machine</td>
+    <td class="src">server/resources.py:292</td></tr>
+</table>
+
+<p class="src" style="margin-top:32px">Les commentaires de
+<code>concurrency.py</code> et la docstring de <code>channels()</code> font
+autorite : ils sont plus longs que le code et disent le pourquoi de chaque
+borne.</p>
+
+</div>
+</html>
