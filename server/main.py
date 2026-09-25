@@ -610,6 +610,27 @@ def list_tool_data(tool_name: str) -> dict:
     # two things a name cannot say -- whether an entry is one file or a whole
     # folder, and how many bytes picking it costs, now that the client
     # downloads what a user picks rather than naming it to the server.
+    # One list per SCOPE, beside the tool's own. A tool serving several
+    # modalities -- AREG registers CBCT volumes, intraoral surfaces, and one
+    # onto the other -- has one folder of test data per modality, and an
+    # argument that draws from one of them must not be offered the others: the
+    # CBCT baseline picker was listing intraoral meshes. Additive, so a client
+    # that reads only the two flat lists behaves exactly as before.
+    scopes = sorted({
+        spec.selectable_scope for spec in tool.arguments.values()
+        if getattr(spec, "selectable_scope", None)
+    })
+    scoped = {
+        scope: {
+            "models": data_store.list_models(slug, scope),
+            "testfiles": data_store.list_testfiles(slug, scope),
+            "entries": {
+                "models": data_store.describe(slug, "models", scope),
+                "testfiles": data_store.describe(slug, "testfiles", scope),
+            },
+        }
+        for scope in scopes
+    }
     return {
         "models": data_store.list_models(slug),
         "testfiles": data_store.list_testfiles(slug),
@@ -617,6 +638,7 @@ def list_tool_data(tool_name: str) -> dict:
             "models": data_store.describe(slug, "models"),
             "testfiles": data_store.describe(slug, "testfiles"),
         },
+        **({"scoped": scoped} if scoped else {}),
     }
 
 
@@ -1930,7 +1952,19 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         try:
             # Not tool.name: the packaged tools are lowercase while the data
             # staged under DATA/ is not, so deployment.toml maps the two.
-            resolved = resolver(deployment_config.data_slug(tool.name), filename)
+            # The scope travels with the ARGUMENT, never with the name the
+            # client sent: the name stays bare, so the traversal defence in
+            # data_store._resolve is untouched.
+            scope = getattr(spec, "selectable_scope", None) or ""
+            # Passed only when there IS one: a DataStore is an extension point
+            # (see the abstract base), and a backend written before scopes
+            # existed must keep serving a deployment that uses none. One that
+            # is handed a scope it cannot honour fails loudly here rather than
+            # quietly serving the wrong folder.
+            resolved = resolver(
+                deployment_config.data_slug(tool.name), filename,
+                *( (scope,) if scope else () ),
+            )
         except DataNotFoundError as exc:
             if work_dir:
                 shutil.rmtree(work_dir, ignore_errors=True)

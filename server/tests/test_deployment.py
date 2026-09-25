@@ -115,6 +115,50 @@ def test_server_selectable_reaches_the_published_schema(make_tool_folder):
     assert tool.arguments["scan"].server_selectable == "testfile"
 
 
+def test_a_scoped_selectable_reaches_the_schema_as_kind_plus_folder(make_tool_folder):
+    """`"testfile:CBCT"` is two facts: what the argument picks, and WHERE from.
+
+    A tool serving several modalities keeps one folder of test data per
+    modality, and an argument drawing from one of them must not be offered the
+    others -- AREG's CBCT baseline picker was listing intraoral meshes.
+    """
+    folder = make_tool_folder(
+        "scoped", arguments={"t1": {"type": "path", "required": True}}
+    )
+    config = DeploymentConfig(
+        {"scoped": ToolDeployment(server_selectable={"t1": "testfile"},
+                                  selectable_scopes={"t1": "CBCT"})}
+    )
+
+    tool = schema_tool.load_tool(folder, config)
+
+    assert tool.arguments["t1"].server_selectable == "testfile"
+    assert tool.arguments["t1"].selectable_scope == "CBCT"
+
+
+def test_a_scope_that_is_a_path_is_refused(tmp_path):
+    """One level, no separators: the scope is joined under DATA/<tool>/<kind>/
+    and a deployment that could write a path there would be writing a
+    traversal into the configuration."""
+    path = _write(tmp_path, """
+[tools.x]
+server_selectable = { t1 = "testfile:../../etc" }
+""")
+    with pytest.raises(deployment.DeploymentConfigError, match="plain folder name"):
+        deployment.load(path)
+
+
+def test_opting_out_and_scoping_at_once_is_refused(tmp_path):
+    """"none" means this argument offers nothing hosted. A scope says where to
+    offer it from. Asking for both says nothing coherent."""
+    path = _write(tmp_path, """
+[tools.x]
+server_selectable = { t1 = "none:CBCT" }
+""")
+    with pytest.raises(deployment.DeploymentConfigError, match="One or the other"):
+        deployment.load(path)
+
+
 def test_a_tool_with_no_entry_gets_the_conventions(make_tool_folder):
     """Adding a tool must need no edit to this repository, so an empty
     deployment.toml is the normal case rather than a lapse."""
