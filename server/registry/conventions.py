@@ -47,7 +47,7 @@ TECHNICAL = frozenset(
         "n_workers",
         "batch_size",
         "threads",
-        "search_seconds",
+        "search_steps",
         "seed",
         "max_triplets",
         "surface_smoothing",
