@@ -33,35 +33,47 @@ data_dir = "AREG"
 # The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
 # this each looks for DATA/<its own name>/ and falls back to the run-together
 # spelling (ALICBCT), which was never going to exist.
-# ALI_CBCT searches a scan's landmarks in parallel PROCESSES, and two is as
-# wide as this deployment lets it go.
+# ALI_CBCT searches a scan's landmarks in parallel PROCESSES, and the width is
+# no longer capped here: the two things that used to make a wide run worse have
+# both been fixed in the engine, and the ceiling was a workaround for them.
 #
-# Measured on the reference scan's 119 landmarks, real bundle, RTX 6000 Ada:
+# Measured on the reference scan's 119 landmarks, real bundle, RTX 6000 Ada,
+# card otherwise idle. Every width places the same 114 landmarks, and every
+# coordinate is identical to width 1 to the last bit (max |delta| = 0.0 mm):
 #
-#   width  budget   search   found   card       card busy
-#       1    15 s   353.8 s     114   0.78 GiB        24 %
-#       2    15 s   210.1 s     114   1.55 GiB        76 %
-#       4    15 s   169.1 s     113   3.10 GiB        74 %
-#       4    60 s   192.3 s     115   3.10 GiB        72 %
+#   width   before    after     card
+#       1   358.7 s        -   1.4 GiB
+#       4   191.4 s  141.3 s   3.7 GiB
+#       8   425.1 s  128.0 s   6.8 GiB
+#      12   456.5 s  127.3 s   9.7 GiB
 #
-# Two is free: 1.68x for a byte-identical markups file, on a card that goes
-# from a quarter busy to three quarters. Four is faster still but drops C4 --
-# the landmark this codebase already documents as the one that leaves the field
-# of view and respawns -- because `search_seconds` is a per-agent WALL CLOCK
-# and four agents time-slicing one card each run slower than one does. Raising
-# the budget to 60 s restores it, which is the fix, but the budget is the
-# CALLER's argument and a deployment must not silently redefine it.
+# "before" is the honest shape of the trap: past four agents a wider run was
+# SLOWER THAN NO PARALLELISM AT ALL, and nothing in the report said so -- it
+# finished, it placed every landmark, it just took longer. The volume lives in
+# host memory, so every step crops and rescales it on the CPU: 0.9 ms of
+# arithmetic that enters torch's intra-op pool and occupies about ten cores
+# doing it. Twelve workers asked 42 cores for 120. `torch.set_num_threads(1)`
+# in each worker, on the card only, is the whole fix.
 #
-# Threads were tried first and refused: the same widths were SLOWER at every
-# step (23.6 s -> 37.3 s on eight landmarks) and lost 32 of 119, because an
-# agent's step is microseconds of kernel around a lot of Python and the GIL
-# serialises the walk. Processes do not share a GIL, which is the whole
-# difference -- and the reason this is capped at two rather than refused.
+# **The budget is counted in STEPS now, not seconds, and that is what let the
+# cap go.** A wall clock made the bound depend on how busy the machine was, so
+# four agents sharing one card dropped C4 -- reported as "did not converge",
+# which a clinician cannot tell from a landmark genuinely outside the field of
+# view. A step is a forward pass and means the same thing at any width.
 #
-# Raise it to 4 the day `search_seconds` scales with the width inside the
-# engine. Not before: a clinician cannot tell "this scan is hard" from "this
-# run was too wide", and that confusion is exactly what the run report exists
-# to prevent.
+# **After eight, it is flat**: 8 -> 12 buys 0.7 s for 3 GiB more card. Nothing
+# enforces that, deliberately. A cap inside the tool would not shrink what
+# admission RESERVED -- that is decided before anyone can ask -- so it would
+# trade real speed for no real room, and it would put a number that cannot see
+# the machine back inside the tool. The card's own budget is what bounds this.
+#
+# Threads were tried first and refused, twice, and the reason first written
+# here was wrong: an agent's step is not "microseconds of kernel around a lot
+# of Python". Measured inside it -- 15.50 ms a step, of which the forward pass
+# is 15.16 (97.8 %), the batch preparation 0.28 and the argmax 0.06. The GIL
+# is held for essentially all of it, inside torch's own dispatch, which is why
+# a thread pool came out at x1.04. Processes do not share a GIL; that is the
+# whole difference, and it is worth 2.80x.
 [tools.ALI_CBCT]
 data_dir = "ALI"
 # Its channels are the LANDMARKS searched within one scan, not the scans -- so
