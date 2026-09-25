@@ -666,9 +666,18 @@ def _remove_path(path: str) -> None:
 # clinician actually has.
 @app.api_route("/tools/{tool_name}/testfiles/{filename}", methods=["GET", "HEAD"],
                dependencies=[Depends(verify_token)])
-async def download_testfile(tool_name: str, filename: str, background_tasks: BackgroundTasks):
+async def download_testfile(tool_name: str, filename: str,
+                            background_tasks: BackgroundTasks, scope: str = ""):
     """Stream one of the tool's hosted test files, so a user can fill an input
     with reference data. The valid names are what GET /tools/{name}/data lists.
+
+    `scope` names the subfolder the name was listed under, for a tool whose
+    deployment scopes an argument's hosted files. It has to be said, not
+    guessed: a name is bare and two scopes may legitimately hold the same one.
+    Omitted, the tool's own folder is read, which is every unscoped
+    deployment. A run resolves the same name through the ARGUMENT it was sent
+    for, and this route had to learn the same trick -- without it the picker
+    listed a file it could not then download.
 
     Only test files are downloadable. Models are deliberately NOT: they are
     selected by name and used in place (see ArgSpec.server_selectable).
@@ -683,7 +692,10 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     try:
-        resolved = data_store.resolve_testfile(deployment_config.data_slug(tool.name), filename)
+        resolved = data_store.resolve_testfile(
+            deployment_config.data_slug(tool.name), filename,
+            *((scope,) if scope else ()),
+        )
     except DataNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
