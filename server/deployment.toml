@@ -19,9 +19,53 @@
 # selected by name answers 404 for a folder that was never going to exist.
 [tools.AREG_CBCT]
 data_dir = "AREG"
+# `t1_masks` is the clinician's OWN segmentations of their own patients. The
+# convention reads a file argument as "offer what the server hosts for this
+# tool too", which put a dropdown of AREG's reference test files in front of a
+# field where picking one would register a patient against somebody else's
+# masks. Nothing on this server is a plausible answer here, so the field stops
+# offering any.
+# And `segmentation_model` opts out too, for the reason [tools.ASO] gives
+# below about its own: the convention fills an unnamed model argument with
+# DATA/<tool>/models/ -- the FOLDER -- and AREG passed that straight to AMASSS,
+# which answered "No nnUNet model found in 'models'". The folder is not a
+# bundle. Left empty, the tool resolves the AMASSS bundle itself
+# (dispatch._own_segmentation), which is the one answer there was ever going
+# to be.
+# One folder per ARGUMENT, not per modality. Scoped to the modality, the
+# picker still offered whole cohorts -- `<name>/{T1,T2}/` -- so the baseline
+# field listed entries holding the follow-up too, and the intraoral field
+# listed entries holding a CBCT. The per-argument folders are hardlinked views
+# of the same cohorts (`cp -al`), so they cost directory entries and no data.
+#
+# `t1`/`t2` draw from DATA/AREG/testfiles/CBCT_T1|CBCT_T2 only. This tool registers
+# volumes; the intraoral cohorts staged beside them for the other two engines
+# cannot be a baseline, and offering them put a folder of `.vtk` one click away
+# from a CBCT picker.
+server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:CBCT_T1", t2 = "testfile:CBCT_T2" }
 
 [tools.AREG_IOS]
 data_dir = "AREG"
+# The intraoral cohorts, for the same reason AREG_CBCT takes only the CBCT ones.
+# `crown_model` opts out here too: a name has to mean ONE thing across the
+# engines the AREG facade composes, and IOSCBCT having opted its own out is
+# what made the facade refuse to publish at all.
+#
+# The three remaining model arguments opt out for the reason AREG_CBCT gives
+# about its own `segmentation_model`: the convention fills an unnamed model
+# argument with DATA/<tool>/models/ -- the FOLDER, which holds every AREG bundle
+# together, around sixty checkpoints. This engine then died on "'models' holds
+# several checkpoints: 'registration_model' has to name an entry holding exactly
+# one", AFTER it had segmented and oriented both timepoints, so the failure cost
+# the whole prediction. Left genuinely empty, the tool resolves `AREG_model` and
+# `IOS_Gold_files` itself (dispatch._own_bundle) and ALI_IOS resolves the
+# mucogingival bundle, as it does every other landmark bundle in this family.
+#
+# `ios_reference`, not `reference`: AREG_CBCT publishes a `reference` that IS a
+# clinical choice -- Frankfurt or Occlusal -- and keeps its dropdown. Opting out
+# under the shared name would have changed what that name means between two
+# engines of one facade, which is what the note above is about.
+server_selectable = { t1 = "testfile:IOS_T1", t2 = "testfile:IOS_T2", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none" }
 
 # Orchestrates four tools and computes almost nothing itself; see the rule in
 # deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
@@ -29,6 +73,16 @@ data_dir = "AREG"
 # global default applies while the chain is still being measured.
 [tools.AREG_IOSCBCT]
 data_dir = "AREG"
+# Its cohorts hold BOTH modalities -- a patient's intraoral scans and their
+# CBCT, which is the pairing this engine registers -- so all four inputs draw
+# from the one folder staged for it.
+# The four model arguments opt OUT of the hosted-model convention, which fills
+# an unnamed one with DATA/<tool>/models/ -- the FOLDER, which is not a bundle
+# and is what AMASSS refused with "No nnUNet model found in 'models'". Left
+# genuinely empty, each callee resolves its own weights (Crown_Seg, ALI_IOS and
+# ALI_CBCT all can), and the orientation reference is resolved by this engine,
+# there being one frame the rest of the chain expects.
+server_selectable = { ios = "testfile:IOSCBCT_IOS", cbct = "testfile:IOSCBCT_CBCT", ios_landmarks = "testfile:IOSCBCT_IOS_LM", cbct_landmarks = "testfile:IOSCBCT_CBCT_LM", crown_model = "none", ios_landmark_model = "none", landmark_model = "none", cbct_reference = "none" }
 
 # The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
 # this each looks for DATA/<its own name>/ and falls back to the run-together
@@ -99,7 +153,13 @@ width_from = false
 # schema is composed from the three at startup, so changing one of them changes
 # what this offers, with nothing to keep in sync.
 [tools.AREG]
-dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "CBCT to IOS" = "AREG_IOSCBCT" }
+# "IOS to CBCT", and not the reverse: that is the wording the published
+# extension puts in front of clinicians -- AREG.ui's own CbInputType offers
+# "CBCT to CBCT", "IOS to IOS", "IOS to CBCT" -- and it is also the direction
+# of the operation, an intraoral surface being moved onto a CBCT. The mode
+# name travels on the wire, so a saved request holding the old spelling has
+# to be re-made; nothing else reads it.
+dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "IOS to CBCT" = "AREG_IOSCBCT" }
 
 [tools.ASO]
 # `landmark_model` is no longer a bundle this tool HOSTS. It names the weights
