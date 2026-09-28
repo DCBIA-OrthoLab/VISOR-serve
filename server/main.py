@@ -213,7 +213,17 @@ def _expected_extensions(tool, field_name: str) -> Optional[tuple]:
     # only: Surg_Mov_Pred could not be sent its own .csv.
     if spec.accepts is None and PATH_TYPE in spec.types:
         return (_ACCEPT_ALL_EXTENSIONS,)
-    return spec.extensions
+    declared = spec.extensions
+    if declared and PATH_TYPE in spec.types and ".zip" not in declared:
+        # A path argument may be given a FOLDER, and a folder reaches the
+        # server as a .zip it unpacks -- `_is_folder_upload` a few lines down
+        # says exactly that. What a tool declares is what it READS, not how a
+        # directory travels: a cohort of `.vtk` sent as one archive was refused
+        # for not being a `.vtk`, which is the transport answering for the
+        # content. Adding ".zip" to every tool's declaration would be restating
+        # the same transport in each of them.
+        return tuple(declared) + (".zip",)
+    return declared
 
 
 def _matched_extension(filename: str, expected: Optional[tuple]) -> Optional[str]:

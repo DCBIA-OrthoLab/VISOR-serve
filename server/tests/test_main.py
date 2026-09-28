@@ -363,6 +363,50 @@ def test_run_tool_rejects_wrong_extension_for_specific_file_type(monkeypatch):
     assert response.status_code == 400
 
 
+def test_a_declared_path_argument_still_takes_a_zipped_folder(monkeypatch):
+    """What a tool declares is what it READS, not how a directory travels.
+
+    AREG_IOSCBCT says its intraoral argument takes `.vtk`/`.stl`; a hosted test
+    cohort is a FOLDER, and a folder reaches the server as one `.zip` it
+    unpacks. Checked against the declaration alone, that archive was refused --
+    "Unsupported file extension for 'ios'. Allowed: ('.stl', '.vtk')" -- which
+    is the transport answering for the content.
+    """
+    import base
+    import registry
+
+    class MeshOnlyTestTool(base.Tool):
+        name = "mesh_only_test_tool"
+        arguments = {
+            "meshes": base.ArgSpec(type="path", required=True,
+                                   accepts=(".vtk", ".stl")),
+        }
+        output_kind = "text"
+
+        def run(self, meshes: str) -> str:
+            return "unused"
+
+    monkeypatch.setitem(registry.TOOLS, "mesh_only_test_tool", MeshOnlyTestTool())
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("P001_T2_L.vtk", "# vtk DataFile Version 3.0\n")
+    zipped = client.post(
+        "/run/mesh_only_test_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"meshes": ("cohort.zip", buffer.getvalue(), "application/zip")},
+    )
+    wrong = client.post(
+        "/run/mesh_only_test_tool",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"meshes": ("scan.nii.gz", b"x", "application/octet-stream")},
+    )
+
+    assert zipped.status_code != 400, zipped.text
+    assert wrong.status_code == 400, "what the tool cannot read is still refused"
+    assert ".vtk" in wrong.json()["detail"]
+
+
 def test_tools_reports_every_declared_type():
     """GET /tools keeps a single-string "type" for older clients and adds
     "types" with the full list, so a client can filter its file picker."""
