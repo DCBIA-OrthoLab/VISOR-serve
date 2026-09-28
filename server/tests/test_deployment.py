@@ -408,3 +408,31 @@ def test_server_ctl_looks_for_the_marker_this_module_writes():
     found = re.search(r'_CONFIG_AHEAD_MARKER = "([^"]+)"', source)
     assert found, "server_ctl.py no longer names the marker"
     assert found.group(1) == deployment.CONFIG_AHEAD_MARKER
+
+
+# ----------------------------------------------------------------------
+# The shipped file, read as it will be read in production
+
+
+def test_the_shipped_file_counts_amasss_channels_from_its_structures():
+    """Its channels are the STRUCTURES predicted within one scan, not the
+    scans -- the same shape as ALI_CBCT's landmarks.
+
+    Without the line the ladder is bounded by the batch axis, `scans`, which
+    on the ordinary single-patient run is ONE: the tool asked for five
+    structures and was answered one, the card stayed at 2.4 GiB, and the run
+    took as long as it always had while leaving the GPU idle most of its own
+    length.
+    """
+    import os
+
+    try:  # tomllib is standard from 3.11; the server targets the newest Python
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - 3.10 and below
+        import tomli as tomllib
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(here, "deployment.toml"), "rb") as handle:
+        shipped = tomllib.load(handle)
+
+    assert shipped["tools"]["AMASSS"]["width_from"] == "structures"
