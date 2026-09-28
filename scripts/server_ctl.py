@@ -506,6 +506,75 @@ def clone_status(check_remote: bool = False, want_branch=None) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# What a remote is offering, and what it would cost to take it
+# ---------------------------------------------------------------------------
+
+# A pull delivers SOURCE. It cannot deliver a dependency, because the
+# virtualenvs a tool runs in are built into the image and are never touched by
+# git -- `docker-compose.dev.yml` mounts `src/` and deliberately leaves the
+# `.venv` beside it alone. So a change to any of these paths means the image's
+# environments can no longer satisfy the source that would land next to them,
+# and pulling it would produce a deployment that is broken in a way no log line
+# explains: a tool importing a package that is not installed.
+#
+# Refusing is the whole point. "Updated, and every run of that tool now fails"
+# is worse than "not updated, and here is why".
+_NEEDS_IMAGE_SUFFIXES = ("/pyproject.toml", "/uv.lock")
+_NEEDS_IMAGE_EXACT = ("pyproject.toml", "uv.lock")
+_NEEDS_IMAGE_PREFIXES = ("docker/", "server/requirements")
+
+
+def remote_head(ref: str, remote: str = "origin", timeout: int = 60):
+    """The sha at the tip of `ref` on the remote, fetching nothing.
+
+    `git ls-remote` rather than the GitHub API on purpose. The API allows 60
+    unauthenticated requests an hour, which caps polling at once a minute and
+    would need a token on every clinic machine; `ls-remote` speaks the git
+    protocol, has no such quota, and measured 0.21-0.56 s against the real
+    remotes. It also works for any git host, which the API does not.
+
+    Returns None rather than raising: a poll that cannot reach the network is
+    "nothing new to say", not an error worth stopping a loop over.
+    """
+    rc, out, _err = _git(["ls-remote", remote, f"refs/heads/{ref}"], timeout=timeout)
+    if rc != 0 or not out:
+        return None
+    return out.split()[0]
+
+
+def changed_paths(old: str, new: str) -> list:
+    """Every path that differs between two commits, as git reports them.
+
+    Both must be present locally, so this runs after a fetch and before a
+    pull -- which is exactly the window in which the decision below has to be
+    made.
+    """
+    rc, out, _err = _git(["diff", "--name-only", f"{old}..{new}"])
+    if rc != 0:
+        return []
+    return [line for line in out.splitlines() if line.strip()]
+
+
+def needs_image(paths) -> list:
+    """The changed paths a pull cannot deliver, or [] when a pull is enough.
+
+    Returned rather than answered yes/no so the refusal can NAME what it is
+    refusing over. "An image is needed" sends someone reading a diff; "an image
+    is needed because tools/AMASSS/uv.lock changed" sends them to the commit.
+    """
+    blockers = []
+    for entry in paths:
+        path = entry.strip()
+        if (
+            path in _NEEDS_IMAGE_EXACT
+            or path.endswith(_NEEDS_IMAGE_SUFFIXES)
+            or path.startswith(_NEEDS_IMAGE_PREFIXES)
+        ):
+            blockers.append(path)
+    return blockers
+
+
+# ---------------------------------------------------------------------------
 # The container
 # ---------------------------------------------------------------------------
 
@@ -749,6 +818,159 @@ def catalog() -> dict:
 # Subcommands
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# The update gate
+# ---------------------------------------------------------------------------
+
+# How long the server is asked to hold the door for at a time. It reopens by
+# itself after this, so the number is a DEADMAN and not a plan: the updater
+# renews it while it works, and an updater that is killed leaves a clinic
+# waiting this long rather than until somebody notices.
+GATE_LEASE_SECONDS = 60
+
+# How often the drain asks whether the server has gone idle. The Slicer
+# dashboard already polls at two seconds, so this adds nothing a running server
+# does not field anyway.
+DRAIN_POLL_SECONDS = 2
+
+# A run nothing has said anything about for this long is one whose client
+# vanished; the server's own reaper owns it and the drain must not sit behind
+# it. Mirrors RUN_TTL_SECONDS in server/config.py -- if that moves, this is the
+# other half that has to move with it.
+GHOST_AFTER_SECONDS = 900
+
+# States in which a run is still going to want the machine. From
+# runs._STATE_OF_PHASE: received/staging/queued_gpu are "pending", and
+# running/packaging are "running". done, failed, cancelled and paused are not
+# here, and paused is the interesting absence -- see `wait_until_idle`.
+BUSY_STATES = ("pending", "running")
+
+
+def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0):
+    """One JSON request to the server, or None if it could not be made.
+
+    None is deliberately not distinguished from an error: every caller below
+    treats "I could not ask" and "the answer was no" the same way, which is to
+    not proceed with an update. Raising here would only move that decision.
+    """
+    request = urllib.request.Request(
+        f"{url.rstrip('/')}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if payload is not None:
+        request.data = json.dumps(payload).encode("utf-8")
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            # An older server, with no gate. The updater and the server ship in
+            # the same pull, so the FIRST run of a new updater always talks to
+            # an old server -- this is the expected case once, not a fault.
+            return {"unsupported": True}
+        return None
+    except Exception:  # noqa: BLE001 - a probe answers None, it never raises
+        return None
+
+
+def set_accepting(url: str, token: str, accepting: bool,
+                  seconds: int = GATE_LEASE_SECONDS, reason: str = ""):
+    """Open or close the server's door. Returns its answer, or None."""
+    return _api(url, token, "/maintenance",
+                {"accepting": accepting, "seconds": seconds, "reason": reason})
+
+
+def server_load(url: str, token: str):
+    """What is still holding the machine, or None if the server did not answer.
+
+    Three sources, because no one of them is complete:
+
+    * `admission.running` and `waiting` miss a run that is still STAGING its
+      inputs -- the reservation is taken after the upload is written to disk,
+      so a cohort being streamed reads as zero;
+    * `runs` misses a run sent without an `X-Run-Id`, which creates no run
+      directory at all (curl, the test suite and the benchmarks do this);
+    * so both are read, and the union is what has to go quiet.
+    """
+    status = _api(url, token, "/status")
+    if not status or status.get("unsupported"):
+        return None
+    admission = status.get("admission") or {}
+    now = time.time()
+    busy = []
+    for run in status.get("runs") or []:
+        if run.get("state") not in BUSY_STATES:
+            continue
+        updated = run.get("updated_at") or 0
+        if updated and now - updated > GHOST_AFTER_SECONDS:
+            # The client went away; the server's reaper owns this one.
+            continue
+        busy.append(run)
+    return {
+        "running": admission.get("running", 0),
+        "waiting": admission.get("waiting", 0),
+        "busy": busy,
+        "paused": [r for r in (status.get("runs") or []) if r.get("state") == "paused"],
+        "accepting": (status.get("maintenance") or {}).get("accepting", True),
+    }
+
+
+def _describe(busy) -> str:
+    return ", ".join(
+        f"{run.get('tool') or 'a run'} ({run.get('phase') or run.get('state')})"
+        for run in busy[:4]
+    ) or "an unnamed run"
+
+
+def wait_until_idle(url: str, token: str, timeout=None) -> bool:
+    """Wait, with the door OPEN, until nothing is left running. True if it went.
+
+    The door stays open for this, and that is the sequencing the whole design
+    turns on. Closing it first and then waiting would refuse clinicians for the
+    length of a cohort; waiting first means the door is shut only for the
+    restart, which is seconds.
+
+    **A paused run does not block.** It holds no reservation, no thread and no
+    subprocess -- it is a record on disk plus a staged cohort, and a restart
+    that keeps TEMP_DIR keeps both. Waiting for one would mean waiting up to
+    its four-hour idle timeout for a clinician who may have gone home, and the
+    only thing that would end that wait is the reaper deleting the very work
+    the wait was protecting.
+
+    `timeout=None` waits for as long as it takes, which is the honest default:
+    a cohort legitimately runs for hours, and no update is worth interrupting
+    one.
+    """
+    started = time.monotonic()
+    announced = None
+    while True:
+        load = server_load(url, token)
+        if load is None:
+            log("The server did not answer; not updating while its state is unknown.")
+            return False
+        if not load["busy"] and not load["running"] and not load["waiting"]:
+            if announced is not None:
+                log("The server is idle.")
+            return True
+
+        busy = load["busy"] or []
+        summary = _describe(busy) if busy else f"{load['running']} run(s) admitted"
+        if summary != announced:
+            # Only when it CHANGES: a silent wait gets killed just before it
+            # would have worked, and a line every two seconds for an hour is
+            # the same thing with more noise.
+            waiting_for = f", {load['waiting']} queued" if load["waiting"] else ""
+            log(f"Waiting for {summary}{waiting_for}.")
+            announced = summary
+
+        if timeout is not None and time.monotonic() - started >= timeout:
+            log(f"Still busy after {timeout}s. Leaving this server alone; "
+                f"the next poll will try again.")
+            return False
+        time.sleep(DRAIN_POLL_SECONDS)
+
+
 def cmd_status(args) -> dict:
     url = args.url or url_for()
     service = pick_service(args.device)
@@ -958,6 +1180,126 @@ def cmd_update(args) -> dict:
     return result
 
 
+def cmd_watch(args) -> dict:
+    """Follow a branch, and apply what lands on it without dropping a run.
+
+    The loop, once every `--poll` seconds:
+
+        git ls-remote          ~0.3 s, no quota, nothing fetched
+          -> same sha?         sleep
+          -> new sha:          fetch, classify the diff, drain, pull, restart
+
+    **It runs on the host, and it has to.** The container is given only
+    `server/`; the deployment's `.git` is not in it, so the thing that pulls
+    code is necessarily outside the thing that serves it -- which is also what
+    lets this survive the restart it causes.
+
+    **It never interrupts a run.** `wait_until_idle` waits with the door OPEN
+    for as long as the work takes, and the door is shut only for the restart.
+    A run that outlasts `--drain-timeout` does not get killed; this server is
+    left alone and the next poll tries again.
+
+    **It refuses what a pull cannot deliver.** A change to a lockfile or to
+    `requirements.txt` means the virtualenvs baked into the image can no longer
+    satisfy the source a pull would land next to them. That is reported and not
+    applied: "not updated, and here is the path that needs an image" beats
+    "updated, and every run of that tool now fails".
+
+    And because tier one is exactly the case where no dependency moved,
+    `docker compose restart` is the right restart -- it keeps TEMP_DIR, and
+    with it every paused run's staged cohort, every parked result a client has
+    not collected and every upload in flight. `up -d --force-recreate`, which
+    `update` uses, destroys all three.
+    """
+    branch = args.branch or _upstream().split("/")[-1]
+    url = args.url or url_for()
+    service = pick_service(args.device)
+    token = read_env().get("API_TOKEN")
+    if not token:
+        raise ServerCtlError(
+            "No API_TOKEN in the .env, so this cannot ask the server to stop taking "
+            "work before it restarts it. Run 'up' first, or set one."
+        )
+
+    log(f"Watching {branch} every {args.poll}s. The server is at {url}.")
+    applied, refused = [], []
+    while True:
+        outcome = _watch_once(branch, url, service, token, args)
+        if outcome.get("applied"):
+            applied.append(outcome["applied"])
+        if outcome.get("needs_image"):
+            refused.append(outcome["needs_image"])
+        if args.once:
+            return {
+                "branch": branch, "applied": applied, "refused": refused,
+                "head": outcome.get("head"),
+            }
+        time.sleep(args.poll)
+
+
+def _watch_once(branch: str, url: str, service: str, token: str, args) -> dict:
+    """One poll. Separated so `--once` and the loop are the same code path."""
+    remote = remote_head(branch)
+    if remote is None:
+        log(f"Could not reach the remote for {branch}; will try again.")
+        return {}
+
+    _rc, local, _err = _git(["rev-parse", "HEAD"])
+    if local == remote:
+        return {"head": local}
+
+    log(f"{branch} is at {remote[:9]}; this clone is at {(local or '?')[:9]}. Fetching.")
+    rc, _out, err = _git(["fetch", "--quiet", "origin", branch], timeout=300)
+    if rc != 0:
+        log(f"Could not fetch {branch}: {err or 'git refused'}")
+        return {}
+
+    blockers = needs_image(changed_paths(local, remote))
+    if blockers:
+        # Said once per sha, not once per poll: a refusal repeated every 30
+        # seconds is a log nobody reads.
+        if remote != getattr(args, "_last_refused", None):
+            log(f"{remote[:9]} changes {', '.join(blockers[:4])}, which a pull cannot "
+                f"deliver -- the virtualenvs live in the image. Not updating. "
+                f"Build and publish an image for this one.")
+            args._last_refused = remote
+        return {"head": local, "needs_image": {"sha": remote, "paths": blockers}}
+
+    if not wait_until_idle(url, token, args.drain_timeout):
+        return {"head": local}
+
+    # Shut the door only now. Everything above happened with it open.
+    gate = set_accepting(url, token, False, GATE_LEASE_SECONDS, f"updating to {remote[:9]}")
+    if gate is None:
+        log("The server would not take the maintenance request; not updating.")
+        return {"head": local}
+    if gate.get("unsupported"):
+        log("This server has no maintenance endpoint (it predates it). Updating "
+            "without the gate -- a run started in the next second will be lost.")
+
+    try:
+        again = server_load(url, token)
+        if again and (again["busy"] or again["running"] or again["waiting"]):
+            log("A run arrived while the door was closing; leaving this one for later.")
+            return {"head": local}
+
+        rc, _out, err = _git(["pull", "--ff-only", "origin", branch], timeout=300)
+        if rc != 0:
+            log(f"'git pull --ff-only' failed: {err or 'the branch has diverged'}. "
+                f"Resolve it by hand in the clone.")
+            return {"head": local}
+
+        log(f"Pulled {remote[:9]}. Restarting {service}.")
+        _stream(compose_base(service) + ["restart", service], cwd=REPO_ROOT, prefix="  ")
+        wait_for_health(url, args.timeout, service)
+        return {"head": remote, "applied": {"sha": remote, "branch": branch}}
+    finally:
+        # On every path out, including the ones above that return early. The
+        # lease is the backstop for this process being killed, not for it
+        # taking a branch it forgot to clean up after.
+        set_accepting(url, token, True)
+
+
 def cmd_down(args) -> dict:
     service = pick_service(args.device)
     # No port argument: stopping never binds anything, so the conflict check
@@ -1155,6 +1497,26 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--force", action="store_true", help="Recreate even when nothing changed.")
     update.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
     update.set_defaults(func=cmd_update, printer=None)
+
+    watch = subparsers.add_parser(
+        "watch",
+        help="Follow a branch and apply what lands on it, without dropping a run.",
+    )
+    add_common(watch)
+    watch.add_argument("--poll", type=int, default=30,
+                       help="Seconds between remote checks. Each one is a "
+                            "'git ls-remote', about 0.3s, and consumes no API quota.")
+    watch.add_argument("--drain-timeout", type=int, default=None,
+                       help="Give up waiting for a busy server after this many seconds "
+                            "and retry at the next poll. The default waits for as long "
+                            "as the work takes: a cohort legitimately runs for hours, "
+                            "and no update is worth interrupting one.")
+    watch.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT,
+                       help="Seconds to wait for /health after a restart.")
+    watch.add_argument("--once", action="store_true",
+                       help="Check once and exit, instead of looping. What a timer "
+                            "or a cron entry calls, and what the tests drive.")
+    watch.set_defaults(func=cmd_watch, printer=None)
 
     down = subparsers.add_parser("down", help="Stop the server container.")
     add_common(down, with_url=False)
