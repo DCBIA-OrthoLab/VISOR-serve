@@ -50,7 +50,22 @@ data_dir = "AREG"
 # `crown_model` opts out here too: a name has to mean ONE thing across the
 # engines the AREG facade composes, and IOSCBCT having opted its own out is
 # what made the facade refuse to publish at all.
-server_selectable = { t1 = "testfile:IOS_T1", t2 = "testfile:IOS_T2", crown_model = "none" }
+#
+# The three remaining model arguments opt out for the reason AREG_CBCT gives
+# about its own `segmentation_model`: the convention fills an unnamed model
+# argument with DATA/<tool>/models/ -- the FOLDER, which holds every AREG bundle
+# together, around sixty checkpoints. This engine then died on "'models' holds
+# several checkpoints: 'registration_model' has to name an entry holding exactly
+# one", AFTER it had segmented and oriented both timepoints, so the failure cost
+# the whole prediction. Left genuinely empty, the tool resolves `AREG_model` and
+# `IOS_Gold_files` itself (dispatch._own_bundle) and ALI_IOS resolves the
+# mucogingival bundle, as it does every other landmark bundle in this family.
+#
+# `ios_reference`, not `reference`: AREG_CBCT publishes a `reference` that IS a
+# clinical choice -- Frankfurt or Occlusal -- and keeps its dropdown. Opting out
+# under the shared name would have changed what that name means between two
+# engines of one facade, which is what the note above is about.
+server_selectable = { t1 = "testfile:IOS_T1", t2 = "testfile:IOS_T2", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none" }
 
 # Orchestrates four tools and computes almost nothing itself; see the rule in
 # deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
