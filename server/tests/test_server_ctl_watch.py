@@ -301,3 +301,59 @@ def test_the_door_is_reopened_even_when_the_pull_fails(monkeypatch):
     ctl._watch_once("deploy", "http://x", "inference", "token", _Args())
 
     assert reopened == [False, True], "the door must be reopened on the failure path too"
+
+
+# ---------------------------------------------------------------------------
+# Whether this deployment follows its branch at all
+# ---------------------------------------------------------------------------
+
+def test_a_deployment_follows_nothing_unless_it_was_told_to(monkeypatch):
+    """The default is off, and that is a safety property rather than a
+    convenience one: a machine holding patient imaging must not begin executing
+    code from the internet because somebody installed a timer."""
+    monkeypatch.delenv("SADT_AUTO_UPDATE", raising=False)
+    monkeypatch.setattr(ctl, "read_env", lambda *a, **k: {})
+    assert ctl.auto_update_mode() == ctl.AUTO_UPDATE_OFF
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("apply", ctl.AUTO_UPDATE_APPLY),
+    ("NOTIFY", ctl.AUTO_UPDATE_NOTIFY),
+    ("  off  ", ctl.AUTO_UPDATE_OFF),
+])
+def test_the_mode_is_read_from_the_environment(monkeypatch, raw, expected):
+    monkeypatch.setenv("SADT_AUTO_UPDATE", raw)
+    assert ctl.auto_update_mode() == expected
+
+
+def test_a_value_nobody_recognises_is_treated_as_off(monkeypatch):
+    """The safe direction. A typo must not be read as consent to self-update."""
+    monkeypatch.setenv("SADT_AUTO_UPDATE", "yes")
+    monkeypatch.setattr(ctl, "read_env", lambda *a, **k: {})
+    assert ctl.auto_update_mode() == ctl.AUTO_UPDATE_OFF
+
+
+def test_off_asks_the_remote_nothing_at_all(monkeypatch):
+    """Inert means inert: no network, no git, no server. A unit installed on
+    every machine and switched off costs that machine nothing."""
+    monkeypatch.setattr(ctl, "remote_head", lambda *a, **k: pytest.fail("it polled"))
+    monkeypatch.setattr(ctl, "_git", lambda *a, **k: pytest.fail("it ran git"))
+
+    args = _Args()
+    args.mode = ctl.AUTO_UPDATE_OFF
+    assert ctl.cmd_watch(args)["mode"] == ctl.AUTO_UPDATE_OFF
+
+
+def test_notify_classifies_but_never_touches_the_clone(monkeypatch):
+    """What a site runs while it decides whether to trust the mechanism: it
+    reports exactly what it would have done, and does none of it."""
+    git = _Git(local="aaaaaaa", changed=["server/main.py"])
+    monkeypatch.setattr(ctl, "_git", git)
+    monkeypatch.setattr(ctl, "remote_head", lambda *a, **k: "bbbbbbb")
+    monkeypatch.setattr(ctl, "wait_until_idle", lambda *a, **k: pytest.fail(
+        "notify must not drain a server"))
+
+    outcome = ctl._watch_once("deploy", "http://x", "inference", "t", _Args(), apply=False)
+
+    assert outcome["would_apply"]["sha"] == "bbbbbbb"
+    assert not git.pulled

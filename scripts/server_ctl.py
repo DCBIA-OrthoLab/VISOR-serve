@@ -822,6 +822,37 @@ def catalog() -> dict:
 # The update gate
 # ---------------------------------------------------------------------------
 
+# Whether this deployment follows its branch at all, and how far it goes.
+#
+#   off     the default, and deliberately so. A machine holding patient
+#           imaging does not start executing code from the internet because
+#           somebody installed a timer; turning this on is a decision taken
+#           per deployment, by whoever is accountable for that machine.
+#   notify  poll and say what would happen. What a site runs while it decides
+#           whether to trust the mechanism.
+#   apply   drain, pull and restart.
+#
+# Read from the environment first so a systemd unit or a container can set it
+# without editing a file, then from the .env `up` already writes and `update`
+# already preserves line by line.
+AUTO_UPDATE_OFF = "off"
+AUTO_UPDATE_NOTIFY = "notify"
+AUTO_UPDATE_APPLY = "apply"
+AUTO_UPDATE_MODES = (AUTO_UPDATE_OFF, AUTO_UPDATE_NOTIFY, AUTO_UPDATE_APPLY)
+
+
+def auto_update_mode() -> str:
+    """`off` / `notify` / `apply`, from the environment or the .env."""
+    raw = os.environ.get("SADT_AUTO_UPDATE") or read_env().get("SADT_AUTO_UPDATE") or ""
+    mode = raw.strip().lower()
+    if mode not in AUTO_UPDATE_MODES:
+        if mode:
+            log(f"SADT_AUTO_UPDATE is '{raw}', which is not one of "
+                f"{', '.join(AUTO_UPDATE_MODES)}. Treating it as '{AUTO_UPDATE_OFF}'.")
+        return AUTO_UPDATE_OFF
+    return mode
+
+
 # How long the server is asked to hold the door for at a time. It reopens by
 # itself after this, so the number is a DEADMAN and not a plan: the updater
 # renews it while it works, and an updater that is killed leaves a clinic
@@ -1211,9 +1242,24 @@ def cmd_watch(args) -> dict:
     not collected and every upload in flight. `up -d --force-recreate`, which
     `update` uses, destroys all three.
     """
+    mode = args.mode or auto_update_mode()
+    if mode == AUTO_UPDATE_OFF:
+        # Not an error. A unit installed on every machine and inert until a
+        # site turns it on is the shape this is meant to have, so the quiet
+        # exit is the normal path, not a failure to report.
+        log("SADT_AUTO_UPDATE is 'off'; this deployment does not follow its branch.")
+        return {"mode": AUTO_UPDATE_OFF, "applied": [], "refused": []}
+
     branch = args.branch or _upstream().split("/")[-1]
     url = args.url or url_for()
-    service = pick_service(args.device)
+    # `pick_service` answers `inference` or `inference-cpu`, which is what the
+    # rest of this file drives -- and .env.example says plainly that
+    # `inference-venvs` "is the real deployment" and that "neither of the two
+    # below is managed by server_ctl.py". Restarting the wrong container is a
+    # silent no-op: the update lands on disk, the server never reloads, and
+    # every report says it worked. So the service is nameable, and the default
+    # stays what every other command here already assumes.
+    service = args.service or pick_service(args.device)
     token = read_env().get("API_TOKEN")
     if not token:
         raise ServerCtlError(
@@ -1221,24 +1267,32 @@ def cmd_watch(args) -> dict:
             "work before it restarts it. Run 'up' first, or set one."
         )
 
-    log(f"Watching {branch} every {args.poll}s. The server is at {url}.")
+    log(f"Watching {branch} every {args.poll}s in '{mode}' mode. "
+        f"The server is at {url}.")
     applied, refused = [], []
     while True:
-        outcome = _watch_once(branch, url, service, token, args)
+        outcome = _watch_once(branch, url, service, token, args, apply=mode == AUTO_UPDATE_APPLY)
         if outcome.get("applied"):
             applied.append(outcome["applied"])
         if outcome.get("needs_image"):
             refused.append(outcome["needs_image"])
         if args.once:
             return {
-                "branch": branch, "applied": applied, "refused": refused,
-                "head": outcome.get("head"),
+                "mode": mode, "branch": branch, "applied": applied,
+                "refused": refused, "head": outcome.get("head"),
             }
         time.sleep(args.poll)
 
 
-def _watch_once(branch: str, url: str, service: str, token: str, args) -> dict:
-    """One poll. Separated so `--once` and the loop are the same code path."""
+def _watch_once(branch: str, url: str, service: str, token: str, args,
+                apply: bool = True) -> dict:
+    """One poll. Separated so `--once` and the loop are the same code path.
+
+    `apply=False` is `notify` mode: everything up to and including the
+    classification happens, and nothing is drained, pulled or restarted. That
+    is where the reporting is, so a site evaluating the mechanism sees exactly
+    what it would have done.
+    """
     remote = remote_head(branch)
     if remote is None:
         log(f"Could not reach the remote for {branch}; will try again.")
@@ -1264,6 +1318,11 @@ def _watch_once(branch: str, url: str, service: str, token: str, args) -> dict:
                 f"Build and publish an image for this one.")
             args._last_refused = remote
         return {"head": local, "needs_image": {"sha": remote, "paths": blockers}}
+
+    if not apply:
+        log(f"{remote[:9]} is a source-only change and would be applied now. "
+            f"SADT_AUTO_UPDATE is 'notify', so nothing was.")
+        return {"head": local, "would_apply": {"sha": remote, "branch": branch}}
 
     if not wait_until_idle(url, token, args.drain_timeout):
         return {"head": local}
@@ -1513,6 +1572,14 @@ def build_parser() -> argparse.ArgumentParser:
                             "and no update is worth interrupting one.")
     watch.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT,
                        help="Seconds to wait for /health after a restart.")
+    watch.add_argument("--service", default=None,
+                       help="Which compose service to restart once a pull lands. "
+                            "Default: the same one 'up' and 'update' drive. Name "
+                            "'inference-venvs' if that is what this deployment runs.")
+    watch.add_argument("--mode", choices=AUTO_UPDATE_MODES, default=None,
+                       help="Override SADT_AUTO_UPDATE for this invocation. "
+                            "Default: whatever the environment or the .env says, "
+                            "and 'off' when neither says anything.")
     watch.add_argument("--once", action="store_true",
                        help="Check once and exit, instead of looping. What a timer "
                             "or a cron entry calls, and what the tests drive.")
