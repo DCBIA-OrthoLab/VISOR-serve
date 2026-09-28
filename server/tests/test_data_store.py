@@ -108,3 +108,52 @@ def test_describe_of_a_tool_with_no_data_is_empty(tmp_path):
     store = LocalDataStore(str(tmp_path))
     assert store.describe("Absent", "testfiles") == []
     assert store.describe("Absent", "models") == []
+
+
+# ---------------------------------------------------------------------------
+# Scoped hosted files: one folder per modality, one argument drawing from one
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def scoped(tmp_path):
+    """`testfiles/{CBCT,IOS}/`, the shape a tool serving two modalities needs.
+
+    AREG registers CBCT volumes, intraoral surfaces, and one onto the other.
+    Flat, its whole catalogue was offered to every argument: the CBCT baseline
+    picker listed the intraoral meshes, which cannot be a baseline.
+    """
+    root = tmp_path / "AREG" / "testfiles"
+    (root / "CBCT").mkdir(parents=True)
+    (root / "IOS").mkdir(parents=True)
+    (root / "CBCT" / "CBCT_FullyAuto").mkdir()
+    (root / "IOS" / "IOS_test_scans").mkdir()
+    # An entry left at the top level: a deployment mid-migration still works.
+    (root / "loose_set").mkdir()
+    return LocalDataStore(str(tmp_path))
+
+
+def test_a_scope_lists_only_its_own_folder(scoped):
+    assert scoped.list_testfiles("AREG", "CBCT") == ["CBCT_FullyAuto"]
+    assert scoped.list_testfiles("AREG", "IOS") == ["IOS_test_scans"]
+
+
+def test_no_scope_still_lists_the_folder_itself(scoped):
+    """Unscoped arguments, and every existing deployment, are unchanged."""
+    assert scoped.list_testfiles("AREG") == ["CBCT", "IOS", "loose_set"]
+
+
+def test_a_name_resolves_inside_its_scope(scoped):
+    resolved = scoped.resolve_testfile("AREG", "CBCT_FullyAuto", "CBCT")
+    assert resolved.path.endswith(os.path.join("testfiles", "CBCT", "CBCT_FullyAuto"))
+
+
+def test_a_name_from_another_scope_is_not_found(scoped):
+    """The whole point: what one argument may pick, another may not."""
+    with pytest.raises(DataNotFoundError):
+        scoped.resolve_testfile("AREG", "IOS_test_scans", "CBCT")
+
+
+def test_a_scope_cannot_be_escaped_by_the_name(scoped):
+    """The scope comes from deployment.toml and the name from the request, so
+    the name is the attacker-controlled half and stays bare."""
+    with pytest.raises(DataNotFoundError):
+        scoped.resolve_testfile("AREG", "../IOS/IOS_test_scans", "CBCT")

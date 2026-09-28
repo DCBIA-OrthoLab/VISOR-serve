@@ -169,6 +169,12 @@ class ArgSpec:
     # option (main.py rejects uploads for non-file arguments). run() receives a
     # local path either way.
     server_selectable: Optional[str] = None
+    # The SUBFOLDER of DATA/<tool>/<kind>/ this argument draws from, when a
+    # deployment scopes it (`server_selectable = { t1 = "testfile:CBCT" }`).
+    # Published so the client can offer this argument its own list instead of
+    # the tool's whole catalogue -- AREG's CBCT baseline picker was listing the
+    # intraoral meshes, which cannot be a baseline.
+    selectable_scope: Optional[str] = None
 
     # Required by "choice"/"multichoice", forbidden elsewhere: the available
     # options, each mapped to whether it is on by default. One declaration

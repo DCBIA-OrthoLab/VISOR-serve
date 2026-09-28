@@ -383,6 +383,9 @@ def test_a_schema_tool_is_published_in_the_shape_the_client_reads(make_tool_fold
         # By convention: a path argument that is not a model may be filled from
         # DATA/<tool>/testfiles/, and can still be uploaded.
         "server_selectable": "testfile",
+        # Unscoped: this deployment does not point the argument at a subfolder
+        # of DATA/<tool>/testfiles/, so it reads the whole folder as before.
+        "selectable_scope": None,
         "choices": None,
         "initial": None,
         # null, so the client falls back to ALLOWED_EXTENSIONS: the schema

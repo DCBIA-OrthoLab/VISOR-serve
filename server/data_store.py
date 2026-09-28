@@ -67,15 +67,23 @@ def _size_on_disk(path: str):
 class DataStore(ABC):
     """Read-only access to server-side models and test files, per tool."""
 
+    # `scope` is a SUBFOLDER of the tool's own folder, or "" for the folder
+    # itself. It exists because one tool can serve several modalities -- AREG
+    # registers CBCT volumes, intraoral surfaces, and one onto the other -- and
+    # a single flat list offered every argument every cohort: the CBCT
+    # baseline picker listed the intraoral meshes, which cannot be a baseline.
+    # A deployment says which subfolder an argument draws from
+    # (`server_selectable = { t1 = "testfile:CBCT" }`); the names inside stay
+    # BARE, so the traversal defence in `_resolve` is untouched.
     @abstractmethod
-    def list_models(self, tool_name: str) -> list:
+    def list_models(self, tool_name: str, scope: str = "") -> list:
         ...
 
     @abstractmethod
-    def list_testfiles(self, tool_name: str) -> list:
+    def list_testfiles(self, tool_name: str, scope: str = "") -> list:
         ...
 
-    def describe(self, tool_name: str, kind: str) -> list:
+    def describe(self, tool_name: str, kind: str, scope: str = "") -> list:
         """`[{"name", "kind", "size"}]` for one of "models"/"testfiles".
 
         A name alone cannot say whether an entry is one scan or a cohort of
@@ -89,15 +97,15 @@ class DataStore(ABC):
         than guessing.
         """
         return [{"name": name, "kind": None, "size": None}
-                for name in (self.list_models(tool_name) if kind == "models"
-                             else self.list_testfiles(tool_name))]
+                for name in (self.list_models(tool_name, scope) if kind == "models"
+                             else self.list_testfiles(tool_name, scope))]
 
     @abstractmethod
-    def resolve_model(self, tool_name: str, filename: str) -> ResolvedFile:
+    def resolve_model(self, tool_name: str, filename: str, scope: str = "") -> ResolvedFile:
         ...
 
     @abstractmethod
-    def resolve_testfile(self, tool_name: str, filename: str) -> ResolvedFile:
+    def resolve_testfile(self, tool_name: str, filename: str, scope: str = "") -> ResolvedFile:
         ...
 
 
@@ -115,22 +123,22 @@ class LocalDataStore(DataStore):
     def __init__(self, root: str):
         self._root = root
 
-    def list_models(self, tool_name: str) -> list:
-        return self._list(tool_name, "models")
+    def list_models(self, tool_name: str, scope: str = "") -> list:
+        return self._list(tool_name, "models", scope)
 
-    def list_testfiles(self, tool_name: str) -> list:
-        return self._list(tool_name, "testfiles")
+    def list_testfiles(self, tool_name: str, scope: str = "") -> list:
+        return self._list(tool_name, "testfiles", scope)
 
-    def resolve_model(self, tool_name: str, filename: str) -> ResolvedFile:
-        return ResolvedFile(path=self._resolve(tool_name, "models", filename))
+    def resolve_model(self, tool_name: str, filename: str, scope: str = "") -> ResolvedFile:
+        return ResolvedFile(path=self._resolve(tool_name, "models", filename, scope))
 
-    def resolve_testfile(self, tool_name: str, filename: str) -> ResolvedFile:
-        return ResolvedFile(path=self._resolve(tool_name, "testfiles", filename))
+    def resolve_testfile(self, tool_name: str, filename: str, scope: str = "") -> ResolvedFile:
+        return ResolvedFile(path=self._resolve(tool_name, "testfiles", filename, scope))
 
-    def describe(self, tool_name: str, kind: str) -> list:
-        directory = os.path.join(self._root, tool_name, kind)
+    def describe(self, tool_name: str, kind: str, scope: str = "") -> list:
+        directory = self._directory(tool_name, kind, scope)
         described = []
-        for name in self._list(tool_name, kind):
+        for name in self._list(tool_name, kind, scope):
             path = os.path.join(directory, name)
             described.append({
                 "name": name,
@@ -139,8 +147,21 @@ class LocalDataStore(DataStore):
             })
         return described
 
-    def _list(self, tool_name: str, kind: str) -> list:
-        directory = os.path.join(self._root, tool_name, kind)
+    def _directory(self, tool_name: str, kind: str, scope: str = "") -> str:
+        """`DATA/<tool>/<kind>/[<scope>]`.
+
+        The scope comes from deployment.toml, never from a request, so it is
+        not attacker-controlled -- but it is still joined and not interpolated,
+        and `_resolve` below re-checks containment of the final path either
+        way.
+        """
+        parts = [self._root, tool_name, kind]
+        if scope:
+            parts.append(scope)
+        return os.path.join(*parts)
+
+    def _list(self, tool_name: str, kind: str, scope: str = "") -> list:
+        directory = self._directory(tool_name, kind, scope)
         if not os.path.isdir(directory):
             return []
         return sorted(
@@ -149,13 +170,13 @@ class LocalDataStore(DataStore):
             if not entry.startswith(".") and entry not in self._IGNORED_NAMES
         )
 
-    def _resolve(self, tool_name: str, kind: str, filename: str) -> str:
+    def _resolve(self, tool_name: str, kind: str, filename: str, scope: str = "") -> str:
         # First line of defense: filename must be a bare name, not a path
         # (rejects "../../etc/passwd" style traversal before touching disk).
         if not filename or os.path.basename(filename) != filename:
             raise DataNotFoundError(f"Invalid file name: '{filename}'")
 
-        directory = os.path.realpath(os.path.join(self._root, tool_name, kind))
+        directory = os.path.realpath(self._directory(tool_name, kind, scope))
         candidate = os.path.realpath(os.path.join(directory, filename))
 
         # Second line of defense: a bare name could still resolve outside

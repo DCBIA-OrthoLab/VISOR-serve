@@ -213,7 +213,17 @@ def _expected_extensions(tool, field_name: str) -> Optional[tuple]:
     # only: Surg_Mov_Pred could not be sent its own .csv.
     if spec.accepts is None and PATH_TYPE in spec.types:
         return (_ACCEPT_ALL_EXTENSIONS,)
-    return spec.extensions
+    declared = spec.extensions
+    if declared and PATH_TYPE in spec.types and ".zip" not in declared:
+        # A path argument may be given a FOLDER, and a folder reaches the
+        # server as a .zip it unpacks -- `_is_folder_upload` a few lines down
+        # says exactly that. What a tool declares is what it READS, not how a
+        # directory travels: a cohort of `.vtk` sent as one archive was refused
+        # for not being a `.vtk`, which is the transport answering for the
+        # content. Adding ".zip" to every tool's declaration would be restating
+        # the same transport in each of them.
+        return tuple(declared) + (".zip",)
+    return declared
 
 
 def _matched_extension(filename: str, expected: Optional[tuple]) -> Optional[str]:
@@ -507,6 +517,12 @@ def list_tools() -> list:
                     "required": spec.required,
                     "description": spec.description,
                     "server_selectable": spec.server_selectable,
+                    # Which subfolder of the tool's hosted files this argument
+                    # draws from, when a deployment scoped it. The client picks
+                    # its list out of `scoped` with this; without it published,
+                    # the scoped lists are sent and nobody can tell which is
+                    # whose.
+                    "selectable_scope": spec.selectable_scope,
                     # For "choice"/"multichoice": the options to render, each
                     # with its initial state. null for every other type.
                     "choices": spec.choices,
@@ -610,6 +626,27 @@ def list_tool_data(tool_name: str) -> dict:
     # two things a name cannot say -- whether an entry is one file or a whole
     # folder, and how many bytes picking it costs, now that the client
     # downloads what a user picks rather than naming it to the server.
+    # One list per SCOPE, beside the tool's own. A tool serving several
+    # modalities -- AREG registers CBCT volumes, intraoral surfaces, and one
+    # onto the other -- has one folder of test data per modality, and an
+    # argument that draws from one of them must not be offered the others: the
+    # CBCT baseline picker was listing intraoral meshes. Additive, so a client
+    # that reads only the two flat lists behaves exactly as before.
+    scopes = sorted({
+        spec.selectable_scope for spec in tool.arguments.values()
+        if getattr(spec, "selectable_scope", None)
+    })
+    scoped = {
+        scope: {
+            "models": data_store.list_models(slug, scope),
+            "testfiles": data_store.list_testfiles(slug, scope),
+            "entries": {
+                "models": data_store.describe(slug, "models", scope),
+                "testfiles": data_store.describe(slug, "testfiles", scope),
+            },
+        }
+        for scope in scopes
+    }
     return {
         "models": data_store.list_models(slug),
         "testfiles": data_store.list_testfiles(slug),
@@ -617,6 +654,7 @@ def list_tool_data(tool_name: str) -> dict:
             "models": data_store.describe(slug, "models"),
             "testfiles": data_store.describe(slug, "testfiles"),
         },
+        **({"scoped": scoped} if scoped else {}),
     }
 
 
@@ -638,9 +676,18 @@ def _remove_path(path: str) -> None:
 # clinician actually has.
 @app.api_route("/tools/{tool_name}/testfiles/{filename}", methods=["GET", "HEAD"],
                dependencies=[Depends(verify_token)])
-async def download_testfile(tool_name: str, filename: str, background_tasks: BackgroundTasks):
+async def download_testfile(tool_name: str, filename: str,
+                            background_tasks: BackgroundTasks, scope: str = ""):
     """Stream one of the tool's hosted test files, so a user can fill an input
     with reference data. The valid names are what GET /tools/{name}/data lists.
+
+    `scope` names the subfolder the name was listed under, for a tool whose
+    deployment scopes an argument's hosted files. It has to be said, not
+    guessed: a name is bare and two scopes may legitimately hold the same one.
+    Omitted, the tool's own folder is read, which is every unscoped
+    deployment. A run resolves the same name through the ARGUMENT it was sent
+    for, and this route had to learn the same trick -- without it the picker
+    listed a file it could not then download.
 
     Only test files are downloadable. Models are deliberately NOT: they are
     selected by name and used in place (see ArgSpec.server_selectable).
@@ -655,7 +702,10 @@ async def download_testfile(tool_name: str, filename: str, background_tasks: Bac
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
     try:
-        resolved = data_store.resolve_testfile(deployment_config.data_slug(tool.name), filename)
+        resolved = data_store.resolve_testfile(
+            deployment_config.data_slug(tool.name), filename,
+            *((scope,) if scope else ()),
+        )
     except DataNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
@@ -1930,7 +1980,19 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         try:
             # Not tool.name: the packaged tools are lowercase while the data
             # staged under DATA/ is not, so deployment.toml maps the two.
-            resolved = resolver(deployment_config.data_slug(tool.name), filename)
+            # The scope travels with the ARGUMENT, never with the name the
+            # client sent: the name stays bare, so the traversal defence in
+            # data_store._resolve is untouched.
+            scope = getattr(spec, "selectable_scope", None) or ""
+            # Passed only when there IS one: a DataStore is an extension point
+            # (see the abstract base), and a backend written before scopes
+            # existed must keep serving a deployment that uses none. One that
+            # is handed a scope it cannot honour fails loudly here rather than
+            # quietly serving the wrong folder.
+            resolved = resolver(
+                deployment_config.data_slug(tool.name), filename,
+                *( (scope,) if scope else () ),
+            )
         except DataNotFoundError as exc:
             if work_dir:
                 shutil.rmtree(work_dir, ignore_errors=True)
