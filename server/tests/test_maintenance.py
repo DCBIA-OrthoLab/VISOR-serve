@@ -126,7 +126,7 @@ def test_a_transfer_already_under_way_is_not_cut_off():
 
 
 def test_a_shut_door_refuses_every_way_of_starting_a_run():
-    """A resume IS a run, and so is a rewind, and so is a benchmark battery.
+    """A resume IS a run, and so is a rewind.
 
     This is the hole the first draft of the gate had. It matched paths by
     prefix, and `"/run/"` does not match `/runs/{id}/resume` -- so a paused
@@ -139,7 +139,6 @@ def test_a_shut_door_refuses_every_way_of_starting_a_run():
 
     assert client.post("/runs/whatever/resume", headers=AUTH, json={}).status_code == 503
     assert client.post("/runs/whatever/rewind", headers=AUTH, json={}).status_code == 503
-    assert client.post("/benchmark/run", headers=AUTH, json={}).status_code == 503
 
 
 def test_every_endpoint_that_starts_work_is_gated():
@@ -158,6 +157,9 @@ def test_every_endpoint_that_starts_work_is_gated():
     # something a client needs to FINISH work it already started, or the
     # control that opens the door again.
     ALLOWED_OPEN = {"/maintenance"}
+    # This is also what catches a route that does not exist yet. A benchmark
+    # battery is a run too, and the day `POST /benchmark/run` lands it arrives
+    # here ungated and fails this test until somebody decides.
 
     open_routes = {
         route.path
