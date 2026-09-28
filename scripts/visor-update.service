@@ -1,0 +1,52 @@
+# Follows the deployment branch and applies what lands on it, without ever
+# interrupting a run. Install it, then decide per machine whether it acts:
+#
+#     cp scripts/visor-update.service ~/.config/systemd/user/
+#     # edit WorkingDirectory below to point at this clone
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now visor-update
+#     loginctl enable-linger "$USER"      # so it starts before anyone logs in
+#
+# It does NOTHING until SADT_AUTO_UPDATE says otherwise, which is the point:
+# a unit installed on every machine and inert until a site turns it on is safer
+# than one that has to be remembered. Set it in this deployment's .env, beside
+# the API token:
+#
+#     off      the default. The unit starts, says so, and exits.
+#     notify   poll and report what would happen. What to run while deciding
+#              whether to trust the mechanism.
+#     apply    drain, pull, restart.
+#
+# It runs on the HOST and not in the container, and it has to: the container is
+# given only `server/`, so the deployment's .git is not in it. Running outside
+# is also what lets this survive the restart it causes.
+#
+# A word about what this executes. It pulls code from a public repository and
+# runs it on a machine that holds patient imaging. Following a deployment
+# branch rather than `main` narrows WHAT ships; it does not change WHO can ship
+# it, and no commit in these repositories is signed today. Turning this to
+# `apply` is a decision about that, taken by whoever is accountable for the
+# machine.
+
+[Unit]
+Description=VISOR deployment updater (follows the deployment branch)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/code/VISOR-serve
+ExecStart=/usr/bin/env python3 scripts/server_ctl.py watch --branch deploy --poll 30
+
+# The updater restarts the server it watches, so it must not be brought down
+# with it, and it must come back if it falls over.
+Restart=always
+RestartSec=30
+
+# Nothing here is urgent, and a poll every thirty seconds must never compete
+# with an inference for the machine.
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

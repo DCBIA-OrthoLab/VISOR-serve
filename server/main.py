@@ -39,7 +39,7 @@ from registry import facade
 from registry.facade import FacadeTool
 import file_utils
 import resources
-from wire import runs, transfer
+from wire import maintenance, runs, transfer
 from base import (
     FILE_TYPES,
     FOLDER_TYPE,
@@ -485,6 +485,12 @@ def server_status() -> dict:
             "max_parallel_jobs": allocation.max_parallel_jobs,
         },
         "admission": budget.snapshot(),
+        # Whether this server is taking new work, and for how long it is not.
+        # The updater polls this to know its own request landed; an operator
+        # reads it to tell "an update is in progress" from "something shut this
+        # and went away" -- the second being a countdown that keeps running
+        # without the server ever restarting.
+        "maintenance": maintenance.snapshot(),
         "card": {"free_bytes": free_vram, "total_bytes": total_vram},
         "runs": runs.active(),
         "costs": {
@@ -499,6 +505,47 @@ def server_status() -> dict:
             for name, cost in learned.items() if cost
         },
     }
+
+
+class _Maintenance(BaseModel):
+    accepting: bool
+    # Ignored when reopening. Clamped by `maintenance.MAX_CLOSE_SECONDS`, and
+    # the response says what was actually granted rather than what was asked.
+    seconds: Optional[float] = None
+    reason: str = ""
+
+
+@app.post("/maintenance", dependencies=[Depends(verify_token)])
+def set_maintenance(wanted: _Maintenance) -> dict:
+    """Close or reopen this server to new work.
+
+    Called by the updater, which runs on the HOST and not in this container --
+    the container has only `server/` bind-mounted and cannot see the
+    deployment's `.git`, so the thing that pulls code is necessarily outside,
+    and this is how it reaches in.
+
+    **It closes for a bounded time and cannot shut this server for good.** An
+    updater that dies between closing the door and restarting the process would
+    otherwise leave a clinic with a server that answers `/health` and refuses
+    every run until a human notices. See `wire/maintenance.py` for the two
+    independent ways back.
+
+    The expected sequence holds the door for well under a second: the updater
+    waits for `admission.running == 0` with the door OPEN, closes it, re-reads
+    `/status` to confirm nothing slipped in, pulls, and lets the restart clear
+    the flag. What is held is the restart, not the drain.
+    """
+    if not wanted.accepting:
+        granted = maintenance.close(
+            wanted.seconds if wanted.seconds is not None else 60.0, wanted.reason
+        )
+        logger.info(
+            "Not accepting new work for %.0fs (%s)", granted, wanted.reason or "no reason given"
+        )
+    else:
+        maintenance.reopen()
+        logger.info("Accepting new work again")
+    return maintenance.snapshot()
 
 
 @app.get("/tools")
@@ -783,7 +830,7 @@ def _transfer_error(exc: transfer.TransferError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=str(exc))
 
 
-@app.post("/uploads", dependencies=[Depends(verify_token)])
+@app.post("/uploads", dependencies=[Depends(verify_token), Depends(maintenance.require_accepting)])
 async def create_upload(spec: _NewUpload) -> dict:
     """Open a session the client then fills with parallel PUTs.
 
@@ -1635,7 +1682,7 @@ def _tool_of(job_dir: str):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
 
-@app.post("/runs/{run_id}/rewind", dependencies=[Depends(verify_token)])
+@app.post("/runs/{run_id}/rewind", dependencies=[Depends(verify_token), Depends(maintenance.require_accepting)])
 async def rewind_run(run_id: str, request: Request,
                      background_tasks: BackgroundTasks):
     """Send a stopped run BACK to a checkpoint it already went past.
@@ -1700,7 +1747,7 @@ async def rewind_run(run_id: str, request: Request,
                             already_staged=True)
 
 
-@app.post("/runs/{run_id}/resume", dependencies=[Depends(verify_token)])
+@app.post("/runs/{run_id}/resume", dependencies=[Depends(verify_token), Depends(maintenance.require_accepting)])
 async def resume_run(run_id: str, request: Request,
                      background_tasks: BackgroundTasks,
                      already_staged: bool = False):
@@ -1756,7 +1803,7 @@ async def resume_run(run_id: str, request: Request,
     return await _tracked_run(run_id, "/runs/resume", background_tasks, carry_on)
 
 
-@app.post("/run/{tool_name}", dependencies=[Depends(verify_token)])
+@app.post("/run/{tool_name}", dependencies=[Depends(verify_token), Depends(maintenance.require_accepting)])
 async def run_tool(tool_name: str, request: Request, background_tasks: BackgroundTasks):
     """The run, with its progress recorded when the client asked for it.
 
