@@ -1,0 +1,23 @@
+# The stand-in for the repository's root-level `naming/`, which the image
+# copies to `/naming` because three tools depend on it from outside `tools/`.
+#
+# It exists so the build works against THIS context as well as against a real
+# checkout: the COPY is unconditional, and a fixture context without this
+# directory fails the build with "lstat /naming: no such file or directory"
+# before a single tool is synced.
+#
+# Deliberately empty of dependencies, as the real one is, and deliberately
+# installable: a fixture tool may declare `sadt-naming = { path = "..." }` to
+# exercise that path, and then this has to resolve rather than merely exist.
+[project]
+name = "sadt-naming"
+version = "0.0.0"
+requires-python = ">=3.9"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sadt_naming"]
