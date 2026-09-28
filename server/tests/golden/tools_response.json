@@ -10,6 +10,7 @@
         "required": true,
         "description": "Free-text label for this run",
         "server_selectable": null,
+        "selectable_scope": null,
         "choices": null,
         "initial": null,
         "extensions": null,
@@ -38,6 +39,7 @@
         "required": true,
         "description": "A single .csv file, or a folder of .csv/.xlsx/.ods files sent as a .zip archive",
         "server_selectable": null,
+        "selectable_scope": null,
         "choices": null,
         "initial": null,
         "extensions": {
@@ -72,6 +74,7 @@
         "required": true,
         "description": "Numeric threshold parameter",
         "server_selectable": null,
+        "selectable_scope": null,
         "choices": null,
         "initial": null,
         "extensions": null,
@@ -99,6 +102,7 @@
         "required": false,
         "description": "Optional number of iterations",
         "server_selectable": null,
+        "selectable_scope": null,
         "choices": null,
         "initial": null,
         "extensions": null,
@@ -126,6 +130,7 @@
         "required": false,
         "description": "Which result files to produce",
         "server_selectable": null,
+        "selectable_scope": null,
         "choices": {
           "summary": true,
           "preview": true,
@@ -157,6 +162,7 @@
         "required": false,
         "description": "Format of the preview file",
         "server_selectable": null,
+        "selectable_scope": null,
         "choices": {
           "csv": true,
           "json": false
@@ -193,6 +199,7 @@
         "required": true,
         "description": "First string",
         "server_selectable": null,
+        "selectable_scope": null,
         "choices": null,
         "initial": null,
         "extensions": null,
@@ -220,6 +227,7 @@
         "required": true,
         "description": "Second string",
         "server_selectable": null,
+        "selectable_scope": null,
         "choices": null,
         "initial": null,
         "extensions": null,

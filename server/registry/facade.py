@@ -34,7 +34,7 @@ import copy
 import logging
 from typing import Optional
 
-from base import ArgSpec, Tool, ToolArgumentError
+from base import CHOICE_TYPE, ArgSpec, Tool, ToolArgumentError
 
 logger = logging.getLogger("inference_server")
 
@@ -173,12 +173,40 @@ def compose(name: str, targets: dict, registry: dict) -> FacadeTool:
             # offered; it cannot add to it, so an option only the second engine
             # has was published nowhere and could not be picked -- ALI's
             # intraoral landmarks were simply absent, and the panel showed the
-            # CBCT catalogue in both modes. Each mode's own default is kept for
-            # its own options; an option a mode does not have is off there, and
-            # `options_when` hides it anyway.
+            # CBCT catalogue in both modes.
+            #
+            # The DEFAULT, though, is the first mode's. `update` gave it to the
+            # last: AREG's `automation` is Fully-Automated for CBCT and for
+            # IOS, Registration for IOSCBCT, and merged last-wins the facade
+            # published Registration as the default of the whole tool while
+            # turning Fully-Automated off. Registration is a value CBCT does
+            # not have, so every CBCT panel opened on the first option left to
+            # it -- Semi-Automated, the one mode where the segmentation boxes
+            # do not exist and the masks field does. Nobody chose that; it read
+            # as the tool having lost half its panel.
+            #
+            # First mode wins because that is the mode the panel opens on (the
+            # mode box itself is `index == 0` below), so the two agree by
+            # construction rather than by luck.
             merged = {}
             for options in per_mode.values():
-                merged.update(options)
+                for option, selected in options.items():
+                    merged.setdefault(option, selected)
+
+            # A "choice" is exactly one option, and a union can hold one
+            # default per mode -- here Fully-Automated for CBCT and
+            # Registration for IOSCBCT, both on. A combo cannot express that,
+            # and a client reading two would pick whichever it met first. The
+            # first is the one that matches the mode being opened; the rest are
+            # off, and each becomes reachable when its own mode narrows the
+            # list.
+            if spec.type == CHOICE_TYPE:
+                seen_default = False
+                for option, selected in list(merged.items()):
+                    if selected and not seen_default:
+                        seen_default = True
+                    elif selected:
+                        merged[option] = False
             spec.choices = merged
 
         # Same reasoning for the tabs the options are laid out in: ALI's four

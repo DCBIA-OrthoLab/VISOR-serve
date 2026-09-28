@@ -321,40 +321,47 @@ tools:
         dest: IOS_Gold_files
         url: https://github.com/HUTIN1/ASO/releases/download/v1.0.0/Gold_file.zip
         extract: true
+    # One folder per MODALITY, which is what `server_selectable = { t1 =
+    # "testfile:CBCT" }` draws from: AREG registers CBCT volumes, intraoral
+    # surfaces, and one onto the other, and flat, every argument was offered
+    # every cohort -- the CBCT baseline picker listed the intraoral meshes.
+    # The shape mirrors the one the Slicer extension downloads into
+    # (AREG/<engine>/Test_Files/).
     testfiles:
       - name: AREG_test_scans.zip
+        dest: IOS/AREG_test_scans
         url: https://github.com/HUTIN1/AREG/releases/download/v1.0.0/AREG_test_scans.zip
         size: 3700969
         extract: true
       - name: FullyAuto.zip
-        dest: CBCT_FullyAuto
+        dest: CBCT/CBCT_FullyAuto
         url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/FullyAuto.zip
         size: 352211664
         extract: true
       - name: SemiAuto.zip
-        dest: CBCT_SemiAuto
+        dest: CBCT/CBCT_SemiAuto
         url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/SemiAuto.zip
         size: 353120642
         extract: true
       - name: Or_FullyAuto.zip
-        dest: CBCT_Or_FullyAuto
+        dest: CBCT/CBCT_Or_FullyAuto
         url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/Or_FullyAuto.zip
         size: 278088796
         extract: true
       - name: Or_FullyAuto_DCM.zip
-        dest: CBCT_Or_FullyAuto_DCM
+        dest: CBCT/CBCT_Or_FullyAuto_DCM
         url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/Or_FullyAuto_DCM.zip
         size: 233583082
         extract: true
       # IOSCBCT mode: RegTestFiles is the registration-only set, TestFile the
       # semi- and fully-automated ones. Near-identical sizes, distinct content.
       - name: RegTestFiles.zip
-        dest: IOSCBCT_RegTestFiles
+        dest: IOSCBCT/IOSCBCT_RegTestFiles
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AREG_IOSCBCT/RegTestFiles.zip
         size: 222374572
         extract: true
       - name: TestFile.zip
-        dest: IOSCBCT_TestFile
+        dest: IOSCBCT/IOSCBCT_TestFile
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AREG_IOSCBCT/TestFile.zip
         size: 222369355
         extract: true

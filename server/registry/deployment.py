@@ -52,6 +52,12 @@ logger = logging.getLogger("inference_server")
 SERVER_SELECTABLE_NONE = "none"
 SERVER_SELECTABLE_KINDS = ("model", "testfile", SERVER_SELECTABLE_NONE)
 
+# What separates the kind from the subfolder in `server_selectable`:
+# `"testfile:CBCT"`. A colon rather than a slash, so nothing in this value can
+# ever read as a path -- the folder name is validated as a plain name below and
+# joined by the data store, which re-checks containment either way.
+SCOPE_SEPARATOR = ":"
+
 # Put in the message of every "this file asks for a value this server does not
 # know" refusal, so `scripts/server_ctl.py` can recognise it in a container's log
 # and explain it in one sentence instead of leaving an operator reading a
@@ -143,6 +149,8 @@ class ToolDeployment:
     # business being asked. A deployment decision, which is why it lives here
     # and not in the tool: the tool knows nothing about who is looking at it.
     hidden: tuple = ()
+    # {argument name: subfolder of DATA/<tool>/<kind>/ it draws from}
+    selectable_scopes: dict = field(default_factory=dict)
 
     # How long this tool may run before it is killed, in seconds. None falls
     # back to settings.TOOL_TIMEOUT_SECONDS, and 0 there means "no limit".
@@ -353,13 +361,37 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
             f"{where}: 'server_selectable' must be a table of argument name -> "
             f"{' | '.join(SERVER_SELECTABLE_KINDS)}."
         )
-    for argument, kind in selectable.items():
+    # `"testfile:CBCT"` -- a kind, then the SUBFOLDER of DATA/<tool>/testfiles/
+    # that this argument draws from. One tool can serve several modalities, and
+    # a single flat list offered every argument every cohort: AREG's CBCT
+    # baseline picker listed the intraoral meshes, which cannot be a baseline.
+    # Optional, and absent it means the folder itself, so every existing entry
+    # keeps its meaning.
+    scopes = {}
+    cleaned = {}
+    for argument, value in selectable.items():
+        kind, _, scope = str(value).partition(SCOPE_SEPARATOR)
         if kind not in SERVER_SELECTABLE_KINDS:
             raise _unknown_value(
                 where,
-                f"argument '{argument}' is declared server_selectable as {kind!r}",
+                f"argument '{argument}' is declared server_selectable as {value!r}",
                 SERVER_SELECTABLE_KINDS,
             )
+        if scope and (os.path.basename(scope) != scope or scope in (".", "..")):
+            raise DeploymentConfigError(
+                f"{where}: argument '{argument}' scopes its hosted files to "
+                f"{scope!r}, which is not a plain folder name. One level, no "
+                f"separators: the server joins it under DATA/<tool>/<kind>/."
+            )
+        if scope and kind == SERVER_SELECTABLE_NONE:
+            raise DeploymentConfigError(
+                f"{where}: argument '{argument}' is opted out of hosted files "
+                f"and given the scope {scope!r} at once. One or the other."
+            )
+        cleaned[argument] = kind
+        if scope:
+            scopes[argument] = scope
+    selectable = cleaned
 
     dispatch = table.get("dispatch", {})
     if dispatch and not isinstance(dispatch, dict):
@@ -409,6 +441,7 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
 
     return ToolDeployment(
         server_selectable=dict(selectable),
+        selectable_scopes=dict(scopes),
         max_upload_mb=limit,
         data_dir=data_dir,
         dispatch=dict(dispatch or {}),

@@ -553,6 +553,7 @@ def _argument_spec(
         raise SchemaError(f"{where}: 'required' must be true or false.")
 
     selectable = deployment.server_selectable.get(argument_name)
+    selectable_scope = deployment.selectable_scopes.get(argument_name)
     if selectable is not None and declared_type != "path":
         # A server-side file standing in for a str/int argument is exactly the
         # SurgMovPred case and is legitimate -- but only the deployment can say
@@ -606,6 +607,7 @@ def _argument_spec(
             required=required and not hidden,
             description=declaration.get("description", ""),
             server_selectable=selectable,
+            selectable_scope=selectable_scope,
             hidden=hidden,
         )
 
@@ -622,6 +624,7 @@ def _argument_spec(
         required=required,
         description=declaration.get("description", ""),
         server_selectable=selectable,
+        selectable_scope=selectable_scope,
         accepts=tuple(accepts) if accepts else None,
         # Advisory, exactly as for a ported tool: the value a client pre-fills
         # its widget with. Not applied server-side -- an omitted optional
