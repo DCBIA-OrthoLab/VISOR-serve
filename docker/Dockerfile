@@ -110,6 +110,17 @@ RUN uv venv --python 3.13 /opt/sadt/.venv && \
 # ---- the tools -------------------------------------------------------
 COPY --from=manifests /manifests/ /tools/
 
+# The shared vocabulary three tools now depend on (ASO, AMASSS,
+# Batch_Dental_Seg), which lives at the ROOT of the tools repository rather
+# than under `tools/` -- so copying `tools` alone leaves it out and every
+# `uv sync` below stops at "Distribution not found at: file:///naming".
+#
+# At `/naming`, because that is where `sadt-naming = { path = "../../naming" }`
+# resolves from `/tools/<tool>/`, and BEFORE the sync layer rather than with
+# the tool sources: uv builds a path dependency while it syncs, so the package
+# has to be there already, not arrive afterwards.
+COPY --from=tools --exclude=**/.venv --exclude=**/__pycache__ naming /naming/
+
 # Two levels, and gated on [tool.sadt], for the same reason the registry is: a
 # tool may live inside a GROUPING folder (tools/ALI/ALI_CBCT), and a folder with
 # a pyproject.toml but no [tool.sadt] is a shared package rather than a tool --

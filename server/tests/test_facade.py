@@ -101,6 +101,55 @@ def test_a_choice_whose_options_differ_per_mode_narrows():
     assert sorted(narrowed["b"]) == ["Full", "Semi"]
 
 
+def test_the_default_of_a_narrowed_choice_is_the_first_modes():
+    """Measured on AREG, 2026-09-25: `automation` defaults to Fully-Automated
+    for CBCT and for IOS, and to Registration for IOSCBCT. Merged last-wins,
+    the facade published Registration as the default of the whole tool and
+    turned Fully-Automated off -- and Registration is a value CBCT does not
+    have, so every CBCT panel opened on the first option left to it,
+    Semi-Automated. That is the one mode with no segmentation boxes and with a
+    masks field, so the panel read as having lost half of itself.
+
+    The first mode's default, because the first mode is what the panel opens
+    on (the mode box is built `index == 0`)."""
+    registry = _registry(
+        A={"automation": ArgSpec(type="choice", choices={"Semi": False, "Full": True})},
+        B={"automation": ArgSpec(type="choice",
+                                 choices={"Semi": False, "Full": False, "Reg": True})},
+    )
+    composed = facade.compose("F", {"a": "A", "b": "B"}, registry)
+
+    choices = composed.arguments["automation"].choices
+    assert sorted(choices) == ["Full", "Reg", "Semi"], "the union is still offered"
+    assert [option for option, on in choices.items() if on] == ["Full"]
+
+
+def test_an_option_only_a_later_mode_has_is_offered_but_not_the_default():
+    """Its own mode turns it on: `options_when` narrows the list there, and a
+    combo that cannot show the current value re-selects within what is left."""
+    registry = _registry(
+        A={"automation": ArgSpec(type="choice", choices={"Full": True})},
+        B={"automation": ArgSpec(type="choice", choices={"Full": False, "Reg": True})},
+    )
+    composed = facade.compose("F", {"a": "A", "b": "B"}, registry)
+
+    assert composed.arguments["automation"].choices["Reg"] is False
+    assert "Reg" in composed.arguments["automation"].options_when[facade.MODE_ARGUMENT]["b"]
+
+
+def test_a_multichoice_keeps_every_mode_s_own_defaults():
+    """Not a combo: several options may legitimately be on, and each mode's
+    own default has to survive the union."""
+    registry = _registry(
+        A={"keep": ArgSpec(type="multichoice", choices={"x": True, "y": False})},
+        B={"keep": ArgSpec(type="multichoice", choices={"y": False, "z": True})},
+    )
+    composed = facade.compose("F", {"a": "A", "b": "B"}, registry)
+
+    choices = composed.arguments["keep"].choices
+    assert [option for option, on in choices.items() if on] == ["x", "z"]
+
+
 def test_a_choice_offering_the_same_options_everywhere_is_left_alone():
     registry = _registry(
         A={"pick": ArgSpec(type="choice", choices={"x": True, "y": False})},
