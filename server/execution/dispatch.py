@@ -38,6 +38,7 @@ from typing import Any, Optional
 
 import file_utils
 import resources
+import telemetry
 from execution import admission, concurrency, costs
 from base import ToolUnavailableError
 from config import settings
@@ -1030,6 +1031,8 @@ def _reset_job(job_dir: str) -> None:
     os.makedirs(output, exist_ok=True)
 
 
+# Pinned equal to `execution.runner.RESUME_ENV` by a test; the runner is
+# executed by a TOOL's interpreter and the two cannot share a module.
 RESUME_ENV = "SADT_RESUME"
 
 # Where corrections are staged, one directory per slot. Pinned equal to
@@ -1169,8 +1172,28 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None,
             ]
             exit_code = None
             try:
+                asked_at = time.monotonic()
                 with _admitted(candidates, run_id) as grant:
                     cpu_grant, channels = grant
+                    # Recorded HERE, not inside `_admitted`: the wait is the
+                    # whole time between asking and being let in, and this is
+                    # the only scope holding both that interval and the name of
+                    # the tool that spent it. An observation, never a decision.
+                    waited = time.monotonic() - asked_at
+                    telemetry.record_admission(tool.name, waited, channels)
+                    # What this run actually holds, for the page's per-run
+                    # detail. Taken from the candidate that was granted rather
+                    # than from the widest one asked for: a run admitted at two
+                    # channels holds two channels' worth, and reporting the
+                    # eight it hoped for would overstate the machine.
+                    admitted = next(
+                        (demand for width, demand in candidates if width == channels),
+                        None)
+                    telemetry.record_run_grant(
+                        run_id, channels=channels, cpus=cpu_grant,
+                        ram_bytes=admitted.ram_bytes if admitted else None,
+                        vram_bytes=admitted.vram_bytes if admitted else None,
+                        waited=waited)
                     _raise_if_cancelled(run_id)
                     # Applied HERE rather than when the environment was built,
                     # because neither number is knowable until the run has been

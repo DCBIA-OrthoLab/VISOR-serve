@@ -48,6 +48,7 @@ import shutil
 import time
 from typing import List, Optional
 
+import telemetry
 from config import settings
 from wire import _scratch
 
@@ -175,7 +176,8 @@ def run_directory(run_id: str) -> str:
     return path
 
 
-def register(run_id: str, tool: Optional[str] = None) -> str:
+def register(run_id: str, tool: Optional[str] = None,
+             client: Optional[str] = None) -> str:
     """Claim an id and open its directory. Returns the id.
 
     Called as the FIRST thing `POST /run` does, before `await request.form()`,
@@ -202,13 +204,16 @@ def register(run_id: str, tool: Optional[str] = None) -> str:
     # SADT_PROGRESS_FILE would otherwise litter whatever it points at.
     with open(os.path.join(directory, EVENTS_FILE), "wb"):
         pass
-    if tool:
+    if tool or client:
         # Best effort: a run whose name could not be written is still a run.
         try:
             with open(os.path.join(directory, META_FILE), "w", encoding="utf-8") as handle:
-                json.dump({"tool": str(tool)[:100], "at": time.time()}, handle)
+                json.dump({"tool": str(tool)[:100] if tool else None,
+                           "client": str(client)[:64] if client else None,
+                           "at": time.time()}, handle)
         except OSError:
             pass
+    telemetry.record_run_start(run_id, tool, client)
     reap_expired()
     return run_id
 
@@ -464,6 +469,12 @@ def finish(run_id: str, phase: str, message: str = "", result=None) -> None:
     """The terminal event. Written before the directory is discarded, so a
     watcher that polls once more sees how the run ended."""
     append(run_id, phase, None, message, result=result)
+    # The ledger is closed HERE rather than at each of the five call sites that
+    # end a run, because this is the one funnel all of them pass through: a
+    # sixth ending added later is recorded without anybody remembering to. The
+    # phase is all that travels -- never `message`, which on a failure carries
+    # a tool's own words and can name the file it died on.
+    telemetry.record_run_end(run_id, phase, phase)
 
 
 # ----------------------------------------------------------------------
@@ -551,8 +562,16 @@ class EventReader:
     completed on the next poll instead of being parsed in half.
     """
 
-    def __init__(self, directory: str):
+    def __init__(self, directory: str, keep_alive: bool = True):
+        # `keep_alive=False` reads WITHOUT stamping the directory, and exists
+        # for the operator listing. The TTL is an idle timeout so that a run
+        # still reporting progress is never reaped under itself -- that is
+        # about the RUN's own activity, not about somebody looking at it. A
+        # dashboard polling every two seconds would otherwise keep every
+        # abandoned run alive for as long as the tab stayed open, which is
+        # exactly the leak the idle timeout exists to close.
         self.directory = directory
+        self._keep_alive = keep_alive
         self.finished = False
         self._offset = 0
         self._partial = b""
@@ -577,7 +596,8 @@ class EventReader:
             self.finished = True
             return []
 
-        touch(self.directory)
+        if self._keep_alive:
+            touch(self.directory)
         buffer = self._partial + chunk
         lines = buffer.split(b"\n")
         self._partial = lines.pop()
@@ -877,19 +897,35 @@ def active(limit: int = 500) -> list:
             continue
         latest = None
         try:
-            events = EventReader(directory).read()
+            # keep_alive=False: LOOKING at a run is not the run being alive.
+            # Reading stamps the directory, and the TTL is an idle timeout, so
+            # an operator page polling every couple of seconds would hold every
+            # abandoned run open for as long as the tab stayed on screen.
+            events = EventReader(directory, keep_alive=False).read()
             latest = events[-1] if events else None
         except Exception:  # noqa: BLE001 - a listing must not fail on one bad run
             pass
         tool = None
+        client = None
         try:
             with open(os.path.join(directory, META_FILE), encoding="utf-8") as handle:
-                tool = (json.load(handle) or {}).get("tool")
+                meta = json.load(handle) or {}
+            tool = meta.get("tool")
+            client = meta.get("client")
+            # The registration stamp, not the directory's ctime. ctime is the
+            # INODE CHANGE time: every `touch` moves it, so a run that reported
+            # progress -- or that anything stat'd and stamped -- claimed to have
+            # started at that moment, and an elapsed column read zero for
+            # everything. `at` is written once and never rewritten.
+            recorded = meta.get("at")
+            if isinstance(recorded, (int, float)) and recorded > 0:
+                started_at = float(recorded)
         except (OSError, ValueError):
             pass
         found.append({
             "run_id": name,
             "tool": tool,
+            "client": client,
             "state": latest["state"] if latest else STATE_PENDING,
             "phase": latest["phase"] if latest else PHASE_RECEIVED,
             "fraction": latest["fraction"] if latest else None,

@@ -14,6 +14,10 @@ export TOOLS_DIR="$SADT_TOOLS/tools"          # <-- the link to SADT-VISOR
 export DESCRIBE_PATH="$SADT_TOOLS/scripts/describe.py"
 export DATA_DIR="${DATA_DIR:-$HERE/DATA}"
 export SCHEMA_CACHE_DIR="${SCHEMA_CACHE_DIR:-$HERE/.schema-cache}"
+# Where a campaign left its summaries. The default is the container's mount
+# point, which does not exist outside it -- so `/benchmarks/view` served from a
+# checkout rendered an empty page rather than the campaigns sitting right here.
+export SADT_BENCHMARK_DIR="${SADT_BENCHMARK_DIR:-$HERE/benchmarks/results/summary}"
 export DEVICE="${DEVICE:-cuda}"
 
 LOG="${LOG:-$HERE/local-server.log}"

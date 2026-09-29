@@ -138,7 +138,10 @@ def test_a_bare_dotdot_never_reaches_the_route_at_all(route, tmp_path):
     witness = tmp_path / "witness"
     witness.write_text("untouched")
     response = client.get(f"{route}{_RESOLVED_AWAY_BY_THE_CLIENT}", headers=AUTH)
-    assert response.status_code == 404
+    # Either code satisfies the paragraph above: this deployment DOES mount
+    # something at `/` -- the dashboard -- so the request lands there with 200
+    # instead of 404, having got no closer to the transfer root either way.
+    assert response.status_code in (200, 404)
     assert "root:" not in response.text
     assert witness.read_text() == "untouched"
 
