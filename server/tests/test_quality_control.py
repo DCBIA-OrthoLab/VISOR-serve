@@ -124,12 +124,16 @@ def test_a_chain_offers_the_checkpoints_of_the_tools_it_calls(tmp_path):
         {"name": "AMASSS"},
         {"name": "AREG", "supervisor": True, "calls": ["ASO", "AMASSS"]},
     )
+    # Deepest first within a branch: `ALI_CBCT/landmarks` is a moment inside
+    # the ALI_CBCT call, so it is passed before that call returns. The list is
+    # read as a sequence by whoever picks where to stop, and a point listed
+    # after one it actually precedes sends a rewind backwards.
     assert list(tools["ASO"].arguments["stop_after"].choices) == [
-        "ALI_CBCT", "ALI_CBCT/landmarks",
+        "ALI_CBCT/landmarks", "ALI_CBCT",
     ]
     assert list(tools["AREG"].arguments["stop_after"].choices) == [
-        "ASO", "ASO/ALI_CBCT", "ASO/ALI_CBCT/landmarks", "AMASSS",
-    ], "a nested checkpoint is unreachable unless it is published"
+        "ASO/ALI_CBCT/landmarks", "ASO/ALI_CBCT", "ASO", "AMASSS",
+    ], "a nested checkpoint is unreachable unless it is published, and it happens first"
 
 
 def test_a_tool_that_calls_nobody_is_offered_exactly_what_it_declares(tmp_path):
@@ -174,11 +178,11 @@ def test_a_facade_publishes_the_nested_checkpoints_of_each_of_its_modes(tmp_path
         "ASO", {"CBCT": "ASO_CBCT", "IOS": "ASO_IOS"}, tools)
     spec = composed.arguments["stop_after"]
     assert list(spec.choices) == [
-        "ALI_CBCT", "ALI_CBCT/landmarks", "ALI_IOS", "ALI_IOS/teeth",
+        "ALI_CBCT/landmarks", "ALI_CBCT", "ALI_IOS/teeth", "ALI_IOS",
     ]
     assert spec.options_when == {"mode": {
-        "CBCT": ["ALI_CBCT", "ALI_CBCT/landmarks"],
-        "IOS": ["ALI_IOS", "ALI_IOS/teeth"],
+        "CBCT": ["ALI_CBCT/landmarks", "ALI_CBCT"],
+        "IOS": ["ALI_IOS/teeth", "ALI_IOS"],
     }}, "a mode is offered the other engine's checkpoints"
 
 
@@ -192,7 +196,7 @@ def test_a_cycle_is_walked_once_rather_than_for_ever(tmp_path):
         {"name": "B", "supervisor": True, "calls": ["A"]},
         {"name": "Self", "supervisor": True, "calls": ["Self"]},
     )
-    assert list(tools["A"].arguments["stop_after"].choices) == ["B", "B/A"]
+    assert list(tools["A"].arguments["stop_after"].choices) == ["B/A", "B"]
     assert list(tools["Self"].arguments["stop_after"].choices) == ["Self"]
 
 

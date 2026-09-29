@@ -62,3 +62,11 @@ services:
       - ../SADT-VISOR/tools/AREG/AREG_CBCT/src:/tools/AREG/AREG_CBCT/src:ro
       - ../SADT-VISOR/tools/AREG/AREG_IOS/src:/tools/AREG/AREG_IOS/src:ro
       - ../SADT-VISOR/tools/AREG/AREG_IOSCBCT/src:/tools/AREG/AREG_IOSCBCT/src:ro
+      # The schema GENERATOR, from the same repository as the tools and
+      # deployed beside them. Without it mounted, a tool source that uses a
+      # newer layout key is described by the image's older describe.py and
+      # fails to load -- measured on 2026-09-29, `order` was added to
+      # LAYOUT_KEYS and all three AREG engines dropped out of the registry
+      # with "unknown key(s) order". Loud rather than silent, which is right,
+      # but a rebuild for one key in a stdlib-only file is not.
+      - ../SADT-VISOR/scripts:/tools/scripts:ro

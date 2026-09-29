@@ -164,8 +164,23 @@ SUP_DIRNAME = "sup"
 _ALL_STEPS = frozenset({"*"})
 
 
-class QualityControlStop(Exception):
+class QualityControlStop(BaseException):
     """A run stopping where it was ASKED to stop, which is not a failure.
+
+    **BaseException, not Exception, and that is the whole point.** This class
+    lives here, in the file the server injects by path, so a tool CANNOT import
+    it -- and therefore cannot write `except QualityControlStop: raise`. Every
+    tool that wraps a `sup.run()` in `except Exception` to keep one bad case
+    from costing the cohort would otherwise catch this too, and turn "the
+    reader asked to stop here" into "that step failed". Measured on 2026-09-29:
+    `ALI_IOS` armed at `Crown_Seg` answered 500 with "Crown_Seg could not label
+    them. First reason: QualityControlStop", and no pause ever happened.
+    `ASO` and `AREG_IOSCBCT` have the same shape of catch.
+
+    Deriving from BaseException puts it beside `KeyboardInterrupt` and
+    `SystemExit`, which is exactly the company it keeps: control flow that
+    unwinds a program and must not be mistaken for an error. `except Exception`
+    no longer sees it, and nothing in any tool had to change.
 
     Raised inside the tool's own code -- by `sup.declareQualityControl` or by
     the supervisor on the way out of a `sup.run()` the caller armed -- and
