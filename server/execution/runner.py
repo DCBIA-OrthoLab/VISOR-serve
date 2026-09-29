@@ -2226,8 +2226,23 @@ class _Supervisor:
         self.log("{} channel(s) of {} asked for".format(answer, asked or "any"))
         return _record_width(answer)
 
-    def declareQualityControl(self, name: str) -> bool:
+    def declareQualityControl(self, name: str, kind: str = "view") -> bool:
         """Offer the caller a place to stop, here, and stop if they asked.
+
+        `kind` is DECLARATIVE and is not read here. It says what a reader may
+        do at this point -- look, drag the points, drag the scan -- and its one
+        consumer is `describe.py`, which lifts it out of this call site by AST
+        so the server can publish it beside the option. The signature has to
+        accept it all the same, and did not: the keyword was parseable and not
+        callable, which nothing discovered because no tool had ever passed one.
+        `AREG_CBCT` declaring the first `kind="registration"` answered 500 with
+        "got an unexpected keyword argument 'kind'" after a full 143-second
+        registration -- at the finish line, the worst place to find it.
+
+        The default is the literal "view" rather than a shared constant: this
+        file is standard-library only and injected by path, so it imports
+        nothing from the server. The vocabulary itself is checked where it is
+        read, in `describe.REVIEW_KINDS`.
 
         Called by a tool in the MIDDLE of its own work, where no `sup.run()`
         boundary exists: AMASSS between its crop and its prediction, ALI once
@@ -2514,6 +2529,19 @@ def main(argv=None) -> int:
             where = arguments.get(OUTPUT_DIR_ARGUMENT) if isinstance(arguments, dict) else None
             produced = _collect_supervised_outputs(
                 job["job_dir"], where, _ALL_STEPS, move=False)
+            # The tool's OWN output, which was missing -- and no earlier
+            # checkpoint could reveal that: stopping after a `sup.run()` means
+            # the tool has barely started and its output directory holds
+            # nothing of its own, so the omission stayed invisible until a tool
+            # declared a checkpoint at the END of its work. `AREG_CBCT`'s
+            # `Registration` then handed back `01_AMASSS` -- 772 kB of masks --
+            # for a pause whose entire purpose is to show the registered scans.
+            #
+            # It REPLACES the step list rather than joining it: the collect
+            # above has already copied every step under `<output>/intermediate/`,
+            # so naming both sent each step's files twice in one archive.
+            if where and os.path.isdir(where) and os.listdir(where):
+                produced = [where]
             _write_result(job["job_dir"], {
                 STOPPED_AFTER_KEY: stop.name,
                 # Named so a client can tell this from a finished run without
