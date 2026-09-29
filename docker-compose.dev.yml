@@ -43,6 +43,12 @@ services:
       #
       # Listed one by one rather than mounted wholesale, so adding a tool here
       # is a decision. These are the ones carrying work not yet in an image.
+      #
+      # `server/tests/test_dev_mounts.py` pins this list against the tools that
+      # actually exist. It was written because this named TEN of eighteen, and
+      # the eight missing included all three AREG engines -- so an AREG fix was
+      # committed, pulled, reported deployed, and the container went on serving
+      # the copy inside the image. Nothing failed; it simply did not change.
       - ../SADT-VISOR/tools/ALI/ALI_CBCT/src:/tools/ALI/ALI_CBCT/src:ro
       - ../SADT-VISOR/tools/ALI/ALI_IOS/src:/tools/ALI/ALI_IOS/src:ro
       - ../SADT-VISOR/tools/AMASSS/src:/tools/AMASSS/src:ro
@@ -53,3 +59,6 @@ services:
       - ../SADT-VISOR/tools/CLIC/src:/tools/CLIC/src:ro
       - ../SADT-VISOR/tools/Crown_Seg/src:/tools/Crown_Seg/src:ro
       - ../SADT-VISOR/tools/GreedyReg/src:/tools/GreedyReg/src:ro
+      - ../SADT-VISOR/tools/AREG/AREG_CBCT/src:/tools/AREG/AREG_CBCT/src:ro
+      - ../SADT-VISOR/tools/AREG/AREG_IOS/src:/tools/AREG/AREG_IOS/src:ro
+      - ../SADT-VISOR/tools/AREG/AREG_IOSCBCT/src:/tools/AREG/AREG_IOSCBCT/src:ro
