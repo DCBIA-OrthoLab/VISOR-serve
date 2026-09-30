@@ -957,6 +957,25 @@ REPLAY_DIRNAME = "replay"
 REPLAY_JOB_FILE = "job.replay.json"
 
 
+def _inside(folder: str, path: str) -> bool:
+    """Whether `path` really sits under `folder`, symlinks resolved.
+
+    `os.path.join` happily builds `<cohort>/../../etc/passwd`, and
+    `os.path.isfile` happily confirms it. Both halves matter: `realpath`
+    because a symlink inside the cohort points wherever it likes, and
+    `commonpath` rather than `startswith` because `/data/cohort2` starts with
+    `/data/cohort` and is a different cohort.
+    """
+    try:
+        folder = os.path.realpath(folder)
+        resolved = os.path.realpath(path)
+        return folder == resolved or os.path.commonpath([folder, resolved]) == folder
+    except (OSError, ValueError):
+        # A path so malformed that commonpath refuses it -- mixed drives on
+        # Windows, an empty string. Not inside anything.
+        return False
+
+
 def narrow_to_cases(job_dir: str, tool, keep) -> str:
     """A job file feeding `tool` only the inputs of `keep`, or "".
 
@@ -1011,6 +1030,21 @@ def narrow_to_cases(job_dir: str, tool, keep) -> str:
         for case in wanted:
             relative = (stated.get(case) or {}).get(named, case)
             origin = os.path.join(source, relative)
+            if not _inside(source, origin):
+                # `wanted` reaches here from the REQUEST -- a reader names the
+                # cases they marked -- so a name is untrusted input and
+                # `../../etc/passwd` is a path that exists. Measured before
+                # this check: `case_0=../secret.txt` hardlinked a file from
+                # outside the cohort into the job directory, whose outputs are
+                # zipped and returned, AND left the tool an empty input folder
+                # to register nobody from. Confidential imaging, so the answer
+                # is to refuse the whole narrowing rather than skip the entry.
+                logger.warning("Not narrowing %s: %r leaves %s",
+                               getattr(tool, "name", "?"), relative, named)
+                for undo in list(narrowed) + [named]:
+                    shutil.rmtree(os.path.join(job_dir, REPLAY_DIRNAME, undo),
+                                  ignore_errors=True)
+                return ""
             if not os.path.isfile(origin):
                 # A case named something that is not a file under this
                 # argument: the report and the request disagree, and narrowing

@@ -1501,3 +1501,184 @@ def test_a_patient_whose_name_holds_a_comma_survives():
 
     assert main._declared_cases(
         _Form({"case_0": "Doe, John"})) == ["Doe, John"]
+
+
+# ----------------------------------------------------------------------
+# What a request can make the narrowing do
+# ----------------------------------------------------------------------
+#
+# `wanted` reaches `narrow_to_cases` from the REQUEST since a reader began
+# naming the cases they marked. Before that it was derived from a tool's own
+# report, so a case name was as trustworthy as the tool; now it is untrusted
+# input and every one of these was reachable.
+
+
+def _escape_job(tmp_path, names=("a.nii.gz",)):
+    """A job whose cohort has a sibling the caller never offered."""
+    from execution import dispatch
+    cohort = tmp_path / "cohort"
+    cohort.mkdir()
+    for name in names:
+        (cohort / name).write_text(name)
+    (tmp_path / "secret.txt").write_text("a scan from another study")
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / dispatch.JOB_OUTPUT_DIRNAME).mkdir()
+    with open(job / dispatch.JOB_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"job_id": "j", "tool": "Narrows", "job_dir": str(job),
+                   "params": {"scans": str(cohort)}}, handle)
+    return str(job), cohort
+
+
+def test_a_case_name_cannot_reach_outside_the_cohort(tmp_path):
+    """Measured before the check: `case_0=../secret.txt` hardlinked a file
+    from outside the cohort into the job directory -- whose outputs are zipped
+    and returned -- and left the tool an empty folder to register nobody
+    from."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["../secret.txt"]) == ""
+    assert not os.path.exists(os.path.join(job, dispatch.REPLAY_DIRNAME))
+
+
+def test_an_absolute_case_name_is_refused(tmp_path):
+    """`os.path.join(folder, "/etc/passwd")` IS `/etc/passwd`."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    assert dispatch.narrow_to_cases(
+        job, _NarrowingTool(), [str(tmp_path / "secret.txt")]) == ""
+
+
+def test_a_symlink_out_of_the_cohort_is_refused(tmp_path):
+    """A name that IS under the folder and resolves somewhere else. This is
+    why the check resolves before it compares."""
+    from execution import dispatch
+    job, cohort = _escape_job(tmp_path)
+    try:
+        os.symlink(tmp_path / "secret.txt", cohort / "b.nii.gz")
+    except (OSError, NotImplementedError):
+        pytest.skip("this filesystem does not do symlinks")
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["b.nii.gz"]) == ""
+
+
+def test_a_sibling_folder_with_the_same_prefix_is_not_inside(tmp_path):
+    """`/data/cohort2` starts with `/data/cohort` and is another cohort, which
+    is why this compares paths rather than strings."""
+    from execution import dispatch
+    job, cohort = _escape_job(tmp_path)
+    other = tmp_path / "cohort2"
+    other.mkdir()
+    (other / "c.nii.gz").write_text("another study")
+
+    assert dispatch.narrow_to_cases(
+        job, _NarrowingTool(), ["../cohort2/c.nii.gz"]) == ""
+
+
+def test_a_case_nobody_has_replays_the_whole_cohort(tmp_path):
+    """The ordinary mistake -- a stale panel, a renamed folder. Refused rather
+    than narrowed to nothing: an empty input folder is a run that registers
+    nobody and says it worked."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["P99"]) == ""
+
+
+def test_naming_every_case_still_narrows_to_every_case(tmp_path):
+    """A reader who marked the lot. Equivalent to no narrowing, and it must
+    not be mistaken for the refusals above."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path, names=("a.nii.gz", "b.nii.gz"))
+
+    written = dispatch.narrow_to_cases(
+        job, _NarrowingTool(), ["a.nii.gz", "b.nii.gz"])
+
+    assert written
+    with open(written, encoding="utf-8") as handle:
+        assert sorted(os.listdir(json.load(handle)["params"]["scans"])) == [
+            "a.nii.gz", "b.nii.gz"]
+
+
+def test_a_paired_tool_with_one_argument_stated_is_refused(tmp_path):
+    """Half a pairing. Narrowing `t1` and not `t2` hands a registration tool
+    three baselines and forty follow-ups, and what its own pairing makes of
+    that is not anything the server intended."""
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1"])
+    with open(os.path.join(job, dispatch.JOB_OUTPUT_DIRNAME,
+                           "Pairs_report.json"), "w", encoding="utf-8") as handle:
+        json.dump({"cases": {"P1": {"produced": [],
+                                    "inputs": {"t1": "P1_T1.nii.gz"}}}}, handle)
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_a_stated_input_that_leaves_its_argument_is_refused(tmp_path):
+    """The report is the TOOL's word and still not taken on trust: a tool that
+    names `../` has a bug, and the failure must not be a file leaving the
+    cohort."""
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1"])
+    with open(os.path.join(job, dispatch.JOB_OUTPUT_DIRNAME,
+                           "Pairs_report.json"), "w", encoding="utf-8") as handle:
+        json.dump({"cases": {"P1": {"produced": [], "inputs": {
+            "t1": "../t2/P1_T2.nii.gz", "t2": "P1_T2.nii.gz"}}}}, handle)
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_an_unreadable_report_narrows_nothing_rather_than_raising(tmp_path):
+    """A truncated write, a disk that filled. The replay is the cohort."""
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1"])
+    with open(os.path.join(job, dispatch.JOB_OUTPUT_DIRNAME,
+                           "Pairs_report.json"), "w", encoding="utf-8") as handle:
+        handle.write('{"cases": {"P1": ')
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_a_report_writing_cases_as_a_list_narrows_nothing(tmp_path):
+    """AMASSS's shape. Read as the mapping the contract states, every mask
+    would key to the wrong patient -- so it is not read at all."""
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1"])
+    with open(os.path.join(job, dispatch.JOB_OUTPUT_DIRNAME,
+                           "Pairs_report.json"), "w", encoding="utf-8") as handle:
+        json.dump({"cases": [{"case_id": "p_000", "produced": []}]}, handle)
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_no_declaration_at_all_narrows_nothing(tmp_path):
+    """A tool that never said which argument holds its cases. Every tool but
+    two, today."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    class Silent:
+        name = "Silent"
+
+    assert dispatch.narrow_to_cases(job, Silent(), ["a.nii.gz"]) == ""
+
+
+def test_an_empty_list_of_cases_narrows_nothing(tmp_path):
+    """A reader who marked nobody and pressed the button anyway."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), []) == ""
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["", "  "]) == ""
+
+
+def test_a_case_that_is_a_directory_is_not_a_file(tmp_path):
+    """A patient folder rather than a scan. `isfile` is what says so, and the
+    refusal is the whole cohort rather than a folder hardlinked as a file."""
+    from execution import dispatch
+    job, cohort = _escape_job(tmp_path)
+    (cohort / "P1").mkdir()
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["P1"]) == ""
