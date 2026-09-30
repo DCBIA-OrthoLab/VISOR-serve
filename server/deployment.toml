@@ -253,3 +253,40 @@ batch = false
 # entirely.
 [tools.CLIC]
 width_from = false
+
+
+# VFACE orchestrates seven tools and computes the measurements itself. It is
+# declared here for its DATA folder and, above all, to opt ten arguments out of
+# the hosted-file convention -- for four different reasons, which is why they are
+# listed apart below rather than as one gesture.
+#
+# SEVEN are bundles this tool resolves itself (`dispatch._BUNDLES`):
+# `segmentation_model`, `classifier_model`, `cranial_base_reference`,
+# `maxilla_reference`, `mirror_reference`, `measurements`, `feature_template`.
+# The convention fills an unnamed model argument with DATA/<tool>/models/ -- the
+# FOLDER, which here holds six bundles at once -- so each callee would be handed
+# a directory that is not a bundle. AREG showed what that costs: the run dies
+# after the segmentation and the orientation have already been paid for. None of
+# them is a clinical choice either: one classifier, one mirror transform, one
+# reference per frame, one measurement list per region.
+#
+# `landmark_model` opts out for the reason [tools.ASO] gives about its own:
+# ALI_CBCT finds its own weights from the same data root, and a name held here
+# would be AREG holding a name for its neighbour's storage.
+#
+# `surface_model` is Batch_Dental_Seg's, and this deployment publishes none. Left
+# offering the models folder, the heat-map path would fail inside a child process
+# instead of saying which bundle is missing.
+#
+# `registration_transforms` is the clinician's OWN transforms, for the mode that
+# measures scans somebody else registered. Nothing this server hosts is a
+# plausible answer, and a dropdown of reference test files in front of that field
+# is an invitation to measure a patient against another patient's registration --
+# the same reason [tools.AREG_CBCT] opts `t1_masks` out.
+#
+# `t1`/`t2` draw from the scan folders alone: `Testing` holds landmarks and a
+# ground-truth spreadsheet, not volumes, and offering it where a CBCT goes puts a
+# folder of .json one click away from a scan picker.
+[tools.VFACE]
+data_dir = "VFACE"
+server_selectable = { t1 = "testfile:Scans", t2 = "testfile:Scans", segmentation_model = "none", landmark_model = "none", classifier_model = "none", surface_model = "none", cranial_base_reference = "none", maxilla_reference = "none", mirror_reference = "none", measurements = "none", feature_template = "none", registration_transforms = "none" }
