@@ -39,7 +39,7 @@ from typing import Any, Optional
 import file_utils
 import resources
 import telemetry
-from execution import admission, concurrency, costs
+from execution import admission, concurrency, costs, reports
 from base import ToolUnavailableError
 from config import settings
 from registry.deployment import deployment_config
@@ -975,41 +975,64 @@ def narrow_to_cases(job_dir: str, tool, keep) -> str:
     Hardlinked, not copied: a cohort is gigabytes and this is the same
     filesystem, so the narrowed folder costs directory entries.
     """
-    named = getattr(tool, "case_input", "") or ""
+    declared = getattr(tool, "case_input", "") or ""
+    arguments = [declared] if isinstance(declared, str) else list(declared)
     wanted = [name for name in (keep or ()) if name]
-    if not named or not wanted:
+    if not arguments or not wanted:
         return ""
     try:
         with open(os.path.join(job_dir, JOB_FILE), encoding="utf-8") as handle:
             job = json.load(handle)
     except (OSError, ValueError):
         return ""
-    source = (job.get("params") or {}).get(named)
-    if not isinstance(source, str) or not os.path.isdir(source):
+
+    # Which file a case has under each argument. A tool naming ONE argument
+    # may leave this unsaid and be narrowed by case name, which is what ASO
+    # does and what this did for everybody: the id IS the file. A tool naming
+    # SEVERAL cannot -- patient `C_0001` is `C_0001_T1.nii.gz` under `t1` and
+    # `C_0001_T2.nii.gz` under `t2` -- so it states the pairing in its report
+    # and this reads it back rather than guessing at names.
+    stated = reports.inputs_per_argument(
+        reports.read(os.path.join(job_dir, JOB_OUTPUT_DIRNAME)), wanted)
+    if len(arguments) > 1 and not stated:
+        logger.info("Not narrowing %s: it names %d inputs and its report "
+                    "pairs none of them", getattr(tool, "name", "?"),
+                    len(arguments))
         return ""
 
-    destination = os.path.join(job_dir, REPLAY_DIRNAME, named)
-    shutil.rmtree(destination, ignore_errors=True)
-    kept = 0
-    for relative in wanted:
-        origin = os.path.join(source, relative)
-        if not os.path.isfile(origin):
-            # A case named something that is not a file under this argument:
-            # the report and the request disagree, and narrowing on half an
-            # agreement would drop the rest.
-            logger.info("Not narrowing %s: %r is not under %s",
-                        getattr(tool, "name", "?"), relative, named)
-            shutil.rmtree(destination, ignore_errors=True)
+    narrowed = {}
+    for named in arguments:
+        source = (job.get("params") or {}).get(named)
+        if not isinstance(source, str) or not os.path.isdir(source):
             return ""
-        landing = os.path.join(destination, relative)
-        os.makedirs(os.path.dirname(landing), exist_ok=True)
-        try:
-            os.link(origin, landing)
-        except OSError:
-            shutil.copy2(origin, landing)
-        kept += 1
+        destination = os.path.join(job_dir, REPLAY_DIRNAME, named)
+        shutil.rmtree(destination, ignore_errors=True)
+        kept = 0
+        for case in wanted:
+            relative = (stated.get(case) or {}).get(named, case)
+            origin = os.path.join(source, relative)
+            if not os.path.isfile(origin):
+                # A case named something that is not a file under this
+                # argument: the report and the request disagree, and narrowing
+                # on half an agreement would drop the rest. Every argument
+                # already narrowed is undone -- feeding a tool three baselines
+                # and forty follow-ups is worse than feeding it everything.
+                logger.info("Not narrowing %s: %r is not under %s",
+                            getattr(tool, "name", "?"), relative, named)
+                for undo in list(narrowed) + [named]:
+                    shutil.rmtree(os.path.join(job_dir, REPLAY_DIRNAME, undo),
+                                  ignore_errors=True)
+                return ""
+            landing = os.path.join(destination, relative)
+            os.makedirs(os.path.dirname(landing), exist_ok=True)
+            try:
+                os.link(origin, landing)
+            except OSError:
+                shutil.copy2(origin, landing)
+            kept += 1
+        narrowed[named] = destination
 
-    job["params"] = dict(job.get("params") or {}, **{named: destination})
+    job["params"] = dict(job.get("params") or {}, **narrowed)
     replay = os.path.join(job_dir, REPLAY_JOB_FILE)
     with open(replay, "w", encoding="utf-8") as handle:
         json.dump(job, handle)

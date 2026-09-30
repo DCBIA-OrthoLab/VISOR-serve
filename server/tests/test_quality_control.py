@@ -1363,3 +1363,89 @@ def test_keeping_something_for_a_run_that_is_not_paused_is_silent(tmp_path):
 
     runs.keep_while_paused(uuid.uuid4().hex, [str(tmp_path)])
     runs.keep_while_paused(None, [str(tmp_path)])
+
+
+# ----------------------------------------------------------------------
+# Narrowing a tool that takes SEVERAL paired inputs
+# ----------------------------------------------------------------------
+
+class _PairedTool:
+    """A registration tool: a baseline and a follow-up, narrowed together."""
+    name = "Pairs"
+    case_input = ("t1", "t2")
+
+
+def _paired_job(tmp_path, patients, report=True):
+    """A job whose request points at two folders, and a report pairing them.
+
+    The names differ per timepoint on purpose -- `P1_T1.nii.gz` against
+    `P1_T2.nii.gz` -- because that is the shape that makes the case id
+    useless as a file name and the report necessary.
+    """
+    from execution import dispatch
+    for argument, token in (("t1", "T1"), ("t2", "T2")):
+        folder = tmp_path / argument
+        folder.mkdir()
+        for patient in patients:
+            (folder / f"{patient}_{token}.nii.gz").write_text(patient)
+    job = tmp_path / "job"
+    job.mkdir()
+    with open(job / dispatch.JOB_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"job_id": "j", "tool": "Pairs", "job_dir": str(job),
+                   "params": {"t1": str(tmp_path / "t1"),
+                              "t2": str(tmp_path / "t2")}}, handle)
+    output = job / dispatch.JOB_OUTPUT_DIRNAME
+    output.mkdir()
+    if report:
+        with open(output / "Pairs_report.json", "w", encoding="utf-8") as handle:
+            json.dump({"cases": {
+                patient: {"produced": [],
+                          "inputs": {"t1": f"{patient}_T1.nii.gz",
+                                     "t2": f"{patient}_T2.nii.gz"}}
+                for patient in patients}}, handle)
+    return str(job)
+
+
+def test_both_paired_inputs_are_narrowed_to_the_marked_cases(tmp_path):
+    """Narrowing one and not the other is the failure this guards.
+
+    It would hand the tool three baselines and forty follow-ups, and what its
+    own pairing then makes of that is not anything the server intended.
+    """
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1", "P2", "P3"])
+
+    written = dispatch.narrow_to_cases(job, _PairedTool(), ["P1", "P3"])
+
+    assert written
+    with open(written, encoding="utf-8") as handle:
+        params = json.load(handle)["params"]
+    assert sorted(os.listdir(params["t1"])) == ["P1_T1.nii.gz", "P3_T1.nii.gz"]
+    assert sorted(os.listdir(params["t2"])) == ["P1_T2.nii.gz", "P3_T2.nii.gz"]
+
+
+def test_a_paired_tool_whose_report_says_nothing_is_not_narrowed(tmp_path):
+    """The case id is not a file name here, so there is nothing to guess from.
+
+    Refused rather than attempted: `P1` is under neither folder, so narrowing
+    on the id would keep nothing and the run would register no one.
+    """
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1", "P2"], report=False)
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_one_argument_that_cannot_be_narrowed_undoes_the_other(tmp_path):
+    """Half a narrowing is worse than none, so the first folder is undone.
+
+    Left behind, the replay would read a narrowed `t1` beside a whole `t2`
+    from a job file that was never rewritten -- the exact asymmetry this
+    refuses.
+    """
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1", "P2"])
+    os.remove(os.path.join(tmp_path, "t2", "P1_T2.nii.gz"))
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+    assert not os.path.isdir(os.path.join(job, dispatch.REPLAY_DIRNAME, "t1"))
