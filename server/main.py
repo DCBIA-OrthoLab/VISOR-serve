@@ -2082,6 +2082,32 @@ def _tool_of(job_dir: str):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
 
+# The form fields a client names its marked cases in. One per case rather than
+# one joined string: a patient identifier is whatever a clinic calls its
+# folders, so any separator picked here is one that will turn up inside a name
+# and split it in half.
+_CASE_FIELD_PREFIX = "case_"
+
+
+def _declared_cases(form) -> list:
+    """The cases a reader asked to have done again, as the client named them.
+
+    Order is the form's, duplicates dropped. Nothing is validated here: a name
+    that is not a case of this run reaches `dispatch.narrow_to_cases`, which
+    refuses to narrow at all rather than narrowing on half an agreement -- and
+    the replay is then the whole cohort, which is the direction everything on
+    this path fails in.
+    """
+    named = []
+    for field, value in form.multi_items():
+        if not str(field).startswith(_CASE_FIELD_PREFIX):
+            continue
+        case = (value or "").strip() if isinstance(value, str) else ""
+        if case and case not in named:
+            named.append(case)
+    return named
+
+
 @app.post("/runs/{run_id}/rewind", dependencies=[Depends(verify_token), Depends(maintenance.require_accepting)])
 async def rewind_run(run_id: str, request: Request,
                      background_tasks: BackgroundTasks):
@@ -2117,11 +2143,16 @@ async def rewind_run(run_id: str, request: Request,
         )
     job_dir = paused["job_dir"]
     staged = _stage_corrections(_tool_of(job_dir), job_dir, form)
-    # Which cases the reader sent back, read out of the step's own report --
-    # the tool stated which of its files belong to which case, so nothing is
+    # What the reader SAID, before anything is deduced. A bad registration is
+    # marked and not corrected -- the landmarks that caused it are two steps
+    # back, so there is no file to send from where the reader is standing --
+    # and without this the only evidence was the corrections, so a reader who
+    # marked three of forty and edited nothing replayed all forty.
+    marked = _declared_cases(form)
+    # Then which cases the reader sent back, read out of the step's own report
+    # -- the tool stated which of its files belong to which case, so nothing is
     # deduced from a file name here. A step that reported nothing narrows
     # nothing, and the replay is the whole cohort: slower, never wrong.
-    marked = []
     for slot in staged:
         located = _located_step(job_dir, slot)
         if located is None:
@@ -2130,6 +2161,9 @@ async def rewind_run(run_id: str, request: Request,
         report = reports.read(os.path.join(step_dir, dispatch.JOB_OUTPUT_DIRNAME))
         marked.extend(name for name in reports.cases_of(
             report, _staged_files(job_dir, slot)) if name not in marked)
+    # The union, deliberately: a reader who corrected one patient's landmarks
+    # AND marked another wants both done again. Taking only one source would
+    # silently drop half of what they said.
     if marked:
         await anyio.to_thread.run_sync(
             dispatch.narrow_to_cases, job_dir, _tool_of(job_dir), marked)

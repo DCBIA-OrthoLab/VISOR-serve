@@ -1449,3 +1449,55 @@ def test_one_argument_that_cannot_be_narrowed_undoes_the_other(tmp_path):
 
     assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
     assert not os.path.isdir(os.path.join(job, dispatch.REPLAY_DIRNAME, "t1"))
+
+
+# ----------------------------------------------------------------------
+# What the reader SAID, beside what they changed
+# ----------------------------------------------------------------------
+
+class _Form(dict):
+    """A form, as starlette hands one over: multi_items() and get()."""
+
+    def multi_items(self):
+        return list(self.items())
+
+
+def test_the_cases_a_reader_marked_are_read_off_the_request():
+    """The one thing the corrections cannot say.
+
+    A reader who sees a registration land two millimetres off marks the
+    patient and changes no file -- the landmarks that caused it are two steps
+    back. Before this, the only evidence was the corrections, so a reader who
+    marked three of forty and edited nothing replayed all forty.
+    """
+    import main
+
+    named = main._declared_cases(_Form({"to": "01_ALI_CBCT",
+                                        "case_0": "P1", "case_1": "P2"}))
+
+    assert named == ["P1", "P2"]
+
+
+def test_a_case_named_twice_travels_once():
+    import main
+
+    assert main._declared_cases(
+        _Form({"case_0": "P1", "case_1": "P1"})) == ["P1"]
+
+
+def test_blanks_and_other_fields_are_not_cases():
+    """`to` is the step, and a blank field is a client sending nothing."""
+    import main
+
+    assert main._declared_cases(
+        _Form({"to": "01_ASO", "case_0": "  ", "case_1": "P1",
+               "01_ASO": "a zip, not a case"})) == ["P1"]
+
+
+def test_a_patient_whose_name_holds_a_comma_survives():
+    """Which is why this is one field per case and not a joined string: any
+    separator picked here is one that turns up inside a folder name."""
+    import main
+
+    assert main._declared_cases(
+        _Form({"case_0": "Doe, John"})) == ["Doe, John"]
