@@ -26,7 +26,7 @@ Slicer's own interpreter, where nothing may be pip-installed on a user's behalf.
 From nothing, on the machine that will host it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-server.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-server.sh | sh
 ```
 
 That clones the repo, checks docker (telling you exactly what to run if it is
@@ -39,6 +39,14 @@ working.
 Add `--tool NAME` (repeatable) to also download that tool's data. Nothing is
 downloaded by default - the full set is ~29 GB and which tools a site uses is
 not something to assume.
+
+Both the URL above and what it clones are the `deploy` branch, not `main`:
+`deploy` is a commit of `main` whose CI went green and which was then moved
+there on purpose, so a clinic installing today gets the same code as the clinic
+that installed last week rather than whatever merged an hour ago. The install
+prints how far behind `main` that is. To follow the tip instead, pass
+`--branch main` -- or fetch this script from `main` too, which is what a
+developer testing an unreleased change wants.
 
 ### Afterwards, from the clone
 
@@ -124,8 +132,8 @@ On a machine with nothing checked out - run it from the directory that should
 end up holding `DATA/`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-models.sh | sh
-curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-testfiles.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-models.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-testfiles.sh | sh
 ```
 
 From a clone, the same thing without the network round trip (the wrappers
