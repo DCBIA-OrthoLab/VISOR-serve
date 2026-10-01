@@ -33,6 +33,10 @@
 #                   instead of the two built-in demos. Pass a git URL, or
 #                   `default` for DCBIA-OrthoLab/SADT-VISOR.
 #   --tools-dir DIR where to clone it (default: beside the server clone)
+#   --build-tools   build each tool's virtualenv after cloning, which is what
+#                   makes them actually RUN. ~25 GB and well over an hour, it
+#                   downloads two CUDA torch runtimes. Implied by --full.
+#                   Installs `uv` from astral.sh if it is not on PATH.
 #   --yes           never ask anything; take the defaults and the options given
 #
 # Environment:
@@ -62,6 +66,7 @@ AUTO_UPDATE=""
 ASK=1
 TOOLS_REPO=""
 TOOLS_DIR_OPT=""
+BUILD_TOOLS=0
 DEFAULT_TOOLS_REPO="https://github.com/DCBIA-OrthoLab/SADT-VISOR.git"
 
 while [ $# -gt 0 ]; do
@@ -78,6 +83,7 @@ while [ $# -gt 0 ]; do
         --branch) REF="$2"; shift 2 ;;
         --tools) TOOLS_REPO="$2"; shift 2 ;;
         --tools-dir) TOOLS_DIR_OPT="$2"; shift 2 ;;
+        --build-tools) BUILD_TOOLS=1; shift ;;
         --yes|-y|--non-interactive) ASK=0; shift ;;
         -h|--help) sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "setup-server: unknown option '$1'" >&2; exit 2 ;;
@@ -143,6 +149,15 @@ if [ "$FULL" -eq 0 ] && [ -z "$TOOLS" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] &
     case "$_all" in y|Y|yes|YES) FULL=1 ;; esac
 fi
 
+# A server whose tools have no virtualenv reports every one of them as
+# unloadable, which reads as a broken deployment rather than an unbuilt one.
+[ "$FULL" -eq 1 ] && BUILD_TOOLS=1
+if [ "$BUILD_TOOLS" -eq 0 ] && [ -n "$TOOLS_REPO" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    printf 'Build each tool virtualenv now? Needed to run them. ~25 GB, over an hour [y/N]: ' > /dev/tty
+    read -r _bt < /dev/tty || _bt=""
+    case "$_bt" in y|Y|yes|YES) BUILD_TOOLS=1 ;; esac
+fi
+
 for tool in git python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "setup-server: $tool is required but was not found in PATH." >&2
@@ -191,10 +206,6 @@ if ! docker info >/dev/null 2>&1; then
     exit 1
 fi
 
-# --- models --------------------------------------------------------------
-# Before starting the server, not after: the tools that have no weights on
-# disk answer 422 rather than failing mysteriously, so it is better to know
-# what is missing while someone is still watching the terminal.
 # --- settings that outlive this run --------------------------------------
 # Merged line by line, never rewritten: an operator's own additions to .env
 # must survive, which is the same rule server_ctl.py's write_env follows.
@@ -237,6 +248,10 @@ if [ -n "$TOOLS_REPO" ]; then
 fi
 
 # --- models and test files -----------------------------------------------
+# Before starting the server, not after: a tool with no weights on disk
+# answers 422 rather than failing mysteriously, so it is better to know what
+# is missing while someone is still watching the terminal.
+#
 # Delegated to the TOOLS repository's own script: the manifest listing which
 # bundle belongs to which tool is dental knowledge and lives beside the tools.
 # Falls back to this repo's copy while both exist, so an older tools checkout
@@ -258,6 +273,53 @@ if [ "$FULL" -eq 1 ]; then
 elif [ -n "$TOOLS" ]; then
     # shellcheck disable=SC2086 -- $TOOLS is a deliberately word-split option list
     fetch_data $TOOLS
+fi
+
+# --- the tool virtualenvs ------------------------------------------------
+# One per tool, built from its own committed lockfile. They are what makes a
+# tool runnable: TOOLS_DIR pointing at a tree with no `.venv` registers
+# nothing. A tool that fails to build is REPORTED and the others carry on --
+# the same rule the registry follows, because with eighteen tools one missing
+# dependency must not cost the other seventeen.
+if [ "$BUILD_TOOLS" -eq 1 ] && [ -n "$TOOLS_ROOT" ]; then
+    if ! command -v uv >/dev/null 2>&1; then
+        echo
+        echo "Installing uv (the tools' package manager) from astral.sh ..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        # Its installer puts uv here and prints a line about restarting the
+        # shell, which a non-interactive run cannot do.
+        PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+        export PATH
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+        echo "setup-server: uv is still not on PATH; cannot build the tool virtualenvs." >&2
+        echo "  Install it yourself (https://docs.astral.sh/uv/) and re-run with --build-tools." >&2
+    else
+        echo
+        echo "Building each tool's virtualenv. This downloads two CUDA torch"
+        echo "runtimes and lands at roughly 25 GB; it is resumable, so a"
+        echo "re-run only does what is missing."
+        _failed=""
+        for _pyproject in "$TOOLS_ROOT"/tools/*/pyproject.toml "$TOOLS_ROOT"/tools/*/*/pyproject.toml; do
+            [ -f "$_pyproject" ] || continue
+            grep -q '^\[tool.sadt\]' "$_pyproject" || continue   # a tool, not a shared package
+            _tool_dir="$(dirname "$_pyproject")"
+            _tool_name="$(basename "$_tool_dir")"
+            printf '  %-20s ' "$_tool_name"
+            if ( cd "$_tool_dir" && uv sync --frozen --quiet ) >/dev/null 2>&1; then
+                echo "built"
+            else
+                echo "FAILED"
+                _failed="$_failed $_tool_name"
+            fi
+        done
+        if [ -n "$_failed" ]; then
+            echo
+            echo "These tools did not build and will not be served:$_failed"
+            echo "  Re-run the one that matters from its own folder to see why:"
+            echo "      cd $TOOLS_ROOT/tools/<name> && uv sync --frozen"
+        fi
+    fi
 fi
 
 # --- point the deployment at the tools -----------------------------------
