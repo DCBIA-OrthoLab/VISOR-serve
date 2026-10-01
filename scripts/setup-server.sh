@@ -28,10 +28,13 @@
 #                   scripts/visor-update.service for the unit that runs it.
 #   --branch NAME   the branch this deployment follows (default: main). Both
 #                   what is cloned and what `watch` fast-forwards to.
-#   --tools URL     also clone the TOOLS repository (SADT-VISOR) and point this
-#                   deployment at it, so the server serves the real tools
-#                   instead of the two built-in demos. Pass a git URL, or
-#                   `default` for DCBIA-OrthoLab/SADT-VISOR.
+#   --tools URL     also clone a TOOLS repository and point this deployment at
+#                   it, so the server serves real tools instead of the two
+#                   built-in demos. A git URL, and there is deliberately no
+#                   default: this server imports nothing from the tools and
+#                   knows no dental tool, so naming one repository in here
+#                   would be the one piece of that knowledge it holds. The
+#                   operator says which tools this deployment serves.
 #   --tools-dir DIR where to clone it (default: beside the server clone)
 #   --tools-ref REF which branch of the tools repository to clone (default:
 #                   its own default branch). The counterpart of --branch.
@@ -70,7 +73,6 @@ TOOLS_REPO=""
 TOOLS_DIR_OPT=""
 TOOLS_REF=""
 BUILD_TOOLS=0
-DEFAULT_TOOLS_REPO="https://github.com/DCBIA-OrthoLab/SADT-VISOR.git"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -123,14 +125,13 @@ ask BIND "Host address to publish it on (127.0.0.1 keeps it off the network)" "1
 ask REF  "Branch this deployment follows" "$REF"
 ask AUTO_UPDATE "Follow that branch automatically? off | notify | apply" "off"
 
-# Without this the server starts with its two demo tools and nothing else,
-# which reads as a small deployment rather than an unfinished one.
+# Without a tools repository the server starts with its two demo tools and
+# nothing else, which reads as a small deployment rather than an unfinished
+# one. Asked as a URL rather than offered as a default: see --tools.
 if [ -z "$TOOLS_REPO" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
-    printf 'Also clone the tools repository, so the real tools are served? [Y/n]: ' > /dev/tty
-    read -r _wt < /dev/tty || _wt=""
-    case "$_wt" in n|N|no|NO) ;; *) TOOLS_REPO="default" ;; esac
+    printf 'Git URL of the tools repository to serve (empty: the demos only): ' > /dev/tty
+    read -r TOOLS_REPO < /dev/tty || TOOLS_REPO=""
 fi
-[ "$TOOLS_REPO" = "default" ] && TOOLS_REPO="$DEFAULT_TOOLS_REPO"
 
 case "$AUTO_UPDATE" in
     off|notify|apply) ;;
@@ -232,7 +233,11 @@ if [ -n "$TOOLS_REPO" ]; then
     if [ -n "$TOOLS_DIR_OPT" ]; then
         TOOLS_ROOT="$TOOLS_DIR_OPT"
     else
-        TOOLS_ROOT="$(dirname "$INSTALL_DIR")/SADT-VISOR"
+        # Named after the repository, never after a repository this script
+        # knows: `--tools .../Foo.git` clones into ./Foo beside the server.
+        _tools_name="$(basename "$TOOLS_REPO")"
+        _tools_name="${_tools_name%.git}"
+        TOOLS_ROOT="$(dirname "$INSTALL_DIR")/${_tools_name}"
     fi
     if [ -d "$TOOLS_ROOT/.git" ]; then
         echo "Updating the tools clone in $TOOLS_ROOT ..."
