@@ -33,6 +33,8 @@
 #                   instead of the two built-in demos. Pass a git URL, or
 #                   `default` for DCBIA-OrthoLab/SADT-VISOR.
 #   --tools-dir DIR where to clone it (default: beside the server clone)
+#   --tools-ref REF which branch of the tools repository to clone (default:
+#                   its own default branch). The counterpart of --branch.
 #   --build-tools   build each tool's virtualenv after cloning, which is what
 #                   makes them actually RUN. ~25 GB and well over an hour, it
 #                   downloads two CUDA torch runtimes. Implied by --full.
@@ -66,6 +68,7 @@ AUTO_UPDATE=""
 ASK=1
 TOOLS_REPO=""
 TOOLS_DIR_OPT=""
+TOOLS_REF=""
 BUILD_TOOLS=0
 DEFAULT_TOOLS_REPO="https://github.com/DCBIA-OrthoLab/SADT-VISOR.git"
 
@@ -83,6 +86,7 @@ while [ $# -gt 0 ]; do
         --branch) REF="$2"; shift 2 ;;
         --tools) TOOLS_REPO="$2"; shift 2 ;;
         --tools-dir) TOOLS_DIR_OPT="$2"; shift 2 ;;
+        --tools-ref) TOOLS_REF="$2"; shift 2 ;;
         --build-tools) BUILD_TOOLS=1; shift ;;
         --yes|-y|--non-interactive) ASK=0; shift ;;
         -h|--help) sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -242,7 +246,11 @@ if [ -n "$TOOLS_REPO" ]; then
         exit 1
     else
         echo "Cloning the tools from $TOOLS_REPO into $TOOLS_ROOT ..."
-        git clone "$TOOLS_REPO" "$TOOLS_ROOT"
+        if [ -n "$TOOLS_REF" ]; then
+            git clone --branch "$TOOLS_REF" "$TOOLS_REPO" "$TOOLS_ROOT"
+        else
+            git clone "$TOOLS_REPO" "$TOOLS_ROOT"
+        fi
     fi
     TOOLS_ROOT="$(cd "$TOOLS_ROOT" && pwd)"
 fi
