@@ -42,7 +42,7 @@ data_dir = "AREG"
 # volumes; the intraoral cohorts staged beside them for the other two engines
 # cannot be a baseline, and offering them put a folder of `.vtk` one click away
 # from a CBCT picker.
-server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:CBCT", t2 = "testfile:CBCT" }
+server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:T1", t2 = "testfile:T2" }
 
 [tools.AREG_IOS]
 data_dir = "AREG"
@@ -65,7 +65,7 @@ data_dir = "AREG"
 # clinical choice -- Frankfurt or Occlusal -- and keeps its dropdown. Opting out
 # under the shared name would have changed what that name means between two
 # engines of one facade, which is what the note above is about.
-server_selectable = { t1 = "testfile:IOS", t2 = "testfile:IOS", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none" }
+server_selectable = { t1 = "testfile:T1", t2 = "testfile:T2", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none" }
 
 # Orchestrates four tools and computes almost nothing itself; see the rule in
 # deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
@@ -284,9 +284,28 @@ width_from = false
 # is an invitation to measure a patient against another patient's registration --
 # the same reason [tools.AREG_CBCT] opts `t1_masks` out.
 #
-# `t1`/`t2` draw from the scan folders alone: `Testing` holds landmarks and a
-# ground-truth spreadsheet, not volumes, and offering it where a CBCT goes puts a
-# folder of .json one click away from a scan picker.
+# `t1` is scoped to the one hosted cohort that holds volumes. `Testing` holds
+# landmarks and a ground-truth spreadsheet, so offering the testfiles folder
+# whole puts a directory of .json one click away from a scan picker; and the
+# scope this carried first, `Scans`, named a folder nothing stages -- the
+# manifest's VFACE entries land in `Testing` and `CBCT_Or_FullyAuto`, so the
+# picker was empty on every fresh install. An empty dropdown reads as "this
+# deployment hosts no scans", which is the one thing it does host.
+#
+# `t2` is opted out rather than pointed at the same cohort. It is the FOLLOW-UP
+# of a longitudinal study, the hosted cohort holds a single timepoint
+# (`C_0001_T1.nii.gz`), and a picker offering it on both sides is an invitation
+# to register a patient against themselves -- which does not fail, it returns a
+# study reporting no change. The clinician's own second timepoint is an upload,
+# which `"none"` leaves in place: it removes the hosted kind, not the argument.
 [tools.VFACE]
 data_dir = "VFACE"
-server_selectable = { t1 = "testfile:Scans", t2 = "testfile:Scans", segmentation_model = "none", landmark_model = "none", classifier_model = "none", surface_model = "none", cranial_base_reference = "none", maxilla_reference = "none", mirror_reference = "none", measurements = "none", feature_template = "none", registration_transforms = "none" }
+server_selectable = { t1 = "testfile:CBCT_Or_FullyAuto", t2 = "none", segmentation_model = "none", landmark_model = "none", classifier_model = "none", surface_model = "none", cranial_base_reference = "none", maxilla_reference = "none", mirror_reference = "none", measurements = "none", feature_template = "none", registration_transforms = "none" }
+
+[tools.GreedyReg]
+# Each side of a registration is ONE timepoint, and the tool refuses a folder
+# holding both -- "the two will be paired timepoint against timepoint and the
+# run will look like it worked". The hosted cohort splits them into `T1/` and
+# `T2/`, so both pickers draw from inside it rather than offering the cohort
+# folder the tool cannot accept.
+server_selectable = { t1 = "testfile:CBCT_T1_T2_pair", t2 = "testfile:CBCT_T1_T2_pair" }
