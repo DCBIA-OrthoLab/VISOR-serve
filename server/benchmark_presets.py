@@ -138,12 +138,51 @@ PRESETS = {
 
 # --- resolving a tool's arguments ------------------------------------------
 
+# Which hosted name a given argument should be filled with, where the first one
+# alphabetically is the WRONG KIND rather than merely a different cohort.
+#
+# `pool[0]` is deterministic on purpose -- two batteries of one preset have to
+# be comparable -- but determinism is not correctness: a pool can hold several
+# kinds and nothing in the schema separates them, since none of these arguments
+# declares `extensions`. Measured, every one of these refused in under a second
+# with a message naming exactly this:
+#
+#   AutoCrop3D  "'MG_test_scan.nii.gz' is not a Slicer ROI."
+#   ALI_IOS     "'MG_test_scan.nii.gz' is a CBCT volume. This tool places
+#                landmarks on intraoral surfaces; run ALI_CBCT on volumes."
+#   AREG_IOS    a CBCT cohort handed to the intraoral engine
+#   GreedyReg   one folder holding both timepoints, which it refuses by design
+#
+# A name here is a PREFERENCE, not a requirement: it is used only when the pool
+# actually offers it, so a deployment staging different cohorts falls back to
+# the first-alphabetically rule and stays runnable.
+PREFERRED = {
+    "AutoCrop3D": {"roi": "ROI_box"},
+    "ALI_IOS": {"input": "T1_01_U_segmented.vtk"},
+    "AREG_IOS": {"t1": "IOS_test_scans", "t2": "IOS_test_scans"},
+    "GreedyReg": {"t1": "T1", "t2": "T2"},
+}
+
+
 def _pool_for(declaration: dict, hosted: dict) -> list:
-    """The hosted names an argument may be filled from."""
+    """The hosted names an argument may be filled from.
+
+    A SCOPED argument draws from one subfolder, not from the tool's whole
+    catalogue, and the difference is not cosmetic: `AREG_CBCT.t1` is scoped to
+    `T1`, whose siblings are `T2` and `IOSCBCT`. Reading the catalogue made
+    `pool[0]` the alphabetically first name -- `IOSCBCT` -- which `t1` cannot
+    resolve, so all four AREG arms answered 404 in under ten milliseconds and
+    were reported as the tools failing.
+    """
     kind = declaration.get("server_selectable")
+    scope = declaration.get("selectable_scope")
     if kind == "model":
+        if scope:
+            return list((hosted.get("models_by_scope") or {}).get(scope) or ())
         return list(hosted.get("models") or ())
     if kind == "testfile":
+        if scope:
+            return list((hosted.get("testfiles_by_scope") or {}).get(scope) or ())
         return list(hosted.get("testfiles") or ())
     return []
 
@@ -199,7 +238,13 @@ def _applies(declaration: dict, effective: dict) -> bool:
     return True
 
 
-def resolve_arguments(schema: dict, hosted: dict) -> dict:
+def _preferred(tool: str, argument: str, pool: list) -> Optional[str]:
+    """The name `PREFERRED` asks for, if this deployment hosts it."""
+    wanted = (PREFERRED.get(tool) or {}).get(argument)
+    return wanted if wanted in pool else None
+
+
+def resolve_arguments(schema: dict, hosted: dict, tool: str = "") -> dict:
     """{params, missing} for one tool, filled from what this server hosts.
 
     `params` carries only what has to be SENT: a required argument that the
@@ -217,6 +262,10 @@ def resolve_arguments(schema: dict, hosted: dict) -> dict:
         if not isinstance(declaration, dict) or not declaration.get("required"):
             continue
         pool = _pool_for(declaration, hosted)
+        chosen = _preferred(tool, name, pool)
+        if chosen:
+            params[name] = chosen
+            continue
         if pool:
             # The first hosted name, deterministically: a battery re-run on the
             # same deployment must be comparable with the one before it, and
@@ -340,7 +389,7 @@ def runnable_tools(schemas: dict, hosted_for) -> dict:
             hosted = hosted_for(name) or {}
         except Exception:  # noqa: BLE001 - one unreadable tool is not a failure
             hosted = {}
-        report[name] = resolve_arguments(schema, hosted)
+        report[name] = resolve_arguments(schema, hosted, name)
     return report
 
 

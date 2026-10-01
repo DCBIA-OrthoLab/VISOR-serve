@@ -831,6 +831,13 @@ def _benchmark_resolution() -> dict:
                   # it here a battery sends the mode alone and collects a 422
                   # from the tool the facade dispatched to.
                   "visible_when": spec.visible_when,
+                  # Carried for the same reason `visible_when` is: a scoped
+                  # argument draws from ONE subfolder, and a resolver reading
+                  # the whole catalogue picks a name that argument cannot
+                  # resolve. `AREG_CBCT.t1` is scoped to `T1`; unscoped, the
+                  # first hosted name is `IOSCBCT`, a sibling, and every AREG
+                  # arm answered 404 before a process started.
+                  "selectable_scope": spec.selectable_scope,
                   "type": _type_name(spec.types[0])}
             for arg, spec in tool.arguments.items()
         }}
@@ -839,8 +846,23 @@ def _benchmark_resolution() -> dict:
 
     def hosted(name: str) -> dict:
         slug = deployment_config.data_slug(name)
+        # One list per scope the tool's arguments actually name, beside the
+        # unscoped catalogue an unscoped argument still draws from.
+        scopes = {
+            spec.selectable_scope
+            for spec in TOOLS[name].arguments.values()
+            if getattr(spec, "selectable_scope", None)
+        }
         return {"models": data_store.list_models(slug),
-                "testfiles": data_store.list_testfiles(slug)}
+                "testfiles": data_store.list_testfiles(slug),
+                "testfiles_by_scope": {
+                    scope: data_store.list_testfiles(slug, scope)
+                    for scope in sorted(scopes)
+                },
+                "models_by_scope": {
+                    scope: data_store.list_models(slug, scope)
+                    for scope in sorted(scopes)
+                }}
 
     return benchmark_presets.runnable_tools(schemas, hosted)
 
