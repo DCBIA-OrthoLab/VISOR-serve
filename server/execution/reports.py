@@ -40,6 +40,11 @@ _SUFFIX = "_report.json"
 CASES = "cases"
 INPUT = "input"
 PRODUCED = "produced"
+# What a case was given under EACH of a tool's case inputs, when it names
+# several. Beside `INPUT` rather than replacing it: a tool with one input says
+# `input` and is read by `inputs_for`, which narrows a replay by feeding those
+# paths back; nothing about that changes.
+INPUTS = "inputs"
 
 
 def find(directory: str):
@@ -105,6 +110,42 @@ def inputs_for(report: dict, wanted) -> list:
     keep = set(wanted or ())
     return [entry[INPUT] for name, entry in cases(report).items()
             if name in keep and isinstance(entry.get(INPUT), str)]
+
+
+def inputs_per_argument(report: dict, wanted) -> dict:
+    """`{case: {argument: relative path}}` for the cases that state it.
+
+    The pairing a tool with SEVERAL case inputs has to say out loud. One
+    argument can be narrowed by case name -- the id is the file, which is what
+    `ASO` relies on -- but a registration tool takes a baseline and a
+    follow-up, and patient `C_0001` is `C_0001_T1.nii.gz` under one and
+    `C_0001_T2.nii.gz` under the other. No rule turns the id into both, and a
+    server that invented one would be guessing at the tool's naming again.
+
+        {"cases": {"C_0001": {"inputs": {"t1": "T1/C_0001_T1.nii.gz",
+                                         "t2": "T2/C_0001_T2.nii.gz"}}}}
+
+    Relative to the ARGUMENT the tool was given, not to anything it derived:
+    a path under an oriented copy the run made for itself names a file the
+    caller never sent, and narrowing the caller's folder by it keeps nothing.
+
+    `{}` for a report that says nothing, which is every report written before
+    this existed. The caller then narrows nothing and replays the cohort,
+    which is the direction everything here fails in.
+    """
+    keep = set(wanted or ())
+    paired = {}
+    for name, entry in cases(report).items():
+        if name not in keep:
+            continue
+        stated = entry.get(INPUTS)
+        if not isinstance(stated, dict):
+            continue
+        per_argument = {argument: path for argument, path in stated.items()
+                        if isinstance(argument, str) and isinstance(path, str)}
+        if per_argument:
+            paired[name] = per_argument
+    return paired
 
 
 def produced_by(report: dict, wanted) -> list:

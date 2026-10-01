@@ -42,7 +42,7 @@ data_dir = "AREG"
 # volumes; the intraoral cohorts staged beside them for the other two engines
 # cannot be a baseline, and offering them put a folder of `.vtk` one click away
 # from a CBCT picker.
-server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:CBCT_T1", t2 = "testfile:CBCT_T2" }
+server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:CBCT", t2 = "testfile:CBCT" }
 
 [tools.AREG_IOS]
 data_dir = "AREG"
@@ -65,7 +65,7 @@ data_dir = "AREG"
 # clinical choice -- Frankfurt or Occlusal -- and keeps its dropdown. Opting out
 # under the shared name would have changed what that name means between two
 # engines of one facade, which is what the note above is about.
-server_selectable = { t1 = "testfile:IOS_T1", t2 = "testfile:IOS_T2", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none" }
+server_selectable = { t1 = "testfile:IOS", t2 = "testfile:IOS", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none" }
 
 # Orchestrates four tools and computes almost nothing itself; see the rule in
 # deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
@@ -82,7 +82,7 @@ data_dir = "AREG"
 # genuinely empty, each callee resolves its own weights (Crown_Seg, ALI_IOS and
 # ALI_CBCT all can), and the orientation reference is resolved by this engine,
 # there being one frame the rest of the chain expects.
-server_selectable = { ios = "testfile:IOSCBCT_IOS", cbct = "testfile:IOSCBCT_CBCT", ios_landmarks = "testfile:IOSCBCT_IOS_LM", cbct_landmarks = "testfile:IOSCBCT_CBCT_LM", crown_model = "none", ios_landmark_model = "none", landmark_model = "none", cbct_reference = "none" }
+server_selectable = { ios = "testfile:IOSCBCT", cbct = "testfile:IOSCBCT", ios_landmarks = "testfile:IOSCBCT", cbct_landmarks = "testfile:IOSCBCT", crown_model = "none", ios_landmark_model = "none", landmark_model = "none", cbct_reference = "none" }
 
 # The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
 # this each looks for DATA/<its own name>/ and falls back to the run-together

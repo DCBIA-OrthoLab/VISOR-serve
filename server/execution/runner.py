@@ -164,8 +164,23 @@ SUP_DIRNAME = "sup"
 _ALL_STEPS = frozenset({"*"})
 
 
-class QualityControlStop(Exception):
+class QualityControlStop(BaseException):
     """A run stopping where it was ASKED to stop, which is not a failure.
+
+    **BaseException, not Exception, and that is the whole point.** This class
+    lives here, in the file the server injects by path, so a tool CANNOT import
+    it -- and therefore cannot write `except QualityControlStop: raise`. Every
+    tool that wraps a `sup.run()` in `except Exception` to keep one bad case
+    from costing the cohort would otherwise catch this too, and turn "the
+    reader asked to stop here" into "that step failed". Measured on 2026-09-29:
+    `ALI_IOS` armed at `Crown_Seg` answered 500 with "Crown_Seg could not label
+    them. First reason: QualityControlStop", and no pause ever happened.
+    `ASO` and `AREG_IOSCBCT` have the same shape of catch.
+
+    Deriving from BaseException puts it beside `KeyboardInterrupt` and
+    `SystemExit`, which is exactly the company it keeps: control flow that
+    unwinds a program and must not be mistaken for an error. `except Exception`
+    no longer sees it, and nothing in any tool had to change.
 
     Raised inside the tool's own code -- by `sup.declareQualityControl` or by
     the supervisor on the way out of a `sup.run()` the caller armed -- and
@@ -2211,8 +2226,23 @@ class _Supervisor:
         self.log("{} channel(s) of {} asked for".format(answer, asked or "any"))
         return _record_width(answer)
 
-    def declareQualityControl(self, name: str) -> bool:
+    def declareQualityControl(self, name: str, kind: str = "view") -> bool:
         """Offer the caller a place to stop, here, and stop if they asked.
+
+        `kind` is DECLARATIVE and is not read here. It says what a reader may
+        do at this point -- look, drag the points, drag the scan -- and its one
+        consumer is `describe.py`, which lifts it out of this call site by AST
+        so the server can publish it beside the option. The signature has to
+        accept it all the same, and did not: the keyword was parseable and not
+        callable, which nothing discovered because no tool had ever passed one.
+        `AREG_CBCT` declaring the first `kind="registration"` answered 500 with
+        "got an unexpected keyword argument 'kind'" after a full 143-second
+        registration -- at the finish line, the worst place to find it.
+
+        The default is the literal "view" rather than a shared constant: this
+        file is standard-library only and injected by path, so it imports
+        nothing from the server. The vocabulary itself is checked where it is
+        read, in `describe.REVIEW_KINDS`.
 
         Called by a tool in the MIDDLE of its own work, where no `sup.run()`
         boundary exists: AMASSS between its crop and its prediction, ALI once
@@ -2499,6 +2529,30 @@ def main(argv=None) -> int:
             where = arguments.get(OUTPUT_DIR_ARGUMENT) if isinstance(arguments, dict) else None
             produced = _collect_supervised_outputs(
                 job["job_dir"], where, _ALL_STEPS, move=False)
+            # The tool's OWN output, which was missing from the ARCHIVE -- and
+            # no earlier checkpoint could reveal that: stopping after a
+            # `sup.run()` means the tool has barely started and its output
+            # directory holds nothing of its own, so the omission stayed
+            # invisible until a tool declared a checkpoint at the END of its
+            # work. `AREG_CBCT`'s `Registration` then handed back `01_AMASSS`
+            # -- 772 kB of masks -- for a pause whose entire purpose is to show
+            # the registered scans.
+            #
+            # It joins `outputs` and NOT `produced`, and the two are different
+            # things however alike they look. `produced` is a protocol field:
+            # the client parses each entry as a step slot, splitting `01_ASO`
+            # into a position and a tool name so it can walk the run backwards
+            # and offer a rewind (`base_widget._previousCorrectableStep`). A
+            # `"output"` in that list has no underscore, names no tool, and
+            # silently cost the reader every rewind offer. `outputs` is what
+            # the server PACKS, and the archive is where the scans belong.
+            packed = {os.path.basename(path): path for path in produced}
+            if where and os.path.isdir(where) and os.listdir(where):
+                # Under its own name, so a reader opening the archive can tell
+                # this run's results from the steps that fed them -- and so the
+                # steps, already copied to `<output>/intermediate/` by the
+                # collect above, are not also added at the root and sent twice.
+                packed = {os.path.basename(where): where}
             _write_result(job["job_dir"], {
                 STOPPED_AFTER_KEY: stop.name,
                 # Named so a client can tell this from a finished run without
@@ -2506,12 +2560,14 @@ def main(argv=None) -> int:
                 # the level above reads it back through `_stopped_after`,
                 # which is what makes a nested stop the whole chain's.
                 QUALITY_CONTROL_KEY: True,
+                # The STEPS, in the order they ran. See above: this is read as
+                # slots, not as archive members.
                 "produced": [os.path.basename(path) for path in produced],
                 # The canonical shape for "what this run produced", which is
                 # what the server packs. A stopped run still has an answer --
                 # everything the chain got through -- and it travels the same
                 # way a finished one's does.
-                "outputs": {os.path.basename(path): path for path in produced},
+                "outputs": packed,
             })
         return 0
     except RunnerError as exc:

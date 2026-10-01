@@ -38,7 +38,8 @@ from typing import Any, Optional
 
 import file_utils
 import resources
-from execution import admission, concurrency, costs
+import telemetry
+from execution import admission, concurrency, costs, reports
 from base import ToolUnavailableError
 from config import settings
 from registry.deployment import deployment_config
@@ -956,6 +957,25 @@ REPLAY_DIRNAME = "replay"
 REPLAY_JOB_FILE = "job.replay.json"
 
 
+def _inside(folder: str, path: str) -> bool:
+    """Whether `path` really sits under `folder`, symlinks resolved.
+
+    `os.path.join` happily builds `<cohort>/../../etc/passwd`, and
+    `os.path.isfile` happily confirms it. Both halves matter: `realpath`
+    because a symlink inside the cohort points wherever it likes, and
+    `commonpath` rather than `startswith` because `/data/cohort2` starts with
+    `/data/cohort` and is a different cohort.
+    """
+    try:
+        folder = os.path.realpath(folder)
+        resolved = os.path.realpath(path)
+        return folder == resolved or os.path.commonpath([folder, resolved]) == folder
+    except (OSError, ValueError):
+        # A path so malformed that commonpath refuses it -- mixed drives on
+        # Windows, an empty string. Not inside anything.
+        return False
+
+
 def narrow_to_cases(job_dir: str, tool, keep) -> str:
     """A job file feeding `tool` only the inputs of `keep`, or "".
 
@@ -974,41 +994,79 @@ def narrow_to_cases(job_dir: str, tool, keep) -> str:
     Hardlinked, not copied: a cohort is gigabytes and this is the same
     filesystem, so the narrowed folder costs directory entries.
     """
-    named = getattr(tool, "case_input", "") or ""
+    declared = getattr(tool, "case_input", "") or ""
+    arguments = [declared] if isinstance(declared, str) else list(declared)
     wanted = [name for name in (keep or ()) if name]
-    if not named or not wanted:
+    if not arguments or not wanted:
         return ""
     try:
         with open(os.path.join(job_dir, JOB_FILE), encoding="utf-8") as handle:
             job = json.load(handle)
     except (OSError, ValueError):
         return ""
-    source = (job.get("params") or {}).get(named)
-    if not isinstance(source, str) or not os.path.isdir(source):
+
+    # Which file a case has under each argument. A tool naming ONE argument
+    # may leave this unsaid and be narrowed by case name, which is what ASO
+    # does and what this did for everybody: the id IS the file. A tool naming
+    # SEVERAL cannot -- patient `C_0001` is `C_0001_T1.nii.gz` under `t1` and
+    # `C_0001_T2.nii.gz` under `t2` -- so it states the pairing in its report
+    # and this reads it back rather than guessing at names.
+    stated = reports.inputs_per_argument(
+        reports.read(os.path.join(job_dir, JOB_OUTPUT_DIRNAME)), wanted)
+    if len(arguments) > 1 and not stated:
+        logger.info("Not narrowing %s: it names %d inputs and its report "
+                    "pairs none of them", getattr(tool, "name", "?"),
+                    len(arguments))
         return ""
 
-    destination = os.path.join(job_dir, REPLAY_DIRNAME, named)
-    shutil.rmtree(destination, ignore_errors=True)
-    kept = 0
-    for relative in wanted:
-        origin = os.path.join(source, relative)
-        if not os.path.isfile(origin):
-            # A case named something that is not a file under this argument:
-            # the report and the request disagree, and narrowing on half an
-            # agreement would drop the rest.
-            logger.info("Not narrowing %s: %r is not under %s",
-                        getattr(tool, "name", "?"), relative, named)
-            shutil.rmtree(destination, ignore_errors=True)
+    narrowed = {}
+    for named in arguments:
+        source = (job.get("params") or {}).get(named)
+        if not isinstance(source, str) or not os.path.isdir(source):
             return ""
-        landing = os.path.join(destination, relative)
-        os.makedirs(os.path.dirname(landing), exist_ok=True)
-        try:
-            os.link(origin, landing)
-        except OSError:
-            shutil.copy2(origin, landing)
-        kept += 1
+        destination = os.path.join(job_dir, REPLAY_DIRNAME, named)
+        shutil.rmtree(destination, ignore_errors=True)
+        kept = 0
+        for case in wanted:
+            relative = (stated.get(case) or {}).get(named, case)
+            origin = os.path.join(source, relative)
+            if not _inside(source, origin):
+                # `wanted` reaches here from the REQUEST -- a reader names the
+                # cases they marked -- so a name is untrusted input and
+                # `../../etc/passwd` is a path that exists. Measured before
+                # this check: `case_0=../secret.txt` hardlinked a file from
+                # outside the cohort into the job directory, whose outputs are
+                # zipped and returned, AND left the tool an empty input folder
+                # to register nobody from. Confidential imaging, so the answer
+                # is to refuse the whole narrowing rather than skip the entry.
+                logger.warning("Not narrowing %s: %r leaves %s",
+                               getattr(tool, "name", "?"), relative, named)
+                for undo in list(narrowed) + [named]:
+                    shutil.rmtree(os.path.join(job_dir, REPLAY_DIRNAME, undo),
+                                  ignore_errors=True)
+                return ""
+            if not os.path.isfile(origin):
+                # A case named something that is not a file under this
+                # argument: the report and the request disagree, and narrowing
+                # on half an agreement would drop the rest. Every argument
+                # already narrowed is undone -- feeding a tool three baselines
+                # and forty follow-ups is worse than feeding it everything.
+                logger.info("Not narrowing %s: %r is not under %s",
+                            getattr(tool, "name", "?"), relative, named)
+                for undo in list(narrowed) + [named]:
+                    shutil.rmtree(os.path.join(job_dir, REPLAY_DIRNAME, undo),
+                                  ignore_errors=True)
+                return ""
+            landing = os.path.join(destination, relative)
+            os.makedirs(os.path.dirname(landing), exist_ok=True)
+            try:
+                os.link(origin, landing)
+            except OSError:
+                shutil.copy2(origin, landing)
+            kept += 1
+        narrowed[named] = destination
 
-    job["params"] = dict(job.get("params") or {}, **{named: destination})
+    job["params"] = dict(job.get("params") or {}, **narrowed)
     replay = os.path.join(job_dir, REPLAY_JOB_FILE)
     with open(replay, "w", encoding="utf-8") as handle:
         json.dump(job, handle)
@@ -1030,6 +1088,8 @@ def _reset_job(job_dir: str) -> None:
     os.makedirs(output, exist_ok=True)
 
 
+# Pinned equal to `execution.runner.RESUME_ENV` by a test; the runner is
+# executed by a TOOL's interpreter and the two cannot share a module.
 RESUME_ENV = "SADT_RESUME"
 
 # Where corrections are staged, one directory per slot. Pinned equal to
@@ -1169,8 +1229,28 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None,
             ]
             exit_code = None
             try:
+                asked_at = time.monotonic()
                 with _admitted(candidates, run_id) as grant:
                     cpu_grant, channels = grant
+                    # Recorded HERE, not inside `_admitted`: the wait is the
+                    # whole time between asking and being let in, and this is
+                    # the only scope holding both that interval and the name of
+                    # the tool that spent it. An observation, never a decision.
+                    waited = time.monotonic() - asked_at
+                    telemetry.record_admission(tool.name, waited, channels)
+                    # What this run actually holds, for the page's per-run
+                    # detail. Taken from the candidate that was granted rather
+                    # than from the widest one asked for: a run admitted at two
+                    # channels holds two channels' worth, and reporting the
+                    # eight it hoped for would overstate the machine.
+                    admitted = next(
+                        (demand for width, demand in candidates if width == channels),
+                        None)
+                    telemetry.record_run_grant(
+                        run_id, channels=channels, cpus=cpu_grant,
+                        ram_bytes=admitted.ram_bytes if admitted else None,
+                        vram_bytes=admitted.vram_bytes if admitted else None,
+                        waited=waited)
                     _raise_if_cancelled(run_id)
                     # Applied HERE rather than when the environment was built,
                     # because neither number is knowable until the run has been

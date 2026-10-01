@@ -19,6 +19,23 @@ x-inference-base: &inference-base
   volumes:
     - ./server:/workspace/server
     - ./DATA:/data:ro
+    - ./scripts:/workspace/scripts:ro
+    # The tools, when a deployment has them. Mounted at THEIR OWN PATH, not at
+    # a tidy /tools: each tool is a virtualenv, and a virtualenv's
+    # `pyvenv.cfg` and script shebangs hold absolute paths -- moved anywhere
+    # else, `<venv>/bin/python` no longer finds its own interpreter. Same path
+    # in and out is what makes a host-built venv runnable in here, and it is
+    # the pattern `test-gpu` below has used since the real-data suite landed.
+    #
+    # Unset, both of these resolve to the fixtures directory and this is a
+    # no-op: `TOOLS_DIR` falls back to the demos exactly as before, so a
+    # deployment that never passes SADT_TOOLS sees no change at all.
+    - ${SADT_TOOLS:-./docker/fixtures}:${SADT_TOOLS:-/workspace/docker/fixtures}:ro
+    # And the interpreters those virtualenvs point AT. uv installs its own
+    # CPython outside the checkout and symlinks `.venv/bin/python` to it, so
+    # without this every tool's venv is a dangling link and every schema fails
+    # to generate.
+    - ${UV_PYTHON_STORE:-./docker/fixtures}:${UV_PYTHON_STORE:-/workspace/docker/fixtures}:ro
   ports:
     # Unset BIND_ADDR publishes on every interface, which is what a lab GPU
     # server behind a TLS terminator wants. server_ctl.py writes
@@ -75,6 +92,11 @@ x-test-base: &test-base
     # Likewise: the tests check that the image's build fixtures still describe
     # their own source, and that the API requirements stay slim.
     - ./docker:/workspace/docker:ro
+    # And the dev override, which `test_dev_mounts.py` reads to check that no
+    # tool is left frozen in the image. Without it that guard raised
+    # FileNotFoundError here while passing from a checkout -- so the one test
+    # written to catch a silent staleness was itself silently not running.
+    - ./docker-compose.dev.yml:/workspace/docker-compose.dev.yml:ro
   command: >
     sh -c "pip install --no-cache-dir --user -r requirements.txt -r requirements-dev.txt &&
            python -m pytest"
@@ -86,6 +108,13 @@ services:
       - API_TOKEN=${API_TOKEN:-dev-token}
       - DATA_DIR=/data
       - DEVICE=${DEVICE:-cuda}
+      # Resolve to the fixtures when SADT_TOOLS is unset, which is the same
+      # deployment this service has always been.
+      - TOOLS_DIR=${SADT_TOOLS:-/workspace/docker/fixtures}/tools
+      - DESCRIBE_PATH=${SADT_TOOLS:-/workspace/docker/fixtures}/scripts/describe.py
+      # The tools mount is read-only, so regenerated schemas need somewhere of
+      # their own to land.
+      - SCHEMA_CACHE_DIR=/tmp/schema-cache
 
     deploy:
       resources:
@@ -115,6 +144,13 @@ services:
       - API_TOKEN=${API_TOKEN:-dev-token}
       - DATA_DIR=/data
       - DEVICE=cpu
+      # Resolve to the fixtures when SADT_TOOLS is unset, which is the same
+      # deployment this service has always been.
+      - TOOLS_DIR=${SADT_TOOLS:-/workspace/docker/fixtures}/tools
+      - DESCRIBE_PATH=${SADT_TOOLS:-/workspace/docker/fixtures}/scripts/describe.py
+      # The tools mount is read-only, so regenerated schemas need somewhere of
+      # their own to land.
+      - SCHEMA_CACHE_DIR=/tmp/schema-cache
 
   # The pytest suite in the same environment as `inference`, without the GPU
   # reservation: asking for a GPU here would make the pre-push hook fail on any

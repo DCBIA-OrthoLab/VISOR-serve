@@ -124,12 +124,16 @@ def test_a_chain_offers_the_checkpoints_of_the_tools_it_calls(tmp_path):
         {"name": "AMASSS"},
         {"name": "AREG", "supervisor": True, "calls": ["ASO", "AMASSS"]},
     )
+    # Deepest first within a branch: `ALI_CBCT/landmarks` is a moment inside
+    # the ALI_CBCT call, so it is passed before that call returns. The list is
+    # read as a sequence by whoever picks where to stop, and a point listed
+    # after one it actually precedes sends a rewind backwards.
     assert list(tools["ASO"].arguments["stop_after"].choices) == [
-        "ALI_CBCT", "ALI_CBCT/landmarks",
+        "ALI_CBCT/landmarks", "ALI_CBCT",
     ]
     assert list(tools["AREG"].arguments["stop_after"].choices) == [
-        "ASO", "ASO/ALI_CBCT", "ASO/ALI_CBCT/landmarks", "AMASSS",
-    ], "a nested checkpoint is unreachable unless it is published"
+        "ASO/ALI_CBCT/landmarks", "ASO/ALI_CBCT", "ASO", "AMASSS",
+    ], "a nested checkpoint is unreachable unless it is published, and it happens first"
 
 
 def test_a_tool_that_calls_nobody_is_offered_exactly_what_it_declares(tmp_path):
@@ -174,11 +178,11 @@ def test_a_facade_publishes_the_nested_checkpoints_of_each_of_its_modes(tmp_path
         "ASO", {"CBCT": "ASO_CBCT", "IOS": "ASO_IOS"}, tools)
     spec = composed.arguments["stop_after"]
     assert list(spec.choices) == [
-        "ALI_CBCT", "ALI_CBCT/landmarks", "ALI_IOS", "ALI_IOS/teeth",
+        "ALI_CBCT/landmarks", "ALI_CBCT", "ALI_IOS/teeth", "ALI_IOS",
     ]
     assert spec.options_when == {"mode": {
-        "CBCT": ["ALI_CBCT", "ALI_CBCT/landmarks"],
-        "IOS": ["ALI_IOS", "ALI_IOS/teeth"],
+        "CBCT": ["ALI_CBCT/landmarks", "ALI_CBCT"],
+        "IOS": ["ALI_IOS/teeth", "ALI_IOS"],
     }}, "a mode is offered the other engine's checkpoints"
 
 
@@ -192,7 +196,7 @@ def test_a_cycle_is_walked_once_rather_than_for_ever(tmp_path):
         {"name": "B", "supervisor": True, "calls": ["A"]},
         {"name": "Self", "supervisor": True, "calls": ["Self"]},
     )
-    assert list(tools["A"].arguments["stop_after"].choices) == ["B", "B/A"]
+    assert list(tools["A"].arguments["stop_after"].choices) == ["B/A", "B"]
     assert list(tools["Self"].arguments["stop_after"].choices) == ["Self"]
 
 
@@ -1359,3 +1363,322 @@ def test_keeping_something_for_a_run_that_is_not_paused_is_silent(tmp_path):
 
     runs.keep_while_paused(uuid.uuid4().hex, [str(tmp_path)])
     runs.keep_while_paused(None, [str(tmp_path)])
+
+
+# ----------------------------------------------------------------------
+# Narrowing a tool that takes SEVERAL paired inputs
+# ----------------------------------------------------------------------
+
+class _PairedTool:
+    """A registration tool: a baseline and a follow-up, narrowed together."""
+    name = "Pairs"
+    case_input = ("t1", "t2")
+
+
+def _paired_job(tmp_path, patients, report=True):
+    """A job whose request points at two folders, and a report pairing them.
+
+    The names differ per timepoint on purpose -- `P1_T1.nii.gz` against
+    `P1_T2.nii.gz` -- because that is the shape that makes the case id
+    useless as a file name and the report necessary.
+    """
+    from execution import dispatch
+    for argument, token in (("t1", "T1"), ("t2", "T2")):
+        folder = tmp_path / argument
+        folder.mkdir()
+        for patient in patients:
+            (folder / f"{patient}_{token}.nii.gz").write_text(patient)
+    job = tmp_path / "job"
+    job.mkdir()
+    with open(job / dispatch.JOB_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"job_id": "j", "tool": "Pairs", "job_dir": str(job),
+                   "params": {"t1": str(tmp_path / "t1"),
+                              "t2": str(tmp_path / "t2")}}, handle)
+    output = job / dispatch.JOB_OUTPUT_DIRNAME
+    output.mkdir()
+    if report:
+        with open(output / "Pairs_report.json", "w", encoding="utf-8") as handle:
+            json.dump({"cases": {
+                patient: {"produced": [],
+                          "inputs": {"t1": f"{patient}_T1.nii.gz",
+                                     "t2": f"{patient}_T2.nii.gz"}}
+                for patient in patients}}, handle)
+    return str(job)
+
+
+def test_both_paired_inputs_are_narrowed_to_the_marked_cases(tmp_path):
+    """Narrowing one and not the other is the failure this guards.
+
+    It would hand the tool three baselines and forty follow-ups, and what its
+    own pairing then makes of that is not anything the server intended.
+    """
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1", "P2", "P3"])
+
+    written = dispatch.narrow_to_cases(job, _PairedTool(), ["P1", "P3"])
+
+    assert written
+    with open(written, encoding="utf-8") as handle:
+        params = json.load(handle)["params"]
+    assert sorted(os.listdir(params["t1"])) == ["P1_T1.nii.gz", "P3_T1.nii.gz"]
+    assert sorted(os.listdir(params["t2"])) == ["P1_T2.nii.gz", "P3_T2.nii.gz"]
+
+
+def test_a_paired_tool_whose_report_says_nothing_is_not_narrowed(tmp_path):
+    """The case id is not a file name here, so there is nothing to guess from.
+
+    Refused rather than attempted: `P1` is under neither folder, so narrowing
+    on the id would keep nothing and the run would register no one.
+    """
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1", "P2"], report=False)
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_one_argument_that_cannot_be_narrowed_undoes_the_other(tmp_path):
+    """Half a narrowing is worse than none, so the first folder is undone.
+
+    Left behind, the replay would read a narrowed `t1` beside a whole `t2`
+    from a job file that was never rewritten -- the exact asymmetry this
+    refuses.
+    """
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1", "P2"])
+    os.remove(os.path.join(tmp_path, "t2", "P1_T2.nii.gz"))
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+    assert not os.path.isdir(os.path.join(job, dispatch.REPLAY_DIRNAME, "t1"))
+
+
+# ----------------------------------------------------------------------
+# What the reader SAID, beside what they changed
+# ----------------------------------------------------------------------
+
+class _Form(dict):
+    """A form, as starlette hands one over: multi_items() and get()."""
+
+    def multi_items(self):
+        return list(self.items())
+
+
+def test_the_cases_a_reader_marked_are_read_off_the_request():
+    """The one thing the corrections cannot say.
+
+    A reader who sees a registration land two millimetres off marks the
+    patient and changes no file -- the landmarks that caused it are two steps
+    back. Before this, the only evidence was the corrections, so a reader who
+    marked three of forty and edited nothing replayed all forty.
+    """
+    import main
+
+    named = main._declared_cases(_Form({"to": "01_ALI_CBCT",
+                                        "case_0": "P1", "case_1": "P2"}))
+
+    assert named == ["P1", "P2"]
+
+
+def test_a_case_named_twice_travels_once():
+    import main
+
+    assert main._declared_cases(
+        _Form({"case_0": "P1", "case_1": "P1"})) == ["P1"]
+
+
+def test_blanks_and_other_fields_are_not_cases():
+    """`to` is the step, and a blank field is a client sending nothing."""
+    import main
+
+    assert main._declared_cases(
+        _Form({"to": "01_ASO", "case_0": "  ", "case_1": "P1",
+               "01_ASO": "a zip, not a case"})) == ["P1"]
+
+
+def test_a_patient_whose_name_holds_a_comma_survives():
+    """Which is why this is one field per case and not a joined string: any
+    separator picked here is one that turns up inside a folder name."""
+    import main
+
+    assert main._declared_cases(
+        _Form({"case_0": "Doe, John"})) == ["Doe, John"]
+
+
+# ----------------------------------------------------------------------
+# What a request can make the narrowing do
+# ----------------------------------------------------------------------
+#
+# `wanted` reaches `narrow_to_cases` from the REQUEST since a reader began
+# naming the cases they marked. Before that it was derived from a tool's own
+# report, so a case name was as trustworthy as the tool; now it is untrusted
+# input and every one of these was reachable.
+
+
+def _escape_job(tmp_path, names=("a.nii.gz",)):
+    """A job whose cohort has a sibling the caller never offered."""
+    from execution import dispatch
+    cohort = tmp_path / "cohort"
+    cohort.mkdir()
+    for name in names:
+        (cohort / name).write_text(name)
+    (tmp_path / "secret.txt").write_text("a scan from another study")
+    job = tmp_path / "job"
+    job.mkdir()
+    (job / dispatch.JOB_OUTPUT_DIRNAME).mkdir()
+    with open(job / dispatch.JOB_FILE, "w", encoding="utf-8") as handle:
+        json.dump({"job_id": "j", "tool": "Narrows", "job_dir": str(job),
+                   "params": {"scans": str(cohort)}}, handle)
+    return str(job), cohort
+
+
+def test_a_case_name_cannot_reach_outside_the_cohort(tmp_path):
+    """Measured before the check: `case_0=../secret.txt` hardlinked a file
+    from outside the cohort into the job directory -- whose outputs are zipped
+    and returned -- and left the tool an empty folder to register nobody
+    from."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["../secret.txt"]) == ""
+    assert not os.path.exists(os.path.join(job, dispatch.REPLAY_DIRNAME))
+
+
+def test_an_absolute_case_name_is_refused(tmp_path):
+    """`os.path.join(folder, "/etc/passwd")` IS `/etc/passwd`."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    assert dispatch.narrow_to_cases(
+        job, _NarrowingTool(), [str(tmp_path / "secret.txt")]) == ""
+
+
+def test_a_symlink_out_of_the_cohort_is_refused(tmp_path):
+    """A name that IS under the folder and resolves somewhere else. This is
+    why the check resolves before it compares."""
+    from execution import dispatch
+    job, cohort = _escape_job(tmp_path)
+    try:
+        os.symlink(tmp_path / "secret.txt", cohort / "b.nii.gz")
+    except (OSError, NotImplementedError):
+        pytest.skip("this filesystem does not do symlinks")
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["b.nii.gz"]) == ""
+
+
+def test_a_sibling_folder_with_the_same_prefix_is_not_inside(tmp_path):
+    """`/data/cohort2` starts with `/data/cohort` and is another cohort, which
+    is why this compares paths rather than strings."""
+    from execution import dispatch
+    job, cohort = _escape_job(tmp_path)
+    other = tmp_path / "cohort2"
+    other.mkdir()
+    (other / "c.nii.gz").write_text("another study")
+
+    assert dispatch.narrow_to_cases(
+        job, _NarrowingTool(), ["../cohort2/c.nii.gz"]) == ""
+
+
+def test_a_case_nobody_has_replays_the_whole_cohort(tmp_path):
+    """The ordinary mistake -- a stale panel, a renamed folder. Refused rather
+    than narrowed to nothing: an empty input folder is a run that registers
+    nobody and says it worked."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["P99"]) == ""
+
+
+def test_naming_every_case_still_narrows_to_every_case(tmp_path):
+    """A reader who marked the lot. Equivalent to no narrowing, and it must
+    not be mistaken for the refusals above."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path, names=("a.nii.gz", "b.nii.gz"))
+
+    written = dispatch.narrow_to_cases(
+        job, _NarrowingTool(), ["a.nii.gz", "b.nii.gz"])
+
+    assert written
+    with open(written, encoding="utf-8") as handle:
+        assert sorted(os.listdir(json.load(handle)["params"]["scans"])) == [
+            "a.nii.gz", "b.nii.gz"]
+
+
+def test_a_paired_tool_with_one_argument_stated_is_refused(tmp_path):
+    """Half a pairing. Narrowing `t1` and not `t2` hands a registration tool
+    three baselines and forty follow-ups, and what its own pairing makes of
+    that is not anything the server intended."""
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1"])
+    with open(os.path.join(job, dispatch.JOB_OUTPUT_DIRNAME,
+                           "Pairs_report.json"), "w", encoding="utf-8") as handle:
+        json.dump({"cases": {"P1": {"produced": [],
+                                    "inputs": {"t1": "P1_T1.nii.gz"}}}}, handle)
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_a_stated_input_that_leaves_its_argument_is_refused(tmp_path):
+    """The report is the TOOL's word and still not taken on trust: a tool that
+    names `../` has a bug, and the failure must not be a file leaving the
+    cohort."""
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1"])
+    with open(os.path.join(job, dispatch.JOB_OUTPUT_DIRNAME,
+                           "Pairs_report.json"), "w", encoding="utf-8") as handle:
+        json.dump({"cases": {"P1": {"produced": [], "inputs": {
+            "t1": "../t2/P1_T2.nii.gz", "t2": "P1_T2.nii.gz"}}}}, handle)
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_an_unreadable_report_narrows_nothing_rather_than_raising(tmp_path):
+    """A truncated write, a disk that filled. The replay is the cohort."""
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1"])
+    with open(os.path.join(job, dispatch.JOB_OUTPUT_DIRNAME,
+                           "Pairs_report.json"), "w", encoding="utf-8") as handle:
+        handle.write('{"cases": {"P1": ')
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_a_report_writing_cases_as_a_list_narrows_nothing(tmp_path):
+    """AMASSS's shape. Read as the mapping the contract states, every mask
+    would key to the wrong patient -- so it is not read at all."""
+    from execution import dispatch
+    job = _paired_job(tmp_path, ["P1"])
+    with open(os.path.join(job, dispatch.JOB_OUTPUT_DIRNAME,
+                           "Pairs_report.json"), "w", encoding="utf-8") as handle:
+        json.dump({"cases": [{"case_id": "p_000", "produced": []}]}, handle)
+
+    assert dispatch.narrow_to_cases(job, _PairedTool(), ["P1"]) == ""
+
+
+def test_no_declaration_at_all_narrows_nothing(tmp_path):
+    """A tool that never said which argument holds its cases. Every tool but
+    two, today."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    class Silent:
+        name = "Silent"
+
+    assert dispatch.narrow_to_cases(job, Silent(), ["a.nii.gz"]) == ""
+
+
+def test_an_empty_list_of_cases_narrows_nothing(tmp_path):
+    """A reader who marked nobody and pressed the button anyway."""
+    from execution import dispatch
+    job, _cohort = _escape_job(tmp_path)
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), []) == ""
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["", "  "]) == ""
+
+
+def test_a_case_that_is_a_directory_is_not_a_file(tmp_path):
+    """A patient folder rather than a scan. `isfile` is what says so, and the
+    refusal is the whole cohort rather than a folder hardlinked as a file."""
+    from execution import dispatch
+    job, cohort = _escape_job(tmp_path)
+    (cohort / "P1").mkdir()
+
+    assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["P1"]) == ""

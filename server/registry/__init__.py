@@ -413,12 +413,18 @@ def _stop_points(name: str, registry: dict, above: tuple = ()) -> list:
     deeper = above + (name,)
     points = []
     for point in getattr(tool, "stop_points", ()) or ():
-        points.append(point)
+        # A callee's own checkpoints come BEFORE the call itself, because that
+        # is when they happen: `ASO/ALI_CBCT` is a moment INSIDE the ASO call,
+        # so it is reached, and passed, before ASO returns. Listed after, a
+        # reader moving from `ASO` to `ASO/ALI_CBCT` believes they are going
+        # forward while they are going back -- and `rewind` is exactly the
+        # button they would press to do it.
         if point in calls:
             points.extend(
                 point + STOP_PATH_SEPARATOR + inner
                 for inner in _stop_points(point, registry, deeper)
             )
+        points.append(point)
     return points
 
 

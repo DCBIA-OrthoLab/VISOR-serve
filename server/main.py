@@ -39,7 +39,11 @@ from registry import facade
 from registry.facade import FacadeTool
 import file_utils
 import resources
-from wire import maintenance, runs, transfer
+import benchmark_jobs
+import benchmark_presets
+import telemetry
+from wire import (benchmark_launch_page, benchmark_page, debug_page, doc_page,
+                  maintenance, runs, status_page, transfer)
 from base import (
     FILE_TYPES,
     FOLDER_TYPE,
@@ -108,6 +112,47 @@ async def _lifespan(_app: FastAPI):
 
 
 app = FastAPI(lifespan=_lifespan)
+
+
+# Paths that WATCH this server rather than ask it for work. They are not
+# counted as in-flight requests: the dashboard polls every two seconds, so
+# counting its own poll made the chip read "1 request" on a completely idle
+# machine -- the observer appearing in its own observation, and a claim the
+# page could not support. Health checks are excluded for the same reason.
+_UNCOUNTED_PATHS = ("/server-debug", "/status", "/health", "/runs/")
+
+
+def _is_observer(path: str) -> bool:
+    return any(path == prefix.rstrip("/") or path.startswith(prefix)
+               for prefix in _UNCOUNTED_PATHS)
+
+
+@app.middleware("http")
+async def _count_inflight(request: Request, call_next):
+    """How many requests are being served at this instant, for `/server-debug`.
+
+    A counter and not a log: what the page needs is the CONCURRENT figure, and
+    that is knowable only from inside the request's own lifetime. The
+    `try/finally` is what makes it safe -- a handler that raises, a client that
+    disconnects mid-body, and a cancelled `POST /run` all have to decrement, or
+    the number only ever climbs.
+
+    What it counts is work ASKED OF this server: a run, an upload, a result
+    being fetched. A page watching the server is not that, and `_is_observer`
+    is what keeps the two apart.
+
+    It is deliberately the first middleware and does nothing else: every
+    request in this process passes through it, so anything expensive here is
+    expensive everywhere.
+    """
+    if _is_observer(request.url.path):
+        return await call_next(request)
+    telemetry.request_started()
+    try:
+        return await call_next(request)
+    finally:
+        telemetry.request_finished()
+
 
 _CHUNK_SIZE_BYTES = 1024 * 1024  # read/write in 1 MB chunks, never load the full file into RAM
 _MAX_EXTRACTED_BYTES = settings.MAX_EXTRACTED_MB * 1024 * 1024
@@ -331,6 +376,17 @@ def _media_type_of(path: str) -> str:
     return media_type
 
 
+def _gib(count) -> str:
+    """A byte count in GiB, or "unknown" when there is none.
+
+    `Allocation.ram_bytes` and `.vram_bytes` are Optional and vram IS None on a
+    machine with no card -- CI, a CPU deployment. Dividing it took three tests
+    of the debug page down at once. Same lesson as `_human_bytes` below, which
+    records the first time a None reached a formatter.
+    """
+    return "unknown" if count is None else f"{count / 1073741824:.0f} GiB"
+
+
 def _human_bytes(size) -> str:
     """Byte count in the largest unit that keeps it readable. Logged alongside
     the exact figure, never instead of it.
@@ -386,6 +442,43 @@ def _output_roots(outputs: list, work_dir: str) -> set:
 
 
 
+def _campaign_index() -> list:
+    """One entry per campaign summary in SADT_BENCHMARK_DIR, newest first.
+
+    A missing directory is not an error and neither is an empty one: a
+    production deployment runs no campaign, and "nothing measured here" is the
+    honest answer rather than a 500. An unreadable summary costs that summary
+    alone -- a campaign still being written must not take the endpoint down for
+    the ones already finished.
+    """
+    directory = settings.SADT_BENCHMARK_DIR
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    index = []
+    for name in names:
+        if not _CAMPAIGN_NAME.fullmatch(name):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            size = os.path.getsize(path)
+            with open(path, encoding="utf-8") as handle:
+                report = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(report, dict):
+            continue
+        index.append({
+            "source": name,
+            "generated_at": report.get("generated_at"),
+            "arms": len(report.get("arms") or ()),
+            "bytes": size,
+        })
+    index.sort(key=lambda entry: entry["generated_at"] or 0, reverse=True)
+    return index
+
+
 
 # A campaign is addressed BY NAME from a URL. One path segment, starting with
 # an alphanumeric and ending in the suffix the report writer uses: no
@@ -405,11 +498,49 @@ _CAMPAIGN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.json")
 
 
 
+@app.get("/benchmarks", dependencies=[Depends(verify_token)])
+def benchmark_report(campaign: Optional[str] = None) -> dict:
+    """The campaign a reader asked for, and the list of the others.
+
+    Named `benchmark_report`, not `benchmarks`: see the note below on what a
+    handler shadowing a module-level name costs.
+    """
+    index = _campaign_index()
+    if campaign is None:
+        chosen = index[0]["source"] if index else None
+    else:
+        # NOT a fallback to the newest. A reader who asked for yesterday and
+        # silently got today would compare two campaigns believing they were
+        # one; the page is written to expect this 404 and to say so once.
+        chosen = None
+        if _CAMPAIGN_NAME.fullmatch(campaign):
+            chosen = next(
+                (entry["source"] for entry in index if entry["source"] == campaign),
+                None,
+            )
+        if chosen is None:
+            raise HTTPException(status_code=404, detail="No such campaign.")
+    if chosen is None:
+        return {"campaign": None, "campaigns": []}
+    with open(os.path.join(settings.SADT_BENCHMARK_DIR, chosen), encoding="utf-8") as handle:
+        report = json.load(handle)
+    # The file does not carry its own name; the picker keys every option on it.
+    report["source"] = chosen
+    return {"campaign": report, "campaigns": index}
+
+
 
 # NOT named `status`, `benchmarks` or anything else already bound at module
 # level: a handler shadowing an imported name breaks it for every line below
 # it -- a function called `status` here once took out every `status.HTTP_*` in
 # this module at import time.
+
+@app.get("/benchmarks/view", include_in_schema=False)
+def benchmark_view() -> HTMLResponse:
+    """The campaign, drawn. Unauthenticated: the page holds no measurement, it
+    asks for one with the token the reader types into it."""
+    return HTMLResponse(benchmark_page.BENCHMARK_PAGE)
+
 # Per-tool documentation. Unauthenticated like the other two pages: it
 # describes what a tool DOES and what it costs on this deployment, which is
 # what `GET /tools` already publishes in machine-readable form. A tool nobody
@@ -417,6 +548,14 @@ _CAMPAIGN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.json")
 # reads as "there is nothing to say" when the truth is "nobody wrote it".
 
 
+
+
+@app.get("/doc/{tool}", include_in_schema=False)
+def tool_document(tool: str) -> HTMLResponse:
+    body = doc_page.page_for(tool)
+    if not body:
+        raise HTTPException(status_code=404, detail="No document for that tool.")
+    return HTMLResponse(body)
 
 
 @app.get("/health")
@@ -546,6 +685,281 @@ def set_maintenance(wanted: _Maintenance) -> dict:
         maintenance.reopen()
         logger.info("Accepting new work again")
     return maintenance.snapshot()
+
+
+@app.get("/server-debug.json", dependencies=[Depends(verify_token)])
+def server_debug_data() -> dict:
+    """Everything `/status` reports, plus what the machine says about itself.
+
+    A superset rather than a second opinion: the budget, the admission holds
+    and the learned costs are read through `server_status` so the two endpoints
+    cannot drift into disagreeing about the same number. What is added here is
+    the half that `/status` deliberately does not carry -- live CPU, live host
+    memory, disk, in-flight requests, and the queue log -- because it is
+    sampled per call rather than being state the server keeps.
+
+    Like `/status`, it carries no progress MESSAGE: a message is free text
+    written by a tool and can name the file it is working on, which is a
+    patient's. Phases and counts say what the machine is doing without saying
+    whose data it is doing it to.
+    """
+    report = server_status()
+    allocation = resources.allocation()
+    try:
+        node = os.uname().nodename
+    except (AttributeError, OSError):
+        node = "this server"
+    report["hardware"] = (
+        f"{node} · {allocation.cpus:.0f} cpus budgeted · "
+        f"{_gib(allocation.ram_bytes)} ram · "
+        f"{_gib(allocation.vram_bytes)} vram"
+    )
+    # Which server this is, for a page that will be open beside two others.
+    # The origin is the browser's own and is not sent from here; what only this
+    # side knows is which machine answered, which process, which card it was
+    # told to use, and which tool tree it is serving -- the last being the one
+    # that actually distinguishes a checkout from the deployed image. The
+    # BASENAME only: a full path is deployment layout, and this page is read by
+    # anyone holding the shared token.
+    report["server"] = {
+        "node": node,
+        "pid": os.getpid(),
+        "device": settings.DEVICE,
+        "tools": os.path.basename(str(settings.TOOLS_DIR).rstrip("/").split(os.pathsep)[0]),
+        # So the page can say when a paused run will be let go rather than
+        # leaving a reader to wonder whether it is stuck forever.
+        "run_ttl_seconds": settings.RUN_TTL_SECONDS,
+        "paused_ttl_seconds": settings.PAUSED_RUN_TTL_SECONDS,
+    }
+    report["cpu_percent"] = telemetry.cpu_percent()
+    report["ram"] = telemetry.ram()
+    report["inflight"] = telemetry.inflight()
+    report["queue"] = telemetry.queue_history()
+    # The ledger and the live listing are sent side by side rather than merged:
+    # `runs` is read from disk and is the truth about what is happening NOW
+    # across every worker, while `ledger` is this process's memory of what it
+    # admitted and what that cost. The page joins them on `run_id`, and a run
+    # present in one and not the other is a fact worth being able to see.
+    report["ledger"] = telemetry.run_ledger()
+    report["uptime"] = telemetry.tool_uptime()
+    # TEMP_DIR is where uploads, results and run directories live -- the space a
+    # download actually costs this machine. DATA_DIR is mounted read-only and
+    # cannot grow, but it is the other half of "what is this disk holding".
+    report["disk"] = telemetry.disk({
+        "temp": settings.TEMP_DIR,
+        "data": settings.DATA_DIR,
+    })
+    return report
+
+
+_ACTIVITY_LEVEL = {
+    runs.PHASE_DONE: "ok",
+    runs.PHASE_FAILED: "error",
+    runs.PHASE_CANCELLED: "warn",
+    runs.PHASE_QUEUED_GPU: "warn",
+    runs.PHASE_PAUSED: "warn",
+}
+
+# What the server says a phase MEANS. The console shows these instead of the
+# tool's own words, and that substitution is the whole point of the endpoint
+# below: a phase is this server's vocabulary and carries nothing but itself.
+_ACTIVITY_TEXT = {
+    runs.PHASE_RECEIVED: "request received",
+    runs.PHASE_STAGING: "staging inputs",
+    runs.PHASE_QUEUED_GPU: "waiting for room on this machine",
+    runs.PHASE_RUNNING: "running",
+    runs.PHASE_PACKAGING: "packaging the result",
+    runs.PHASE_PAUSED: "paused, holding its work",
+    runs.PHASE_DONE: "finished",
+    runs.PHASE_FAILED: "failed",
+    runs.PHASE_CANCELLED: "cancelled by the client",
+}
+
+
+@app.get("/server-debug/runs/{run_id}.json", dependencies=[Depends(verify_token)])
+def server_debug_run(run_id: str) -> dict:
+    """One run's activity, COMPOSED by this server rather than quoted from the
+    tool.
+
+    It reads like a console and is deliberately not one. A tool's real stdout
+    names the file it is working on -- nnUNet prints every case, and shapeaxi's
+    output is swallowed elsewhere in this codebase for exactly that reason --
+    and this page is read by anyone holding the shared API token, which on this
+    deployment is every workstation. So the tool's own words never travel:
+    every line here is built from the phase, the fraction and the depth, which
+    are this server's vocabulary and say what is happening without saying whose
+    data it is happening to.
+
+    A tool CAN still make itself heard, and usefully: a progress record it
+    wrote turns into "42% · scan 14 of 40"-shaped text built from the fraction
+    alone, so a chatty tool produces a busier console than a silent one without
+    a character of its text being republished.
+    """
+    try:
+        events = runs.read_events(run_id)
+    except runs.RunError as exc:
+        raise _run_error(exc)
+    lines = []
+    for event in events:
+        phase = event.get("phase") or runs.PHASE_RUNNING
+        fraction = event.get("fraction")
+        text = _ACTIVITY_TEXT.get(phase, phase)
+        if fraction is not None:
+            text = f"{text} · {fraction * 100:.0f}%"
+        lines.append({
+            "seq": event.get("seq"),
+            "at": event.get("at"),
+            "depth": event.get("depth", 0),
+            "phase": phase,
+            "state": event.get("state"),
+            "fraction": fraction,
+            "level": _ACTIVITY_LEVEL.get(phase, "info"),
+            "text": text,
+        })
+    return {"run_id": run_id, "lines": lines}
+
+
+def _benchmark_resolution() -> dict:
+    """Which tools this deployment could actually run a preset with.
+
+    Read live rather than cached: a bundle staged into `DATA/` since startup
+    should make its tool runnable without a restart, and the whole point of
+    resolving from what is hosted is that it tracks the deployment.
+    """
+    # Only what the resolver reads, projected straight off the ArgSpec rather
+    # than through `/tools`'s full publication: duplicating forty lines of
+    # presentation here would be a second place for the two to drift.
+    schemas = {
+        name: {"arguments": {
+            arg: {"required": spec.required,
+                  "server_selectable": spec.server_selectable,
+                  "initial": spec.initial,
+                  "choices": spec.choices,
+                  # Carried because the resolver needs it, and for one reason:
+                  # a facade publishes every input as optional -- `t1` belongs
+                  # to AREG's CBCT modes, `ios` to its CBCT-to-IOS one -- and
+                  # `visible_when` is the only thing that says which. Without
+                  # it here a battery sends the mode alone and collects a 422
+                  # from the tool the facade dispatched to.
+                  "visible_when": spec.visible_when,
+                  # Carried for the same reason `visible_when` is: a scoped
+                  # argument draws from ONE subfolder, and a resolver reading
+                  # the whole catalogue picks a name that argument cannot
+                  # resolve. `AREG_CBCT.t1` is scoped to `T1`; unscoped, the
+                  # first hosted name is `IOSCBCT`, a sibling, and every AREG
+                  # arm answered 404 before a process started.
+                  "selectable_scope": spec.selectable_scope,
+                  "type": _type_name(spec.types[0])}
+            for arg, spec in tool.arguments.items()
+        }}
+        for name, tool in TOOLS.items()
+    }
+
+    def hosted(name: str) -> dict:
+        slug = deployment_config.data_slug(name)
+        # One list per scope the tool's arguments actually name, beside the
+        # unscoped catalogue an unscoped argument still draws from.
+        scopes = {
+            spec.selectable_scope
+            for spec in TOOLS[name].arguments.values()
+            if getattr(spec, "selectable_scope", None)
+        }
+        return {"models": data_store.list_models(slug),
+                "testfiles": data_store.list_testfiles(slug),
+                "testfiles_by_scope": {
+                    scope: data_store.list_testfiles(slug, scope)
+                    for scope in sorted(scopes)
+                },
+                "models_by_scope": {
+                    scope: data_store.list_models(slug, scope)
+                    for scope in sorted(scopes)
+                }}
+
+    return benchmark_presets.runnable_tools(schemas, hosted)
+
+
+@app.get("/benchmark", include_in_schema=False)
+def benchmark_home() -> HTMLResponse:
+    """Both halves in one place: what was measured, and what to measure next.
+
+    Unauthenticated like the other pages -- it holds no reading and starts
+    nothing by itself; every call it makes carries the token the reader typed.
+    """
+    return HTMLResponse(benchmark_launch_page.LAUNCH_PAGE)
+
+
+@app.get("/benchmark/presets", dependencies=[Depends(verify_token)])
+def benchmark_catalogue() -> dict:
+    """Every preset, and what it would do on THIS deployment."""
+    resolved = _benchmark_resolution()
+    return {
+        "presets": benchmark_presets.catalogue(resolved),
+        "tools": {name: {"ready": not entry["missing"],
+                         "missing": entry["missing"],
+                         "params": sorted(entry["params"])}
+                  for name, entry in sorted(resolved.items())},
+        "limits": {"max_runs": benchmark_presets.MAX_RUNS,
+                   "max_concurrency": benchmark_presets.MAX_CONCURRENCY},
+        "running": benchmark_jobs.current(),
+    }
+
+
+class BatteryRequest(BaseModel):
+    preset: str
+    tools: Optional[list] = None
+    concurrency: Optional[int] = None
+
+
+@app.post("/benchmark/run", dependencies=[Depends(verify_token), Depends(maintenance.require_accepting)])
+def benchmark_start(request: Request, body: BatteryRequest) -> dict:
+    """Start a battery. One at a time, and never on the event loop.
+
+    The plan is built HERE so a bad preset is a 422 before anything is spawned,
+    and the runs themselves happen in another process -- a battery executed
+    inside this one would hold the very slots it is measuring.
+    """
+    try:
+        plan = benchmark_presets.build_plan(
+            body.preset, _benchmark_resolution(),
+            tools=body.tools, concurrency=body.concurrency)
+    except benchmark_presets.PresetError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    allocation = resources.allocation()
+    plan["hardware"] = (
+        f"{allocation.cpus:.0f} cpus · "
+        f"{_gib(allocation.ram_bytes)} ram · "
+        f"{_gib(allocation.vram_bytes)} vram"
+    )
+    # The battery talks to this server over HTTP like any other client, so it
+    # needs an address to reach it at -- the one this very request arrived on.
+    base = f"{request.url.scheme}://{request.url.netloc}"
+    try:
+        return benchmark_jobs.start(
+            plan, settings.SADT_BENCHMARK_DIR, base, settings.API_TOKEN,
+            os.path.join(settings.TEMP_DIR, "benchmarks"))
+    except benchmark_jobs.BatteryError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not start it: {exc}")
+
+
+@app.get("/benchmark/status", dependencies=[Depends(verify_token)])
+def benchmark_status() -> dict:
+    return {"running": benchmark_jobs.current()}
+
+
+@app.delete("/benchmark/run", dependencies=[Depends(verify_token)])
+def benchmark_stop() -> dict:
+    """Stop the battery, and everything it started."""
+    return {"stopped": benchmark_jobs.stop()}
+
+
+@app.get("/server-debug", include_in_schema=False)
+def server_debug() -> HTMLResponse:
+    """The live view of this machine. Unauthenticated like the other pages: it
+    holds no reading, it fetches them with the token the reader types in."""
+    return HTMLResponse(debug_page.DEBUG_PAGE)
 
 
 @app.get("/tools")
@@ -1318,9 +1732,28 @@ def _registered_run(request: Request, tool_name: str) -> Optional[str]:
     if not raw:
         return None
     try:
-        return runs.register(raw, tool=tool_name)
+        return runs.register(raw, tool=tool_name, client=_client_address(request))
     except runs.RunError as exc:
         raise _run_error(exc)
+
+
+def _client_address(request: Request) -> Optional[str]:
+    """Which workstation asked for this run.
+
+    **The peer this process actually sees, never a header.** `X-Forwarded-For`
+    is written by the client and is trivially forged, so taking it would turn
+    an attribution into a suggestion -- and attribution is the entire reason
+    this field exists. Behind the TLS terminator the README documents, the peer
+    IS the proxy and every run reads as coming from it; a deployment that wants
+    the workstation back has to make its proxy the thing that says so, which is
+    a deployment decision rather than something this server can guess.
+
+    An address is not patient data, but it does identify a person's machine, so
+    it travels no further than `/status` and `/server-debug` already do: behind
+    the shared token, for an operator asking "who is hammering this server".
+    """
+    client = request.client
+    return client.host if client else None
 
 
 def _failure_message(exc: BaseException) -> str:
@@ -1682,6 +2115,32 @@ def _tool_of(job_dir: str):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
 
+# The form fields a client names its marked cases in. One per case rather than
+# one joined string: a patient identifier is whatever a clinic calls its
+# folders, so any separator picked here is one that will turn up inside a name
+# and split it in half.
+_CASE_FIELD_PREFIX = "case_"
+
+
+def _declared_cases(form) -> list:
+    """The cases a reader asked to have done again, as the client named them.
+
+    Order is the form's, duplicates dropped. Nothing is validated here: a name
+    that is not a case of this run reaches `dispatch.narrow_to_cases`, which
+    refuses to narrow at all rather than narrowing on half an agreement -- and
+    the replay is then the whole cohort, which is the direction everything on
+    this path fails in.
+    """
+    named = []
+    for field, value in form.multi_items():
+        if not str(field).startswith(_CASE_FIELD_PREFIX):
+            continue
+        case = (value or "").strip() if isinstance(value, str) else ""
+        if case and case not in named:
+            named.append(case)
+    return named
+
+
 @app.post("/runs/{run_id}/rewind", dependencies=[Depends(verify_token), Depends(maintenance.require_accepting)])
 async def rewind_run(run_id: str, request: Request,
                      background_tasks: BackgroundTasks):
@@ -1717,11 +2176,16 @@ async def rewind_run(run_id: str, request: Request,
         )
     job_dir = paused["job_dir"]
     staged = _stage_corrections(_tool_of(job_dir), job_dir, form)
-    # Which cases the reader sent back, read out of the step's own report --
-    # the tool stated which of its files belong to which case, so nothing is
+    # What the reader SAID, before anything is deduced. A bad registration is
+    # marked and not corrected -- the landmarks that caused it are two steps
+    # back, so there is no file to send from where the reader is standing --
+    # and without this the only evidence was the corrections, so a reader who
+    # marked three of forty and edited nothing replayed all forty.
+    marked = _declared_cases(form)
+    # Then which cases the reader sent back, read out of the step's own report
+    # -- the tool stated which of its files belong to which case, so nothing is
     # deduced from a file name here. A step that reported nothing narrows
     # nothing, and the replay is the whole cohort: slower, never wrong.
-    marked = []
     for slot in staged:
         located = _located_step(job_dir, slot)
         if located is None:
@@ -1730,6 +2194,9 @@ async def rewind_run(run_id: str, request: Request,
         report = reports.read(os.path.join(step_dir, dispatch.JOB_OUTPUT_DIRNAME))
         marked.extend(name for name in reports.cases_of(
             report, _staged_files(job_dir, slot)) if name not in marked)
+    # The union, deliberately: a reader who corrected one patient's landmarks
+    # AND marked another wants both done again. Taking only one source would
+    # silently drop half of what they said.
     if marked:
         await anyio.to_thread.run_sync(
             dispatch.narrow_to_cases, job_dir, _tool_of(job_dir), marked)
@@ -2067,6 +2534,20 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
                 raise
         args[field_name] = ResolvedPath(path, kind)
 
+    # What this request asked for, in the only terms that may be shown to
+    # whoever holds the shared token: how many inputs and how big, and WHICH
+    # arguments were named -- never what they were set to. An argument's value
+    # is a path, and a path is a patient's file name.
+    # Through the ContextVar for the same reason `runs.emit` is: a request that
+    # sent no `X-Run-Id` has no run to record against, and reading it here keeps
+    # the two paths from forking.
+    telemetry.record_run_inputs(
+        runs.CURRENT_RUN.get(), staged_total, size, args.keys(),
+        detail=telemetry.describe_inputs(args, {
+            name: {"server_selectable": spec.server_selectable}
+            for name, spec in tool.arguments.items()
+        }))
+
     # Anything the tool creates through file_utils.make_scratch_dir() lands
     # here, so it can be removed even if run() raises before returning a path.
     scratch_dirs = file_utils.track_scratch_dirs()
@@ -2362,6 +2843,11 @@ async def _finish_run(tool, tool_name: str, start_time: float,
 
 
 
+@app.get("/", include_in_schema=False)
+def dashboard() -> HTMLResponse:
+    """What this server is doing, in a browser. `GET /status` is the same thing
+    as JSON, and the page fetches it with the reader's own token."""
+    return HTMLResponse(status_page.STATUS_PAGE)
 
 
 if __name__ == "__main__":

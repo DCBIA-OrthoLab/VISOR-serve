@@ -444,6 +444,33 @@ def _declared_checkpoints(declared):
     return kinds, tuple(names)
 
 
+def _in_declared_order(names, order) -> tuple:
+    """`names`, resequenced by `order`, with anything it does not mention kept.
+
+    The tool declares the order because nothing else can derive it: this side
+    receives a set of names, and the generator sees call SITES, which for two
+    of the three AREG engines are written in an order their pipeline does not
+    follow. What is not mentioned keeps its relative position at the end rather
+    than being dropped -- a step added to a tool and not to its `order` is then
+    merely last, not invisible.
+
+    A qualified point (`ASO/ALI_CBCT`) is placed by its FIRST segment, the call
+    it happens inside: an order declares the chain's own steps, and a reader
+    naming a callee's internals in it would be restating what that callee
+    already declared for itself.
+    """
+    if not order:
+        return tuple(names)
+    rank = {name: position for position, name in enumerate(order)}
+    fallback = len(rank)
+
+    def key(pair):
+        index, name = pair
+        return (rank.get(name.split(STOP_PATH_SEPARATOR, 1)[0], fallback), index)
+
+    return tuple(name for _index, name in sorted(enumerate(names), key=key))
+
+
 def _own_stop_points(calls: tuple, controls: tuple) -> list:
     """The points a tool provides ITSELF, in the order they are published.
 
@@ -487,6 +514,12 @@ def _stop_after_spec(options, layout: dict, kinds=None) -> ArgSpec:
             "asked to stop does not stop."
         ),
         label=layout.get("label") or "Stop after",
+        # The same pair of buttons `keep_intermediate` has, for the same
+        # reason: a chain of six checkpoints is six boxes nobody wants to tick
+        # one at a time. Arming several is meaningful -- a run stops at the
+        # FIRST it reaches, and each resume stops at the next -- so "all" is a
+        # walk through the chain rather than a nonsense state.
+        select_all=True,
         section=layout.get("section") or STOP_AFTER_SECTION,
         ui=layout.get("ui") or "inline",
         option_help=layout.get("option_help"),
@@ -768,9 +801,19 @@ class SchemaTool(Tool):
         # every sibling has loaded, and kept SEPARATE from what is published:
         # these are the points this tool provides itself, and the published
         # option list also names points inside the tools it calls.
-        self.stop_points = tuple(_own_stop_points(self.calls, self.quality_controls))
         self._stop_after_layout = (schema.get("injected_layout") or {}).get(
             STOP_AFTER_ARGUMENT) or {}
+        self._keep_layout = (schema.get("injected_layout") or {}).get(
+            KEEP_INTERMEDIATE_ARGUMENT) or {}
+        # One declaration serves both boxes: they list the same chain, and a
+        # tool stating its order twice is a drift waiting to happen. Either
+        # entry may carry it; `stop_after` wins if both do.
+        self.chain_order = tuple(
+            self._stop_after_layout.get("order")
+            or self._keep_layout.get("order") or ())
+        self.stop_points = _in_declared_order(
+            _own_stop_points(self.calls, self.quality_controls), self.chain_order)
+        self.calls = _in_declared_order(self.calls, self.chain_order)
         if self.stop_points:
             self.arguments = _ordered_with(
                 self.arguments,
@@ -781,11 +824,7 @@ class SchemaTool(Tool):
             self.arguments = _ordered_with(
                 self.arguments,
                 KEEP_INTERMEDIATE_ARGUMENT,
-                _keep_intermediate_spec(
-                    self.calls,
-                    (schema.get("injected_layout") or {}).get(
-                        KEEP_INTERMEDIATE_ARGUMENT) or {},
-                ),
+                _keep_intermediate_spec(self.calls, self._keep_layout),
             )
         self.output_kind = RETURN_KINDS.get(schema.get("returns"), DEFAULT_RETURN_KIND)
         self.source_hash = schema.get("source_hash", "")
@@ -807,7 +846,8 @@ class SchemaTool(Tool):
         if STOP_AFTER_ARGUMENT not in self.arguments:
             return
         self.arguments[STOP_AFTER_ARGUMENT] = _stop_after_spec(
-            points, self._stop_after_layout, kinds)
+            _in_declared_order(points, self.chain_order),
+            self._stop_after_layout, kinds)
 
     def invoke(self, args: dict) -> Any:
         """Validate, then run in the tool's own interpreter.
