@@ -376,6 +376,17 @@ def _media_type_of(path: str) -> str:
     return media_type
 
 
+def _gib(count) -> str:
+    """A byte count in GiB, or "unknown" when there is none.
+
+    `Allocation.ram_bytes` and `.vram_bytes` are Optional and vram IS None on a
+    machine with no card -- CI, a CPU deployment. Dividing it took three tests
+    of the debug page down at once. Same lesson as `_human_bytes` below, which
+    records the first time a None reached a formatter.
+    """
+    return "unknown" if count is None else f"{count / 1073741824:.0f} GiB"
+
+
 def _human_bytes(size) -> str:
     """Byte count in the largest unit that keeps it readable. Logged alongside
     the exact figure, never instead of it.
@@ -700,8 +711,8 @@ def server_debug_data() -> dict:
         node = "this server"
     report["hardware"] = (
         f"{node} · {allocation.cpus:.0f} cpus budgeted · "
-        f"{allocation.ram_bytes / 1073741824:.0f} GiB ram · "
-        f"{allocation.vram_bytes / 1073741824:.0f} GiB vram"
+        f"{_gib(allocation.ram_bytes)} ram · "
+        f"{_gib(allocation.vram_bytes)} vram"
     )
     # Which server this is, for a page that will be open beside two others.
     # The origin is the browser's own and is not sent from here; what only this
@@ -917,8 +928,8 @@ def benchmark_start(request: Request, body: BatteryRequest) -> dict:
     allocation = resources.allocation()
     plan["hardware"] = (
         f"{allocation.cpus:.0f} cpus · "
-        f"{allocation.ram_bytes / 1073741824:.0f} GiB ram · "
-        f"{allocation.vram_bytes / 1073741824:.0f} GiB vram"
+        f"{_gib(allocation.ram_bytes)} ram · "
+        f"{_gib(allocation.vram_bytes)} vram"
     )
     # The battery talks to this server over HTTP like any other client, so it
     # needs an address to reach it at -- the one this very request arrived on.

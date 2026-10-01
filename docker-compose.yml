@@ -92,6 +92,11 @@ x-test-base: &test-base
     # Likewise: the tests check that the image's build fixtures still describe
     # their own source, and that the API requirements stay slim.
     - ./docker:/workspace/docker:ro
+    # And the dev override, which `test_dev_mounts.py` reads to check that no
+    # tool is left frozen in the image. Without it that guard raised
+    # FileNotFoundError here while passing from a checkout -- so the one test
+    # written to catch a silent staleness was itself silently not running.
+    - ./docker-compose.dev.yml:/workspace/docker-compose.dev.yml:ro
   command: >
     sh -c "pip install --no-cache-dir --user -r requirements.txt -r requirements-dev.txt &&
            python -m pytest"
