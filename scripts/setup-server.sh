@@ -19,6 +19,16 @@
 #   --port N        host port to publish on (default: 8000). Only needed when
 #                   something else already holds it; it is remembered in .env.
 #   --no-start      clone and check prerequisites, but do not start anything
+#   --full          download EVERY tool's models and test files (~29 GB). The
+#                   same as naming every tool with --tool, and the honest
+#                   default for a site that does not yet know what it uses.
+#   --token VALUE   set the API token instead of keeping or generating one
+#   --auto-update MODE   off | notify | apply. Written to .env as
+#                   SADT_AUTO_UPDATE, which `server_ctl.py watch` reads. See
+#                   scripts/visor-update.service for the unit that runs it.
+#   --branch NAME   the branch this deployment follows (default: main). Both
+#                   what is cloned and what `watch` fast-forwards to.
+#   --yes           never ask anything; take the defaults and the options given
 #
 # Environment:
 #   REPO/REF        fork / branch to clone (default: this repo, main)
@@ -41,6 +51,10 @@ DEVICE="auto"
 BIND="127.0.0.1"
 PORT=""
 START=1
+FULL=0
+TOKEN=""
+AUTO_UPDATE=""
+ASK=1
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -50,10 +64,65 @@ while [ $# -gt 0 ]; do
         --bind) BIND="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --no-start) START=0; shift ;;
-        -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --full) FULL=1; shift ;;
+        --token) TOKEN="$2"; shift 2 ;;
+        --auto-update) AUTO_UPDATE="$2"; shift 2 ;;
+        --branch) REF="$2"; shift 2 ;;
+        --yes|-y|--non-interactive) ASK=0; shift ;;
+        -h|--help) sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "setup-server: unknown option '$1'" >&2; exit 2 ;;
     esac
 done
+
+# --- the questions -------------------------------------------------------
+# Only on a terminal, and read from /dev/tty rather than stdin: the documented
+# way to run this is `curl ... | sh`, where stdin IS the script and a `read`
+# would swallow the rest of it. A machine, a CI job or --yes takes the
+# defaults and never blocks.
+ask() {
+    # ask VARIABLE "question" "default"
+    eval "_current=\${$1}"
+    if [ -n "$_current" ] || [ "$ASK" -eq 0 ] || [ ! -r /dev/tty ] || [ ! -t 1 ]; then
+        [ -n "$_current" ] || eval "$1=\$3"
+        return 0
+    fi
+    printf '%s [%s]: ' "$2" "$3" > /dev/tty
+    read -r _answer < /dev/tty || _answer=""
+    [ -n "$_answer" ] || _answer="$3"
+    eval "$1=\$_answer"
+}
+
+if [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    echo
+    echo "Answer, or press Enter to take the default in brackets."
+    echo
+fi
+
+ask PORT "Host port to publish the server on" "8000"
+ask BIND "Host address to publish it on (127.0.0.1 keeps it off the network)" "127.0.0.1"
+ask REF  "Branch this deployment follows" "$REF"
+ask AUTO_UPDATE "Follow that branch automatically? off | notify | apply" "off"
+
+case "$AUTO_UPDATE" in
+    off|notify|apply) ;;
+    *) echo "setup-server: --auto-update must be off, notify or apply (got '$AUTO_UPDATE')." >&2; exit 2 ;;
+esac
+
+# The token is what the Slicer client and the dashboard authenticate with.
+# Left empty, server_ctl.py generates one and a re-run keeps it, so configured
+# clients keep working -- which is why this does not default to a new value.
+if [ -z "$TOKEN" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    printf 'API token for Slicer and the dashboard [keep existing, else generate]: ' > /dev/tty
+    read -r TOKEN < /dev/tty || TOKEN=""
+fi
+
+# What to download. Asked as one question rather than per tool: the full set is
+# ~29 GB and naming eighteen tools at a prompt is not a thing anyone does.
+if [ "$FULL" -eq 0 ] && [ -z "$TOOLS" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    printf 'Download models and test files for every tool now? ~29 GB [y/N]: ' > /dev/tty
+    read -r _all < /dev/tty || _all=""
+    case "$_all" in y|Y|yes|YES) FULL=1 ;; esac
+fi
 
 for tool in git python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -107,10 +176,32 @@ fi
 # Before starting the server, not after: the tools that have no weights on
 # disk answer 422 rather than failing mysteriously, so it is better to know
 # what is missing while someone is still watching the terminal.
-if [ -n "$TOOLS" ]; then
+if [ "$FULL" -eq 1 ]; then
+    echo
+    echo "Downloading every tool's models and test files (~29 GB)."
+    echo "Whatever is already on disk is skipped, so this is resumable."
+    python3 "$CTL" models
+elif [ -n "$TOOLS" ]; then
     # shellcheck disable=SC2086 -- $TOOLS is a deliberately word-split option list
     python3 "$CTL" models $TOOLS
 fi
+
+# --- settings that outlive this run --------------------------------------
+# Merged line by line, never rewritten: an operator's own additions to .env
+# must survive, which is the same rule server_ctl.py's write_env follows.
+set_env() {
+    _file="$INSTALL_DIR/.env"
+    [ -f "$_file" ] || { printf '%s\n' "# Written by scripts/setup-server.sh." > "$_file"; }
+    if grep -q "^$1=" "$_file" 2>/dev/null; then
+        _tmp="$_file.tmp.$$"
+        sed "s|^$1=.*|$1=$2|" "$_file" > "$_tmp" && mv "$_tmp" "$_file"
+    else
+        printf '%s=%s\n' "$1" "$2" >> "$_file"
+    fi
+}
+
+[ -n "$TOKEN" ] && set_env API_TOKEN "$TOKEN"
+[ -n "$AUTO_UPDATE" ] && set_env SADT_AUTO_UPDATE "$AUTO_UPDATE"
 
 # --- start ---------------------------------------------------------------
 if [ "$START" -eq 0 ]; then
@@ -131,6 +222,22 @@ echo "    token  $(python3 "$CTL" token)"
 echo
 echo "Or open the 'Slicer Cloud' module in Slicer, which does all of the above"
 echo "(clone, start, update, model selection) from a panel."
+echo
+echo "Dashboard   http://localhost:${PORT:-8000}/server-debug   (the same token)"
+echo "Benchmarks  http://localhost:${PORT:-8000}/benchmark"
+
+if [ "$AUTO_UPDATE" != "off" ] && [ -n "$AUTO_UPDATE" ]; then
+    echo
+    echo "SADT_AUTO_UPDATE is '${AUTO_UPDATE}', which only takes effect once the"
+    echo "updater is running. It is a systemd unit, not part of this script:"
+    echo
+    echo "    sudo cp $INSTALL_DIR/scripts/visor-update.service /etc/systemd/system/"
+    echo "    sudo systemctl daemon-reload"
+    echo "    sudo systemctl enable --now visor-update"
+    echo
+    echo "It polls '${REF}' and never interrupts a run in flight; 'notify' reports"
+    echo "what it would do, 'apply' fast-forwards and restarts between runs."
+fi
 echo
 echo "This deployment listens on ${BIND} over plain HTTP. That is fine for"
 echo "localhost; putting it on a network address requires a TLS terminator in"
