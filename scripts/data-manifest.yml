@@ -651,7 +651,7 @@ tools:
         extract: true
 
   # =========================================================================
-  # VFACE -- NOT PORTED YET.
+  # VFACE -- facial asymmetry; drives six neighbours through the supervisor.
   # =========================================================================
   VFACE:
     models:
@@ -666,10 +666,22 @@ tools:
         size: 21515
         extract: true
     testfiles:
-      # Fetched by VFACE's Q3DC helper (functionaq3dc.py).
+      # Fetched by VFACE's Q3DC helper (functionaq3dc.py). Landmarks and a
+      # ground-truth workbook only -- no volume, so it cannot drive a run.
       - name: Testing.zip
         url: https://github.com/HUTIN1/Q3DCExtension/releases/download/v1.0.0/Testing.zip
         size: 19943
+        extract: true
+      # A CBCT cohort, because the entry above holds none and VFACE's first
+      # stage resamples a volume. Upstream's own module registered two generic
+      # `SlicerTestingData` blobs for this and the port dropped them, so there
+      # is no VFACE-specific cohort published anywhere; this is the same
+      # anonymised pair AREG is tested on, from the same release, listed again
+      # here because a tool can only read `DATA/<its own name>/`.
+      - name: Or_FullyAuto.zip
+        dest: CBCT_Or_FullyAuto
+        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/Or_FullyAuto.zip
+        size: 278088796
         extract: true
 
   # =========================================================================
