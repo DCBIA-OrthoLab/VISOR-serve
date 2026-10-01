@@ -28,6 +28,11 @@
 #                   scripts/visor-update.service for the unit that runs it.
 #   --branch NAME   the branch this deployment follows (default: main). Both
 #                   what is cloned and what `watch` fast-forwards to.
+#   --tools URL     also clone the TOOLS repository (SADT-VISOR) and point this
+#                   deployment at it, so the server serves the real tools
+#                   instead of the two built-in demos. Pass a git URL, or
+#                   `default` for DCBIA-OrthoLab/SADT-VISOR.
+#   --tools-dir DIR where to clone it (default: beside the server clone)
 #   --yes           never ask anything; take the defaults and the options given
 #
 # Environment:
@@ -55,6 +60,9 @@ FULL=0
 TOKEN=""
 AUTO_UPDATE=""
 ASK=1
+TOOLS_REPO=""
+TOOLS_DIR_OPT=""
+DEFAULT_TOOLS_REPO="https://github.com/DCBIA-OrthoLab/SADT-VISOR.git"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -68,6 +76,8 @@ while [ $# -gt 0 ]; do
         --token) TOKEN="$2"; shift 2 ;;
         --auto-update) AUTO_UPDATE="$2"; shift 2 ;;
         --branch) REF="$2"; shift 2 ;;
+        --tools) TOOLS_REPO="$2"; shift 2 ;;
+        --tools-dir) TOOLS_DIR_OPT="$2"; shift 2 ;;
         --yes|-y|--non-interactive) ASK=0; shift ;;
         -h|--help) sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "setup-server: unknown option '$1'" >&2; exit 2 ;;
@@ -102,6 +112,15 @@ ask PORT "Host port to publish the server on" "8000"
 ask BIND "Host address to publish it on (127.0.0.1 keeps it off the network)" "127.0.0.1"
 ask REF  "Branch this deployment follows" "$REF"
 ask AUTO_UPDATE "Follow that branch automatically? off | notify | apply" "off"
+
+# Without this the server starts with its two demo tools and nothing else,
+# which reads as a small deployment rather than an unfinished one.
+if [ -z "$TOOLS_REPO" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    printf 'Also clone the tools repository, so the real tools are served? [Y/n]: ' > /dev/tty
+    read -r _wt < /dev/tty || _wt=""
+    case "$_wt" in n|N|no|NO) ;; *) TOOLS_REPO="default" ;; esac
+fi
+[ "$TOOLS_REPO" = "default" ] && TOOLS_REPO="$DEFAULT_TOOLS_REPO"
 
 case "$AUTO_UPDATE" in
     off|notify|apply) ;;
@@ -176,16 +195,6 @@ fi
 # Before starting the server, not after: the tools that have no weights on
 # disk answer 422 rather than failing mysteriously, so it is better to know
 # what is missing while someone is still watching the terminal.
-if [ "$FULL" -eq 1 ]; then
-    echo
-    echo "Downloading every tool's models and test files (~29 GB)."
-    echo "Whatever is already on disk is skipped, so this is resumable."
-    python3 "$CTL" models
-elif [ -n "$TOOLS" ]; then
-    # shellcheck disable=SC2086 -- $TOOLS is a deliberately word-split option list
-    python3 "$CTL" models $TOOLS
-fi
-
 # --- settings that outlive this run --------------------------------------
 # Merged line by line, never rewritten: an operator's own additions to .env
 # must survive, which is the same rule server_ctl.py's write_env follows.
@@ -199,6 +208,68 @@ set_env() {
         printf '%s=%s\n' "$1" "$2" >> "$_file"
     fi
 }
+
+# --- the tools -----------------------------------------------------------
+# A separate repository on purpose: this server imports nothing from it and
+# knows no dental tool. It is cloned, mounted at its own path, and served.
+TOOLS_ROOT=""
+if [ -n "$TOOLS_REPO" ]; then
+    if [ -n "$TOOLS_DIR_OPT" ]; then
+        TOOLS_ROOT="$TOOLS_DIR_OPT"
+    else
+        TOOLS_ROOT="$(dirname "$INSTALL_DIR")/SADT-VISOR"
+    fi
+    if [ -d "$TOOLS_ROOT/.git" ]; then
+        echo "Updating the tools clone in $TOOLS_ROOT ..."
+        git -C "$TOOLS_ROOT" fetch --quiet origin || true
+        git -C "$TOOLS_ROOT" pull --ff-only || {
+            echo "setup-server: could not fast-forward $TOOLS_ROOT; leaving it as it is." >&2
+        }
+    elif [ -e "$TOOLS_ROOT" ]; then
+        echo "setup-server: $TOOLS_ROOT exists and is not a git clone." >&2
+        echo "  Move it aside or pass --tools-dir with somewhere else." >&2
+        exit 1
+    else
+        echo "Cloning the tools from $TOOLS_REPO into $TOOLS_ROOT ..."
+        git clone "$TOOLS_REPO" "$TOOLS_ROOT"
+    fi
+    TOOLS_ROOT="$(cd "$TOOLS_ROOT" && pwd)"
+fi
+
+# --- models and test files -----------------------------------------------
+# Delegated to the TOOLS repository's own script: the manifest listing which
+# bundle belongs to which tool is dental knowledge and lives beside the tools.
+# Falls back to this repo's copy while both exist, so an older tools checkout
+# still works.
+fetch_data() {
+    if [ -n "$TOOLS_ROOT" ] && [ -f "$TOOLS_ROOT/scripts/setup-data.sh" ]; then
+        ( cd "$TOOLS_ROOT" && sh scripts/setup-data.sh --data-dir "$(cd "$INSTALL_DIR" && pwd)/DATA" "$@" )
+    else
+        # shellcheck disable=SC2086
+        python3 "$CTL" models "$@"
+    fi
+}
+
+if [ "$FULL" -eq 1 ]; then
+    echo
+    echo "Downloading every tool's models and test files (~31 GB)."
+    echo "Whatever is already on disk is skipped, so this is resumable."
+    fetch_data
+elif [ -n "$TOOLS" ]; then
+    # shellcheck disable=SC2086 -- $TOOLS is a deliberately word-split option list
+    fetch_data $TOOLS
+fi
+
+# --- point the deployment at the tools -----------------------------------
+if [ -n "$TOOLS_ROOT" ]; then
+    set_env SADT_TOOLS "$TOOLS_ROOT"
+    # The interpreters those virtualenvs symlink to. uv installs its own
+    # CPython outside the checkout, so without this every `.venv/bin/python`
+    # inside the container is a dangling link.
+    for candidate in "${UV_PYTHON_INSTALL_DIR:-}" "$HOME/.local/share/uv/python"; do
+        [ -n "$candidate" ] && [ -d "$candidate" ] && { set_env UV_PYTHON_STORE "$candidate"; break; }
+    done
+fi
 
 [ -n "$TOKEN" ] && set_env API_TOKEN "$TOKEN"
 [ -n "$AUTO_UPDATE" ] && set_env SADT_AUTO_UPDATE "$AUTO_UPDATE"
