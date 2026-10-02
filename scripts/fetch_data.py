@@ -181,6 +181,12 @@ def _entries(manifest: dict, kind: str, only_tools) -> list:
                     raise ManifestError(
                         f"{where}: 'dest' must be a relative path inside the tool's folder"
                     )
+            split = entry.get("split")
+            if split is not None:
+                if not isinstance(split, str) or os.path.basename(split) != split or split in ("", ".", ".."):
+                    raise ManifestError(f"{where}: 'split' must be a bare folder-name prefix")
+                if not entry.get("extract"):
+                    raise ManifestError(f"{where}: 'split' needs 'extract: true', a file has no subfolders")
             selected.append({**entry, "tool": tool, "kind": kind})
     return selected
 
@@ -285,7 +291,64 @@ def _safe_extract(archive: str, destination: str) -> None:
         os.rename(staging, root)
 
 
+def _link_tree(source: str, destination: str) -> None:
+    """Mirror `source` at `destination` with hardlinks, copying where it cannot.
+
+    Built beside the destination and renamed into place, so an interrupted run
+    leaves no half view the next run would report as present.
+    """
+    staging = destination + ".partial"
+    shutil.rmtree(staging, ignore_errors=True)
+
+    def link(src, dst):
+        try:
+            os.link(src, dst)
+        except OSError:
+            # Another filesystem, or one without hardlinks: a copy is correct,
+            # only bigger.
+            shutil.copy2(src, dst)
+
+    try:
+        shutil.copytree(source, staging, copy_function=link)
+        os.rename(staging, destination)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _split(entry: dict, data_dir: str, force: bool) -> None:
+    """Publish each top-level subfolder of an entry as a view (see `split`).
+
+    Run whether the entry was just fetched or already present: a DATA/ staged
+    before the manifest declared the split is repaired by re-running the fetch,
+    with nothing downloaded.
+    """
+    prefix = entry.get("split")
+    target = _target_path(data_dir, entry)
+    if not prefix or not os.path.isdir(target):
+        return
+    kind_dir = os.path.join(data_dir, entry["tool"], entry["kind"])
+    for sub in sorted(os.listdir(target)):
+        source = os.path.join(target, sub)
+        if sub.startswith(".") or sub == "__MACOSX" or not os.path.isdir(source):
+            continue
+        view = os.path.join(kind_dir, f"{prefix}_{sub}", os.path.basename(target))
+        if os.path.exists(view):
+            if not force:
+                continue
+            shutil.rmtree(view)
+        os.makedirs(os.path.dirname(view), exist_ok=True)
+        _link_tree(source, view)
+        print(f"    -> {os.path.relpath(view, data_dir)}")
+
+
 def _fetch(entry: dict, data_dir: str, force: bool, progress) -> str:
+    """Fetch one entry, then its views. Returns "skipped", "fetched", or raises."""
+    status = _fetch_entry(entry, data_dir, force, progress)
+    _split(entry, data_dir, force)
+    return status
+
+
+def _fetch_entry(entry: dict, data_dir: str, force: bool, progress) -> str:
     """Fetch one entry. Returns "skipped", "fetched", or raises."""
     target = _target_path(data_dir, entry)
     label = os.path.relpath(target, data_dir)

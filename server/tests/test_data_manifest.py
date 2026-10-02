@@ -157,3 +157,89 @@ def test_aso_and_ali_landmark_weights_come_from_different_publications(manifest)
         "ASO and ALI now share a landmark weight archive. They are separate "
         "trainings; sharing one silently changes what ASO registers on."
     )
+
+
+# ---------------------------------------------------------------------------
+# A picker scope has to name a folder the manifest builds
+
+
+def _deployment_scopes():
+    """`(data folder, scope)` for every `testfile:<scope>` in deployment.toml."""
+    from registry.deployment import tomllib
+
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "deployment.toml")
+    with open(path, "rb") as handle:
+        tools = tomllib.load(handle).get("tools", {})
+    scopes = set()
+    for name, entry in tools.items():
+        for value in (entry.get("server_selectable") or {}).values():
+            if isinstance(value, str) and value.startswith("testfile:"):
+                scopes.add((entry.get("data_dir", name), value.split(":", 1)[1]))
+    return sorted(scopes)
+
+
+@pytest.mark.parametrize("data_dir, scope", _deployment_scopes())
+def test_every_testfile_scope_is_a_folder_the_manifest_builds(manifest, data_dir, scope):
+    """Found on a fresh deployment: AREG's pickers were scoped to `T1`/`T2`,
+    folders built by hand on one machine and by no script, so every other
+    server listed nothing. A scope is either the top folder of an entry's
+    `dest`, or a view an entry's `split` publishes."""
+    entries = manifest.get(data_dir, {}).get("testfiles", [])
+    tops = {str(e.get("dest") or e["name"]).split("/")[0] for e in entries}
+    views = {e["split"] for e in entries if e.get("split")}
+    assert scope in tops or any(scope.startswith(f"{prefix}_") for prefix in views), (
+        f"deployment.toml scopes a {data_dir} picker to '{scope}', "
+        f"which no entry of the manifest stages"
+    )
+
+
+def _cohort(root, tool, dest):
+    for timepoint in ("T1", "T2"):
+        folder = os.path.join(root, tool, "testfiles", *dest.split("/"), timepoint)
+        os.makedirs(os.path.join(folder, "nested"))
+        with open(os.path.join(folder, f"scan_{timepoint}.nii.gz"), "w") as handle:
+            handle.write(timepoint)
+
+
+def test_split_publishes_each_timepoint_as_a_hardlinked_view(fetch_data, tmp_path):
+    entry = {"tool": "AREG", "kind": "testfiles", "name": "FullyAuto.zip",
+             "dest": "CBCT/CBCT_FullyAuto", "split": "CBCT", "extract": True}
+    _cohort(str(tmp_path), "AREG", entry["dest"])
+
+    # Already present, which is the deployment this repairs: nothing is
+    # downloaded, and the views are built all the same.
+    assert fetch_data._fetch(entry, str(tmp_path), False, None) == "skipped"
+
+    for timepoint in ("T1", "T2"):
+        view = tmp_path / "AREG" / "testfiles" / f"CBCT_{timepoint}" / "CBCT_FullyAuto"
+        scan = view / f"scan_{timepoint}.nii.gz"
+        assert scan.read_text() == timepoint
+        assert (view / "nested").is_dir()
+        assert os.stat(scan).st_nlink == 2, "a view must cost no data"
+    assert not (tmp_path / "AREG" / "testfiles" / "CBCT_T1" / "CBCT_FullyAuto"
+                / "scan_T2.nii.gz").exists()
+
+
+def test_force_rebuilds_a_view_rather_than_keeping_what_it_held(fetch_data, tmp_path):
+    entry = {"tool": "AREG", "kind": "testfiles", "name": "a.zip",
+             "dest": "IOS/scans", "split": "IOS", "extract": True}
+    _cohort(str(tmp_path), "AREG", entry["dest"])
+    fetch_data._split(entry, str(tmp_path), False)
+    stale = tmp_path / "AREG" / "testfiles" / "IOS_T1" / "scans" / "stale"
+    stale.write_text("left over")
+
+    fetch_data._split(entry, str(tmp_path), False)
+    assert stale.exists(), "an existing view is kept, which is what makes a re-run cheap"
+    fetch_data._split(entry, str(tmp_path), True)
+    assert not stale.exists()
+
+
+@pytest.mark.parametrize("split, extract", [("../out", True), ("a/b", True), ("CBCT", False)])
+def test_a_split_that_could_escape_or_cannot_apply_is_refused(fetch_data, split, extract):
+    manifest = {"AREG": {"testfiles": [
+        {"name": "a.zip", "url": "https://example.invalid/a.zip",
+         "split": split, "extract": extract},
+    ]}}
+    with pytest.raises(fetch_data.ManifestError):
+        fetch_data._entries(manifest, "testfiles", ["AREG"])
