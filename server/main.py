@@ -1740,13 +1740,14 @@ def _registered_run(request: Request, tool_name: str) -> Optional[str]:
 def _client_address(request: Request) -> Optional[str]:
     """Which workstation asked for this run.
 
-    **The peer this process actually sees, never a header.** `X-Forwarded-For`
-    is written by the client and is trivially forged, so taking it would turn
-    an attribution into a suggestion -- and attribution is the entire reason
-    this field exists. Behind the TLS terminator the README documents, the peer
-    IS the proxy and every run reads as coming from it; a deployment that wants
-    the workstation back has to make its proxy the thing that says so, which is
-    a deployment decision rather than something this server can guess.
+    **The peer this process actually sees, never a header read here.**
+    `X-Forwarded-For` is written by the client and is trivially forged, so
+    taking it would turn an attribution into a suggestion -- and attribution is
+    the entire reason this field exists. Behind the TLS terminator the README
+    documents, the peer is the proxy; uvicorn replaces it with the address the
+    proxy reports only when that proxy is in `FORWARDED_ALLOW_IPS`, which
+    docker-compose.yml sets to Docker's bridge gateways. Which proxy to believe
+    is a deployment decision, so it lives there and not in this function.
 
     An address is not patient data, but it does identify a person's machine, so
     it travels no further than `/status` and `/server-debug` already do: behind
