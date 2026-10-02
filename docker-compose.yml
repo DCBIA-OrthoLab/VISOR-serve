@@ -115,6 +115,16 @@ services:
       # The tools mount is read-only, so regenerated schemas need somewhere of
       # their own to land.
       - SCHEMA_CACHE_DIR=/tmp/schema-cache
+      # Which peers uvicorn believes about `X-Forwarded-For`. Its default is
+      # 127.0.0.1, and behind the TLS terminator the README documents the peer
+      # is never that: nginx reaches 127.0.0.1:8000, Docker's proxy forwards it
+      # from the bridge gateway (172.18.0.1 on one deployment), and every run
+      # on the dashboard read as that one address whatever machine sent it.
+      # Docker's default bridge pools are inside 172.16.0.0/12. Trusting them
+      # lets only what reaches the published port speak for a client, and
+      # uvicorn takes the right-most untrusted hop, which nginx appends, so a
+      # client cannot name another machine by sending the header itself.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
 
     deploy:
       resources:
@@ -151,6 +161,8 @@ services:
       # The tools mount is read-only, so regenerated schemas need somewhere of
       # their own to land.
       - SCHEMA_CACHE_DIR=/tmp/schema-cache
+      # Trusted proxies for `X-Forwarded-For`; see the `inference` service.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
 
   # The pytest suite in the same environment as `inference`, without the GPU
   # reservation: asking for a GPU here would make the pre-push hook fail on any
@@ -243,6 +255,8 @@ services:
     environment:
       - API_TOKEN=${API_TOKEN:-dev-token}
       - DEVICE=${DEVICE:-cuda}
+      # Trusted proxies for `X-Forwarded-For`; see the `inference` service.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
     volumes:
       - sadt-cache:/var/cache/sadt
       # Read-only, and outside the image: an image gets copied around, a mount
