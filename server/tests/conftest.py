@@ -77,6 +77,9 @@ def schema_cache(tmp_path, monkeypatch):
     # The run history is written on every finished run, and no test may write
     # one into the repository either.
     monkeypatch.setattr(settings, "HISTORY_DIR", str(tmp_path / "history"))
+    # The operator panel answers only to the admin token, so every test has
+    # one; a test about its absence sets it back to "".
+    monkeypatch.setattr(settings, "ADMIN_TOKEN", "test-admin-token")
 
 
 @pytest.fixture(scope="session")

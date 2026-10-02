@@ -22,6 +22,7 @@ import anyio.to_thread
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, status
 from fastapi.responses import (
+    RedirectResponse,
     FileResponse,
     HTMLResponse,
     JSONResponse,
@@ -145,7 +146,7 @@ app = FastAPI(lifespan=_lifespan)
 # counting its own poll made the chip read "1 request" on a completely idle
 # machine -- the observer appearing in its own observation, and a claim the
 # page could not support. Health checks are excluded for the same reason.
-_UNCOUNTED_PATHS = ("/server-debug", "/status", "/health", "/runs/")
+_UNCOUNTED_PATHS = ("/panel-admin", "/server-debug", "/status", "/health", "/runs/")
 
 
 def _is_observer(path: str) -> bool:
@@ -155,7 +156,7 @@ def _is_observer(path: str) -> bool:
 
 @app.middleware("http")
 async def _count_inflight(request: Request, call_next):
-    """How many requests are being served at this instant, for `/server-debug`.
+    """How many requests are being served at this instant, for `/panel-admin`.
 
     A counter and not a log: what the page needs is the CONCURRENT figure, and
     that is knowable only from inside the request's own lifetime. The
@@ -814,7 +815,7 @@ def client_me(request: Request) -> dict:
     }
 
 
-@app.post("/admin/clients/{address}/policy", dependencies=[Depends(verify_token), Depends(verify_admin)])
+@app.post("/admin/clients/{address}/policy", dependencies=[Depends(verify_admin)])
 def admin_client_policy(address: str, wanted: _ClientRule) -> dict:
     """Let one workstation's batches run side by side, or one at a time."""
     try:
@@ -825,13 +826,13 @@ def admin_client_policy(address: str, wanted: _ClientRule) -> dict:
     return answer
 
 
-@app.get("/admin/check", dependencies=[Depends(verify_token), Depends(verify_admin)])
+@app.get("/admin/check", dependencies=[Depends(verify_admin)])
 def admin_check() -> dict:
     """Whether the admin token the dashboard holds is the right one."""
     return {"admin": True}
 
 
-@app.post("/admin/queue/{run_id}/move", dependencies=[Depends(verify_token), Depends(verify_admin)])
+@app.post("/admin/queue/{run_id}/move", dependencies=[Depends(verify_admin)])
 def admin_move(run_id: str, wanted: _Move) -> dict:
     """Move a run waiting for room: `top`, `up`, `down` or `bottom`."""
     try:
@@ -844,7 +845,7 @@ def admin_move(run_id: str, wanted: _Move) -> dict:
     return snapshot
 
 
-@app.post("/admin/runs/{run_id}/priority", dependencies=[Depends(verify_token), Depends(verify_admin)])
+@app.post("/admin/runs/{run_id}/priority", dependencies=[Depends(verify_admin)])
 def admin_priority(run_id: str, wanted: _Priority) -> dict:
     """Mark a run `high` or back to `normal`, whether it is queued yet or not.
 
@@ -860,7 +861,7 @@ def admin_priority(run_id: str, wanted: _Priority) -> dict:
     return snapshot
 
 
-@app.get("/server-debug.json", dependencies=[Depends(verify_token)])
+@app.get("/panel-admin.json", dependencies=[Depends(verify_admin)])
 def server_debug_data() -> dict:
     """Everything `/status` reports, plus what the machine says about itself.
 
@@ -1042,7 +1043,17 @@ def _client_activity(live: list, ledger: list) -> list:
 TRACE_WINDOW_SECONDS = 30 * 60
 
 
-@app.get("/server-debug/tools/{tool_name}.json", dependencies=[Depends(verify_token)])
+@app.get("/panel-admin/history.json", dependencies=[Depends(verify_admin)])
+def panel_history(limit: int = 500) -> dict:
+    """Every finished run the history holds, newest first, for the panel's full
+    history window. The same records the dashboard's strip shows, more of them:
+    timings, shapes, the tools each run called -- never a value or a file name."""
+    limit = max(1, min(int(limit), telemetry.LEDGER_SIZE))
+    records = [r for r in telemetry.run_ledger(limit=telemetry.LEDGER_SIZE) if r.get("ended_at")]
+    return {"runs": records[:limit], "held": len(records), "capacity": telemetry.LEDGER_SIZE}
+
+
+@app.get("/panel-admin/tools/{tool_name}.json", dependencies=[Depends(verify_admin)])
 def server_debug_tool(tool_name: str, limit: int = 120) -> dict:
     """One tool over its recent runs: what the operator page draws when a tool
     is clicked.
@@ -1092,7 +1103,7 @@ def server_debug_tool(tool_name: str, limit: int = 120) -> dict:
     }
 
 
-@app.get("/server-debug/runs/{run_id}.json", dependencies=[Depends(verify_token)])
+@app.get("/panel-admin/runs/{run_id}.json", dependencies=[Depends(verify_admin)])
 def server_debug_run(run_id: str) -> dict:
     """One run's activity, COMPOSED by this server rather than quoted from the
     tool.
@@ -1283,11 +1294,21 @@ def benchmark_stop() -> dict:
     return {"stopped": benchmark_jobs.stop()}
 
 
-@app.get("/server-debug", include_in_schema=False)
-def server_debug() -> HTMLResponse:
-    """The live view of this machine. Unauthenticated like the other pages: it
-    holds no reading, it fetches them with the token the reader types in."""
+@app.get("/panel-admin", include_in_schema=False)
+def panel_admin() -> HTMLResponse:
+    """The operator's panel. The page itself holds no reading and is served to
+    anyone; everything it shows comes from `/panel-admin*.json`, which answers
+    only to the ADMIN token. A clinician's workstation holds the API token,
+    which opens nothing here."""
     return HTMLResponse(debug_page.DEBUG_PAGE)
+
+
+@app.get("/server-debug", include_in_schema=False)
+@app.get("/admin-panel", include_in_schema=False)
+def server_debug_moved() -> RedirectResponse:
+    """The panel's old address, and the other word order people type: both
+    land on the panel rather than on a 404."""
+    return RedirectResponse(url="panel-admin", status_code=status.HTTP_308_PERMANENT_REDIRECT)
 
 
 @app.get("/tools")
@@ -2084,7 +2105,7 @@ def _client_address(request: Request) -> Optional[str]:
     is a deployment decision, so it lives there and not in this function.
 
     An address is not patient data, but it does identify a person's machine, so
-    it travels no further than `/status` and `/server-debug` already do: behind
+    it travels no further than `/status` and `/panel-admin` already do: behind
     the shared token, for an operator asking "who is hammering this server".
     """
     client = request.client

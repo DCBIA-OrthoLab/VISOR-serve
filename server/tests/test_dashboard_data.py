@@ -23,6 +23,11 @@ client = TestClient(app)
 AUTH = {"Authorization": f"Bearer {settings.API_TOKEN}"}
 
 
+def _panel():
+    """The admin token, read when a request is made: tests set it per test."""
+    return {"X-Admin-Token": settings.ADMIN_TOKEN}
+
+
 @pytest.fixture(autouse=True)
 def _clean(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path / "temp"))
@@ -188,7 +193,7 @@ def test_server_debug_json_carries_the_trace_and_each_runs_chain():
     path = runs.progress_file("chain-run-0000000000000001")
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"at": 1e9, "depth": 1, "tool": "ASO"}) + "\n")
-    payload = client.get("/server-debug.json", headers=AUTH).json()
+    payload = client.get("/panel-admin.json", headers=_panel()).json()
     assert "trace" in payload
     entry = [r for r in payload["runs"] if r["run_id"] == "chain-run-0000000000000001"][0]
     assert entry["chain"] == ["ASO"]
@@ -200,14 +205,14 @@ def test_server_debug_json_carries_the_trace_and_each_runs_chain():
 def test_a_reaped_run_is_still_drawn_from_the_ledger():
     _finish("reaped-run-000000000000001", timeline={
         "spans": [{"phase": "running", "start": 1, "end": 9}], "nested": [], "measured": None})
-    payload = client.get("/server-debug/runs/reaped-run-000000000000001.json", headers=AUTH).json()
+    payload = client.get("/panel-admin/runs/reaped-run-000000000000001.json", headers=_panel()).json()
     assert payload["reaped"] is True
     assert payload["timeline"]["spans"] == [{"phase": "running", "start": 1, "end": 9}]
     assert payload["record"]["tool"] == "AMASSS"
 
 
 def test_an_unknown_run_is_still_a_404():
-    response = client.get("/server-debug/runs/never-seen-00000000000001.json", headers=AUTH)
+    response = client.get("/panel-admin/runs/never-seen-00000000000001.json", headers=_panel())
     assert response.status_code == 404
 
 
@@ -218,7 +223,7 @@ def test_the_tool_view_summarises_that_tools_runs_only():
     _finish("a2", "AMASSS", {"spans": [{"phase": "running", "start": 0, "end": 2}],
                             "nested": [], "measured": None})
     _finish("b1", "ALI")
-    payload = client.get("/server-debug/tools/AMASSS.json", headers=AUTH).json()
+    payload = client.get("/panel-admin/tools/AMASSS.json", headers=_panel()).json()
     assert {r["run_id"] for r in payload["runs"]} == {"a1", "a2"}
     assert payload["summary"]["runs"] == 2 and payload["summary"]["ok"] == 2
     phases = {row["phase"]: row for row in payload["phases"]}
@@ -228,4 +233,14 @@ def test_the_tool_view_summarises_that_tools_runs_only():
 
 
 def test_the_tool_view_needs_the_token():
-    assert client.get("/server-debug/tools/AMASSS.json").status_code == 401
+    assert client.get("/panel-admin/tools/AMASSS.json", headers=AUTH).status_code == 401
+
+
+def test_the_full_history_lists_finished_runs_only_newest_first():
+    _finish("old-run-000000000000000001")
+    _finish("new-run-000000000000000001", tool="ALI")
+    telemetry.record_run_start("live-run-00000000000000001", "AMASSS")
+    payload = client.get("/panel-admin/history.json", headers=_panel()).json()
+    assert [r["run_id"] for r in payload["runs"]] == ["new-run-000000000000000001", "old-run-000000000000000001"]
+    assert payload["held"] == 2
+    assert client.get("/panel-admin/history.json", headers=AUTH).status_code == 401

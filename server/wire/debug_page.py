@@ -1,4 +1,7 @@
-"""The page `GET /server-debug` serves: the operator's view of this server.
+"""The page `GET /panel-admin` serves: the operator's view of this server.
+
+Opened with the ADMIN token only. The API token every workstation holds opens
+nothing here: reading the queue and acting on it are the operator's.
 
 What it answers, top to bottom:
 
@@ -50,7 +53,7 @@ DEBUG_PAGE = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Server dashboard</title>
+<title>VISOR admin panel</title>
 <style>
   /* Glass over light: frosted panels on a softly lit ground, after macOS.
      The ground carries a few wide colour glows so the blur behind each panel
@@ -376,6 +379,14 @@ DEBUG_PAGE = r"""<!doctype html>
   .stack-keys { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--soft); margin-top: 7px; }
   .stack-keys b { color: var(--ink); }
 
+  /* full history */
+  .hfilters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .hfilters select, .hfilters input { font-size: 13px; padding: 6px 9px; border-radius: 9px;
+      border: 1px solid var(--line); background: var(--sunk); color: var(--ink); min-width: 0; }
+  .hfilters input { width: 220px; }
+  .htable { max-height: 58vh; overflow: auto; border: 1px solid var(--line); border-radius: 12px; }
+  .htable td.calls { white-space: normal; color: var(--soft); max-width: 260px; }
+  .htable td small { color: var(--ghost); }
   /* clients */
   .client { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 16px; padding: 12px 4px;
             border-bottom: 1px solid var(--line); }
@@ -399,7 +410,6 @@ DEBUG_PAGE = r"""<!doctype html>
   .tag { display: inline-block; font-size: 10.5px; font-weight: 650; padding: 0 6px; border-radius: 5px;
          background: var(--accent-soft); color: var(--accent); }
   /* operator controls */
-  #adminbtn.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 650; }
   .ctl { display: flex; gap: 4px; flex: none; width: 100%; justify-content: flex-end;
          padding-left: 34px; margin-top: -2px; }
   .ctl button { padding: 2px 7px; font-size: 12px; border-radius: 6px; line-height: 1.3; }
@@ -418,14 +428,14 @@ DEBUG_PAGE = r"""<!doctype html>
 <body>
 
 <div id="gate" class="card" hidden>
-  <h2>Server dashboard</h2>
+  <h2>Admin panel</h2>
   <div class="body">
     <p style="margin:0 0 12px;font-size:13px;color:var(--soft)">
-      The readings come from <code>/server-debug.json</code>, which is
-      Bearer-protected like every endpoint that says anything about a run.
+      This panel opens with the server's admin token (<code>ADMIN_TOKEN</code>).
+      The API token a workstation uses for its runs does not open it.
       The token stays in this browser and is never written into this page.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <input id="token" type="password" placeholder="API token" autocomplete="off">
+      <input id="token" type="password" placeholder="Admin token" autocomplete="off">
       <button id="save" type="button">Connect</button>
     </div>
     <div class="err" id="gateerr"></div>
@@ -446,7 +456,7 @@ DEBUG_PAGE = r"""<!doctype html>
     <button id="toggle" type="button" class="ghost">Pause</button>
     <a class="navlink" href="benchmark" title="launch a benchmark preset on this server">Run a benchmark</a>
     <a class="navlink" href="benchmarks/view" title="the campaigns already measured, drawn on one time axis">Benchmark results</a>
-    <button id="adminbtn" type="button" class="ghost" title="operator controls">Admin</button>
+    <button id="adminbtn" type="button" class="ghost" title="forget the admin token in this browser">Lock</button>
     <button id="theme" type="button" class="ghost" title="theme">Theme</button>
   </header>
 
@@ -498,7 +508,8 @@ DEBUG_PAGE = r"""<!doctype html>
   </section>
 
   <section class="card" id="history">
-    <h2>History <span class="count" id="h-count">0</span><span class="note" id="h-note"></span></h2>
+    <h2>History <span class="count" id="h-count">0</span><span class="note" id="h-note"></span>
+      <button type="button" class="ghost" data-history="1" style="margin-left:6px">Full history</button></h2>
     <div class="scroll" id="h-body"></div>
   </section>
 </div>
@@ -509,16 +520,15 @@ DEBUG_PAGE = r"""<!doctype html>
 <script>
 (function () {
   "use strict";
-  var KEY = "visor.token", THEME_KEY = "visor.theme", ADMIN_KEY = "visor.admin";
+  var KEY = "visor.admin", THEME_KEY = "visor.theme";
   var EVERY = 2000;
   var token = "";
   try { token = window.localStorage.getItem(KEY) || ""; } catch (e) { token = ""; }
 
   var live = true, latest = null;
-  // The operator token, kept apart from the API token: it only ever rides an
-  // action, in its own header, and the page reads everything without it.
-  var admin = { token: "", ok: false };
-  try { admin.token = window.localStorage.getItem(ADMIN_KEY) || ""; } catch (e) { admin.token = ""; }
+  // Whether the controls are live: the panel is opened with the admin token,
+  // so once it reads anything at all, every action is allowed.
+  var admin = { ok: false };
   // What the dialog shows: a run or a tool, and what was last fetched for it.
   var dlg = { kind: null, id: null, data: null, error: "", fetchedAt: 0 };
   var filters = { tool: "", client: "", outcome: "", text: "" };
@@ -957,8 +967,7 @@ DEBUG_PAGE = r"""<!doctype html>
     var enabled = d.server && d.server.admin_enabled;
     el("c-list").innerHTML = rows.length ? rows.map(function (c) {
       var parallel = c.batches === "parallel";
-      var rule = '<div class="seg2" title="' + (admin.ok ? "how this workstation's cohort batches run"
-          : enabled ? "unlock Admin to change" : "set ADMIN_TOKEN on the server to change") + '">' +
+      var rule = '<div class="seg2" title="how this workstation\'s cohort batches run">' +
         ["serial", "parallel"].map(function (level) {
           return '<button ' + (admin.ok ? 'data-rule="' + level + '" data-addr="' + esc(c.client) + '"' : "disabled") +
             ' class="' + (c.batches === level ? "on" : "") + '">' + (level === "serial" ? "One batch at a time" : "Batches in parallel") + "</button>";
@@ -1047,16 +1056,11 @@ DEBUG_PAGE = r"""<!doctype html>
   }
 
   // ---- the dialog ------------------------------------------------------
-  function openDialog(kind, id) {
-    dlg = { kind: kind, id: id, data: null, error: "", fetchedAt: 0 };
+  function openDialog(kind, id, back) {
+    dlg = { kind: kind, id: id, data: null, error: "", fetchedAt: 0, back: back || null };
     el("overlay").hidden = false;
     document.body.classList.add("locked");
     window.requestAnimationFrame(function () { el("overlay").classList.add("open"); });
-    if (kind === "admin") {
-      el("dialog").innerHTML = adminDialog();
-      window.setTimeout(function () { el("admintoken").focus(); }, 30);
-      return;
-    }
     drawDialog();
     fetchDialog();
   }
@@ -1067,12 +1071,13 @@ DEBUG_PAGE = r"""<!doctype html>
     window.setTimeout(function () { if (!dlg.kind) { el("overlay").hidden = true; } }, 170);
   }
   function fetchDialog() {
-    if (!dlg.kind || !token || dlg.kind === "admin") { return; }
+    if (!dlg.kind || !token) { return; }
     var kind = dlg.kind, id = dlg.id;
-    var url = kind === "run" ? "server-debug/runs/" + encodeURIComponent(id) + ".json"
-                             : "server-debug/tools/" + encodeURIComponent(id) + ".json";
+    var url = kind === "run" ? "panel-admin/runs/" + encodeURIComponent(id) + ".json"
+            : kind === "history" ? "panel-admin/history.json?limit=1000"
+            : "panel-admin/tools/" + encodeURIComponent(id) + ".json";
     dlg.fetchedAt = Date.now();
-    fetch(url, { headers: { Authorization: "Bearer " + token } })
+    fetch(url, { headers: { "X-Admin-Token": token } })
       .then(function (r) {
         if (r.status === 404) { throw new Error("This run is no longer known to the server."); }
         if (!r.ok) { throw new Error("The server answered " + r.status + "."); }
@@ -1094,8 +1099,7 @@ DEBUG_PAGE = r"""<!doctype html>
 
   function drawDialog() {
     if (!dlg.kind) { return; }
-    if (dlg.kind === "admin") { return; }    // drawn once, so typing is not wiped by a poll
-    el("dialog").innerHTML = dlg.kind === "run" ? runDialog() : toolDialog();
+    el("dialog").innerHTML = dlg.kind === "run" ? runDialog() : dlg.kind === "history" ? historyDialog() : toolDialog();
   }
 
   function runDialog() {
@@ -1123,6 +1127,7 @@ DEBUG_PAGE = r"""<!doctype html>
           '" data-id="' + esc(id) + '">' + (((latest.admission || {}).priorities || {})[id] === "high" ? "Remove priority" : "\u2605 Give priority") + "</button>"
         : "") +
       '<button class="ghost" data-copy="' + esc(id) + '">Copy id</button>' +
+      (dlg.back ? '<button class="ghost" data-back="1">\u2190 History</button>' : "") +
       '<button data-close="1">Close ✕</button></div></div>';
 
     var spans = tl.spans || [];
@@ -1161,6 +1166,106 @@ DEBUG_PAGE = r"""<!doctype html>
       "never named, only its shape (files, bytes, extensions). A hosted bundle is named, because this deployment " +
       "staged it. Console lines are composed by the server from the phase the run reported, never quoted from " +
       "what the tool printed.</div></div>";
+  }
+
+  // ---- the full history ------------------------------------------------
+  function ranSeconds(r) {
+    var total = 0;
+    (r.spans || []).forEach(function (sp) { if (sp.phase === "running" && sp.end != null) { total += sp.end - sp.start; } });
+    return total;
+  }
+  function callsOf(r) {
+    var byTool = {};
+    (r.nested || []).forEach(function (c) {
+      if (c.end == null) { return; }
+      byTool[c.tool] = (byTool[c.tool] || 0) + (c.end - c.start);
+    });
+    return Object.keys(byTool).map(function (t) { return esc(t) + " <small>" + dur(byTool[t]) + "</small>"; }).join(", ");
+  }
+  function dateTime(at) {
+    if (!at) { return "\u2014"; }
+    var d = new Date(at * 1000), today = new Date().toDateString() === d.toDateString();
+    return (today ? "" : d.toLocaleDateString() + " ") + clock(at);
+  }
+  function historyDialog() {
+    var data = dlg.data, f = dlg.hf || (dlg.hf = { tool: "", client: "", outcome: "", text: "" });
+    var head = '<div class="dhd"><div><h3>History</h3><div class="rid">' +
+      (data ? data.held + " finished runs kept on this server (up to " + data.capacity + "), across restarts" : "Loading\u2026") +
+      '</div></div><div class="acts"><button class="ghost" data-hrefresh="1">Refresh</button>' +
+      '<button data-close="1">Close \u2715</button></div></div>';
+    if (!data) { return head + '<div class="dbody"><div class="empty">' + (dlg.error ? esc(dlg.error) : "Loading\u2026") + "</div></div>"; }
+    var all = data.runs || [];
+    function uniq(key) {
+      var seen = {};
+      all.forEach(function (r) { if (r[key]) { seen[r[key]] = true; } });
+      return Object.keys(seen).sort();
+    }
+    function select(key, label, values) {
+      return '<select data-hf="' + key + '"><option value="">' + label + "</option>" + values.map(function (v) {
+        return '<option value="' + esc(v) + '"' + (f[key] === v ? " selected" : "") + ">" + esc(v) + "</option>";
+      }).join("") + "</select>";
+    }
+    var rows = all.filter(function (r) {
+      if (f.tool && r.tool !== f.tool) { return false; }
+      if (f.client && r.client !== f.client) { return false; }
+      if (f.outcome && r.outcome !== f.outcome) { return false; }
+      if (f.text) {
+        var hay = [r.run_id, r.tool, r.client, (r.batch || {}).id].join(" ").toLowerCase();
+        if (hay.indexOf(f.text.toLowerCase()) < 0) { return false; }
+      }
+      return true;
+    });
+    var ok = rows.filter(function (r) { return r.outcome === "done"; }).length;
+    var ran = 0, waited = 0, took = 0;
+    var perTool = {};
+    rows.forEach(function (r) {
+      var rs = ranSeconds(r);
+      ran += rs; waited += r.waited || 0; took += r.seconds || 0;
+      var t = perTool[r.tool || "?"] = perTool[r.tool || "?"] || { runs: 0, ran: 0, took: 0, longest: 0, failed: 0 };
+      t.runs += 1; t.ran += rs; t.took += r.seconds || 0; t.longest = Math.max(t.longest, r.seconds || 0);
+      if (r.outcome !== "done") { t.failed += 1; }
+    });
+    var filters = '<div class="hfilters">' + select("tool", "All tools", uniq("tool")) +
+      select("client", "All workstations", uniq("client")) + select("outcome", "Any outcome", uniq("outcome")) +
+      '<input data-hf="text" type="search" placeholder="Run id, batch id\u2026" value="' + esc(f.text) + '">' +
+      '<span style="color:var(--soft);font-size:12.5px">' + rows.length + " of " + all.length + " shown</span></div>";
+    var kpis = '<div class="kpis">' + kpi("runs", rows.length) +
+      kpi("succeeded", rows.length ? Math.round(100 * ok / rows.length) + "%" : "\u2014") +
+      kpi("computing", dur(ran)) + kpi("waiting", dur(waited)) + kpi("wall clock", dur(took)) + "</div>";
+    var tools = Object.keys(perTool).sort(function (a, b) { return perTool[b].ran - perTool[a].ran; });
+    var maxRan = tools.length ? Math.max(1, perTool[tools[0]].ran) : 1;
+    var byTool = '<table><thead><tr><th>tool</th><th class="r">runs</th><th class="r">failed</th><th>time computing</th>' +
+      '<th class="r">computing</th><th class="r">mean took</th><th class="r">longest</th></tr></thead><tbody>' +
+      tools.map(function (name) {
+        var t = perTool[name];
+        return '<tr data-tool="' + esc(name) + '"><td><b>' + esc(name) + '</b></td><td class="r mono">' + t.runs +
+          '</td><td class="r mono">' + (t.failed || "\u2014") + '</td><td><span class="minibar" style="width:160px"><i style="width:' +
+          pct(t.ran, maxRan).toFixed(1) + '%;background:var(--ok)"></i></span></td><td class="r mono">' + dur(t.ran) +
+          '</td><td class="r mono">' + dur(t.took / t.runs) + '</td><td class="r mono">' + dur(t.longest) + "</td></tr>";
+      }).join("") + "</tbody></table>";
+    var table = '<div class="htable"><table><thead><tr><th>started</th><th>tool</th><th>calls</th><th>from</th>' +
+      "<th>outcome</th><th>phases</th><th class='r'>computing</th><th class='r'>waited</th><th class='r'>took</th>" +
+      "<th class='r'>chan</th><th class='r'>cpus</th><th class='r'>vram peak</th><th class='r'>ram peak</th>" +
+      "<th class='r'>files</th><th class='r'>input</th></tr></thead><tbody>" +
+      rows.map(function (r) {
+        var m = r.measured || {};
+        return '<tr data-run="' + esc(r.run_id) + '" data-from="history"><td class="mono">' + dateTime(r.started_at) + "</td>" +
+          "<td><b>" + esc(r.tool || "?") + "</b>" + (r.batch ? ' <span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") + "</td>" +
+          '<td class="calls">' + (callsOf(r) || "\u2014") + "</td>" +
+          '<td class="mono">' + esc(r.client || "\u2014") + "</td><td>" + pill(r.outcome) + "</td>" +
+          "<td>" + phaseBar(r.spans, r.seconds) + "</td>" +
+          "<td class='r mono'>" + dur(ranSeconds(r)) + "</td>" +
+          "<td class='r mono'>" + (r.waited == null ? "\u2014" : dur(r.waited)) + "</td>" +
+          "<td class='r mono'>" + dur(r.seconds) + "</td>" +
+          "<td class='r mono'>" + (r.channels == null ? "\u2014" : r.channels) + "</td>" +
+          "<td class='r mono'>" + (r.cpus == null ? "\u2014" : r.cpus) + "</td>" +
+          "<td class='r mono'>" + gib(m.vram_bytes) + "</td><td class='r mono'>" + gib(m.ram_bytes) + "</td>" +
+          "<td class='r mono'>" + (r.files == null ? "\u2014" : r.files) + "</td>" +
+          "<td class='r mono'>" + bytes(r.input_bytes) + "</td></tr>";
+      }).join("") + "</tbody></table></div>";
+    return head + '<div class="dbody">' + filters + kpis + section("By tool", byTool) +
+      section("Runs \u00b7 click one for its timeline", rows.length ? table
+        : '<div class="empty">No finished run matches these filters.</div>') + "</div>";
   }
 
   function inputsHtml(led) {
@@ -1268,37 +1373,15 @@ DEBUG_PAGE = r"""<!doctype html>
     window.clearTimeout(toast.timer);
     toast.timer = window.setTimeout(function () { node.hidden = true; }, 2600);
   }
-  function drawAdminButton() {
-    var enabled = latest && latest.server && latest.server.admin_enabled;
-    el("adminbtn").className = "ghost" + (admin.ok ? " on" : "");
-    el("adminbtn").textContent = admin.ok ? "Admin \u2713" : "Admin";
-    el("adminbtn").title = enabled === false ? "Operator controls are off: set ADMIN_TOKEN on the server"
-      : admin.ok ? "operator controls on; click to lock" : "unlock the operator controls";
-  }
-  function checkAdmin(candidate) {
-    return fetch("admin/check", { headers: { Authorization: "Bearer " + token, "X-Admin-Token": candidate } })
-      .then(function (r) {
-        if (r.status === 403) { throw new Error("Operator controls are off on this server: ADMIN_TOKEN is not set."); }
-        if (!r.ok) { throw new Error("That admin token was refused."); }
-        return true;
-      });
-  }
-  function adminDialog() {
-    return '<div class="dhd"><div><h3>Operator controls</h3><div class="rid">Reorder the queue and give a run priority. ' +
-      "Needs the admin token, which is not the API token every workstation holds.</div></div>" +
-      '<div class="acts"><button data-close="1">Close \u2715</button></div></div>' +
-      '<div class="dbody"><div class="adminbox"><input id="admintoken" type="password" placeholder="Admin token" autocomplete="off">' +
-      '<button id="adminsave" type="button">Unlock</button></div><div class="err" id="adminerr"></div>' +
-      '<div class="caveat">Priority puts a run ahead of every normal run waiting, lets it past the wait for a tool slot, ' +
-      "and admits it on the widest shape that fits instead of its fair share. A run already running keeps what it has. " +
-      "The token stays in this browser.</div></div>";
-  }
+
+
+
   function adminAction(path, body, done) {
-    fetch(path, { method: "POST", headers: { Authorization: "Bearer " + token, "X-Admin-Token": admin.token,
+    fetch(path, { method: "POST", headers: { "X-Admin-Token": token,
                                              "Content-Type": "application/json" }, body: JSON.stringify(body) })
       .then(function (r) {
         return r.json().catch(function () { return {}; }).then(function (payload) {
-          if (r.status === 401) { admin.ok = false; drawAdminButton(); }
+          if (r.status === 401) { admin.ok = false; }
           if (!r.ok) { throw new Error(payload.detail || ("The server answered " + r.status + ".")); }
           return payload;
         });
@@ -1323,8 +1406,10 @@ DEBUG_PAGE = r"""<!doctype html>
     drawTools(d);
     drawHistory(d);
     drawFilters();
-    drawAdminButton();
-    if (dlg.kind && dlg.kind !== "admin") {
+    if (dlg.kind === "history") {
+      // Fetched when opened and on Refresh only: a poll redrawing it would
+      // wipe a filter being typed.
+    } else if (dlg.kind) {
       // A live run's detail follows it; a tool view is heavier and refreshes slower.
       var every = dlg.kind === "run" ? EVERY : 10000;
       if (Date.now() - dlg.fetchedAt >= every - 200 && !(dlg.data && dlg.data.reaped)) { fetchDialog(); }
@@ -1334,19 +1419,16 @@ DEBUG_PAGE = r"""<!doctype html>
 
   function load() {
     if (!token) { el("gate").hidden = false; el("shell").hidden = true; return; }
-    fetch("server-debug.json", { headers: { Authorization: "Bearer " + token } })
+    fetch("panel-admin.json", { headers: { "X-Admin-Token": token } })
       .then(function (r) {
-        if (r.status === 401) { throw new Error("That token was refused."); }
+        if (r.status === 401) { throw new Error("That is not this server's admin token."); }
+        if (r.status === 403) { throw new Error("This server has no admin token: set ADMIN_TOKEN in its .env and restart it."); }
         if (!r.ok) { throw new Error("The server answered " + r.status + "."); }
         return r.json();
       })
       .then(function (d) {
         el("gate").hidden = true; el("shell").hidden = false;
-        if (admin.token && !admin.ok && !admin.checked) {
-          admin.checked = true;
-          checkAdmin(admin.token).then(function () { admin.ok = true; if (latest) { draw(latest); } })
-            .catch(function () { admin.token = ""; });
-        }
+        admin.ok = true;
         draw(d);
       })
       .catch(function (e) { el("gate").hidden = false; el("shell").hidden = true; el("gateerr").textContent = e.message; });
@@ -1373,6 +1455,27 @@ DEBUG_PAGE = r"""<!doctype html>
     try { window.localStorage.setItem(THEME_KEY, theme); } catch (e) { /* private mode */ }
     applyTheme(theme);
   });
+  // The history window's own filters, applied in the browser to what it holds.
+  document.addEventListener("change", function (event) {
+    var key = event.target.getAttribute && event.target.getAttribute("data-hf");
+    if (key && dlg.kind === "history" && event.target.tagName === "SELECT") {
+      dlg.hf[key] = event.target.value;
+      drawDialog();
+    }
+  });
+  var hfTimer = null;
+  document.addEventListener("input", function (event) {
+    if (event.target.getAttribute && event.target.getAttribute("data-hf") === "text" && dlg.kind === "history") {
+      window.clearTimeout(hfTimer);
+      var value = event.target.value;
+      hfTimer = window.setTimeout(function () {
+        dlg.hf.text = value;
+        drawDialog();
+        var box = document.querySelector('[data-hf="text"]');
+        if (box) { box.focus(); box.setSelectionRange(value.length, value.length); }
+      }, 250);
+    }
+  });
   var findTimer = null;
   el("find").addEventListener("input", function () {
     window.clearTimeout(findTimer);
@@ -1386,6 +1489,14 @@ DEBUG_PAGE = r"""<!doctype html>
   document.addEventListener("click", function (event) {
     var t = event.target;
     if (t.closest("[data-close]") || t === el("overlay")) { closeDialog(); return; }
+    if (t.closest("[data-history]")) { openDialog("history", null); return; }
+    if (t.closest("[data-hrefresh]")) { fetchDialog(); return; }
+    if (t.closest("[data-back]") && dlg.back) {
+      var back = dlg.back;
+      openDialog("history", null);
+      dlg.data = back.data; dlg.hf = back.hf; drawDialog();
+      return;
+    }
     var mv = t.closest("[data-move]");
     if (mv) {
       adminAction("admin/queue/" + encodeURIComponent(mv.getAttribute("data-id")) + "/move",
@@ -1406,25 +1517,11 @@ DEBUG_PAGE = r"""<!doctype html>
         { priority: level }, level === "high" ? "Priority given." : "Back to normal priority.");
       return;
     }
-    if (t.closest("#adminsave")) {
-      var candidate = el("admintoken").value.trim();
-      checkAdmin(candidate).then(function () {
-        admin.token = candidate; admin.ok = true;
-        try { window.localStorage.setItem(ADMIN_KEY, candidate); } catch (e) { /* private mode */ }
-        drawAdminButton(); closeDialog(); toast("Operator controls unlocked.");
-        if (latest) { draw(latest); }
-      }).catch(function (e) { el("adminerr").textContent = e.message; });
-      return;
-    }
     if (t.closest("#adminbtn")) {
-      if (admin.ok) {
-        admin = { token: "", ok: false };
-        try { window.localStorage.removeItem(ADMIN_KEY); } catch (e) { /* private mode */ }
-        drawAdminButton(); toast("Operator controls locked.");
-        if (latest) { draw(latest); }
-      } else {
-        openDialog("admin", null);
-      }
+      token = ""; admin.ok = false;
+      try { window.localStorage.removeItem(KEY); } catch (e) { /* private mode */ }
+      closeDialog();
+      el("gate").hidden = false; el("shell").hidden = true;
       return;
     }
     var chip = t.closest("[data-clear]");
@@ -1441,11 +1538,14 @@ DEBUG_PAGE = r"""<!doctype html>
     var toolNode = t.closest("[data-tool]");
     if (toolNode) { openDialog("tool", toolNode.getAttribute("data-tool")); return; }
     var runNode = t.closest("[data-run]");
-    if (runNode) { openDialog("run", runNode.getAttribute("data-run")); }
+    if (runNode) {
+      var from = runNode.getAttribute("data-from") === "history" && dlg.kind === "history"
+        ? { data: dlg.data, hf: dlg.hf } : null;
+      openDialog("run", runNode.getAttribute("data-run"), from);
+    }
   });
   document.addEventListener("keydown", function (event) {
     if (event.key === "Escape" && dlg.kind) { closeDialog(); }
-    if (event.key === "Enter" && event.target && event.target.id === "admintoken") { el("adminsave").click(); }
   });
   window.addEventListener("hashchange", function () { readUrl(); if (latest) { draw(latest); } });
 

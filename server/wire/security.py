@@ -37,9 +37,10 @@ ADMIN_HEADER = "X-Admin-Token"
 def verify_admin(x_admin_token: str = Header(default="", alias=ADMIN_HEADER)) -> None:
     """FastAPI dependency: raise unless the operator's admin token is sent.
 
-    Always used BESIDE `verify_token`, never instead of it. A separate header
-    rather than a second Bearer, so the dashboard keeps reading with the API
-    token and only an action carries the admin one.
+    It is the whole of the operator panel's authentication, reading and acting
+    alike: the API token every workstation holds opens nothing on it. A header
+    of its own rather than a Bearer, so the two tokens can never be confused
+    for one another by a client that sends the one it has.
 
     403 when no admin token is configured at all: the controls are off on this
     deployment, which is a different answer from "wrong token" (401).

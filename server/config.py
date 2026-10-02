@@ -257,8 +257,14 @@ class Settings(BaseSettings):
     SADT_VRAM_PER_JOB: str = ""
 
     # --- uploads and results ------------------------------------------
-    MAX_UPLOAD_MB: int = 500  # over this, 413
-    MAX_EXTRACTED_MB: int = 2000  # zip-bomb cap on an extracted archive, 400
+    # Per file, not per request: AREG's two folders are two uploads, each
+    # checked on its own. 2 GB so a whole CBCT cohort sent as one archive --
+    # a tool that cannot be split into batches -- is not refused.
+    MAX_UPLOAD_MB: int = 2048  # over this, 413
+    # The uncompressed size an archive may expand to. Kept well above the
+    # upload cap: a 2 GB archive of compressed volumes legitimately unpacks
+    # to several times that, and this is a zip-bomb guard, not a quota.
+    MAX_EXTRACTED_MB: int = 8192  # zip-bomb cap on an extracted archive, 400
     UPLOAD_CHUNK_MB: int = 8  # default part size, clamped to [1, 64]
     # Idle timeout, not an age limit: every part written and every range read
     # stamps its directory. Bounds how long an uncollected result stays on disk.

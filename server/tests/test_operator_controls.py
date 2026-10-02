@@ -254,6 +254,11 @@ client = TestClient(main.app)
 AUTH = {"Authorization": f"Bearer {settings.API_TOKEN}"}
 
 
+def _panel():
+    """The admin token, read when a request is made: tests set it per test."""
+    return {"X-Admin-Token": settings.ADMIN_TOKEN}
+
+
 @pytest.fixture
 def admin(monkeypatch):
     monkeypatch.setattr(settings, "ADMIN_TOKEN", "operator-secret")
@@ -272,8 +277,9 @@ def test_the_api_token_alone_is_not_enough(admin):
     assert client.get("/admin/check", headers=AUTH).status_code == 401
     wrong = {**AUTH, "X-Admin-Token": "guess"}
     assert client.post("/admin/runs/x/priority", json={"priority": "high"}, headers=wrong).status_code == 401
-    # And the admin token alone is not enough either.
-    assert client.get("/admin/check", headers={"X-Admin-Token": "operator-secret"}).status_code == 401
+    # The admin token alone is: the panel and its controls are the operator's,
+    # and an operator's browser need not hold a workstation's API token.
+    assert client.get("/admin/check", headers={"X-Admin-Token": "operator-secret"}).status_code == 200
 
 
 def test_the_admin_token_can_mark_a_run_and_status_shows_it(admin):
@@ -291,7 +297,20 @@ def test_bad_requests_are_named(admin):
     assert client.post("/admin/queue/x/move", json={"to": "top"}, headers=admin).status_code == 409
 
 
-def test_the_page_is_told_whether_the_controls_exist(admin, monkeypatch):
-    assert client.get("/server-debug.json", headers=AUTH).json()["server"]["admin_enabled"] is True
+def test_without_an_admin_token_the_panel_does_not_open_at_all(monkeypatch):
+    """No ADMIN_TOKEN, no panel: 403, which the page turns into "set
+    ADMIN_TOKEN" rather than "wrong token"."""
     monkeypatch.setattr(settings, "ADMIN_TOKEN", "")
-    assert client.get("/server-debug.json", headers=AUTH).json()["server"]["admin_enabled"] is False
+    assert client.get("/panel-admin.json", headers={"X-Admin-Token": ""}).status_code == 403
+
+
+def test_the_panel_opens_with_the_admin_token_and_not_with_the_api_one(admin):
+    assert client.get("/panel-admin.json", headers=AUTH).status_code == 401
+    assert client.get("/panel-admin.json", headers={"X-Admin-Token": "operator-secret"}).status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/server-debug", "/admin-panel"])
+def test_the_panels_other_addresses_lead_to_it(path):
+    response = client.get(path, follow_redirects=False)
+    assert response.status_code == 308
+    assert response.headers["location"] == "panel-admin"

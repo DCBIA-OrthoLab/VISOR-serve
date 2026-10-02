@@ -30,6 +30,11 @@ client = TestClient(main.app)
 AUTH = {"Authorization": f"Bearer {settings.API_TOKEN}"}
 
 
+def _panel():
+    """The admin token, read when a request is made: tests set it per test."""
+    return {"X-Admin-Token": settings.ADMIN_TOKEN}
+
+
 @pytest.fixture(autouse=True)
 def _clean(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path / "temp"))
@@ -208,7 +213,7 @@ def test_the_dashboard_groups_a_workstations_batches_into_cohorts():
         telemetry.record_run_end(run_id, "done", "done")
     runs.register("cohort-live-0000000000000003", tool="AMASSS", client="10.0.0.5", batch=_batch(3, total=4))
     runs.append("cohort-live-0000000000000003", runs.PHASE_RUNNING)
-    payload = client.get("/server-debug.json", headers=AUTH).json()
+    payload = client.get("/panel-admin.json", headers=_panel()).json()
     row = [c for c in payload["clients"] if c["client"] == "10.0.0.5"][0]
     assert row["batches"] == clients.SERIAL and row["running"] == 1
     cohort = row["cohorts"][0]
