@@ -148,8 +148,16 @@ DEBUG_PAGE = r"""<!doctype html>
   .vital.hot .v { color: var(--hot); }
 
   /* ---- main grid ------------------------------------------------------- */
-  #main { display: grid; gap: 14px; grid-template-columns: minmax(270px, 320px) minmax(0, 1fr) minmax(320px, 400px); }
-  #p-list { max-height: 300px; overflow: auto; }
+  #main { display: grid; gap: 14px; grid-template-columns: minmax(300px, 360px) minmax(0, 1fr) minmax(320px, 400px); }
+  /* The queue is what an operator acts on, so it takes the column; paused
+     runs wait on a person and keep a short, scrolling strip below it. */
+  #queue { flex: 1 1 auto; }
+  #queue .body { min-height: 420px; }
+  #q-list { max-height: 640px; overflow: auto; }
+  #paused { flex: 0 0 auto; }
+  #p-list { max-height: 150px; overflow: auto; }
+  #paused .qitem { padding: 5px 9px; margin-bottom: 5px; }
+  #paused .qitem .pos { width: 20px; height: 20px; font-size: 10px; }
   @media (max-width: 1200px) { #main { grid-template-columns: 1fr; } }
   #left { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 
