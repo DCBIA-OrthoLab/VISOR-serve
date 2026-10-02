@@ -52,35 +52,48 @@ DEBUG_PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Server dashboard</title>
 <style>
-  /* An operator's console: one ink-blue accent, slate neutrals, hairlines
-     instead of boxes. Surfaces are see-through so the page reads as one sheet
-     with regions marked on it, not as a stack of cards. */
+  /* Glass over light: frosted panels on a softly lit ground, after macOS.
+     The ground carries a few wide colour glows so the blur behind each panel
+     has something to pick up; the panels themselves stay neutral. */
   :root {
-    --bg: #eef1f4; --panel: rgba(255,255,255,.62); --sunk: rgba(30,48,72,.045);
-    --line: rgba(30,48,72,.13); --ink: #16202b; --soft: #556270; --ghost: #8b96a3;
-    --bar: rgba(30,48,72,.09); --accent: #2558a8; --accent-soft: rgba(37,88,168,.10);
-    --ok: #1d8a5c; --warn: #b8730c; --hot: #c23b3b; --violet: #6b55c4; --staging: #7d8a9a;
+    --bg: #eef1f6;
+    --glow-1: rgba(120,170,255,.45); --glow-2: rgba(190,150,255,.35); --glow-3: rgba(110,220,200,.30);
+    --panel: rgba(255,255,255,.58); --panel-strong: rgba(255,255,255,.78);
+    --panel-edge: rgba(255,255,255,.75); --sunk: rgba(255,255,255,.55);
+    --line: rgba(60,60,67,.14); --ink: #1d1d1f; --soft: #5f6368; --ghost: #8e8e93;
+    --bar: rgba(120,120,128,.16); --accent: #007aff; --accent-soft: rgba(0,122,255,.12);
+    --ok: #28a745; --warn: #e8890c; --hot: #ff3b30; --violet: #8e5bd8; --staging: #8e8e93;
     --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
-    --shadow-lg: 0 18px 50px rgba(16,24,40,.20);
-    --radius: 8px;
+    --shadow: 0 1px 1px rgba(0,0,0,.03), 0 8px 28px rgba(30,40,60,.08);
+    --shadow-lg: 0 30px 80px rgba(20,30,50,.28);
+    --blur: blur(28px) saturate(180%);
+    --radius: 16px;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg: #0f1419; --panel: rgba(255,255,255,.035); --sunk: rgba(255,255,255,.04);
-      --line: rgba(200,215,235,.12); --ink: #e3e8ee; --soft: #9aa6b3; --ghost: #66727f;
-      --bar: rgba(200,215,235,.10); --accent: #7fa8ea; --accent-soft: rgba(127,168,234,.13);
-      --ok: #45b884; --warn: #e2a24a; --hot: #ec7b7b; --violet: #a493ec; --staging: #8492a3;
+      --bg: #0b0d12;
+      --glow-1: rgba(40,90,200,.38); --glow-2: rgba(110,60,190,.30); --glow-3: rgba(20,140,120,.24);
+      --panel: rgba(30,32,38,.55); --panel-strong: rgba(36,38,44,.82);
+      --panel-edge: rgba(255,255,255,.09); --sunk: rgba(255,255,255,.05);
+      --line: rgba(235,235,245,.12); --ink: #f5f5f7; --soft: #a1a1a6; --ghost: #6e6e73;
+      --bar: rgba(120,120,128,.28); --accent: #0a84ff; --accent-soft: rgba(10,132,255,.18);
+      --ok: #30d158; --warn: #ff9f0a; --hot: #ff453a; --violet: #bf5af2; --staging: #8e8e93;
       --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
-      --shadow-lg: 0 18px 50px rgba(0,0,0,.6);
+      --shadow: 0 1px 1px rgba(0,0,0,.2), 0 8px 28px rgba(0,0,0,.35);
+      --shadow-lg: 0 30px 80px rgba(0,0,0,.7);
     }
   }
   :root[data-theme="dark"] {
-    --bg: #0f1419; --panel: rgba(255,255,255,.035); --sunk: rgba(255,255,255,.04);
-    --line: rgba(200,215,235,.12); --ink: #e3e8ee; --soft: #9aa6b3; --ghost: #66727f;
-    --bar: rgba(200,215,235,.10); --accent: #7fa8ea; --accent-soft: rgba(127,168,234,.13);
-    --ok: #45b884; --warn: #e2a24a; --hot: #ec7b7b; --violet: #a493ec; --staging: #8492a3;
+    --bg: #0b0d12;
+    --glow-1: rgba(40,90,200,.38); --glow-2: rgba(110,60,190,.30); --glow-3: rgba(20,140,120,.24);
+    --panel: rgba(30,32,38,.55); --panel-strong: rgba(36,38,44,.82);
+    --panel-edge: rgba(255,255,255,.09); --sunk: rgba(255,255,255,.05);
+    --line: rgba(235,235,245,.12); --ink: #f5f5f7; --soft: #a1a1a6; --ghost: #6e6e73;
+    --bar: rgba(120,120,128,.28); --accent: #0a84ff; --accent-soft: rgba(10,132,255,.18);
+    --ok: #30d158; --warn: #ff9f0a; --hot: #ff453a; --violet: #bf5af2; --staging: #8e8e93;
     --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
-    --shadow-lg: 0 18px 50px rgba(0,0,0,.6);
+    --shadow: 0 1px 1px rgba(0,0,0,.2), 0 8px 28px rgba(0,0,0,.35);
+    --shadow-lg: 0 30px 80px rgba(0,0,0,.7);
   }
   * { box-sizing: border-box; }
   /* Scrollbars in the page's own colours: the browser's default is a light
@@ -102,26 +115,32 @@ DEBUG_PAGE = r"""<!doctype html>
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
   html, body { min-height: 100%; }
   body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    -webkit-font-smoothing: antialiased;
+    margin: 0; color: var(--ink); background-color: var(--bg);
+    background-image:
+      radial-gradient(60vw 50vh at 8% -5%, var(--glow-1), transparent 70%),
+      radial-gradient(55vw 55vh at 100% 15%, var(--glow-2), transparent 70%),
+      radial-gradient(60vw 50vh at 45% 110%, var(--glow-3), transparent 70%);
+    background-attachment: fixed;
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", system-ui, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased; letter-spacing: -.003em;
   }
   body.locked { overflow: hidden; }
   .mono { font-variant-numeric: tabular-nums; }
   button, input, select { font: inherit; color: inherit; }
-  button { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  button { background: var(--sunk); border: 1px solid var(--line); border-radius: 8px;
            padding: 6px 12px; cursor: pointer; transition: border-color .15s, background .15s; }
   button:hover { border-color: var(--soft); }
   button.ghost { border-color: transparent; background: transparent; }
   button.ghost:hover { background: var(--sunk); border-color: var(--line); }
-  input { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  input { background: var(--sunk); border: 1px solid var(--line); border-radius: 9px;
           padding: 7px 11px; min-width: 220px; outline: none; }
   input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 
   /* ---- shell ---------------------------------------------------------- */
-  #shell { max-width: 1680px; margin: 0 auto; padding: 16px 20px 28px;
+  #shell { max-width: 1680px; margin: 0 auto; padding: 10px 20px 28px;
            display: flex; flex-direction: column; gap: 14px; }
-  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  header#bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; position: sticky;
+               top: 10px; z-index: 10; padding: 10px 14px; border-radius: var(--radius); }
   header button.ghost { padding: 6px 9px; }
   #flag { width: 10px; height: 38px; border-radius: 5px; background: var(--ghost); flex: none; }
   h1 { font-size: 20px; font-weight: 700; letter-spacing: -.015em; margin: 0; line-height: 1.15; }
@@ -140,9 +159,10 @@ DEBUG_PAGE = r"""<!doctype html>
            color: var(--accent); cursor: pointer; }
   .fchip i { font-style: normal; opacity: .7; }
 
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-          display: flex; flex-direction: column; min-width: 0; }
-  .card > h2 { margin: 0; padding: 11px 14px 9px; font-size: 13px; font-weight: 650;
+  .card, #vitals, header#bar { background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+          border: 1px solid var(--panel-edge); box-shadow: var(--shadow); }
+  .card { border-radius: var(--radius); display: flex; flex-direction: column; min-width: 0; }
+  .card > h2 { margin: 0; padding: 13px 16px 10px; font-size: 15px; font-weight: 600; letter-spacing: -.01em;
                display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
   .card > h2 .count { font-size: 12px; font-weight: 600; color: var(--soft); }
   .card > h2 .note { margin-left: auto; font-weight: 400; color: var(--ghost); font-size: 11.5px; }
@@ -155,14 +175,13 @@ DEBUG_PAGE = r"""<!doctype html>
   /* ---- vitals --------------------------------------------------------- */
   /* One strip, divided, rather than six tiles: these are readings of one
      machine, and boxing each one made them look like six separate things. */
-  #vitals { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
-            border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+  #vitals { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-radius: var(--radius); }
   @media (max-width: 1200px) { #vitals { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   @media (max-width: 640px) { #vitals { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
   .vital { padding: 10px 14px 6px; position: relative; overflow: hidden; border: none;
            border-radius: 0; background: transparent; border-left: 1px solid var(--line); }
   .vital:first-child { border-left: none; }
-  .vital .v { font-size: 22px; font-weight: 650; letter-spacing: -.01em; line-height: 1.15; margin-top: 2px; }
+  .vital .v { font-size: 26px; font-weight: 600; letter-spacing: -.02em; line-height: 1.15; margin-top: 2px; }
   .vital .v small { font-size: 13px; font-weight: 500; color: var(--soft); margin-left: 3px; }
   .vital .f { font-size: 11.5px; color: var(--soft); margin-top: 1px; white-space: nowrap;
               overflow: hidden; text-overflow: ellipsis; }
@@ -186,7 +205,7 @@ DEBUG_PAGE = r"""<!doctype html>
 
   /* the queue */
   .qitem { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 8px 10px;
-           border: 1px solid var(--line); border-radius: 6px; margin-bottom: 6px; cursor: pointer;
+           border: 1px solid var(--line); border-radius: 12px; margin-bottom: 7px; cursor: pointer;
            background: color-mix(in srgb, var(--warn) 7%, transparent); }
   .qitem:hover { border-color: var(--warn); }
   .qitem .pos { width: 24px; height: 24px; border-radius: 50%; flex: none; display: grid;
@@ -205,7 +224,7 @@ DEBUG_PAGE = r"""<!doctype html>
 
   /* running */
   .runs { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
-  .run { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px 11px;
+  .run { border: 1px solid var(--panel-edge); border-radius: 12px; padding: 11px 13px 12px;
          background: var(--sunk); cursor: pointer; position: relative; overflow: hidden;
          transition: border-color .15s; }
   .run:hover { border-color: var(--accent); }
@@ -255,7 +274,7 @@ DEBUG_PAGE = r"""<!doctype html>
 
   /* tools */
   #tools .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); }
-  .tool { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; cursor: pointer;
+  .tool { border: 1px solid var(--panel-edge); border-radius: 12px; padding: 11px 13px; cursor: pointer;
           background: var(--sunk); transition: border-color .15s; }
   .tool:hover { border-color: var(--accent); }
   .tool .hd { display: flex; align-items: center; gap: 7px; }
@@ -291,11 +310,12 @@ DEBUG_PAGE = r"""<!doctype html>
   /* ---- the dialog ------------------------------------------------------- */
   #overlay { position: fixed; inset: 0; z-index: 20; display: flex; align-items: flex-start;
              justify-content: center; padding: 5vh 20px; overflow: auto;
-             background: color-mix(in srgb, #0b0e12 46%, transparent); backdrop-filter: blur(3px);
+             background: rgba(0,0,0,.18); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
              opacity: 0; transition: opacity .16s ease; }
   #overlay.open { opacity: 1; }
-  #dialog { width: min(1180px, 100%); background: var(--bg); border: 1px solid var(--line);
-            border-radius: 10px; box-shadow: var(--shadow-lg); transform: translateY(10px) scale(.99);
+  #dialog { width: min(1180px, 100%); background: var(--panel-strong); border: 1px solid var(--panel-edge);
+            -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+            border-radius: 20px; box-shadow: var(--shadow-lg); transform: translateY(10px) scale(.99);
             transition: transform .18s ease; }
   #overlay.open #dialog { transform: none; }
   .dhd { display: flex; align-items: flex-start; gap: 12px; padding: 18px 22px 14px;
@@ -317,7 +337,7 @@ DEBUG_PAGE = r"""<!doctype html>
   table.io tr { cursor: default; }
   table.io tr:hover td { background: none; }
   table.io td:first-child { color: var(--soft); white-space: nowrap; }
-  .con { background: var(--sunk); border: 1px solid var(--line); border-radius: 6px; padding: 9px 11px;
+  .con { background: var(--sunk); border: 1px solid var(--line); border-radius: 12px; padding: 9px 11px;
          max-height: 260px; overflow: auto; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .con .ln { display: flex; gap: 10px; }
   .con .ts { color: var(--ghost); flex: none; }
@@ -363,9 +383,10 @@ DEBUG_PAGE = r"""<!doctype html>
   @media (max-width: 900px) { .client { grid-template-columns: 1fr; } }
   .client .addr { font-weight: 700; font-size: 14px; }
   .client .meta { font-size: 12px; color: var(--soft); margin-top: 2px; }
-  .seg2 { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-top: 8px; }
-  .seg2 button { border: none; border-radius: 0; padding: 4px 10px; font-size: 12px; background: var(--panel); white-space: nowrap; }
-  .seg2 button.on { background: var(--accent); color: #fff; font-weight: 650; }
+  .seg2 { display: inline-flex; gap: 2px; padding: 2px; border-radius: 9px; background: var(--bar); margin-top: 8px; }
+  .seg2 button { border: none; border-radius: 7px; padding: 4px 11px; font-size: 12px; background: transparent; white-space: nowrap; }
+  .seg2 button.on { background: var(--panel-strong); color: var(--ink); font-weight: 600;
+                    box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 0 0 .5px rgba(0,0,0,.04); }
   .seg2 button:disabled { cursor: default; opacity: 1; }
   .seg2 button:disabled:not(.on) { color: var(--ghost); }
   .cohort { display: grid; grid-template-columns: 130px minmax(0, 1fr) 150px; gap: 12px; align-items: center;
@@ -412,7 +433,7 @@ DEBUG_PAGE = r"""<!doctype html>
 </div>
 
 <div id="shell" hidden>
-  <header>
+  <header id="bar">
     <span id="flag" title="derived from this page's own origin"></span>
     <div>
       <h1 id="origin">&nbsp;</h1>
