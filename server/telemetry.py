@@ -336,7 +336,7 @@ def _ledger_record(run_id: str) -> Optional[dict]:
             "ram_bytes": None, "vram_bytes": None,
             "files": None, "input_bytes": None, "arguments": None,
             "inputs": None, "settings": None,
-            "spans": None, "nested": None, "measured": None,
+            "spans": None, "nested": None, "measured": None, "batch": None,
         }
         _ledger[run_id] = record
         while len(_ledger) > LEDGER_SIZE:
@@ -346,7 +346,8 @@ def _ledger_record(run_id: str) -> Optional[dict]:
     return record
 
 
-def record_run_start(run_id: str, tool: str, client: str = None) -> None:
+def record_run_start(run_id: str, tool: str, client: str = None,
+                     batch: Optional[dict] = None) -> None:
     """A run exists and is about to be staged. Never raises.
 
     `client` is the peer the server saw, which is what makes a run attributable
@@ -364,6 +365,8 @@ def record_run_start(run_id: str, tool: str, client: str = None) -> None:
                 record["tool"] = str(tool)[:100] if tool else None
                 if client:
                     record["client"] = str(client)[:64]
+                if batch:
+                    record["batch"] = dict(batch)
     except Exception:  # noqa: BLE001 - telemetry must never fail a run
         pass
 

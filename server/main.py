@@ -56,6 +56,7 @@ from config import settings
 from data_store import DataNotFoundError, data_store
 from registry.deployment import deployment_config
 from registry import TOOLS, get_tool
+from wire import clients
 from wire.security import verify_admin, verify_token
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -120,6 +121,7 @@ async def _lifespan(_app: FastAPI):
     # than what this one will cost.
     for line in costs.banner().splitlines():
         logger.info("%s", line)
+    clients.configure(settings.HISTORY_DIR)
     restored = telemetry.configure_history(settings.HISTORY_DIR)
     if restored:
         logger.info("Run history: %d finished run(s) read back from %s",
@@ -235,6 +237,11 @@ _RUN_DETACHED = "detached"
 # gets exactly the behaviour it always got, and one that sends it to an older
 # server simply finds no /runs endpoints.
 _RUN_ID_HEADER = "X-Run-Id"
+# A run that is one batch of a divided cohort says which, so the server can
+# group them and decide whether they run side by side (wire/clients.py).
+_BATCH_ID_HEADER = "X-Batch-Id"
+_BATCH_INDEX_HEADER = "X-Batch-Index"
+_BATCH_TOTAL_HEADER = "X-Batch-Total"
 
 # nginx's, and non-standard on purpose: no standard code means "the caller
 # withdrew this". The client has to tell a cancellation from a failure without
@@ -285,6 +292,22 @@ async def _tool_slot(run_id: Optional[str]):
     borrower = object()
     acquired = False
     budget = admission.budget()
+    # A batch of a cohort first waits its turn among its siblings, when its
+    # workstation's rule is serial (wire/clients.py). Before the slot, so a
+    # batch waiting on a sibling holds no slot another workstation could use.
+    # Priority goes past this gate too.
+    info = runs.meta(run_id) if run_id else {}
+    batch, address = info.get("batch"), info.get("client")
+    if batch:
+        clients.wait(address, batch, run_id)
+        while not clients.may_start(address, batch, run_id):
+            if budget.priority_of(run_id) == admission.PRIORITY_HIGH:
+                clients.leave(address, batch, run_id)
+                break
+            if runs.is_cancelled(run_id):
+                clients.leave(address, batch, run_id)
+                raise HTTPException(status_code=CLIENT_CLOSED_REQUEST, detail="The client cancelled this run.")
+            await anyio.sleep(_PRIORITY_POLL_SECONDS)
     if run_id is None or budget.priority_of(run_id) != admission.PRIORITY_HIGH:
         async with anyio.create_task_group() as group:
             async def take() -> None:
@@ -306,6 +329,8 @@ async def _tool_slot(run_id: Optional[str]):
     finally:
         if acquired:
             limiter.release_on_behalf_of(borrower)
+        if batch:
+            clients.leave(address, batch, run_id)
 
 
 def _extract_extension(filename: str) -> str:
@@ -771,6 +796,35 @@ class _Priority(BaseModel):
     priority: str
 
 
+class _ClientRule(BaseModel):
+    batches: str
+
+
+@app.get("/clients/me", dependencies=[Depends(verify_token)])
+def client_me(request: Request) -> dict:
+    """How this workstation's cohort batches will be run, so the client can
+    send them accordingly: one at a time when serial, together when parallel
+    -- the server enforcing it either way."""
+    address = _client_address(request)
+    batches = clients.policy_for(address)
+    return {
+        "client": address,
+        "batches": batches,
+        "max_parallel": settings.MAX_CONCURRENT_TOOLS if batches == clients.PARALLEL else 1,
+    }
+
+
+@app.post("/admin/clients/{address}/policy", dependencies=[Depends(verify_token), Depends(verify_admin)])
+def admin_client_policy(address: str, wanted: _ClientRule) -> dict:
+    """Let one workstation's batches run side by side, or one at a time."""
+    try:
+        answer = clients.set_policy(address, wanted.batches)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    logger.info("Operator set the batch rule of %s to %s", address, wanted.batches)
+    return answer
+
+
 @app.get("/admin/check", dependencies=[Depends(verify_token), Depends(verify_admin)])
 def admin_check() -> dict:
     """Whether the admin token the dashboard holds is the right one."""
@@ -869,6 +923,7 @@ def server_debug_data() -> dict:
     # present in one and not the other is a fact worth being able to see.
     report["ledger"] = telemetry.run_ledger()
     report["uptime"] = telemetry.tool_uptime()
+    report["clients"] = _client_activity(report["runs"], telemetry.run_ledger(limit=telemetry.LEDGER_SIZE))
     # TEMP_DIR is where uploads, results and run directories live -- the space a
     # download actually costs this machine. DATA_DIR is mounted read-only and
     # cannot grow, but it is the other half of "what is this disk holding".
@@ -901,6 +956,85 @@ _ACTIVITY_TEXT = {
     runs.PHASE_FAILED: "failed",
     runs.PHASE_CANCELLED: "cancelled by the client",
 }
+
+
+# How long a workstation stays on the dashboard after its last run, and how
+# long a finished cohort stays listed under it.
+_CLIENT_SEEN_SECONDS = 24 * 3600
+_BATCH_SHOWN_SECONDS = 15 * 60
+
+
+def _client_activity(live: list, ledger: list) -> list:
+    """Per workstation: its batch rule, what it has in flight, and its cohorts.
+
+    A cohort is every run sharing a batch id from one address. Its `done` and
+    `failed` come from the ledger, its `running` and `waiting` from the live
+    listing, and `total` is what the client said it would send -- so a serial
+    cohort shows "3 of 12" before batches 4 to 12 have even been sent.
+    """
+    now = time.time()
+    rules = clients.policies()
+    rows: dict = {}
+
+    def row(address):
+        return rows.setdefault(address, {
+            "client": address, "batches": clients.policy_for(address),
+            "custom": address in rules, "last_seen": 0.0,
+            "running": 0, "waiting": 0, "runs_today": 0, "cohorts": {},
+        })
+
+    def cohort(entry, batch, tool):
+        return entry["cohorts"].setdefault(batch["id"], {
+            "id": batch["id"], "tool": tool, "total": batch.get("total"),
+            "done": 0, "failed": 0, "running": 0, "waiting": 0,
+            "started_at": None, "last_at": 0.0,
+        })
+
+    for record in ledger:
+        address = record.get("client")
+        seen = record.get("ended_at") or record.get("started_at") or 0
+        if not address or now - seen > _CLIENT_SEEN_SECONDS:
+            continue
+        entry = row(address)
+        entry["last_seen"] = max(entry["last_seen"], seen)
+        if record.get("started_at") and now - record["started_at"] < 24 * 3600:
+            entry["runs_today"] += 1
+        batch = record.get("batch")
+        if batch and record.get("ended_at"):
+            group = cohort(entry, batch, record.get("tool"))
+            group["done" if record.get("outcome") == "done" else "failed"] += 1
+            group["last_at"] = max(group["last_at"], record["ended_at"])
+            start = record.get("started_at")
+            if start and (group["started_at"] is None or start < group["started_at"]):
+                group["started_at"] = start
+    for run in live:
+        address = run.get("client")
+        if not address or run.get("state") not in ("running", "pending"):
+            continue
+        entry = row(address)
+        entry["last_seen"] = max(entry["last_seen"], run.get("updated_at") or now)
+        waiting = run.get("phase") in (runs.PHASE_QUEUED_GPU, runs.PHASE_RECEIVED)
+        entry["waiting" if waiting else "running"] += 1
+        batch = run.get("batch")
+        if batch:
+            group = cohort(entry, batch, run.get("tool"))
+            group["waiting" if waiting else "running"] += 1
+            group["last_at"] = now
+            start = run.get("started_at")
+            if start and (group["started_at"] is None or start < group["started_at"]):
+                group["started_at"] = start
+    for address in rules:
+        row(address)
+    result = []
+    for entry in rows.values():
+        groups = [g for g in entry["cohorts"].values()
+                  if g["running"] or g["waiting"] or now - g["last_at"] < _BATCH_SHOWN_SECONDS]
+        groups.sort(key=lambda g: g["started_at"] or 0, reverse=True)
+        entry["cohorts"] = groups
+        entry["active_cohorts"] = sum(1 for g in groups if g["running"] or g["waiting"])
+        result.append(entry)
+    result.sort(key=lambda e: (-(e["running"] + e["waiting"]), -e["last_seen"]))
+    return result
 
 
 # How much of the resource trace rides every poll of the operator page. The
@@ -1925,8 +2059,14 @@ def _registered_run(request: Request, tool_name: str) -> Optional[str]:
     raw = request.headers.get(_RUN_ID_HEADER)
     if not raw:
         return None
+    # Which batch of a divided cohort this is, when the client says so. Read
+    # here, with the id, so the dashboard can group the runs from the moment
+    # they exist and the gate in `_tool_slot` can order them.
+    batch = runs.parse_batch(request.headers.get(_BATCH_ID_HEADER),
+                             request.headers.get(_BATCH_INDEX_HEADER),
+                             request.headers.get(_BATCH_TOTAL_HEADER))
     try:
-        return runs.register(raw, tool=tool_name, client=_client_address(request))
+        return runs.register(raw, tool=tool_name, client=_client_address(request), batch=batch)
     except runs.RunError as exc:
         raise _run_error(exc)
 

@@ -177,7 +177,7 @@ def run_directory(run_id: str) -> str:
 
 
 def register(run_id: str, tool: Optional[str] = None,
-             client: Optional[str] = None) -> str:
+             client: Optional[str] = None, batch: Optional[dict] = None) -> str:
     """Claim an id and open its directory. Returns the id.
 
     Called as the FIRST thing `POST /run` does, before `await request.form()`,
@@ -204,18 +204,48 @@ def register(run_id: str, tool: Optional[str] = None,
     # SADT_PROGRESS_FILE would otherwise litter whatever it points at.
     with open(os.path.join(directory, EVENTS_FILE), "wb"):
         pass
-    if tool or client:
+    if tool or client or batch:
         # Best effort: a run whose name could not be written is still a run.
         try:
             with open(os.path.join(directory, META_FILE), "w", encoding="utf-8") as handle:
                 json.dump({"tool": str(tool)[:100] if tool else None,
                            "client": str(client)[:64] if client else None,
+                           "batch": batch,
                            "at": time.time()}, handle)
         except OSError:
             pass
-    telemetry.record_run_start(run_id, tool, client)
+    telemetry.record_run_start(run_id, tool, client, batch=batch)
     reap_expired()
     return run_id
+
+
+# A batch as the client names it: which cohort split this run is one part of.
+# The id is minted by the client per Apply and means nothing outside it.
+_BATCH_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
+_MAX_BATCHES = 10000
+
+
+def parse_batch(batch_id, index, total) -> Optional[dict]:
+    """`{id, index, total}` from the three headers, or None if any is absent
+    or implausible. Never raises: a run with a malformed batch is a run."""
+    if not batch_id or not _BATCH_ID.fullmatch(str(batch_id)):
+        return None
+    try:
+        index, total = int(index), int(total)
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= index <= total <= _MAX_BATCHES):
+        return None
+    return {"id": str(batch_id), "index": index, "total": total}
+
+
+def meta(run_id: str) -> dict:
+    """What `register` wrote for this run, or {}."""
+    try:
+        with open(os.path.join(run_directory(run_id), META_FILE), encoding="utf-8") as handle:
+            return json.load(handle) or {}
+    except (RunError, OSError, ValueError):
+        return {}
 
 
 def discard(run_id: str) -> None:
@@ -981,11 +1011,13 @@ def active(limit: int = 500, with_chain: bool = False) -> list:
             pass
         tool = None
         client = None
+        batch = None
         try:
             with open(os.path.join(directory, META_FILE), encoding="utf-8") as handle:
                 meta = json.load(handle) or {}
             tool = meta.get("tool")
             client = meta.get("client")
+            batch = meta.get("batch")
             # The registration stamp, not the directory's ctime. ctime is the
             # INODE CHANGE time: every `touch` moves it, so a run that reported
             # progress -- or that anything stat'd and stamped -- claimed to have
@@ -1007,6 +1039,8 @@ def active(limit: int = 500, with_chain: bool = False) -> list:
             "started_at": started_at,
             "updated_at": updated_at,
         }
+        if batch:
+            entry["batch"] = batch
         if with_chain:
             # Tool names only, which `_clean_tool_name` already restricted to
             # identifiers: the operator page may say a run is inside ALI_CBCT

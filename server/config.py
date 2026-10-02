@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     # workstation holds that one, and a control any of them can use is one any
     # of them will use to put itself first. Empty disables the controls.
     ADMIN_TOKEN: str = ""
+    # Whether a workstation's cohort batches run one at a time ("serial") or
+    # side by side ("parallel") until an operator says otherwise for that
+    # workstation (wire/clients.py). Serial is what every client did before.
+    DEFAULT_BATCH_POLICY: str = "serial"
     TOOL_TIMEOUT_SECONDS: float = 0  # 0 = none; a cohort legitimately takes hours
     # How many times a run that died for want of memory is started again, with
     # more room reserved each time. A clinician who asked for a segmentation

@@ -326,6 +326,27 @@ DEBUG_PAGE = r"""<!doctype html>
   .stack-keys { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--soft); margin-top: 7px; }
   .stack-keys b { color: var(--ink); }
 
+  /* clients */
+  .client { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 16px; padding: 12px 4px;
+            border-bottom: 1px solid var(--line); }
+  .client:last-child { border-bottom: none; }
+  @media (max-width: 900px) { .client { grid-template-columns: 1fr; } }
+  .client .addr { font-weight: 700; font-size: 14px; }
+  .client .meta { font-size: 12px; color: var(--soft); margin-top: 2px; }
+  .seg2 { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-top: 8px; }
+  .seg2 button { border: none; border-radius: 0; padding: 4px 10px; font-size: 12px; background: var(--panel); }
+  .seg2 button.on { background: var(--accent); color: #fff; font-weight: 650; }
+  .seg2 button:disabled { cursor: default; opacity: 1; }
+  .seg2 button:disabled:not(.on) { color: var(--ghost); }
+  .cohort { display: grid; grid-template-columns: 130px minmax(0, 1fr) 150px; gap: 12px; align-items: center;
+            font-size: 12.5px; padding: 4px 0; }
+  .cohort .tl b { font-weight: 650; }
+  .cohort .tl small { display: block; color: var(--ghost); font-size: 11px; }
+  .cbar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--bar); }
+  .cbar i { display: block; height: 100%; }
+  .cohort .vv { text-align: right; color: var(--soft); }
+  .tag { display: inline-block; font-size: 10.5px; font-weight: 650; padding: 0 6px; border-radius: 5px;
+         background: var(--accent-soft); color: var(--accent); }
   /* operator controls */
   #adminbtn.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 650; }
   .ctl { display: flex; gap: 4px; flex: none; width: 100%; justify-content: flex-end;
@@ -414,6 +435,11 @@ DEBUG_PAGE = r"""<!doctype html>
       </div>
     </section>
   </div>
+
+  <section class="card" id="clientscard">
+    <h2>Clients <span class="count" id="c-count">0</span><span class="note" id="c-note">workstations seen in the last 24 h, and their cohorts</span></h2>
+    <div class="body" id="c-list"></div>
+  </section>
 
   <section class="card" id="tools">
     <h2>Tools<span class="note">click a tool for its runs and graphs</span></h2>
@@ -734,7 +760,8 @@ DEBUG_PAGE = r"""<!doctype html>
         '<button class="star' + (high ? " on" : "") + '" data-prio="' + (high ? "normal" : "high") + '" data-id="' +
         esc(r.run_id) + '" title="' + (high ? "back to normal" : "give priority") + '">\u2605</button></span>' : "";
       return '<div class="qitem' + (slot ? " slot" : "") + (high ? " high" : "") + '" data-run="' + esc(r.run_id) + '"><span class="pos">' + (i + 1) + "</span>" +
-        '<div style="min-width:0;flex:1"><div class="n">' + esc(r.tool || "?") + (high ? ' <span class="prio">PRIORITY</span>' : "") + "</div>" +
+        '<div style="min-width:0;flex:1"><div class="n">' + esc(r.tool || "?") + (high ? ' <span class="prio">PRIORITY</span>' : "") +
+          (r.batch ? ' <span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") + "</div>" +
         '<div class="m mono">' + (slot ? "waiting for a slot " : "waiting for room ") + ago(r.started_at) +
         (r.client ? " \u00b7 " + esc(r.client) : "") + "</div></div>" + ctl + "</div>";
     }).join("") : '<div class="empty">' + (anyFilter() ? "Nothing waiting matches this filter." : "Nothing waiting.") + "</div>";
@@ -785,6 +812,7 @@ DEBUG_PAGE = r"""<!doctype html>
       var chain = r.chain || [];
       return '<div class="run' + (staging ? " s" : "") + '" data-run="' + esc(r.run_id) + '">' +
         '<div class="hd"><span class="nm">' + esc(r.tool || "?") + "</span>" + pill(r.phase) +
+        (r.batch ? '<span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") +
         '<span class="pc mono">' + (frac == null ? "" : (frac * 100).toFixed(0) + "%") + "</span></div>" +
         '<div class="sub mono">' + ago(r.started_at) + " in" +
         (led.waited ? " · waited " + dur(led.waited) : "") +
@@ -849,6 +877,40 @@ DEBUG_PAGE = r"""<!doctype html>
         '<span class="vv mono">' + (e.used_here == null ? "—" : gib(e.used_here)) + " here · " +
         gib(e.free) + " free</span></div>";
     }).join("");
+  }
+
+  // ---- clients ----------------------------------------------------------
+  function drawClients(d) {
+    var rows = (d.clients || []).filter(function (c) { return !filters.client || c.client === filters.client; });
+    el("c-count").textContent = rows.length;
+    var enabled = d.server && d.server.admin_enabled;
+    el("c-list").innerHTML = rows.length ? rows.map(function (c) {
+      var parallel = c.batches === "parallel";
+      var rule = '<div class="seg2" title="' + (admin.ok ? "how this workstation's cohort batches run"
+          : enabled ? "unlock Admin to change" : "set ADMIN_TOKEN on the server to change") + '">' +
+        ["serial", "parallel"].map(function (level) {
+          return '<button ' + (admin.ok ? 'data-rule="' + level + '" data-addr="' + esc(c.client) + '"' : "disabled") +
+            ' class="' + (c.batches === level ? "on" : "") + '">' + (level === "serial" ? "One batch at a time" : "Batches in parallel") + "</button>";
+        }).join("") + "</div>";
+      var cohorts = (c.cohorts || []).map(function (g) {
+        var total = g.total || (g.done + g.failed + g.running + g.waiting) || 1;
+        var sent = g.done + g.failed + g.running + g.waiting;
+        var bar = '<div class="cbar">' +
+          '<i style="width:' + pct(g.done, total).toFixed(1) + '%;background:var(--ok)"></i>' +
+          '<i style="width:' + pct(g.failed, total).toFixed(1) + '%;background:var(--hot)"></i>' +
+          '<i style="width:' + pct(g.running, total).toFixed(1) + '%;background:var(--accent)"></i>' +
+          '<i style="width:' + pct(g.waiting, total).toFixed(1) + '%;background:var(--warn)"></i></div>';
+        var live = g.running || g.waiting;
+        return '<div class="cohort"><span class="tl"><b>' + esc(g.tool || "?") + "</b><small>started " + ago(g.started_at) +
+          " ago</small></span>" + bar + '<span class="vv mono">' + g.done + " / " + total + " done" +
+          (g.running ? " \u00b7 " + g.running + " running" : "") + (g.waiting ? " \u00b7 " + g.waiting + " waiting" : "") +
+          (!live && sent < total ? " \u00b7 stopped" : "") + "</span></div>";
+      }).join("");
+      return '<div class="client"><div><div class="addr mono">' + esc(c.client) + "</div>" +
+        '<div class="meta">' + (c.running ? c.running + " running \u00b7 " : "") + (c.waiting ? c.waiting + " waiting \u00b7 " : "") +
+        c.runs_today + " runs today \u00b7 seen " + ago(c.last_seen) + " ago</div>" + rule + "</div>" +
+        "<div>" + (cohorts || '<div class="empty" style="text-align:left;padding:6px 0">No cohort in the last 15 minutes.</div>') + "</div></div>";
+    }).join("") : '<div class="empty">No workstation has sent a run in the last 24 hours.</div>';
   }
 
   // ---- tools ------------------------------------------------------------
@@ -1007,6 +1069,7 @@ DEBUG_PAGE = r"""<!doctype html>
       kpi("ram held", gib(led.ram_bytes)) + kpi("vram held", gib(led.vram_bytes)) +
       kpi("vram peak", gib(measured.vram_bytes)) + kpi("ram peak", gib(measured.ram_bytes)) +
       kpi("input", (led.files == null ? "—" : led.files + " files · ") + bytes(led.input_bytes)) +
+      kpi("batch", (liveRun.batch || led.batch) ? (liveRun.batch || led.batch).index + " of " + (liveRun.batch || led.batch).total : "\u2014") +
       kpi("started", started ? clock(started) : "—") + "</div>";
 
     var lines = data.lines || [];
@@ -1184,6 +1247,7 @@ DEBUG_PAGE = r"""<!doctype html>
     drawQueue(d);
     drawRunning(d);
     drawMachine(d);
+    drawClients(d);
     drawTools(d);
     drawHistory(d);
     drawFilters();
@@ -1254,6 +1318,13 @@ DEBUG_PAGE = r"""<!doctype html>
     if (mv) {
       adminAction("admin/queue/" + encodeURIComponent(mv.getAttribute("data-id")) + "/move",
         { to: mv.getAttribute("data-move") }, "Moved " + mv.getAttribute("data-move") + ".");
+      return;
+    }
+    var rl = t.closest("[data-rule]");
+    if (rl) {
+      var level2 = rl.getAttribute("data-rule");
+      adminAction("admin/clients/" + encodeURIComponent(rl.getAttribute("data-addr")) + "/policy",
+        { batches: level2 }, level2 === "parallel" ? "Batches of this workstation now run in parallel." : "Batches of this workstation now run one at a time.");
       return;
     }
     var pr = t.closest("[data-prio]");
