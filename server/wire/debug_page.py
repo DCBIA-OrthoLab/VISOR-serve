@@ -130,6 +130,9 @@ DEBUG_PAGE = r"""<!doctype html>
          box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
   .dot.off { background: var(--ghost); box-shadow: none; }
   #filters { display: flex; gap: 6px; flex-wrap: wrap; }
+  .navlink { color: var(--accent); text-decoration: none; font-size: 13px; font-weight: 600;
+             padding: 6px 10px; border-radius: 8px; white-space: nowrap; }
+  .navlink:hover { background: var(--accent-soft); }
   .fchip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
            padding: 4px 9px 4px 11px; border-radius: 999px; background: var(--accent-soft);
            color: var(--accent); cursor: pointer; }
@@ -416,6 +419,8 @@ DEBUG_PAGE = r"""<!doctype html>
     <input id="find" style="min-width:290px" type="search" placeholder="Filter: run id, tool or address" autocomplete="off" spellcheck="false">
     <span id="live"><span class="dot" id="dot"></span><span id="livetext">live</span></span>
     <button id="toggle" type="button" class="ghost">Pause</button>
+    <a class="navlink" href="benchmark" title="launch a benchmark preset on this server">Run a benchmark</a>
+    <a class="navlink" href="benchmarks/view" title="the campaigns already measured, drawn on one time axis">Benchmark results</a>
     <button id="adminbtn" type="button" class="ghost" title="operator controls">Admin</button>
     <button id="theme" type="button" class="ghost" title="theme">Theme</button>
   </header>
