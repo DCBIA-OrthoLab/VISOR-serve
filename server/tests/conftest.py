@@ -74,6 +74,9 @@ def schema_cache(tmp_path, monkeypatch):
     """A .schema.json is a cache the server may regenerate, so no test is
     allowed to write one into the repository."""
     monkeypatch.setattr(settings, "SCHEMA_CACHE_DIR", str(tmp_path / "schema-cache"))
+    # The run history is written on every finished run, and no test may write
+    # one into the repository either.
+    monkeypatch.setattr(settings, "HISTORY_DIR", str(tmp_path / "history"))
 
 
 @pytest.fixture(scope="session")

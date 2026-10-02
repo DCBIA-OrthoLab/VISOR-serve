@@ -85,6 +85,25 @@ async def _reaper_loop() -> None:
                 logger.exception("reaper sweep failed")
 
 
+async def _trace_loop() -> None:
+    """Sample the machine for the operator page's graphs, for as long as the
+    server runs. One point every `telemetry.TRACE_SECONDS`, off the event loop
+    because reading the card is a subprocess."""
+    def take() -> None:
+        try:
+            card = resources.detect_vram_bytes()
+        except Exception:  # noqa: BLE001 - no card is a missing line, not an error
+            card = (None, None)
+        telemetry.sample_trace(admission.budget().snapshot(), card)
+
+    while True:
+        try:
+            await anyio.to_thread.run_sync(take)
+        except Exception:  # noqa: BLE001 - one bad sample must not end the loop
+            logger.exception("trace sample failed")
+        await anyio.sleep(telemetry.TRACE_SECONDS)
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
     # Said out loud, once, before anything runs. A budget that did not take
@@ -101,8 +120,13 @@ async def _lifespan(_app: FastAPI):
     # than what this one will cost.
     for line in costs.banner().splitlines():
         logger.info("%s", line)
+    restored = telemetry.configure_history(settings.HISTORY_DIR)
+    if restored:
+        logger.info("Run history: %d finished run(s) read back from %s",
+                    restored, settings.HISTORY_DIR)
     async with anyio.create_task_group() as task_group:
         task_group.start_soon(_reaper_loop)
+        task_group.start_soon(_trace_loop)
         try:
             yield
         finally:
@@ -731,6 +755,11 @@ def server_debug_data() -> dict:
         "run_ttl_seconds": settings.RUN_TTL_SECONDS,
         "paused_ttl_seconds": settings.PAUSED_RUN_TTL_SECONDS,
     }
+    # The live listing again, with each run's open nested calls: `/status`
+    # keeps the narrower one it always had, and only this page needs to say
+    # that an AREG is, right now, inside ASO inside ALI_CBCT.
+    report["runs"] = runs.active(with_chain=True)
+    report["trace"] = telemetry.trace(since=time.time() - TRACE_WINDOW_SECONDS)
     report["cpu_percent"] = telemetry.cpu_percent()
     report["ram"] = telemetry.ram()
     report["inflight"] = telemetry.inflight()
@@ -776,6 +805,61 @@ _ACTIVITY_TEXT = {
 }
 
 
+# How much of the resource trace rides every poll of the operator page. The
+# per-tool view asks for its own, wider window.
+TRACE_WINDOW_SECONDS = 30 * 60
+
+
+@app.get("/server-debug/tools/{tool_name}.json", dependencies=[Depends(verify_token)])
+def server_debug_tool(tool_name: str, limit: int = 120) -> dict:
+    """One tool over its recent runs: what the operator page draws when a tool
+    is clicked.
+
+    Built from the ledger, which keeps finished runs across restarts, so the
+    graphs have a past: each run's phases and nested calls for the Gantt, the
+    mean time spent in each phase, and the machine's trace over the window
+    those runs cover. The same rule as the rest of the page: timings, shapes
+    and tool names, never an argument value or a file name.
+    """
+    limit = max(1, min(int(limit), telemetry.LEDGER_SIZE))
+    records = telemetry.run_ledger(limit=limit, tool=tool_name)
+    phases = {}
+    for record in records:
+        for span in record.get("spans") or []:
+            if span.get("end") is None or span.get("start") is None:
+                continue
+            row = phases.setdefault(span["phase"], {"phase": span["phase"], "seconds": 0.0, "runs": 0})
+            row["seconds"] += max(0.0, span["end"] - span["start"])
+            row["runs"] += 1
+    for row in phases.values():
+        row["mean"] = round(row["seconds"] / row["runs"], 2) if row["runs"] else 0.0
+        row["seconds"] = round(row["seconds"], 1)
+    finished = [r for r in records if r.get("seconds") is not None]
+    since = min((r["started_at"] for r in records), default=time.time()) if records else None
+    learned = costs.known().get(tool_name)
+    return {
+        "tool": tool_name,
+        "runs": records,
+        "phases": sorted(phases.values(), key=lambda row: row["seconds"], reverse=True),
+        "summary": {
+            "runs": len(records),
+            "ok": sum(1 for r in records if r.get("outcome") == "done"),
+            "failed": sum(1 for r in records if r.get("outcome") == "failed"),
+            "running": sum(1 for r in records if r.get("ended_at") is None),
+            "mean_seconds": round(sum(r["seconds"] for r in finished) / len(finished), 1)
+            if finished else None,
+            "mean_wait": round(sum(r.get("waited") or 0 for r in finished) / len(finished), 2)
+            if finished else None,
+        },
+        "cost": {
+            "vram_bytes": learned.vram_bytes,
+            "ram_bytes": learned.ram_bytes,
+            "samples": learned.samples,
+        } if learned else None,
+        "trace": telemetry.trace(since=since, max_points=900),
+    }
+
+
 @app.get("/server-debug/runs/{run_id}.json", dependencies=[Depends(verify_token)])
 def server_debug_run(run_id: str) -> dict:
     """One run's activity, COMPOSED by this server rather than quoted from the
@@ -795,10 +879,21 @@ def server_debug_run(run_id: str) -> dict:
     alone, so a chatty tool produces a busier console than a silent one without
     a character of its text being republished.
     """
+    record = telemetry.ledger_record(run_id)
     try:
         events = runs.read_events(run_id)
     except runs.RunError as exc:
-        raise _run_error(exc)
+        # Reaped, which is the normal state of a run that finished more than a
+        # few minutes ago. Its timeline survives in the ledger, so the page can
+        # still draw it; only the console is gone.
+        if record is None:
+            raise _run_error(exc)
+        return {
+            "run_id": run_id, "lines": [], "reaped": True, "record": record,
+            "timeline": {"spans": record.get("spans") or [],
+                         "nested": record.get("nested") or [],
+                         "chain": [], "measured": record.get("measured")},
+        }
     lines = []
     for event in events:
         phase = event.get("phase") or runs.PHASE_RUNNING
@@ -816,7 +911,8 @@ def server_debug_run(run_id: str) -> dict:
             "level": _ACTIVITY_LEVEL.get(phase, "info"),
             "text": text,
         })
-    return {"run_id": run_id, "lines": lines}
+    return {"run_id": run_id, "lines": lines, "reaped": False, "record": record,
+            "timeline": runs.timeline(events)}
 
 
 def _benchmark_resolution() -> dict:

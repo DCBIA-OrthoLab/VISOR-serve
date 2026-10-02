@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     # A .schema.json is a cache, and the tool folders are read-only to the
     # process serving them, so a regenerated one cannot live beside its tool.
     SCHEMA_CACHE_DIR: str = os.path.join(_SERVER_DIR, ".schema-cache")
+    # Where finished runs are kept for the operator page, so its history and
+    # per-tool graphs survive an update. Beside the code by default, which in
+    # the `inference` service is the bind-mounted checkout and therefore
+    # outlives the container; empty keeps the history in memory only.
+    HISTORY_DIR: str = os.path.join(_SERVER_DIR, ".history")
     DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
     SADT_API: str = "http://127.0.0.1:8000"  # reaches this server from a tool
     MAX_CONCURRENT_TOOLS: int = 4

@@ -31,10 +31,14 @@ that silently covers one worker of four is worse than no leaderboard.
 from __future__ import annotations
 
 import collections
+import json
+import logging
 import os
 import threading
 import time
 from typing import Optional
+
+logger = logging.getLogger("inference_server")
 
 _PROC_STAT = "/proc/stat"
 _PROC_MEMINFO = "/proc/meminfo"
@@ -312,7 +316,7 @@ def queue_history() -> dict:
 # messages off this page keeps parameters off it: which knobs a caller set is
 # an operational fact, what they set them to is clinical data.
 
-LEDGER_SIZE = 240
+LEDGER_SIZE = 1000
 
 _ledger_lock = threading.Lock()
 _ledger = collections.OrderedDict()  # run_id -> record
@@ -332,6 +336,7 @@ def _ledger_record(run_id: str) -> Optional[dict]:
             "ram_bytes": None, "vram_bytes": None,
             "files": None, "input_bytes": None, "arguments": None,
             "inputs": None, "settings": None,
+            "spans": None, "nested": None, "measured": None,
         }
         _ledger[run_id] = record
         while len(_ledger) > LEDGER_SIZE:
@@ -508,8 +513,14 @@ def record_run_grant(run_id: str, channels=None, cpus=None, ram_bytes=None,
                 pass
 
 
-def record_run_end(run_id: str, outcome: str, phase: str = "") -> None:
+def record_run_end(run_id: str, outcome: str, phase: str = "",
+                   timeline: Optional[dict] = None) -> None:
     """How it ended, and therefore how long it occupied this server.
+
+    `timeline` is `runs.timeline()` of the run's events, taken just before its
+    directory is discarded: the phases and the nested calls are what the
+    operator page draws a finished run from, and after this call nothing else
+    holds them.
 
     Guarded for the same reason `record_run_start` is: `runs.finish` is the one
     funnel every ending passes through, and a run that completed must not be
@@ -525,16 +536,184 @@ def record_run_end(run_id: str, outcome: str, phase: str = "") -> None:
             record["phase"] = str(phase)[:40] if phase else None
             record["seconds"] = round(
                 max(0.0, record["ended_at"] - record["started_at"]), 2)
+            if timeline:
+                record["spans"] = timeline.get("spans") or []
+                record["nested"] = timeline.get("nested") or []
+                record["measured"] = timeline.get("measured")
+            finished = dict(record)
+        _persist(finished)
     except Exception:  # noqa: BLE001 - telemetry must never fail a run
         pass
 
 
-def run_ledger(limit: int = 80) -> list:
-    """The runs this process has seen, newest first."""
+def run_ledger(limit: int = 80, tool: Optional[str] = None) -> list:
+    """The runs this process has seen, newest first, optionally of one tool."""
     with _ledger_lock:
         records = list(_ledger.values())
     records.reverse()
+    if tool is not None:
+        records = [record for record in records if record["tool"] == tool]
     return [dict(record) for record in records[:limit]]
+
+
+def ledger_record(run_id: str) -> Optional[dict]:
+    """One run's record, or None. Never creates one."""
+    with _ledger_lock:
+        record = _ledger.get(run_id)
+        return dict(record) if record is not None else None
+
+
+# ---------------------------------------------------------------------------
+# The ledger, kept across restarts
+# ---------------------------------------------------------------------------
+#
+# A finished run is appended to one JSON-lines file, and the newest
+# LEDGER_SIZE of them are read back at startup. Before this, every update of
+# the server emptied the history and the per-tool graphs had nothing to draw.
+#
+# What is written is exactly the ledger record, which already holds no
+# argument VALUE and no file NAME (see above): a timing, a shape, the names of
+# the tools a run called. Append-only, one line per run, so two uvicorn
+# workers appending to the same file interleave whole lines; the file is
+# compacted to the newest LEDGER_SIZE once it holds a few times that.
+
+HISTORY_FILE = "run_history.jsonl"
+_COMPACT_FACTOR = 3
+
+_history_lock = threading.Lock()
+_history_path: Optional[str] = None
+_history_lines = 0
+
+
+def configure_history(directory: Optional[str]) -> int:
+    """Keep finished runs under `directory`, and load what is already there.
+
+    Returns how many records were read back. A directory that cannot be made
+    or read leaves the ledger in memory only, logged once: losing the history
+    costs a page its past, never a run anything.
+    """
+    global _history_path, _history_lines
+    with _history_lock:
+        _history_path, _history_lines = None, 0
+    if not directory:
+        return 0
+    path = os.path.join(directory, HISTORY_FILE)
+    try:
+        os.makedirs(directory, exist_ok=True)
+        loaded = _read_history(path)
+    except OSError as exc:
+        logger.warning("Run history disabled, %s is not usable: %s", directory, exc)
+        return 0
+    with _ledger_lock:
+        for record in loaded[-LEDGER_SIZE:]:
+            run_id = record.get("run_id")
+            if run_id and run_id not in _ledger:
+                _ledger[run_id] = record
+        while len(_ledger) > LEDGER_SIZE:
+            _ledger.popitem(last=False)
+    with _history_lock:
+        _history_path, _history_lines = path, len(loaded)
+    return len(loaded)
+
+
+def _read_history(path: str) -> list:
+    records = []
+    if not os.path.exists(path):
+        return records
+    with open(path, encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue    # a line torn by a crash mid-append
+            if isinstance(record, dict) and record.get("run_id"):
+                records.append(record)
+    return records
+
+
+def _persist(record: dict) -> None:
+    global _history_lines
+    with _history_lock:
+        path = _history_path
+        if path is None:
+            return
+        try:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+            _history_lines += 1
+            if _history_lines > LEDGER_SIZE * _COMPACT_FACTOR:
+                kept = _read_history(path)[-LEDGER_SIZE:]
+                staging = path + ".tmp"
+                with open(staging, "w", encoding="utf-8") as handle:
+                    for entry in kept:
+                        handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
+                os.replace(staging, path)
+                _history_lines = len(kept)
+        except OSError as exc:
+            logger.warning("Could not record a finished run in %s: %s", path, exc)
+
+
+# ---------------------------------------------------------------------------
+# Resource trace
+# ---------------------------------------------------------------------------
+#
+# What the machine was doing over the last few hours, one point every
+# TRACE_SECONDS, sampled by a background loop in main.py rather than by the
+# page: graphs drawn from the page's own polling lived only as long as the tab
+# and started empty every time it was opened. In memory and bounded, so it
+# resets with the server, and the page says so.
+
+TRACE_SECONDS = 5
+TRACE_POINTS = 6 * 3600 // TRACE_SECONDS
+
+_trace_lock = threading.Lock()
+_trace = collections.deque(maxlen=TRACE_POINTS)
+_trace_cpu_previous = None
+
+
+def sample_trace(admission: Optional[dict] = None, card: tuple = (None, None)) -> dict:
+    """Take one point of the trace and keep it. Never raises.
+
+    `admission` is `Budget.snapshot()` and `card` is `(total, free)` VRAM bytes,
+    passed in so this module imports neither.
+    """
+    global _trace_cpu_previous
+    point = {"at": round(time.time(), 1)}
+    try:
+        sample = _cpu_jiffies()
+        previous, _trace_cpu_previous = _trace_cpu_previous, sample
+        if sample and previous and sample[1] > previous[1]:
+            point["cpu"] = round(100.0 * (sample[0] - previous[0]) / (sample[1] - previous[1]), 1)
+        memory = ram()
+        if memory:
+            point["ram"] = memory["used"]
+        total, free = card if card else (None, None)
+        if total is not None and free is not None:
+            point["vram"] = total - free
+        if admission:
+            point["running"] = admission.get("running")
+            point["waiting"] = admission.get("waiting")
+    except Exception:  # noqa: BLE001 - a trace point must never break the loop
+        pass
+    with _trace_lock:
+        _trace.append(point)
+    return point
+
+
+def trace(since: Optional[float] = None, max_points: int = 720) -> list:
+    """The trace from `since` on, thinned to at most `max_points`.
+
+    Thinned by keeping every n-th point rather than averaging: a peak is the
+    reading a reader is looking for, and an average is exactly what hides it.
+    """
+    with _trace_lock:
+        points = list(_trace)
+    if since is not None:
+        points = [point for point in points if point["at"] >= since]
+    if max_points and len(points) > max_points:
+        step = -(-len(points) // max_points)
+        points = points[::step]
+    return points
 
 
 def tool_uptime() -> list:
@@ -592,3 +771,7 @@ def reset() -> None:
         _queue_log.clear()
     with _ledger_lock:
         _ledger.clear()
+    with _trace_lock:
+        _trace.clear()
+    global _trace_cpu_previous
+    _trace_cpu_previous = None
