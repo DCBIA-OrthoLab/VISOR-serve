@@ -230,7 +230,7 @@ DEBUG_PAGE = r"""<!doctype html>
   .cell:first-child { border-left: none; padding-left: 0; }
   .cell u { display: block; font-size: 9.5px; letter-spacing: .06em; color: var(--ghost);
             text-transform: uppercase; text-decoration: none; }
-  .cell b { font-size: 12.5px; font-weight: 600; }
+  .cell b { font-size: 12.5px; font-weight: 600; white-space: nowrap; }
 
   /* machine */
   .tank { margin-bottom: 12px; }
