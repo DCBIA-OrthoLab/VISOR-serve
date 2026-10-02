@@ -437,7 +437,6 @@ DEBUG_PAGE = r"""<!doctype html>
         <h2>Queue <span class="count" id="q-count">0</span><span class="note">waiting for the machine</span></h2>
         <div class="body">
           <div id="q-list"></div>
-          <div style="margin-top:12px"><div class="label">Total time spent waiting</div><div id="q-rank"></div></div>
         </div>
       </section>
       <section class="card" id="paused">
@@ -462,6 +461,7 @@ DEBUG_PAGE = r"""<!doctype html>
           <span><i style="background:var(--warn)"></i>waiting</span></div>
         <div id="m-load"></div>
         <div id="m-disk" style="margin-top:10px"></div>
+        <div style="margin-top:14px"><div class="label">Time spent waiting, by tool</div><div id="q-rank"></div></div>
       </div>
     </section>
   </div>

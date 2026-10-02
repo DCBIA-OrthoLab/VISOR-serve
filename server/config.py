@@ -78,7 +78,11 @@ class Settings(BaseSettings):
     HISTORY_DIR: str = os.path.join(_SERVER_DIR, ".history")
     DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
     SADT_API: str = "http://127.0.0.1:8000"  # reaches this server from a tool
-    MAX_CONCURRENT_TOOLS: int = 4
+    # How many runs may be inside a tool at once, whatever their size: a bound
+    # on worker threads, not on the machine. Admission decides what each of
+    # them may hold, so this only has to be high enough not to be the binding
+    # limit on a server whose budget has room. Fixed, not derived from cores.
+    MAX_CONCURRENT_TOOLS: int = 6
     # The operator dashboard's controls -- reordering the queue, giving a run
     # priority -- answer only to this token, never to API_TOKEN: every
     # workstation holds that one, and a control any of them can use is one any
@@ -241,10 +245,12 @@ class Settings(BaseSettings):
     # no client identity anywhere, so the server cannot tell ten workstations
     # from one clicking ten times.
     #
-    # Defaulted to MAX_CONCURRENT_TOOLS rather than to 1 so an untouched
-    # deployment keeps the concurrency it already had: at 1 a single job would
-    # reserve the whole budget and every run on the machine would serialise
-    # behind it, which is stricter than the four tool slots that exist today.
+    # Defaulted to 4 rather than to 1 so an untouched deployment keeps the
+    # concurrency it already had: at 1 a single job would reserve the whole
+    # budget and every run on the machine would serialise behind it. It was
+    # equal to MAX_CONCURRENT_TOOLS until that rose to 6; it stays at 4 because
+    # it sets each run's share of the cores, which the thread measurements in
+    # CLAUDE.md were taken against, and raising it would narrow every run.
     SADT_EXPECTED_CLIENTS: int = 4
     SADT_CPU_PER_JOB: str = ""
     SADT_RAM_PER_JOB: str = ""
