@@ -83,6 +83,21 @@ DEBUG_PAGE = r"""<!doctype html>
     }
   }
   * { box-sizing: border-box; }
+  /* Scrollbars in the page's own colours: the browser's default is a light
+     gutter that sits on a dark theme like a stripe of paint. `color-scheme`
+     also gives form controls and the default bars the right palette. */
+  :root { color-scheme: light; --thumb: #c5cad2; --thumb-hover: #9aa1ab; }
+  :root[data-theme="dark"] { color-scheme: dark; --thumb: #343c47; --thumb-hover: #4a5462; }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { color-scheme: dark; --thumb: #343c47; --thumb-hover: #4a5462; }
+  }
+  * { scrollbar-width: thin; scrollbar-color: var(--thumb) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--thumb); border-radius: 999px;
+                              border: 2px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--thumb-hover); background-clip: padding-box; }
+  ::-webkit-scrollbar-corner { background: transparent; }
   [hidden] { display: none !important; }
   html, body { min-height: 100%; }
   body {
