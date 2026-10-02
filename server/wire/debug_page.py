@@ -488,6 +488,14 @@ DEBUG_PAGE = """<!doctype html>
     return true;
   }
 
+  // Not yet ended. A run that is still being received, staged or waiting for
+  // room is "pending", not "running" (runs._STATE_OF_PHASE), and filtering on
+  // "running" alone left the queue empty for good: its own runs were the ones
+  // excluded, and they surfaced in the history as "in flight" instead.
+  function inFlight(run) {
+    return run.state === "running" || run.state === "pending";
+  }
+
   function anyFilter() {
     return Object.keys(filters).some(function (k) { return filters[k]; });
   }
@@ -635,7 +643,7 @@ DEBUG_PAGE = """<!doctype html>
     var ledByRun = {};
     (d.ledger || []).forEach(function (r) { ledByRun[r.run_id] = r; });
     var waiting = (d.runs || []).filter(function (r) {
-      return r.state === "running" && r.phase === "queued_gpu" &&
+      return inFlight(r) && r.phase === "queued_gpu" &&
         matches(r, ledByRun[r.run_id]);
     });
     el("q-note").textContent = "of " + (q.capacity || 0) + " kept, " +
@@ -689,7 +697,7 @@ DEBUG_PAGE = """<!doctype html>
     // own band in the left rail, beside the queue that is waiting for the
     // machine. Showing it here made three ASO look like work in progress.
     var rows = (d.runs || []).filter(function (r) {
-      return r.state === "running" && r.phase !== "paused" &&
+      return inFlight(r) && r.phase !== "paused" &&
         matches(r, byId[r.run_id]);
     });
     if (!rows.length) {
@@ -724,12 +732,12 @@ DEBUG_PAGE = """<!doctype html>
 
   // ---- history ----------------------------------------------------------
   function drawHistory(d) {
-    var inFlight = {};
+    var live = {};
     (d.runs || []).forEach(function (r) {
-      if (r.state === "running") { inFlight[r.run_id] = true; }
+      if (inFlight(r)) { live[r.run_id] = true; }
     });
     var rows = (d.ledger || []).filter(function (r) {
-      return !inFlight[r.run_id] && matches(r, r);
+      return !live[r.run_id] && matches(r, r);
     });
     el("h-note").textContent = rows.length + " kept in this worker's memory, " +
       "cleared on restart";
