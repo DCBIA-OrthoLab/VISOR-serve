@@ -80,6 +80,7 @@ def schema_cache(tmp_path, monkeypatch):
     # The operator panel answers only to the admin token, so every test has
     # one; a test about its absence sets it back to "".
     monkeypatch.setattr(settings, "ADMIN_TOKEN", "test-admin-token")
+    monkeypatch.setattr(settings, "UPDATE_DIR", str(tmp_path / "update"))
 
 
 @pytest.fixture(scope="session")

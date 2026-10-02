@@ -301,16 +301,16 @@ def test_without_an_admin_token_the_panel_does_not_open_at_all(monkeypatch):
     """No ADMIN_TOKEN, no panel: 403, which the page turns into "set
     ADMIN_TOKEN" rather than "wrong token"."""
     monkeypatch.setattr(settings, "ADMIN_TOKEN", "")
-    assert client.get("/panel-admin.json", headers={"X-Admin-Token": ""}).status_code == 403
+    assert client.get("/admin-panel.json", headers={"X-Admin-Token": ""}).status_code == 403
 
 
 def test_the_panel_opens_with_the_admin_token_and_not_with_the_api_one(admin):
-    assert client.get("/panel-admin.json", headers=AUTH).status_code == 401
-    assert client.get("/panel-admin.json", headers={"X-Admin-Token": "operator-secret"}).status_code == 200
+    assert client.get("/admin-panel.json", headers=AUTH).status_code == 401
+    assert client.get("/admin-panel.json", headers={"X-Admin-Token": "operator-secret"}).status_code == 200
 
 
-@pytest.mark.parametrize("path", ["/server-debug", "/admin-panel"])
+@pytest.mark.parametrize("path", ["/server-debug", "/panel-admin"])
 def test_the_panels_other_addresses_lead_to_it(path):
     response = client.get(path, follow_redirects=False)
     assert response.status_code == 308
-    assert response.headers["location"] == "panel-admin"
+    assert response.headers["location"] == "admin-panel"

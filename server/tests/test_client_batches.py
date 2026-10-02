@@ -213,7 +213,7 @@ def test_the_dashboard_groups_a_workstations_batches_into_cohorts():
         telemetry.record_run_end(run_id, "done", "done")
     runs.register("cohort-live-0000000000000003", tool="AMASSS", client="10.0.0.5", batch=_batch(3, total=4))
     runs.append("cohort-live-0000000000000003", runs.PHASE_RUNNING)
-    payload = client.get("/panel-admin.json", headers=_panel()).json()
+    payload = client.get("/admin-panel.json", headers=_panel()).json()
     row = [c for c in payload["clients"] if c["client"] == "10.0.0.5"][0]
     assert row["batches"] == clients.SERIAL and row["running"] == 1
     cohort = row["cohorts"][0]

@@ -1,8 +1,8 @@
-"""What `/panel-admin` is drawn from, and the two rules it must not break.
+"""What `/admin-panel` is drawn from, and the two rules it must not break.
 
 The page itself is a string of HTML and cannot usefully be asserted on. What
 CAN be asserted is everything underneath it: the samplers in `telemetry.py`,
-the ledger they keep, and the shape of `GET /panel-admin.json` that the
+the ledger they keep, and the shape of `GET /admin-panel.json` that the
 diagram reads. So that is what these cover.
 
 Two of them are not shape tests but rules, and they are the reason this file
@@ -228,12 +228,12 @@ def test_uptime_is_ordered_busiest_first():
 # ---------------------------------------------------------------------------
 
 def test_server_debug_json_needs_the_token():
-    assert client.get("/panel-admin.json", headers=AUTH).status_code == 401
+    assert client.get("/admin-panel.json", headers=AUTH).status_code == 401
 
 
 def test_server_debug_json_carries_every_block_the_diagram_draws():
     """The page reads these by name. A rename here is a blank panel there."""
-    payload = client.get("/panel-admin.json", headers=_panel()).json()
+    payload = client.get("/admin-panel.json", headers=_panel()).json()
     for key in ("budget", "admission", "card", "runs", "costs", "hardware",
                 "cpu_percent", "ram", "inflight", "queue", "ledger", "uptime",
                 "disk"):
@@ -246,7 +246,7 @@ def test_server_debug_json_agrees_with_status_on_what_both_report():
     """They are one function plus samples, deliberately, so that two endpoints
     can never disagree about the same number."""
     status = client.get("/status", headers=AUTH).json()
-    debug = client.get("/panel-admin.json", headers=_panel()).json()
+    debug = client.get("/admin-panel.json", headers=_panel()).json()
     assert debug["budget"] == status["budget"]
     assert debug["costs"] == status["costs"]
 
@@ -259,7 +259,7 @@ def test_watching_the_server_is_not_counted_as_asking_it_for_work():
     that came entirely from the thing measuring the load.
     """
     telemetry.reset()
-    client.get("/panel-admin.json", headers=_panel())
+    client.get("/admin-panel.json", headers=_panel())
     client.get("/status", headers=AUTH)
     client.get("/health")
     assert telemetry.inflight() == {"now": 0, "peak": 0}
@@ -275,7 +275,7 @@ def test_a_request_that_asks_for_something_is_counted():
 def test_the_debug_page_is_served_without_a_token_and_holds_none():
     """The page is public; the readings are not. A token baked into the HTML
     would hand every reader the key to the whole API."""
-    response = client.get("/panel-admin")
+    response = client.get("/admin-panel")
     assert response.status_code == 200
     assert settings.API_TOKEN not in response.text
 
@@ -283,6 +283,6 @@ def test_the_debug_page_is_served_without_a_token_and_holds_none():
 def test_the_debug_page_asks_for_nothing_over_the_network():
     """This server runs where there is no internet. A remote stylesheet is a
     broken page, not a degraded one."""
-    body = client.get("/panel-admin").text
+    body = client.get("/admin-panel").text
     for absent in ("http://", "https://", "//cdn", "<link"):
         assert absent not in body, absent

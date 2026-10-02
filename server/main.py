@@ -57,7 +57,7 @@ from config import settings
 from data_store import DataNotFoundError, data_store
 from registry.deployment import deployment_config
 from registry import TOOLS, get_tool
-from wire import clients
+from wire import clients, updates
 from wire.security import verify_admin, verify_token
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -146,7 +146,7 @@ app = FastAPI(lifespan=_lifespan)
 # counting its own poll made the chip read "1 request" on a completely idle
 # machine -- the observer appearing in its own observation, and a claim the
 # page could not support. Health checks are excluded for the same reason.
-_UNCOUNTED_PATHS = ("/panel-admin", "/server-debug", "/status", "/health", "/runs/")
+_UNCOUNTED_PATHS = ("/admin-panel", "/server-debug", "/status", "/health", "/runs/")
 
 
 def _is_observer(path: str) -> bool:
@@ -156,7 +156,7 @@ def _is_observer(path: str) -> bool:
 
 @app.middleware("http")
 async def _count_inflight(request: Request, call_next):
-    """How many requests are being served at this instant, for `/panel-admin`.
+    """How many requests are being served at this instant, for `/admin-panel`.
 
     A counter and not a log: what the page needs is the CONCURRENT figure, and
     that is knowable only from inside the request's own lifetime. The
@@ -826,6 +826,70 @@ def admin_client_policy(address: str, wanted: _ClientRule) -> dict:
     return answer
 
 
+class _Door(BaseModel):
+    accepting: bool
+    # How long to stay closed, when closing. Bounded by the maintenance module.
+    hours: float = 2.0
+    reason: str = ""
+
+
+class _UpdateRequest(BaseModel):
+    target: str = "all"
+
+
+@app.post("/admin/door", dependencies=[Depends(verify_admin)])
+def admin_door(wanted: _Door) -> dict:
+    """Stop accepting new runs, or start again -- the operator's own switch.
+
+    Closing refuses new runs with a 503 that says why; every run already
+    received finishes as it would have. What an operator does before an update
+    or a restart they are about to make by hand.
+    """
+    if wanted.accepting:
+        maintenance.reopen()
+        logger.info("Operator reopened the server to new work")
+    else:
+        granted = maintenance.close_by_operator(
+            wanted.hours * 3600, wanted.reason or "closed by an operator before maintenance")
+        logger.info("Operator closed the server to new work for %.0fs", granted)
+    return maintenance.snapshot()
+
+
+@app.get("/admin-panel/updates.json", dependencies=[Depends(verify_admin)])
+def panel_updates() -> dict:
+    """What the host's update agent says can be updated, and what it is doing."""
+    report = updates.overview()
+    report["maintenance"] = maintenance.snapshot()
+    report["load"] = {
+        "running": admission.budget().snapshot()["running"],
+        "in_flight": sum(1 for r in runs.active() if r.get("state") in ("running", "pending")),
+    }
+    return report
+
+
+@app.post("/admin/update", dependencies=[Depends(verify_admin)])
+def admin_update(wanted: _UpdateRequest) -> dict:
+    """Ask the host's update agent to apply what is waiting.
+
+    It stops new runs, waits for those in flight to finish, pulls, rebuilds
+    what has to be rebuilt and restarts the server. The request is a file the
+    agent picks up (wire/updates.py); without an agent running, nothing happens
+    and the panel says so.
+    """
+    try:
+        request = updates.request_update(wanted.target, by="admin panel")
+    except updates.UpdateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    logger.info("Operator requested an update (%s)", wanted.target)
+    return request
+
+
+@app.delete("/admin/update", dependencies=[Depends(verify_admin)])
+def admin_update_withdraw() -> dict:
+    """Withdraw a pending update, while the agent is still waiting on runs."""
+    return {"withdrawn": updates.withdraw()}
+
+
 @app.get("/admin/check", dependencies=[Depends(verify_admin)])
 def admin_check() -> dict:
     """Whether the admin token the dashboard holds is the right one."""
@@ -861,7 +925,7 @@ def admin_priority(run_id: str, wanted: _Priority) -> dict:
     return snapshot
 
 
-@app.get("/panel-admin.json", dependencies=[Depends(verify_admin)])
+@app.get("/admin-panel.json", dependencies=[Depends(verify_admin)])
 def server_debug_data() -> dict:
     """Everything `/status` reports, plus what the machine says about itself.
 
@@ -1043,7 +1107,7 @@ def _client_activity(live: list, ledger: list) -> list:
 TRACE_WINDOW_SECONDS = 30 * 60
 
 
-@app.get("/panel-admin/history.json", dependencies=[Depends(verify_admin)])
+@app.get("/admin-panel/history.json", dependencies=[Depends(verify_admin)])
 def panel_history(limit: int = 500) -> dict:
     """Every finished run the history holds, newest first, for the panel's full
     history window. The same records the dashboard's strip shows, more of them:
@@ -1053,7 +1117,7 @@ def panel_history(limit: int = 500) -> dict:
     return {"runs": records[:limit], "held": len(records), "capacity": telemetry.LEDGER_SIZE}
 
 
-@app.get("/panel-admin/tools/{tool_name}.json", dependencies=[Depends(verify_admin)])
+@app.get("/admin-panel/tools/{tool_name}.json", dependencies=[Depends(verify_admin)])
 def server_debug_tool(tool_name: str, limit: int = 120) -> dict:
     """One tool over its recent runs: what the operator page draws when a tool
     is clicked.
@@ -1103,7 +1167,7 @@ def server_debug_tool(tool_name: str, limit: int = 120) -> dict:
     }
 
 
-@app.get("/panel-admin/runs/{run_id}.json", dependencies=[Depends(verify_admin)])
+@app.get("/admin-panel/runs/{run_id}.json", dependencies=[Depends(verify_admin)])
 def server_debug_run(run_id: str) -> dict:
     """One run's activity, COMPOSED by this server rather than quoted from the
     tool.
@@ -1294,21 +1358,20 @@ def benchmark_stop() -> dict:
     return {"stopped": benchmark_jobs.stop()}
 
 
-@app.get("/panel-admin", include_in_schema=False)
-def panel_admin() -> HTMLResponse:
+@app.get("/admin-panel", include_in_schema=False)
+def admin_panel() -> HTMLResponse:
     """The operator's panel. The page itself holds no reading and is served to
-    anyone; everything it shows comes from `/panel-admin*.json`, which answers
+    anyone; everything it shows comes from `/admin-panel*.json`, which answers
     only to the ADMIN token. A clinician's workstation holds the API token,
     which opens nothing here."""
     return HTMLResponse(debug_page.DEBUG_PAGE)
 
 
 @app.get("/server-debug", include_in_schema=False)
-@app.get("/admin-panel", include_in_schema=False)
+@app.get("/panel-admin", include_in_schema=False)
 def server_debug_moved() -> RedirectResponse:
-    """The panel's old address, and the other word order people type: both
-    land on the panel rather than on a 404."""
-    return RedirectResponse(url="panel-admin", status_code=status.HTTP_308_PERMANENT_REDIRECT)
+    """The panel's earlier addresses: both land on it rather than on a 404."""
+    return RedirectResponse(url="admin-panel", status_code=status.HTTP_308_PERMANENT_REDIRECT)
 
 
 @app.get("/tools")
@@ -2105,7 +2168,7 @@ def _client_address(request: Request) -> Optional[str]:
     is a deployment decision, so it lives there and not in this function.
 
     An address is not patient data, but it does identify a person's machine, so
-    it travels no further than `/status` and `/panel-admin` already do: behind
+    it travels no further than `/status` and `/admin-panel` already do: behind
     the shared token, for an operator asking "who is hammering this server".
     """
     client = request.client

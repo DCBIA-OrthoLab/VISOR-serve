@@ -1,4 +1,4 @@
-"""The page `GET /panel-admin` serves: the operator's view of this server.
+"""The page `GET /admin-panel` serves: the operator's view of this server.
 
 Opened with the ADMIN token only. The API token every workstation holds opens
 nothing here: reading the queue and acting on it are the operator's.
@@ -379,6 +379,32 @@ DEBUG_PAGE = r"""<!doctype html>
   .stack-keys { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--soft); margin-top: 7px; }
   .stack-keys b { color: var(--ink); }
 
+  /* maintenance & updates */
+  .mrow { display: grid; grid-template-columns: 1.2fr 1fr 1.3fr auto; }
+  @media (max-width: 1000px) { .mrow { grid-template-columns: 1fr; } }
+  .mcell { padding: 12px 16px; border-left: 1px solid var(--line); min-width: 0; }
+  .mcell:first-child { border-left: none; }
+  .mcell .t { font-weight: 600; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+  .mcell .s { font-size: 12.5px; color: var(--soft); margin-top: 2px; }
+  .mact { display: flex; flex-direction: column; gap: 6px; justify-content: center; }
+  .sdot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--ok); }
+  .sdot.closed { background: var(--warn); } .sdot.off { background: var(--ghost); } .sdot.up { background: var(--accent); }
+  .chips { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
+  .chip2 { font-size: 11.5px; padding: 1px 8px; border-radius: 6px; background: var(--sunk); border: 1px solid var(--line); }
+  .chip2.env { border-color: var(--warn); color: var(--warn); }
+  .doorctl { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+  .doorctl select { font-size: 12.5px; padding: 4px 8px; border-radius: 8px; border: 1px solid var(--line);
+                    background: var(--sunk); color: var(--ink); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:disabled { opacity: .45; cursor: default; }
+  #m-progress:not(:empty) { border-top: 1px solid var(--line); padding: 10px 16px; font-size: 13px; }
+  .commit { display: grid; grid-template-columns: 80px minmax(0, 1fr) 120px; gap: 10px; font-size: 12.5px;
+            padding: 4px 0; border-bottom: 1px solid var(--line); }
+  .commit .sha { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--ghost); }
+  .warnbox { border: 1px solid color-mix(in srgb, var(--warn) 50%, transparent); border-radius: 10px;
+             padding: 8px 12px; font-size: 12.5px; background: color-mix(in srgb, var(--warn) 8%, transparent); }
+  .okbox { border: 1px solid color-mix(in srgb, var(--ok) 45%, transparent); border-radius: 10px;
+           padding: 8px 12px; font-size: 12.5px; background: color-mix(in srgb, var(--ok) 8%, transparent); }
   /* full history */
   .hfilters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .hfilters select, .hfilters input { font-size: 13px; padding: 6px 9px; border-radius: 9px;
@@ -461,6 +487,16 @@ DEBUG_PAGE = r"""<!doctype html>
   </header>
 
   <section id="vitals"></section>
+
+  <section class="card" id="maint">
+    <div class="mrow">
+      <div class="mcell" id="m-door"></div>
+      <div class="mcell" id="m-server"></div>
+      <div class="mcell" id="m-tools"></div>
+      <div class="mcell mact" id="m-act"></div>
+    </div>
+    <div id="m-progress"></div>
+  </section>
 
   <div id="main">
     <div id="left">
@@ -1072,10 +1108,11 @@ DEBUG_PAGE = r"""<!doctype html>
   }
   function fetchDialog() {
     if (!dlg.kind || !token) { return; }
+    if (dlg.kind === "updates") { loadUpdates(true); drawDialog(); return; }
     var kind = dlg.kind, id = dlg.id;
-    var url = kind === "run" ? "panel-admin/runs/" + encodeURIComponent(id) + ".json"
-            : kind === "history" ? "panel-admin/history.json?limit=1000"
-            : "panel-admin/tools/" + encodeURIComponent(id) + ".json";
+    var url = kind === "run" ? "admin-panel/runs/" + encodeURIComponent(id) + ".json"
+            : kind === "history" ? "admin-panel/history.json?limit=1000"
+            : "admin-panel/tools/" + encodeURIComponent(id) + ".json";
     dlg.fetchedAt = Date.now();
     fetch(url, { headers: { "X-Admin-Token": token } })
       .then(function (r) {
@@ -1099,7 +1136,8 @@ DEBUG_PAGE = r"""<!doctype html>
 
   function drawDialog() {
     if (!dlg.kind) { return; }
-    el("dialog").innerHTML = dlg.kind === "run" ? runDialog() : dlg.kind === "history" ? historyDialog() : toolDialog();
+    el("dialog").innerHTML = dlg.kind === "run" ? runDialog() : dlg.kind === "history" ? historyDialog()
+      : dlg.kind === "updates" ? updatesDialog() : toolDialog();
   }
 
   function runDialog() {
@@ -1166,6 +1204,138 @@ DEBUG_PAGE = r"""<!doctype html>
       "never named, only its shape (files, bytes, extensions). A hosted bundle is named, because this deployment " +
       "staged it. Console lines are composed by the server from the phase the run reported, never quoted from " +
       "what the tool printed.</div></div>";
+  }
+
+  // ---- maintenance & updates ------------------------------------------
+  var upd = null, updFetchedAt = 0, doorHours = "2";
+  function loadUpdates(force) {
+    if (!token || (!force && Date.now() - updFetchedAt < 4000)) { return; }
+    updFetchedAt = Date.now();
+    fetch("admin-panel/updates.json", { headers: { "X-Admin-Token": token } })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) {
+        if (!d) { return; }
+        upd = d;
+        drawMaint();
+        if (dlg.kind === "updates") { drawDialog(); }
+      })
+      .catch(function () { /* the next poll tries again */ });
+  }
+  function repoSummary(info, label) {
+    if (!info || info.error) {
+      return '<div class="t"><span class="sdot off"></span>' + label + '</div><div class="s">' +
+        esc(info && info.error ? info.error : "not reported") + "</div>";
+    }
+    var behind = info.behind || 0;
+    var head = '<div class="t"><span class="sdot ' + (behind ? "up" : "") + '"></span>' + label + " \u00b7 " +
+      (behind ? behind + " update" + (behind > 1 ? "s" : "") + " waiting" : "up to date") + "</div>" +
+      '<div class="s mono">' + esc(info.branch) + " @ " + esc(info.local) +
+      (info.current && info.current.subject ? " \u00b7 " + esc(info.current.subject.slice(0, 60)) : "") + "</div>";
+    var extra = "";
+    if (info.kind === "tools" && behind) {
+      extra = '<div class="chips">' + ((info.changes || {}).tools || []).map(function (t) {
+        return '<span class="chip2' + (t.environment ? " env" : "") + '" title="' +
+          (t.environment ? "dependencies changed: its environment is rebuilt" : "code only") + '">' +
+          esc(t.tool) + (t.environment ? " \u00b7 env" : "") + "</span>";
+      }).join("") + "</div>";
+    }
+    if (info.kind === "server" && behind && info.changes) {
+      var what = { restart: "a restart applies it", recreate: "the container is recreated",
+                   image: "needs a new image: cannot be applied from here" }[info.changes.action] || "";
+      extra = '<div class="s">' + esc(what) + "</div>";
+    }
+    return head + extra;
+  }
+  function drawMaint() {
+    var m = (upd && upd.maintenance) || (latest && latest.maintenance) || { accepting: true };
+    var door = m.accepting
+      ? '<div class="t"><span class="sdot"></span>Accepting new runs</div>' +
+        '<div class="s">New runs are admitted as usual.</div>' +
+        '<div class="doorctl"><select id="doorhours">' + ["1", "2", "4", "12"].map(function (h) {
+          return '<option value="' + h + '"' + (doorHours === h ? " selected" : "") + ">for " + h + " h</option>";
+        }).join("") + "</select>" +
+        '<button data-door="close">Stop accepting new runs</button></div>'
+      : '<div class="t"><span class="sdot closed"></span>Closed to new runs</div>' +
+        '<div class="s">' + esc(m.reason || "") + " \u00b7 reopens by itself in " + dur(m.closed_for) +
+        ". Runs already in finish normally.</div>" +
+        '<div class="doorctl"><button class="primary" data-door="open">Reopen now</button></div>';
+    el("m-door").innerHTML = door;
+    if (!upd) {
+      el("m-server").innerHTML = '<div class="s">Loading\u2026</div>';
+      el("m-tools").innerHTML = ""; el("m-act").innerHTML = ""; el("m-progress").innerHTML = "";
+      return;
+    }
+    var st = upd.status || {};
+    if (!upd.agent.alive) {
+      el("m-server").innerHTML = '<div class="t"><span class="sdot off"></span>Update agent not running</div>' +
+        '<div class="s">' + (upd.agent.seen ? "Last heard from " + ago(upd.agent.heartbeat) + " ago. " : "") +
+        "Start it on the host: <code>python3 scripts/update_agent.py</code></div>";
+      el("m-tools").innerHTML = ""; el("m-act").innerHTML = "";
+    } else {
+      el("m-server").innerHTML = repoSummary(st.server, "Server");
+      el("m-tools").innerHTML = repoSummary(st.tools, "Tools library");
+      var waiting = ((st.server || {}).behind || 0) + ((st.tools || {}).behind || 0);
+      el("m-act").innerHTML = '<button class="' + (waiting ? "primary" : "") + '" data-updates="1">' +
+        (waiting ? "Review &amp; update" : "Details") + "</button>" +
+        '<span class="s" style="font-size:11.5px;color:var(--ghost)">checked ' + ago(upd.agent.heartbeat) + " ago</span>";
+    }
+    var progress = "";
+    if (st.applying) {
+      progress = '<b>Updating</b> \u00b7 ' + esc(st.applying.phase || "starting") +
+        (upd.request ? ' <button class="ghost" data-withdraw="1" style="margin-left:8px">Cancel</button>' : "");
+    } else if (upd.request) {
+      progress = "<b>Update requested</b> \u00b7 waiting for the agent to pick it up " +
+        '<button class="ghost" data-withdraw="1" style="margin-left:8px">Cancel</button>';
+    } else if (st.last && now() - st.last.at < 3600) {
+      progress = '<span style="color:' + (st.last.ok ? "var(--ok)" : "var(--hot)") + '">' +
+        (st.last.ok ? "\u2713 " : "\u2715 ") + esc(st.last.message) + "</span> \u00b7 " + ago(st.last.at) + " ago";
+    }
+    el("m-progress").innerHTML = progress;
+  }
+  function commitsHtml(info) {
+    if (!info || !(info.commits || []).length) { return '<div class="empty" style="text-align:left">Nothing waiting.</div>'; }
+    return info.commits.map(function (c) {
+      return '<div class="commit"><span class="sha">' + esc(c.sha) + "</span><span>" + esc(c.subject) +
+        '</span><span style="color:var(--ghost)">' + esc(c.author) + " \u00b7 " + ago(c.at) + "</span></div>";
+    }).join("");
+  }
+  function updatesDialog() {
+    var st = (upd && upd.status) || {}, srv = st.server || {}, tl = st.tools || {};
+    function block(info, label, target) {
+      var reasons = info.blockers || [];
+      var detail = "";
+      if (info.kind === "tools" && info.behind) {
+        detail = '<table class="io"><tbody>' + ((info.changes || {}).tools || []).map(function (t) {
+          return "<tr><td><b>" + esc(t.tool) + "</b></td><td>" + t.files + " file" + (t.files > 1 ? "s" : "") +
+            "</td><td>" + (t.environment ? '<span class="chip2 env">environment rebuilt (uv sync)</span>' : "code only, restart") + "</td></tr>";
+        }).join("") + "</tbody></table>";
+      }
+      if (info.kind === "server" && info.behind && info.changes) {
+        detail = '<div class="s">' + ({ restart: "Source only: the server is restarted.",
+          recreate: "Dependencies or compose changed: the container is recreated (" + esc((info.changes.heavy || []).join(", ")) + ").",
+          image: "The image changes: " + esc((info.changes.heavy || []).join(", ")) }[info.changes.action] || "") + "</div>";
+      }
+      return section(label + (info.branch ? " \u00b7 " + info.branch + " @ " + (info.local || "") : ""),
+        (reasons.length ? '<div class="warnbox">Cannot be updated from here: ' + esc(reasons.join("; ")) + "</div>" : "") +
+        detail + commitsHtml(info) +
+        (info.behind && !reasons.length ? '<div style="margin-top:8px"><button class="primary" data-update="' + target +
+          '">Update ' + label.toLowerCase() + "</button></div>" : ""));
+    }
+    var busy = st.applying || (upd && upd.request);
+    var both = (srv.behind && tl.behind && !(srv.blockers || []).length && !(tl.blockers || []).length);
+    var last = st.last ? (st.last.ok ? '<div class="okbox">' : '<div class="warnbox">') + esc(st.last.message) +
+      " \u00b7 " + ago(st.last.at) + " ago" + ((st.last.log || []).length
+        ? '<div class="con" style="margin-top:8px;max-height:180px">' + st.last.log.map(function (l) {
+            return '<div class="ln"><span class="tx">' + esc(l) + "</span></div>"; }).join("") + "</div>" : "") + "</div>" : "";
+    var head = '<div class="dhd"><div><h3>Updates</h3><div class="rid">Applying one stops new runs, waits for the ones in flight, ' +
+      "pulls, rebuilds what changed and restarts the server. Runs already in are never interrupted.</div></div>" +
+      '<div class="acts">' + (both && !busy ? '<button class="primary" data-update="all">Update both</button>' : "") +
+      '<button data-close="1">Close \u2715</button></div></div>';
+    var progress = busy ? '<div class="warnbox"><b>In progress:</b> ' + esc((st.applying || {}).phase || "requested, waiting for the agent") +
+      ((st.applying || {}).log ? '<div class="con" style="margin-top:8px;max-height:160px">' + st.applying.log.map(function (l) {
+        return '<div class="ln"><span class="tx">' + esc(l) + "</span></div>"; }).join("") + "</div>" : "") + "</div>" : "";
+    return head + '<div class="dbody">' + progress + (busy ? "" : '<div class="two">' + block(srv, "Server", "server") +
+      block(tl, "Tools library", "tools") + "</div>") + (last ? section("Last update", last) : "") + "</div>";
   }
 
   // ---- the full history ------------------------------------------------
@@ -1402,11 +1572,15 @@ DEBUG_PAGE = r"""<!doctype html>
     drawQueue(d);
     drawRunning(d);
     drawMachine(d);
+    drawMaint();
+    loadUpdates(false);
     drawClients(d);
     drawTools(d);
     drawHistory(d);
     drawFilters();
-    if (dlg.kind === "history") {
+    if (dlg.kind === "updates") {
+      // Redrawn when the updates report arrives (loadUpdates).
+    } else if (dlg.kind === "history") {
       // Fetched when opened and on Refresh only: a poll redrawing it would
       // wipe a filter being typed.
     } else if (dlg.kind) {
@@ -1419,7 +1593,7 @@ DEBUG_PAGE = r"""<!doctype html>
 
   function load() {
     if (!token) { el("gate").hidden = false; el("shell").hidden = true; return; }
-    fetch("panel-admin.json", { headers: { "X-Admin-Token": token } })
+    fetch("admin-panel.json", { headers: { "X-Admin-Token": token } })
       .then(function (r) {
         if (r.status === 401) { throw new Error("That is not this server's admin token."); }
         if (r.status === 403) { throw new Error("This server has no admin token: set ADMIN_TOKEN in its .env and restart it."); }
@@ -1457,6 +1631,7 @@ DEBUG_PAGE = r"""<!doctype html>
   });
   // The history window's own filters, applied in the browser to what it holds.
   document.addEventListener("change", function (event) {
+    if (event.target.id === "doorhours") { doorHours = event.target.value; return; }
     var key = event.target.getAttribute && event.target.getAttribute("data-hf");
     if (key && dlg.kind === "history" && event.target.tagName === "SELECT") {
       dlg.hf[key] = event.target.value;
@@ -1490,6 +1665,29 @@ DEBUG_PAGE = r"""<!doctype html>
     var t = event.target;
     if (t.closest("[data-close]") || t === el("overlay")) { closeDialog(); return; }
     if (t.closest("[data-history]")) { openDialog("history", null); return; }
+    if (t.closest("[data-updates]")) { openDialog("updates", null); return; }
+    var dr = t.closest("[data-door]");
+    if (dr) {
+      var opening = dr.getAttribute("data-door") === "open";
+      var hours = opening ? 0 : parseFloat((el("doorhours") || {}).value || "2");
+      adminAction("admin/door", { accepting: opening, hours: hours },
+        opening ? "Accepting new runs again." : "No new runs will be accepted; the ones already in will finish.");
+      updFetchedAt = 0;
+      return;
+    }
+    var up = t.closest("[data-update]");
+    if (up) {
+      adminAction("admin/update", { target: up.getAttribute("data-update") },
+        "Update requested. New runs are stopped once the agent picks it up.");
+      updFetchedAt = 0;
+      window.setTimeout(function () { loadUpdates(true); }, 600);
+      return;
+    }
+    if (t.closest("[data-withdraw]")) {
+      fetch("admin/update", { method: "DELETE", headers: { "X-Admin-Token": token } })
+        .then(function () { toast("Update cancelled."); loadUpdates(true); });
+      return;
+    }
     if (t.closest("[data-hrefresh]")) { fetchDialog(); return; }
     if (t.closest("[data-back]") && dlg.back) {
       var back = dlg.back;

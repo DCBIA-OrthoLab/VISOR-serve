@@ -76,6 +76,10 @@ class Settings(BaseSettings):
     # the `inference` service is the bind-mounted checkout and therefore
     # outlives the container; empty keeps the history in memory only.
     HISTORY_DIR: str = os.path.join(_SERVER_DIR, ".history")
+    # Where this server and the host's update agent (scripts/update_agent.py)
+    # leave each other notes: what can be updated, and an operator's request
+    # to do it. In the bind-mounted checkout, so both sides see the same files.
+    UPDATE_DIR: str = os.path.join(_SERVER_DIR, ".update")
     DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
     SADT_API: str = "http://127.0.0.1:8000"  # reaches this server from a tool
     # How many runs may be inside a tool at once, whatever their size: a bound
