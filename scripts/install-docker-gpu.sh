@@ -129,9 +129,25 @@ fi
 
 step "2/4 - Driver NVIDIA"
 
+# `lspci | grep -qi nvidia` under `set -o pipefail` reports NO CARD precisely
+# WHEN THERE IS ONE. `grep -q` exits at the first match, closing the pipe while
+# lspci is still writing -- on the machine this was found on, the card sits at
+# ac:00.0 of 203 lines -- so lspci dies of SIGPIPE and the pipeline's status is
+# 141. Measured there: 141 with pipefail, detected without it. The condition was
+# therefore true only when `nvidia` happened to be lspci's LAST line, which is
+# to say almost never, and every GPU install since silently skipped step 3 and
+# told the operator their workstation had no GPU.
+#
+# Two changes, not one. The output is captured BEFORE being matched, so there is
+# no pipe left to break; and nvidia-smi is asked first, because a driver that
+# answers is stronger evidence than a PCI string -- the earlier version could
+# print the card's name in step 2 and still conclude there was none.
 HAS_NVIDIA_CARD=false
-if command -v lspci >/dev/null 2>&1 && lspci | grep -qi nvidia; then
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
   HAS_NVIDIA_CARD=true
+elif command -v lspci >/dev/null 2>&1; then
+  PCI_DEVICES="$(lspci 2>/dev/null || true)"
+  case "${PCI_DEVICES}" in *[Nn][Vv][Ii][Dd][Ii][Aa]*) HAS_NVIDIA_CARD=true ;; esac
 fi
 
 if ! $HAS_NVIDIA_CARD; then
