@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
     SADT_API: str = "http://127.0.0.1:8000"  # reaches this server from a tool
     MAX_CONCURRENT_TOOLS: int = 4
+    # The operator dashboard's controls -- reordering the queue, giving a run
+    # priority -- answer only to this token, never to API_TOKEN: every
+    # workstation holds that one, and a control any of them can use is one any
+    # of them will use to put itself first. Empty disables the controls.
+    ADMIN_TOKEN: str = ""
     TOOL_TIMEOUT_SECONDS: float = 0  # 0 = none; a cohort legitimately takes hours
     # How many times a run that died for want of memory is started again, with
     # more room reserved each time. A clinician who asked for a segmentation

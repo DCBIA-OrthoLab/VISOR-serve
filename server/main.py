@@ -56,7 +56,7 @@ from config import settings
 from data_store import DataNotFoundError, data_store
 from registry.deployment import deployment_config
 from registry import TOOLS, get_tool
-from wire.security import verify_token
+from wire.security import verify_admin, verify_token
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("inference_server")
@@ -254,6 +254,58 @@ def _get_tool_limiter() -> anyio.CapacityLimiter:
     if _tool_limiter is None:
         _tool_limiter = anyio.CapacityLimiter(settings.MAX_CONCURRENT_TOOLS)
     return _tool_limiter
+
+
+
+
+async def _run_in_slot(call):
+    """`call` in a worker thread, inside a tool slot (see `_tool_slot`)."""
+    async with _tool_slot(runs.CURRENT_RUN.get()):
+        return await anyio.to_thread.run_sync(call)
+
+
+# How often a run waiting for a slot checks whether an operator has given it
+# priority. Half a second is invisible next to a wait for a slot, which is a
+# wait for a whole other run to finish.
+_PRIORITY_POLL_SECONDS = 0.5
+
+
+@contextlib.asynccontextmanager
+async def _tool_slot(run_id: Optional[str]):
+    """One of the MAX_CONCURRENT_TOOLS slots, or none for a run given priority.
+
+    The slot is the FIRST queue a run meets, before admission's, and it is
+    anyio's own FIFO: a run an operator marks HIGH while it waits here would
+    otherwise sit behind every run that arrived first, which is the opposite
+    of what the mark means. So the wait is raced against the mark, and a
+    marked run goes through without a slot. Admission still decides what it
+    may hold -- the slot bounds worker threads, the budget bounds the machine.
+    """
+    limiter = _get_tool_limiter()
+    borrower = object()
+    acquired = False
+    budget = admission.budget()
+    if run_id is None or budget.priority_of(run_id) != admission.PRIORITY_HIGH:
+        async with anyio.create_task_group() as group:
+            async def take() -> None:
+                nonlocal acquired
+                await limiter.acquire_on_behalf_of(borrower)
+                acquired = True
+                group.cancel_scope.cancel()
+
+            async def watch() -> None:
+                while budget.priority_of(run_id) != admission.PRIORITY_HIGH:
+                    await anyio.sleep(_PRIORITY_POLL_SECONDS)
+                group.cancel_scope.cancel()
+
+            group.start_soon(take)
+            if run_id is not None:
+                group.start_soon(watch)
+    try:
+        yield
+    finally:
+        if acquired:
+            limiter.release_on_behalf_of(borrower)
 
 
 def _extract_extension(filename: str) -> str:
@@ -711,6 +763,49 @@ def set_maintenance(wanted: _Maintenance) -> dict:
     return maintenance.snapshot()
 
 
+class _Move(BaseModel):
+    to: str
+
+
+class _Priority(BaseModel):
+    priority: str
+
+
+@app.get("/admin/check", dependencies=[Depends(verify_token), Depends(verify_admin)])
+def admin_check() -> dict:
+    """Whether the admin token the dashboard holds is the right one."""
+    return {"admin": True}
+
+
+@app.post("/admin/queue/{run_id}/move", dependencies=[Depends(verify_token), Depends(verify_admin)])
+def admin_move(run_id: str, wanted: _Move) -> dict:
+    """Move a run waiting for room: `top`, `up`, `down` or `bottom`."""
+    try:
+        snapshot = admission.budget().move(run_id, wanted.to)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    except admission.NotQueued as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    logger.info("Operator moved run %s %s", run_id, wanted.to)
+    return snapshot
+
+
+@app.post("/admin/runs/{run_id}/priority", dependencies=[Depends(verify_token), Depends(verify_admin)])
+def admin_priority(run_id: str, wanted: _Priority) -> dict:
+    """Mark a run `high` or back to `normal`, whether it is queued yet or not.
+
+    HIGH puts it ahead of every normal run waiting for room, lets it past the
+    wait for a tool slot, and admits it on the widest shape that fits. A run
+    already admitted keeps what it was given.
+    """
+    try:
+        snapshot = admission.budget().set_priority(run_id, wanted.priority)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    logger.info("Operator set run %s to %s priority", run_id, wanted.priority)
+    return snapshot
+
+
 @app.get("/server-debug.json", dependencies=[Depends(verify_token)])
 def server_debug_data() -> dict:
     """Everything `/status` reports, plus what the machine says about itself.
@@ -754,6 +849,9 @@ def server_debug_data() -> dict:
         # leaving a reader to wonder whether it is stuck forever.
         "run_ttl_seconds": settings.RUN_TTL_SECONDS,
         "paused_ttl_seconds": settings.PAUSED_RUN_TTL_SECONDS,
+        # Whether the operator controls exist here at all, so the page can
+        # offer them or say why it does not. Never the token itself.
+        "admin_enabled": bool(settings.ADMIN_TOKEN),
     }
     # The live listing again, with each run's open nested calls: `/status`
     # keeps the narrower one it always had, and only this page needs to say
@@ -2419,11 +2517,8 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             # wants a number.
             size=0,
             work_dir=None, scratch_dirs=file_utils.track_scratch_dirs(),
-            result=await anyio.to_thread.run_sync(
-                functools.partial(dispatch.dispatch, tool, {},
-                                  resume_from=resume_from),
-                limiter=_get_tool_limiter(),
-            ),
+            result=await _run_in_slot(
+                functools.partial(dispatch.dispatch, tool, {}, resume_from=resume_from)),
         )
 
     # Generic argument collection: whatever scalar fields and/or files the
@@ -2656,9 +2751,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # bounded by MAX_CONCURRENT_TOOLS and safe: tools are stateless
         # (everything arrives via args), each request gets its own work_dir,
         # and DATA_DIR is read-only.
-        result = await anyio.to_thread.run_sync(
-            tool.invoke, args, limiter=_get_tool_limiter()
-        )
+        result = await _run_in_slot(functools.partial(tool.invoke, args))
     except ToolArgumentError as exc:
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))

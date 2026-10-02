@@ -2,7 +2,7 @@
 
 import secrets
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from config import settings
@@ -28,4 +28,29 @@ def verify_token(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token.",
+        )
+
+
+ADMIN_HEADER = "X-Admin-Token"
+
+
+def verify_admin(x_admin_token: str = Header(default="", alias=ADMIN_HEADER)) -> None:
+    """FastAPI dependency: raise unless the operator's admin token is sent.
+
+    Always used BESIDE `verify_token`, never instead of it. A separate header
+    rather than a second Bearer, so the dashboard keeps reading with the API
+    token and only an action carries the admin one.
+
+    403 when no admin token is configured at all: the controls are off on this
+    deployment, which is a different answer from "wrong token" (401).
+    """
+    if not settings.ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Operator controls are disabled on this server: ADMIN_TOKEN is not set.",
+        )
+    if not x_admin_token or not secrets.compare_digest(x_admin_token, settings.ADMIN_TOKEN):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin token.",
         )

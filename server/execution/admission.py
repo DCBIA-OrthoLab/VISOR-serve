@@ -31,7 +31,7 @@ Three rules make it safe to be optimistic:
 from __future__ import annotations
 
 import contextlib
-import itertools
+import time
 import logging
 import threading
 from dataclasses import dataclass
@@ -236,15 +236,45 @@ class Cancelled(RuntimeError):
     """The wait was abandoned because the client withdrew the run."""
 
 
+PRIORITY_NORMAL = "normal"
+PRIORITY_HIGH = "high"
+PRIORITIES = (PRIORITY_NORMAL, PRIORITY_HIGH)
+MOVES = ("top", "up", "down", "bottom")
+
+
+class NotQueued(Exception):
+    """An operator asked to move a run that is not waiting for room."""
+
+
+class _Waiter:
+    """One run in the queue. Identity is the object; `run_id` may be None for
+    a run whose client sent no id, which an operator then cannot address."""
+
+    __slots__ = ("run_id", "since")
+
+    def __init__(self, run_id: Optional[str]):
+        self.run_id = run_id
+        self.since = time.time()
+
+
 class Budget:
     """A resource vector, and a queue of jobs waiting for room in it.
 
-    FIFO by ticket: only the job at the head of the queue may be admitted, so a
-    heavy job is never starved by a stream of light ones. The cost is
+    FIFO by arrival: only the job at the head of the queue may be admitted, so
+    a heavy job is never starved by a stream of light ones. The cost is
     head-of-line blocking -- a small job waits behind a big one it would have
     fitted beside -- and that is the deliberate trade. Predictable order is
     worth more here than the last few percent of utilisation, because the thing
     being ordered is somebody's patient cohort.
+
+    **An operator may change that order, and nothing else may.** `move` shifts
+    a waiting run within the queue; `set_priority` marks a run HIGH, which puts
+    it ahead of every normal waiter -- now, and the moment it arrives if it is
+    marked before it queues -- and admits it on the widest shape that fits
+    rather than on its fair share of what is left, since being fair to the
+    runs behind it is exactly what a priority overrides. A run already
+    admitted is never touched: priority decides who goes next and how wide,
+    never who is stopped.
     """
 
     def __init__(self, allocation, free_vram=None):
@@ -257,8 +287,12 @@ class Budget:
         self.cpus_per_job = int(allocation.cpus_per_job or 1)
         self._free_vram = free_vram or (lambda: resources.detect_vram_bytes()[1])
         self._condition = threading.Condition()
-        self._tickets = itertools.count()
-        self._queue: list = []
+        self._queue: list = []          # _Waiter, head first
+        # run_id -> priority, for runs an operator has marked. Kept apart from
+        # the queue so a run may be marked before it reaches it -- while it is
+        # still uploading or waiting for a slot -- and is forgotten once it is
+        # admitted.
+        self._priority: dict = {}
         self._held_cpus = 0.0
         self._held_ram = 0
         self._held_vram = 0
@@ -289,7 +323,84 @@ class Budget:
                 "cpus_held": self._held_cpus,
                 "ram_held": self._held_ram,
                 "vram_held": self._held_vram,
+                # The queue in the order it will be admitted. Run ids and a
+                # priority only: what is waiting, not whose data it is.
+                "queue": [
+                    {"run_id": waiter.run_id, "position": index + 1,
+                     "priority": self._priority.get(waiter.run_id, PRIORITY_NORMAL),
+                     "since": waiter.since}
+                    for index, waiter in enumerate(self._queue)
+                ],
+                "priorities": {run_id: level for run_id, level in self._priority.items()},
             }
+
+    # -- operator controls ---------------------------------------------
+    def _is_high(self, waiter: _Waiter) -> bool:
+        return self._priority.get(waiter.run_id) == PRIORITY_HIGH
+
+    def _place(self, waiter: _Waiter) -> None:
+        """Put a HIGH waiter behind the HIGH ones already there and ahead of
+        every normal one. Caller holds the condition."""
+        if waiter in self._queue:
+            self._queue.remove(waiter)
+        index = 0
+        while index < len(self._queue) and self._is_high(self._queue[index]):
+            index += 1
+        self._queue.insert(index, waiter)
+
+    def priority_of(self, run_id: Optional[str]) -> str:
+        with self._condition:
+            return self._priority.get(run_id, PRIORITY_NORMAL)
+
+    def set_priority(self, run_id: str, level: str) -> dict:
+        """Mark a run, queued or not yet. Returns the new snapshot."""
+        if level not in PRIORITIES:
+            raise ValueError(f"Unknown priority {level!r}. Expected one of: {', '.join(PRIORITIES)}")
+        with self._condition:
+            if level == PRIORITY_HIGH:
+                self._priority[run_id] = level
+            else:
+                self._priority.pop(run_id, None)
+            for waiter in list(self._queue):
+                if waiter.run_id == run_id:
+                    if level == PRIORITY_HIGH:
+                        self._place(waiter)
+                    else:
+                        # Back among the normal runs, in arrival order.
+                        self._queue.remove(waiter)
+                        index = 0
+                        while index < len(self._queue) and (
+                                self._is_high(self._queue[index]) or
+                                self._queue[index].since <= waiter.since):
+                            index += 1
+                        self._queue.insert(index, waiter)
+            self._condition.notify_all()
+        return self.snapshot()
+
+    def move(self, run_id: str, where: str) -> dict:
+        """Move a waiting run `top`, `up`, `down` or `bottom`.
+
+        Within its own band: a normal run is never moved ahead of a HIGH one,
+        and a HIGH one never behind a normal one -- marking it is how a run
+        changes band.
+        """
+        if where not in MOVES:
+            raise ValueError(f"Unknown move {where!r}. Expected one of: {', '.join(MOVES)}")
+        with self._condition:
+            current = [w for w in self._queue if w.run_id == run_id]
+            if not current:
+                raise NotQueued(f"Run {run_id} is not waiting for room on this machine.")
+            waiter = current[0]
+            band = [w for w in self._queue if self._is_high(w) == self._is_high(waiter)]
+            index = band.index(waiter)
+            target = {"top": 0, "up": max(0, index - 1),
+                      "down": min(len(band) - 1, index + 1), "bottom": len(band) - 1}[where]
+            band.insert(target, band.pop(index))
+            high = [w for w in self._queue if self._is_high(w)]
+            normal = [w for w in self._queue if not self._is_high(w)]
+            self._queue = band + normal if self._is_high(waiter) else high + band
+            self._condition.notify_all()
+        return self.snapshot()
 
     # -- the decision --------------------------------------------------
     def _would_fit(self, demand: Demand, last_resort: bool = True,
@@ -443,7 +554,7 @@ class Budget:
         return max(1, int(openable or self.cpus_per_job))
 
     @contextlib.contextmanager
-    def reserve(self, candidates, on_wait=None, is_cancelled=None):
+    def reserve(self, candidates, on_wait=None, is_cancelled=None, run_id=None):
         """Hold room for the duration of the block, taking the widest that fits.
 
         `candidates` is `[(channels, Demand), ...]`, widest FIRST. They are the
@@ -467,6 +578,9 @@ class Budget:
         Yields a `Grant` -- what it may spend, how widely, and whether it ever
         had the machine to itself. It unpacks as `(cores, channels)`, so a
         caller with no use for the third thing reads it exactly as before.
+
+        `run_id` is what an operator addresses the waiting run by (`move`,
+        `set_priority`); without one the run queues exactly as before.
         """
         # A bare Demand is one candidate at one channel. Accepted because most
         # callers -- and every test that predates channels -- have exactly one
@@ -475,18 +589,24 @@ class Budget:
         if isinstance(candidates, Demand):
             candidates = [(1, candidates)]
         candidates = list(candidates) or [(1, whole_machine(self))]
-        ticket = next(self._tickets)
+        waiter = _Waiter(run_id)
         announced = False
         with self._condition:
-            self._queue.append(ticket)
+            if self._is_high(waiter):
+                self._place(waiter)
+            else:
+                self._queue.append(waiter)
             while True:
                 if is_cancelled is not None and is_cancelled():
-                    self._queue.remove(ticket)
+                    self._queue.remove(waiter)
                     self._condition.notify_all()
                     raise Cancelled("The client cancelled this run.")
                 channels, demand = candidates[-1]
-                if self._queue[0] == ticket:
-                    fitted = self._widest_that_fits(candidates, len(self._queue) - 1)
+                if self._queue[0] is waiter:
+                    # A HIGH run is not asked to leave room for the runs
+                    # behind it: it takes the widest shape that fits now.
+                    behind = 0 if self._is_high(waiter) else len(self._queue) - 1
+                    fitted = self._widest_that_fits(candidates, behind)
                     if fitted is not None:
                         channels, demand = fitted
                         break
@@ -500,7 +620,8 @@ class Budget:
                         self._condition.acquire()
                     continue
                 self._condition.wait(timeout=settings.RUN_CANCEL_POLL_SECONDS)
-            self._queue.remove(ticket)
+            self._queue.remove(waiter)
+            self._priority.pop(run_id, None)
             # SOLO means nothing else held a reservation at ANY point between
             # this run's admission and its release. A run admitted onto an idle
             # machine starts solo; the moment a second reservation is taken

@@ -148,12 +148,13 @@ DEBUG_PAGE = r"""<!doctype html>
   .vital.hot .v { color: var(--hot); }
 
   /* ---- main grid ------------------------------------------------------- */
-  #main { display: grid; gap: 14px; grid-template-columns: minmax(250px, 300px) minmax(0, 1fr) minmax(320px, 400px); }
+  #main { display: grid; gap: 14px; grid-template-columns: minmax(270px, 320px) minmax(0, 1fr) minmax(320px, 400px); }
+  #p-list { max-height: 300px; overflow: auto; }
   @media (max-width: 1200px) { #main { grid-template-columns: 1fr; } }
   #left { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 
   /* the queue */
-  .qitem { display: flex; gap: 10px; align-items: center; padding: 8px 10px;
+  .qitem { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 8px 10px;
            border: 1px solid var(--line); border-radius: 10px; margin-bottom: 7px; cursor: pointer;
            background: color-mix(in srgb, var(--warn) 6%, var(--panel)); }
   .qitem:hover { border-color: var(--warn); }
@@ -325,6 +326,19 @@ DEBUG_PAGE = r"""<!doctype html>
   .stack-keys { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--soft); margin-top: 7px; }
   .stack-keys b { color: var(--ink); }
 
+  /* operator controls */
+  #adminbtn.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 650; }
+  .ctl { display: flex; gap: 4px; flex: none; width: 100%; justify-content: flex-end;
+         padding-left: 34px; margin-top: -2px; }
+  .ctl button { padding: 2px 7px; font-size: 12px; border-radius: 6px; line-height: 1.3; }
+  .ctl button.star.on { background: var(--hot); border-color: var(--hot); color: #fff; }
+  .qitem.high { border-color: var(--hot); background: color-mix(in srgb, var(--hot) 8%, var(--panel)); }
+  .qitem.high .pos { background: var(--hot); }
+  .prio { font-size: 10.5px; font-weight: 700; color: var(--hot); letter-spacing: .04em; }
+  .adminbox { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); z-index: 40;
+           background: var(--ink); color: var(--panel); padding: 8px 14px; border-radius: 9px;
+           font-size: 13px; box-shadow: var(--shadow-lg); }
   #gate { max-width: 520px; margin: 14vh auto; }
   .err { color: var(--hot); font-size: 12.5px; margin-top: 8px; }
 </style>
@@ -358,6 +372,7 @@ DEBUG_PAGE = r"""<!doctype html>
     <input id="find" style="min-width:290px" type="search" placeholder="Filter: run id, tool or address" autocomplete="off" spellcheck="false">
     <span id="live"><span class="dot" id="dot"></span><span id="livetext">live</span></span>
     <button id="toggle" type="button" class="ghost">Pause</button>
+    <button id="adminbtn" type="button" class="ghost" title="operator controls">Admin</button>
     <button id="theme" type="button" class="ghost" title="theme">Theme</button>
   </header>
 
@@ -412,16 +427,21 @@ DEBUG_PAGE = r"""<!doctype html>
 </div>
 
 <div id="overlay" hidden><div id="dialog" role="dialog" aria-modal="true"></div></div>
+<div id="toast" class="toast" hidden></div>
 
 <script>
 (function () {
   "use strict";
-  var KEY = "visor.token", THEME_KEY = "visor.theme";
+  var KEY = "visor.token", THEME_KEY = "visor.theme", ADMIN_KEY = "visor.admin";
   var EVERY = 2000;
   var token = "";
   try { token = window.localStorage.getItem(KEY) || ""; } catch (e) { token = ""; }
 
   var live = true, latest = null;
+  // The operator token, kept apart from the API token: it only ever rides an
+  // action, in its own header, and the page reads everything without it.
+  var admin = { token: "", ok: false };
+  try { admin.token = window.localStorage.getItem(ADMIN_KEY) || ""; } catch (e) { admin.token = ""; }
   // What the dialog shows: a run or a tool, and what was last fetched for it.
   var dlg = { kind: null, id: null, data: null, error: "", fetchedAt: 0 };
   var filters = { tool: "", client: "", outcome: "", text: "" };
@@ -694,19 +714,29 @@ DEBUG_PAGE = r"""<!doctype html>
     // MAX_CONCURRENT_TOOLS the server serves at once (the run is "received"
     // until it gets one -- or still uploading, which this page cannot tell
     // apart), then room on the machine ("queued_gpu").
+    // The order admission will actually admit in, which an operator may have
+    // changed; runs still waiting for a slot follow, oldest first.
+    var adm = d.admission || {}, prios = adm.priorities || {}, position = {};
+    (adm.queue || []).forEach(function (entry) { if (entry.run_id) { position[entry.run_id] = entry.position; } });
     var waiting = (d.runs || []).filter(function (r) {
       return inFlight(r) && (r.phase === "queued_gpu" || r.phase === "received") && matches(r, byId[r.run_id]);
     }).sort(function (x, y) {
-      var gx = x.phase === "queued_gpu" ? 0 : 1, gy = y.phase === "queued_gpu" ? 0 : 1;
-      return gx - gy || x.started_at - y.started_at;
+      var px = position[x.run_id] || 1e6, py = position[y.run_id] || 1e6;
+      return px - py || x.started_at - y.started_at;
     });
     el("q-count").textContent = waiting.length;
     el("q-list").innerHTML = waiting.length ? waiting.map(function (r, i) {
-      var slot = r.phase === "received";
-      return '<div class="qitem' + (slot ? " slot" : "") + '" data-run="' + esc(r.run_id) + '"><span class="pos">' + (i + 1) + "</span>" +
-        '<div style="min-width:0"><div class="n">' + esc(r.tool || "?") + "</div>" +
+      var slot = r.phase === "received", high = prios[r.run_id] === "high";
+      var ctl = admin.ok ? '<span class="ctl">' +
+        (slot ? "" : '<button data-move="top" data-id="' + esc(r.run_id) + '" title="to the top">\u2912</button>' +
+          '<button data-move="up" data-id="' + esc(r.run_id) + '" title="up one">\u2191</button>' +
+          '<button data-move="down" data-id="' + esc(r.run_id) + '" title="down one">\u2193</button>') +
+        '<button class="star' + (high ? " on" : "") + '" data-prio="' + (high ? "normal" : "high") + '" data-id="' +
+        esc(r.run_id) + '" title="' + (high ? "back to normal" : "give priority") + '">\u2605</button></span>' : "";
+      return '<div class="qitem' + (slot ? " slot" : "") + (high ? " high" : "") + '" data-run="' + esc(r.run_id) + '"><span class="pos">' + (i + 1) + "</span>" +
+        '<div style="min-width:0;flex:1"><div class="n">' + esc(r.tool || "?") + (high ? ' <span class="prio">PRIORITY</span>' : "") + "</div>" +
         '<div class="m mono">' + (slot ? "waiting for a slot " : "waiting for room ") + ago(r.started_at) +
-        (r.client ? " · " + esc(r.client) : "") + "</div></div></div>";
+        (r.client ? " \u00b7 " + esc(r.client) : "") + "</div></div>" + ctl + "</div>";
     }).join("") : '<div class="empty">' + (anyFilter() ? "Nothing waiting matches this filter." : "Nothing waiting.") + "</div>";
 
     var held = (d.runs || []).filter(function (r) { return r.phase === "paused" && matches(r, byId[r.run_id]); });
@@ -888,6 +918,11 @@ DEBUG_PAGE = r"""<!doctype html>
     el("overlay").hidden = false;
     document.body.classList.add("locked");
     window.requestAnimationFrame(function () { el("overlay").classList.add("open"); });
+    if (kind === "admin") {
+      el("dialog").innerHTML = adminDialog();
+      window.setTimeout(function () { el("admintoken").focus(); }, 30);
+      return;
+    }
     drawDialog();
     fetchDialog();
   }
@@ -898,7 +933,7 @@ DEBUG_PAGE = r"""<!doctype html>
     window.setTimeout(function () { if (!dlg.kind) { el("overlay").hidden = true; } }, 170);
   }
   function fetchDialog() {
-    if (!dlg.kind || !token) { return; }
+    if (!dlg.kind || !token || dlg.kind === "admin") { return; }
     var kind = dlg.kind, id = dlg.id;
     var url = kind === "run" ? "server-debug/runs/" + encodeURIComponent(id) + ".json"
                              : "server-debug/tools/" + encodeURIComponent(id) + ".json";
@@ -925,6 +960,7 @@ DEBUG_PAGE = r"""<!doctype html>
 
   function drawDialog() {
     if (!dlg.kind) { return; }
+    if (dlg.kind === "admin") { return; }    // drawn once, so typing is not wiped by a poll
     el("dialog").innerHTML = dlg.kind === "run" ? runDialog() : toolDialog();
   }
 
@@ -948,6 +984,10 @@ DEBUG_PAGE = r"""<!doctype html>
       '<button class="ghost" data-tool="' + esc(tool) + '">Tool view</button>' +
       '<button class="ghost" data-filter="tool" data-value="' + esc(tool) + '">Filter tool</button>' +
       (client ? '<button class="ghost" data-filter="client" data-value="' + esc(client) + '">Filter address</button>' : "") +
+      (admin.ok && (state === "queued_gpu" || state === "received" || state === "staging")
+        ? '<button class="ghost" data-prio="' + (((latest.admission || {}).priorities || {})[id] === "high" ? "normal" : "high") +
+          '" data-id="' + esc(id) + '">' + (((latest.admission || {}).priorities || {})[id] === "high" ? "Remove priority" : "\u2605 Give priority") + "</button>"
+        : "") +
       '<button class="ghost" data-copy="' + esc(id) + '">Copy id</button>' +
       '<button data-close="1">Close ✕</button></div></div>';
 
@@ -1085,6 +1125,53 @@ DEBUG_PAGE = r"""<!doctype html>
       "</div></div>";
   }
 
+  // ---- operator controls ----------------------------------------------
+  function toast(text) {
+    var node = el("toast");
+    node.textContent = text;
+    node.hidden = false;
+    window.clearTimeout(toast.timer);
+    toast.timer = window.setTimeout(function () { node.hidden = true; }, 2600);
+  }
+  function drawAdminButton() {
+    var enabled = latest && latest.server && latest.server.admin_enabled;
+    el("adminbtn").className = "ghost" + (admin.ok ? " on" : "");
+    el("adminbtn").textContent = admin.ok ? "Admin \u2713" : "Admin";
+    el("adminbtn").title = enabled === false ? "Operator controls are off: set ADMIN_TOKEN on the server"
+      : admin.ok ? "operator controls on; click to lock" : "unlock the operator controls";
+  }
+  function checkAdmin(candidate) {
+    return fetch("admin/check", { headers: { Authorization: "Bearer " + token, "X-Admin-Token": candidate } })
+      .then(function (r) {
+        if (r.status === 403) { throw new Error("Operator controls are off on this server: ADMIN_TOKEN is not set."); }
+        if (!r.ok) { throw new Error("That admin token was refused."); }
+        return true;
+      });
+  }
+  function adminDialog() {
+    return '<div class="dhd"><div><h3>Operator controls</h3><div class="rid">Reorder the queue and give a run priority. ' +
+      "Needs the admin token, which is not the API token every workstation holds.</div></div>" +
+      '<div class="acts"><button data-close="1">Close \u2715</button></div></div>' +
+      '<div class="dbody"><div class="adminbox"><input id="admintoken" type="password" placeholder="Admin token" autocomplete="off">' +
+      '<button id="adminsave" type="button">Unlock</button></div><div class="err" id="adminerr"></div>' +
+      '<div class="caveat">Priority puts a run ahead of every normal run waiting, lets it past the wait for a tool slot, ' +
+      "and admits it on the widest shape that fits instead of its fair share. A run already running keeps what it has. " +
+      "The token stays in this browser.</div></div>";
+  }
+  function adminAction(path, body, done) {
+    fetch(path, { method: "POST", headers: { Authorization: "Bearer " + token, "X-Admin-Token": admin.token,
+                                             "Content-Type": "application/json" }, body: JSON.stringify(body) })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (payload) {
+          if (r.status === 401) { admin.ok = false; drawAdminButton(); }
+          if (!r.ok) { throw new Error(payload.detail || ("The server answered " + r.status + ".")); }
+          return payload;
+        });
+      })
+      .then(function () { toast(done); load(); })
+      .catch(function (e) { toast(e.message); });
+  }
+
   // ---- assembly -----------------------------------------------------------
   function draw(d) {
     latest = d;
@@ -1100,7 +1187,8 @@ DEBUG_PAGE = r"""<!doctype html>
     drawTools(d);
     drawHistory(d);
     drawFilters();
-    if (dlg.kind) {
+    drawAdminButton();
+    if (dlg.kind && dlg.kind !== "admin") {
       // A live run's detail follows it; a tool view is heavier and refreshes slower.
       var every = dlg.kind === "run" ? EVERY : 10000;
       if (Date.now() - dlg.fetchedAt >= every - 200 && !(dlg.data && dlg.data.reaped)) { fetchDialog(); }
@@ -1116,7 +1204,15 @@ DEBUG_PAGE = r"""<!doctype html>
         if (!r.ok) { throw new Error("The server answered " + r.status + "."); }
         return r.json();
       })
-      .then(function (d) { el("gate").hidden = true; el("shell").hidden = false; draw(d); })
+      .then(function (d) {
+        el("gate").hidden = true; el("shell").hidden = false;
+        if (admin.token && !admin.ok && !admin.checked) {
+          admin.checked = true;
+          checkAdmin(admin.token).then(function () { admin.ok = true; if (latest) { draw(latest); } })
+            .catch(function () { admin.token = ""; });
+        }
+        draw(d);
+      })
       .catch(function (e) { el("gate").hidden = false; el("shell").hidden = true; el("gateerr").textContent = e.message; });
   }
   function tick() { if (live) { load(); } window.setTimeout(tick, EVERY); }
@@ -1154,6 +1250,40 @@ DEBUG_PAGE = r"""<!doctype html>
   document.addEventListener("click", function (event) {
     var t = event.target;
     if (t.closest("[data-close]") || t === el("overlay")) { closeDialog(); return; }
+    var mv = t.closest("[data-move]");
+    if (mv) {
+      adminAction("admin/queue/" + encodeURIComponent(mv.getAttribute("data-id")) + "/move",
+        { to: mv.getAttribute("data-move") }, "Moved " + mv.getAttribute("data-move") + ".");
+      return;
+    }
+    var pr = t.closest("[data-prio]");
+    if (pr) {
+      var level = pr.getAttribute("data-prio");
+      adminAction("admin/runs/" + encodeURIComponent(pr.getAttribute("data-id")) + "/priority",
+        { priority: level }, level === "high" ? "Priority given." : "Back to normal priority.");
+      return;
+    }
+    if (t.closest("#adminsave")) {
+      var candidate = el("admintoken").value.trim();
+      checkAdmin(candidate).then(function () {
+        admin.token = candidate; admin.ok = true;
+        try { window.localStorage.setItem(ADMIN_KEY, candidate); } catch (e) { /* private mode */ }
+        drawAdminButton(); closeDialog(); toast("Operator controls unlocked.");
+        if (latest) { draw(latest); }
+      }).catch(function (e) { el("adminerr").textContent = e.message; });
+      return;
+    }
+    if (t.closest("#adminbtn")) {
+      if (admin.ok) {
+        admin = { token: "", ok: false };
+        try { window.localStorage.removeItem(ADMIN_KEY); } catch (e) { /* private mode */ }
+        drawAdminButton(); toast("Operator controls locked.");
+        if (latest) { draw(latest); }
+      } else {
+        openDialog("admin", null);
+      }
+      return;
+    }
     var chip = t.closest("[data-clear]");
     if (chip) { setFilter(chip.getAttribute("data-clear"), filters[chip.getAttribute("data-clear")]); return; }
     var fbtn = t.closest("[data-filter]");
@@ -1170,7 +1300,10 @@ DEBUG_PAGE = r"""<!doctype html>
     var runNode = t.closest("[data-run]");
     if (runNode) { openDialog("run", runNode.getAttribute("data-run")); }
   });
-  document.addEventListener("keydown", function (event) { if (event.key === "Escape" && dlg.kind) { closeDialog(); } });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && dlg.kind) { closeDialog(); }
+    if (event.key === "Enter" && event.target && event.target.id === "admintoken") { el("adminsave").click(); }
+  });
   window.addEventListener("hashchange", function () { readUrl(); if (latest) { draw(latest); } });
 
   // A stable hue per origin, so two deployments open side by side never look alike.

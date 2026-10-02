@@ -156,7 +156,10 @@ def test_every_endpoint_that_starts_work_is_gated():
     # Endpoints that legitimately answer while the door is shut. Each one is
     # something a client needs to FINISH work it already started, or the
     # control that opens the door again.
-    ALLOWED_OPEN = {"/maintenance"}
+    # The operator's queue controls start nothing: they reorder or mark runs
+    # that are already waiting, which is exactly what an operator may need to
+    # do while an update is draining the server.
+    ALLOWED_OPEN = {"/maintenance", "/admin/queue/{run_id}/move", "/admin/runs/{run_id}/priority"}
     # This is also what catches a route that does not exist yet. A benchmark
     # battery is a run too, and the day `POST /benchmark/run` lands it arrives
     # here ungated and fails this test until somebody decides.
