@@ -100,3 +100,22 @@ def test_only_the_admin_token_can_touch_any_of_it():
     assert client.post("/admin/door", json={"accepting": False}, headers=api).status_code == 401
     assert client.post("/admin/update", json={"target": "all"}, headers=api).status_code == 401
     assert client.get("/admin-panel/updates.json", headers=api).status_code == 401
+
+
+def test_a_data_request_is_queued_for_the_agent_and_checked():
+    answer = client.post("/admin/data", json={"tool": "AMASSS", "force": True}, headers=_admin())
+    assert answer.status_code == 200
+    queued = client.get("/admin-panel/updates.json", headers=_admin()).json()["request"]
+    assert queued["kind"] == "data" and queued["tool"] == "AMASSS" and queued["force"] is True
+    # One request slot: an update cannot be queued behind it, nor another download.
+    assert client.post("/admin/update", json={"target": "all"}, headers=_admin()).status_code == 409
+    assert client.post("/admin/data", json={"tool": "ALI"}, headers=_admin()).status_code == 409
+    client.delete("/admin/update", headers=_admin())
+    assert client.post("/admin/data", json={"tool": "../etc"}, headers=_admin()).status_code == 422
+
+
+def test_the_tool_view_lists_what_the_server_holds_for_it():
+    payload = client.get("/admin-panel/tools/Test_Tool.json", headers=_admin()).json()
+    assert set(payload["data"]) >= {"models", "testfiles", "entries", "folder"}
+    unknown = client.get("/admin-panel/tools/NoSuchTool.json", headers=_admin()).json()
+    assert unknown["data"] is None

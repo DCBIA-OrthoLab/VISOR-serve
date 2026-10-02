@@ -884,6 +884,27 @@ def admin_update(wanted: _UpdateRequest) -> dict:
     return request
 
 
+class _DataRequest(BaseModel):
+    tool: str
+    force: bool = False
+
+
+@app.post("/admin/data", dependencies=[Depends(verify_admin)])
+def admin_data(wanted: _DataRequest) -> dict:
+    """Ask the host's agent to download a tool's models and test files.
+
+    `DATA/` is read-only inside the container, so the download happens on the
+    host, from the tools library's manifest -- what is missing, or everything
+    again with `force`. Nothing is stopped: a tool reads its data when it runs.
+    """
+    try:
+        request = updates.request_data(wanted.tool, wanted.force, by="admin panel")
+    except updates.UpdateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    logger.info("Operator requested the data of %s (force=%s)", wanted.tool, wanted.force)
+    return request
+
+
 @app.delete("/admin/update", dependencies=[Depends(verify_admin)])
 def admin_update_withdraw() -> dict:
     """Withdraw a pending update, while the agent is still waiting on runs."""
@@ -1144,6 +1165,13 @@ def server_debug_tool(tool_name: str, limit: int = 120) -> dict:
     finished = [r for r in records if r.get("seconds") is not None]
     since = min((r["started_at"] for r in records), default=time.time()) if records else None
     learned = costs.known().get(tool_name)
+    # What this deployment holds for the tool, as a workstation would see it.
+    # A tool in the history that is no longer served has none.
+    try:
+        hosted = list_tool_data(tool_name)
+        hosted["folder"] = deployment_config.data_slug(get_tool(tool_name).name)
+    except HTTPException:
+        hosted = None
     return {
         "tool": tool_name,
         "runs": records,
@@ -1164,6 +1192,7 @@ def server_debug_tool(tool_name: str, limit: int = 120) -> dict:
             "samples": learned.samples,
         } if learned else None,
         "trace": telemetry.trace(since=since, max_points=900),
+        "data": hosted,
     }
 
 

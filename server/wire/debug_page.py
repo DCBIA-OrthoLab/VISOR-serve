@@ -1109,6 +1109,7 @@ DEBUG_PAGE = r"""<!doctype html>
   function fetchDialog() {
     if (!dlg.kind || !token) { return; }
     if (dlg.kind === "updates") { loadUpdates(true); drawDialog(); return; }
+    if (dlg.kind === "tool") { loadUpdates(true); }
     var kind = dlg.kind, id = dlg.id;
     var url = kind === "run" ? "admin-panel/runs/" + encodeURIComponent(id) + ".json"
             : kind === "history" ? "admin-panel/history.json?limit=1000"
@@ -1217,7 +1218,7 @@ DEBUG_PAGE = r"""<!doctype html>
         if (!d) { return; }
         upd = d;
         drawMaint();
-        if (dlg.kind === "updates") { drawDialog(); }
+        if (dlg.kind === "updates" || dlg.kind === "tool") { drawDialog(); }
       })
       .catch(function () { /* the next poll tries again */ });
   }
@@ -1456,6 +1457,69 @@ DEBUG_PAGE = r"""<!doctype html>
     }).join("") + "</tbody></table>";
   }
 
+  // ---- a tool's data ---------------------------------------------------
+  function norm(name) { return String(name || "").toLowerCase().replace(/[^a-z0-9]/g, ""); }
+  function manifestFor(tool, folder) {
+    var tools = (((upd || {}).status || {}).data || {}).tools || {};
+    var keys = Object.keys(tools), i;
+    for (i = 0; i < keys.length; i++) {
+      var k = keys[i], provides = (tools[k].provides || []).map(norm);
+      if (norm(k) === norm(folder) || norm(k) === norm(tool) || provides.indexOf(norm(tool)) >= 0) {
+        return { key: k, info: tools[k] };
+      }
+    }
+    return null;
+  }
+  function hostedList(entries) {
+    if (!entries || !entries.length) { return '<div class="empty" style="text-align:left;padding:4px 0">Nothing.</div>'; }
+    return '<table class="io"><tbody>' + entries.map(function (e) {
+      return "<tr><td>" + (e.kind === "folder" ? "\ud83d\udcc1 " : "") + esc(e.name) + '</td><td class="mono" style="text-align:right">' +
+        bytes(e.size) + "</td></tr>";
+    }).join("") + "</tbody></table>";
+  }
+  function dataSection(name, data) {
+    if (!data) { return section("Data", '<div class="empty" style="text-align:left">This tool is not served here.</div>'); }
+    var hosted = '<div class="two"><div><div class="label">Models</div>' + hostedList((data.entries || {}).models) +
+      '</div><div><div class="label">Test files</div>' + hostedList((data.entries || {}).testfiles) + "</div></div>";
+    var scoped = data.scoped ? Object.keys(data.scoped).map(function (scope) {
+      var sc = data.scoped[scope];
+      return '<div style="margin-top:8px"><span class="label">testfiles/' + esc(scope) + "</span> " +
+        '<span style="color:var(--soft);font-size:12.5px">' + esc((sc.testfiles || []).join(", ") || "empty") + "</span></div>";
+    }).join("") : "";
+    var m = manifestFor(name, data.folder), st = (upd || {}).status || {};
+    var manifest = "";
+    if (!upd || !upd.agent.alive) {
+      manifest = '<div class="warnbox">The update agent is not running on the host, so the manifest cannot be compared ' +
+        "and nothing can be downloaded from here. Start it with <code>python3 scripts/update_agent.py</code>.</div>";
+    } else if (!m) {
+      manifest = '<div class="empty" style="text-align:left">The tools library\'s manifest lists nothing for this tool.</div>';
+    } else {
+      var entries = m.info.entries || [], missing = entries.filter(function (e) { return !e.present; });
+      var missingBytes = missing.reduce(function (a, e) { return a + (e.size || 0); }, 0);
+      var running = st.applying && st.applying.kind === "data" && st.applying.tool === m.key;
+      var busy = st.applying || upd.request;
+      manifest = '<div style="font-size:12.5px;color:var(--soft);margin-bottom:6px">' + (entries.length - missing.length) + " of " +
+        entries.length + " entries on disk" + (missing.length ? " \u00b7 " + bytes(missingBytes) + " missing" : "") +
+        " \u00b7 manifest key <b>" + esc(m.key) + "</b></div>" +
+        '<table class="io"><tbody>' + entries.map(function (e) {
+          return "<tr><td>" + esc(e.kind) + "</td><td>" + esc(e.name) + '</td><td class="mono" style="text-align:right">' +
+            bytes(e.size) + "</td><td>" + (e.present ? '<span class="pill done">on disk</span>' : '<span class="pill failed">missing</span>') +
+            "</td></tr>";
+        }).join("") + "</tbody></table>" +
+        (running ? '<div class="warnbox" style="margin-top:8px"><b>Downloading</b> \u00b7 ' + esc(st.applying.phase || "") + "</div>"
+          : '<div class="doorctl" style="margin-top:10px">' +
+            '<button class="primary" data-fetch="' + esc(m.key) + '"' + (missing.length && !busy ? "" : " disabled") + ">Download missing</button>" +
+            '<button data-fetch="' + esc(m.key) + '" data-force="1"' + (busy ? " disabled" : "") + ">Re-download everything</button>" +
+            (busy && !running ? '<span class="s">the agent is busy with another request</span>' : "") + "</div>");
+      if (st.last && st.last.kind === "data" && st.last.tool === m.key && now() - st.last.at < 3600) {
+        manifest += '<div class="' + (st.last.ok ? "okbox" : "warnbox") + '" style="margin-top:8px">' + esc(st.last.message) +
+          " \u00b7 " + ago(st.last.at) + " ago</div>";
+      }
+    }
+    return section("Data on this server \u00b7 DATA/" + esc(data.folder || name), hosted + scoped) +
+      section("From the tools library's manifest", manifest);
+  }
+
   function toolDialog() {
     var name = dlg.id, data = dlg.data;
     var head = '<div class="dhd"><div><h3>' + esc(name) + '</h3><div class="rid">every run of this tool the history holds</div></div>' +
@@ -1524,7 +1588,7 @@ DEBUG_PAGE = r"""<!doctype html>
     ], tr[0].at, Math.max(tr[tr.length - 1].at, tr[0].at + 1), { height: 130, marks: marks })
       : '<div class="empty" style="text-align:left">The machine trace covers the last six hours of this process only.</div>';
 
-    return head + '<div class="dbody">' + kpis + section("Where the time goes, on average", stack) +
+    return head + '<div class="dbody">' + kpis + dataSection(name, data.data) + section("Where the time goes, on average", stack) +
       section("Recent runs, each from its own start", runsGantt) +
       '<div class="two">' +
       section("Duration of each run", '<div class="legend"><span><i style="background:var(--accent)"></i>took</span>' +
@@ -1681,6 +1745,15 @@ DEBUG_PAGE = r"""<!doctype html>
         "Update requested. New runs are stopped once the agent picks it up.");
       updFetchedAt = 0;
       window.setTimeout(function () { loadUpdates(true); }, 600);
+      return;
+    }
+    var fe = t.closest("[data-fetch]");
+    if (fe && !fe.disabled) {
+      var force = fe.getAttribute("data-force") === "1";
+      adminAction("admin/data", { tool: fe.getAttribute("data-fetch"), force: force },
+        force ? "Re-download requested." : "Download requested.");
+      updFetchedAt = 0;
+      window.setTimeout(function () { loadUpdates(true); }, 800);
       return;
     }
     if (t.closest("[data-withdraw]")) {

@@ -22,6 +22,11 @@ two things:
       restart the server              (compose restart, or recreate if needed)
       reopen the door, report
 
+It also downloads a tool's models and test files when an operator asks
+(`{"kind": "data", "tool": ...}`), from the tools library's manifest into
+`DATA/`, which the container can only read. And each survey reports, per
+manifest entry, whether it is on disk -- what the panel's tool view lists.
+
 It never acts on its own: no request, no update. A change that needs an image
 rebuilt is reported and refused, because a pull cannot deliver it.
 
@@ -45,6 +50,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 
 import server_ctl  # noqa: E402 - beside this file, and stdlib only too
+import importlib.util  # noqa: E402
 
 REPO_ROOT = server_ctl.REPO_ROOT
 STATUS_FILE = "status.json"
@@ -214,6 +220,60 @@ def blockers(info: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Data: what the manifest lists, and what is on disk
+# ---------------------------------------------------------------------------
+
+def manifest_paths(tools_repo: str):
+    """`(fetch_data.py, data-manifest.yml)` from the tools library when it
+    carries them, else this repository's copy -- the same order setup-server
+    follows."""
+    for root in (tools_repo, REPO_ROOT):
+        if not root:
+            continue
+        engine = os.path.join(root, "scripts", "fetch_data.py")
+        manifest = os.path.join(root, "scripts", "data-manifest.yml")
+        if os.path.isfile(engine) and os.path.isfile(manifest):
+            return engine, manifest
+    return None, None
+
+
+def load_engine(path: str):
+    spec = importlib.util.spec_from_file_location("fetch_data_for_agent", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def data_summary(tools_repo: str, data_dir: str) -> dict:
+    """Per manifest entry: what it is, how big, and whether it is on disk."""
+    engine_path, manifest_path = manifest_paths(tools_repo)
+    if not engine_path:
+        return {"error": "no data manifest found", "tools": {}}
+    try:
+        engine = load_engine(engine_path)
+        manifest = engine._parse_manifest(manifest_path)
+    except Exception as exc:  # noqa: BLE001 - reported, never fatal to the agent
+        return {"error": f"the manifest could not be read: {exc}", "tools": {}}
+    tools = {}
+    for key, sections in manifest.items():
+        entries = []
+        for kind in engine.KINDS:
+            for entry in sections.get(kind, []):
+                if "name" not in entry:
+                    continue
+                target = engine._target_path(data_dir, {**entry, "tool": key, "kind": kind})
+                entries.append({
+                    "kind": kind,
+                    "name": entry.get("dest") or entry["name"],
+                    "size": entry.get("size"),
+                    "present": os.path.exists(target),
+                })
+        tools[key] = {"provides": sections.get("provides") or [], "entries": entries}
+    return {"error": "", "manifest": os.path.relpath(manifest_path, tools_repo or REPO_ROOT),
+            "data_dir": data_dir, "tools": tools}
+
+
+# ---------------------------------------------------------------------------
 # The agent
 # ---------------------------------------------------------------------------
 
@@ -228,6 +288,7 @@ class Agent:
         self.state["last"] = previous.get("last")
         self.server = {}
         self.tools = {}
+        self.data = {}
         self.log_lines = []
 
     # -- files ---------------------------------------------------------
@@ -249,6 +310,7 @@ class Agent:
             "poll": self.args.poll,
             "server": self.server,
             "tools": self.tools,
+            "data": self.data,
             "applying": self.state["applying"],
             "last": self.state["last"],
         }
@@ -307,7 +369,54 @@ class Agent:
         self.server = inspect(self.args.server_repo, "server", fetch=fetch)
         self.tools = inspect(self.args.tools_repo, "tools", fetch=fetch) if self.args.tools_repo else {
             "kind": "tools", "error": "no tools checkout configured (SADT_TOOLS or --tools-repo)"}
+        self.data = data_summary(self.args.tools_repo, self.args.data_dir)
         self.write_status()
+
+    def apply_data(self, request: dict) -> None:
+        """Download one tool's data from the manifest. No door, no restart: the
+        server reads DATA/ live, and a tool reads its data when it runs."""
+        tool = request.get("tool") or ""
+        force = bool(request.get("force"))
+        self.log_lines = []
+        self.state["applying"] = {"id": request.get("id"), "kind": "data", "tool": tool,
+                                  "started_at": time.time(), "phase": "", "log": []}
+        ok, message = False, ""
+        try:
+            try:
+                os.remove(self._path(REQUEST_FILE))
+            except FileNotFoundError:
+                pass
+            engine, manifest = manifest_paths(self.args.tools_repo)
+            if not engine:
+                message = "No data manifest found in the tools library."
+                return
+            command = [sys.executable, engine, "--manifest", manifest, "--data-dir", self.args.data_dir,
+                       "--tool", tool, "--progress", "always"] + (["--force"] if force else [])
+            self.phase(("Re-downloading" if force else "Downloading what is missing for") + f" {tool}.")
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            last_write = 0.0
+            for line in process.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
+                self.state["applying"]["phase"] = line.strip()
+                self.state["applying"]["log"] = self.log_lines
+                if time.monotonic() - last_write > 1:
+                    self.write_status()
+                    last_write = time.monotonic()
+            process.wait()
+            ok = process.returncode == 0
+            message = (f"The data of {tool} is in place." if ok
+                       else f"Some of {tool}'s data could not be downloaded; see the log.")
+        except Exception as exc:  # noqa: BLE001
+            message = f"The download stopped on an unexpected error: {exc}"
+        finally:
+            self.state["last"] = {"id": request.get("id"), "kind": "data", "tool": tool, "ok": ok,
+                                  "message": message, "at": time.time(), "log": self.log_lines}
+            self.state["applying"] = None
+            log(message)
+            self.survey(fetch=False)
 
     # -- applying ------------------------------------------------------
     def apply(self, request: dict) -> None:
@@ -423,7 +532,10 @@ class Agent:
         while True:
             request = self._read(REQUEST_FILE)
             if request:
-                self.apply(request)
+                if request.get("kind") == "data":
+                    self.apply_data(request)
+                else:
+                    self.apply(request)
                 next_survey = time.monotonic() + self.args.poll
             elif time.monotonic() >= next_survey:
                 self.survey()
@@ -451,6 +563,8 @@ def main(argv=None) -> int:
     parser.add_argument("--server-repo", default=REPO_ROOT)
     parser.add_argument("--tools-repo", default=None, help="Default: the checkout holding SADT_TOOLS.")
     parser.add_argument("--update-dir", default=os.path.join(REPO_ROOT, "server", ".update"))
+    parser.add_argument("--data-dir", default=os.path.join(REPO_ROOT, "DATA"),
+                        help="Where models and test files are downloaded (the server's DATA/).")
     parser.add_argument("--url", default=None, help="Default: this deployment's own address.")
     parser.add_argument("--token", default=None, help="Default: API_TOKEN from the .env.")
     parser.add_argument("--service", default=None, help="The compose service to restart.")

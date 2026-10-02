@@ -93,6 +93,24 @@ def request_update(target: str, by: Optional[str] = None) -> dict:
     return request
 
 
+def request_data(tool: str, force: bool = False, by: Optional[str] = None) -> dict:
+    """Ask the agent to download a tool's models and test files from the
+    manifest: what is missing, or everything again with `force`. Shares the
+    one request slot with updates, so a download and an update never run at
+    the same time."""
+    if not tool or len(tool) > 100 or not all(c.isalnum() or c in "_-" for c in tool):
+        raise UpdateError("A tool is named by its identifier.", 422)
+    if _read(REQUEST_FILE):
+        raise UpdateError("The agent already has a request; wait for it to finish or withdraw it.")
+    request = {"id": secrets.token_hex(6), "kind": "data", "tool": tool, "force": bool(force),
+               "at": time.time(), "by": by}
+    try:
+        _write(REQUEST_FILE, request)
+    except OSError as exc:
+        raise UpdateError(f"Could not record the request in {settings.UPDATE_DIR}: {exc}", 500)
+    return request
+
+
 def withdraw() -> bool:
     """Remove a pending request. True if there was one.
 

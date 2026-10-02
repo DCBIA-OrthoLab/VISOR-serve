@@ -129,6 +129,7 @@ def _agent(agent_module, checkout, tmp_path, **extra):
     args = agent_module.argparse.Namespace(
         server_repo=str(checkout), tools_repo="", update_dir=str(tmp_path / "update"),
         url="http://127.0.0.1:1", token="t", service=None, restart_cmd="true", poll=60,
+        data_dir=str(tmp_path / "DATA"),
         health_timeout=5, no_sync=True, once=True)
     for key, value in extra.items():
         setattr(args, key, value)
@@ -204,3 +205,47 @@ def test_a_failed_restart_still_reopens_the_door(agent_module, repos, tmp_path, 
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is False and "restart failed" in last["message"]
     assert server.door_calls[-1] is True
+
+
+def _manifest_repo(tmp_path):
+    repo = tmp_path / "tools-lib"
+    (repo / "scripts").mkdir(parents=True)
+    engine = os.path.join(_SCRIPTS, "fetch_data.py")
+    (repo / "scripts" / "fetch_data.py").write_text(open(engine).read())
+    (repo / "scripts" / "data-manifest.yml").write_text(
+        "tools:\n"
+        "  AMASSS:\n"
+        "    models:\n"
+        "      - name: weights.zip\n"
+        "        dest: AMASSS_Models\n"
+        "        url: https://example.invalid/w.zip\n"
+        "        size: 1000\n"
+        "        extract: true\n"
+        "    testfiles:\n"
+        "      - name: scan.nii.gz\n"
+        "        url: https://example.invalid/scan.nii.gz\n"
+        "        size: 20\n")
+    return repo
+
+
+def test_the_survey_says_which_manifest_entries_are_on_disk(agent_module, tmp_path):
+    repo = _manifest_repo(tmp_path)
+    data = tmp_path / "DATA"
+    (data / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    summary = agent_module.data_summary(str(repo), str(data))
+    entries = {e["name"]: e for e in summary["tools"]["AMASSS"]["entries"]}
+    assert entries["AMASSS_Models"]["present"] is True and entries["AMASSS_Models"]["kind"] == "models"
+    assert entries["scan.nii.gz"]["present"] is False and entries["scan.nii.gz"]["size"] == 20
+
+
+def test_a_data_request_runs_the_download_for_that_tool_only(agent_module, repos, tmp_path):
+    _writer, checkout = repos
+    repo = _manifest_repo(tmp_path)
+    agent = _agent(agent_module, checkout, tmp_path, tools_repo=str(repo))
+    os.makedirs(agent.update_dir, exist_ok=True)
+    agent.apply_data({"id": "d1", "kind": "data", "tool": "AMASSS", "force": False})
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    # example.invalid cannot be reached, so the download fails -- and says so,
+    # with the engine's own output in the log.
+    assert last["kind"] == "data" and last["tool"] == "AMASSS" and last["ok"] is False
+    assert any("AMASSS" in line for line in last["log"])
