@@ -78,6 +78,24 @@ def _offer(address, batch, run_id):
     return clients.may_start(address, batch, run_id)
 
 
+def test_a_higher_batch_arriving_first_waits_for_the_lower_ones(monkeypatch):
+    """Sent together, batch 4 can reach the server before batch 1."""
+    assert not _offer("10.0.0.5", _batch(3), "r3"), "batch 3 started before 1 and 2 arrived"
+    assert _offer("10.0.0.5", _batch(1), "r1")
+
+
+def test_a_lower_batch_that_never_comes_holds_the_rest_only_briefly(monkeypatch):
+    monkeypatch.setattr(clients, "ARRIVAL_GRACE_SECONDS", 0.0)
+    assert _offer("10.0.0.5", _batch(3), "r3")
+
+
+def test_a_serial_client_sending_one_at_a_time_never_waits_for_the_grace():
+    """Batch 2 arrives after batch 1 has finished, which it remembers."""
+    assert _offer("10.0.0.5", _batch(1), "r1")
+    clients.leave("10.0.0.5", _batch(1), "r1")
+    assert _offer("10.0.0.5", _batch(2), "r2")
+
+
 def test_serial_lets_one_batch_through_lowest_index_first():
     clients.wait("10.0.0.5", _batch(3), "r3")
     clients.wait("10.0.0.5", _batch(1), "r1")

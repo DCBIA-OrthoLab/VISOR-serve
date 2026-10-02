@@ -327,14 +327,14 @@ DEBUG_PAGE = r"""<!doctype html>
   .stack-keys b { color: var(--ink); }
 
   /* clients */
-  .client { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 16px; padding: 12px 4px;
+  .client { display: grid; grid-template-columns: 290px minmax(0, 1fr); gap: 16px; padding: 12px 4px;
             border-bottom: 1px solid var(--line); }
   .client:last-child { border-bottom: none; }
   @media (max-width: 900px) { .client { grid-template-columns: 1fr; } }
   .client .addr { font-weight: 700; font-size: 14px; }
   .client .meta { font-size: 12px; color: var(--soft); margin-top: 2px; }
   .seg2 { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; margin-top: 8px; }
-  .seg2 button { border: none; border-radius: 0; padding: 4px 10px; font-size: 12px; background: var(--panel); }
+  .seg2 button { border: none; border-radius: 0; padding: 4px 10px; font-size: 12px; background: var(--panel); white-space: nowrap; }
   .seg2 button.on { background: var(--accent); color: #fff; font-weight: 650; }
   .seg2 button:disabled { cursor: default; opacity: 1; }
   .seg2 button:disabled:not(.on) { color: var(--ghost); }
@@ -960,7 +960,8 @@ DEBUG_PAGE = r"""<!doctype html>
       rows.map(function (r) {
         var called = [];
         (r.nested || []).forEach(function (c) { if (called.indexOf(c.tool) < 0) { called.push(c.tool); } });
-        return '<tr data-run="' + esc(r.run_id) + '"><td><b>' + esc(r.tool || "?") + "</b></td>" +
+        return '<tr data-run="' + esc(r.run_id) + '"><td><b>' + esc(r.tool || "?") + "</b>" +
+          (r.batch ? ' <span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") + "</td>" +
           '<td style="color:var(--soft)">' + esc(called.join(", ") || "—") + "</td>" +
           '<td class="mono">' + esc(r.client || "—") + "</td><td>" + pill(r.outcome) + "</td>" +
           "<td>" + phaseBar(r.spans, r.seconds) + "</td>" +

@@ -115,6 +115,18 @@ def policies() -> dict:
 _gate_lock = threading.Lock()
 _active: dict = {}             # (address, batch id) -> set of run ids
 _waiting: dict = {}            # (address, batch id) -> {run id: index}
+# Every index of a cohort that has reached the gate, and when the cohort was
+# last seen, so a batch can tell "batch 1 has not arrived yet" from "batch 1
+# already ran". Forgotten after a while of nothing.
+_seen: dict = {}               # (address, batch id) -> {"indices": set, "at": t}
+_arrived: dict = {}            # run id -> when it reached the gate
+
+# How long a serial batch waits for a LOWER index that has not arrived yet.
+# A client sending its batches together sends them within a second or two; a
+# lower batch that never comes (cancelled before it was sent) must not hold
+# the rest of the cohort for ever.
+ARRIVAL_GRACE_SECONDS = 10.0
+_SEEN_TTL_SECONDS = 6 * 3600
 
 
 def _key(address, batch) -> tuple:
@@ -123,15 +135,24 @@ def _key(address, batch) -> tuple:
 
 def wait(address: Optional[str], batch: dict, run_id: str) -> None:
     """Declare that this batch wants to start. Pair with `may_start`/`leave`."""
+    now = time.time()
+    key = _key(address, batch)
     with _gate_lock:
-        _waiting.setdefault(_key(address, batch), {})[run_id] = batch["index"]
+        for stale in [k for k, v in _seen.items() if now - v["at"] > _SEEN_TTL_SECONDS]:
+            _seen.pop(stale, None)
+        _waiting.setdefault(key, {})[run_id] = batch["index"]
+        seen = _seen.setdefault(key, {"indices": set(), "at": now})
+        seen["indices"].add(batch["index"])
+        seen["at"] = now
+        _arrived.setdefault(run_id, now)
 
 
 def may_start(address: Optional[str], batch: dict, run_id: str) -> bool:
     """True, and the batch is marked running, when it may go now.
 
-    Parallel: always. Serial: when no other batch of this cohort is running and
-    this one has the lowest index of those waiting.
+    Parallel: always. Serial: when no other batch of this cohort is running,
+    this one has the lowest index of those waiting, and every lower index has
+    already arrived -- or has been given `ARRIVAL_GRACE_SECONDS` to.
     """
     key = _key(address, batch)
     with _gate_lock:
@@ -141,7 +162,12 @@ def may_start(address: Optional[str], batch: dict, run_id: str) -> bool:
                 return False
             if waiting and min(waiting.values()) < waiting.get(run_id, batch["index"]):
                 return False
+            seen = _seen.get(key, {"indices": set()})["indices"]
+            missing = any(index not in seen for index in range(1, batch["index"]))
+            if missing and time.time() - _arrived.get(run_id, 0) < ARRIVAL_GRACE_SECONDS:
+                return False
         waiting.pop(run_id, None)
+        _arrived.pop(run_id, None)
         if not waiting:
             _waiting.pop(key, None)
         _active.setdefault(key, set()).add(run_id)
@@ -152,6 +178,7 @@ def leave(address: Optional[str], batch: dict, run_id: str) -> None:
     """The batch ended, or gave up waiting."""
     key = _key(address, batch)
     with _gate_lock:
+        _arrived.pop(run_id, None)
         waiting = _waiting.get(key)
         if waiting is not None:
             waiting.pop(run_id, None)
@@ -172,3 +199,5 @@ def reset() -> None:
     with _gate_lock:
         _active.clear()
         _waiting.clear()
+        _seen.clear()
+        _arrived.clear()
