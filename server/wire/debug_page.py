@@ -52,35 +52,35 @@ DEBUG_PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Server dashboard</title>
 <style>
+  /* An operator's console: one ink-blue accent, slate neutrals, hairlines
+     instead of boxes. Surfaces are see-through so the page reads as one sheet
+     with regions marked on it, not as a stack of cards. */
   :root {
-    --bg: #f3f4f6; --panel: #ffffff; --sunk: #f6f7f9; --line: #e3e6ea;
-    --ink: #14171c; --soft: #5f6773; --ghost: #9aa1ab;
-    --bar: #e8ebef; --accent: #2f6fdb; --accent-soft: #e6eefc;
-    --ok: #1f9d6b; --warn: #d4860f; --hot: #d14343; --violet: #7a5bd6;
-    --staging: #8a96a8;
-    --shadow: 0 1px 2px rgba(16,24,40,.05), 0 4px 16px rgba(16,24,40,.06);
-    --shadow-lg: 0 24px 64px rgba(16,24,40,.22);
-    --radius: 12px;
-  }
-  :root[data-theme="dark"] {
-    --bg: #0d1014; --panel: #151a20; --sunk: #11151a; --line: #262d36;
-    --ink: #e8ebef; --soft: #9aa3ae; --ghost: #5f6873;
-    --bar: #222932; --accent: #6ea2ff; --accent-soft: #1b2638;
-    --ok: #3fc48d; --warn: #f0a63a; --hot: #f07070; --violet: #a68cf5;
-    --staging: #7d8898;
-    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.3);
-    --shadow-lg: 0 24px 64px rgba(0,0,0,.6);
+    --bg: #eef1f4; --panel: rgba(255,255,255,.62); --sunk: rgba(30,48,72,.045);
+    --line: rgba(30,48,72,.13); --ink: #16202b; --soft: #556270; --ghost: #8b96a3;
+    --bar: rgba(30,48,72,.09); --accent: #2558a8; --accent-soft: rgba(37,88,168,.10);
+    --ok: #1d8a5c; --warn: #b8730c; --hot: #c23b3b; --violet: #6b55c4; --staging: #7d8a9a;
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
+    --shadow-lg: 0 18px 50px rgba(16,24,40,.20);
+    --radius: 8px;
   }
   @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
-      --bg: #0d1014; --panel: #151a20; --sunk: #11151a; --line: #262d36;
-      --ink: #e8ebef; --soft: #9aa3ae; --ghost: #5f6873;
-      --bar: #222932; --accent: #6ea2ff; --accent-soft: #1b2638;
-      --ok: #3fc48d; --warn: #f0a63a; --hot: #f07070; --violet: #a68cf5;
-      --staging: #7d8898;
-      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.3);
-      --shadow-lg: 0 24px 64px rgba(0,0,0,.6);
+      --bg: #0f1419; --panel: rgba(255,255,255,.035); --sunk: rgba(255,255,255,.04);
+      --line: rgba(200,215,235,.12); --ink: #e3e8ee; --soft: #9aa6b3; --ghost: #66727f;
+      --bar: rgba(200,215,235,.10); --accent: #7fa8ea; --accent-soft: rgba(127,168,234,.13);
+      --ok: #45b884; --warn: #e2a24a; --hot: #ec7b7b; --violet: #a493ec; --staging: #8492a3;
+      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+      --shadow-lg: 0 18px 50px rgba(0,0,0,.6);
     }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0f1419; --panel: rgba(255,255,255,.035); --sunk: rgba(255,255,255,.04);
+    --line: rgba(200,215,235,.12); --ink: #e3e8ee; --soft: #9aa6b3; --ghost: #66727f;
+    --bar: rgba(200,215,235,.10); --accent: #7fa8ea; --accent-soft: rgba(127,168,234,.13);
+    --ok: #45b884; --warn: #e2a24a; --hot: #ec7b7b; --violet: #a493ec; --staging: #8492a3;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
+    --shadow-lg: 0 18px 50px rgba(0,0,0,.6);
   }
   * { box-sizing: border-box; }
   /* Scrollbars in the page's own colours: the browser's default is a light
@@ -99,6 +99,7 @@ DEBUG_PAGE = r"""<!doctype html>
   ::-webkit-scrollbar-thumb:hover { background: var(--thumb-hover); background-clip: padding-box; }
   ::-webkit-scrollbar-corner { background: transparent; }
   [hidden] { display: none !important; }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
   html, body { min-height: 100%; }
   body {
     margin: 0; background: var(--bg); color: var(--ink);
@@ -120,7 +121,8 @@ DEBUG_PAGE = r"""<!doctype html>
   /* ---- shell ---------------------------------------------------------- */
   #shell { max-width: 1680px; margin: 0 auto; padding: 16px 20px 28px;
            display: flex; flex-direction: column; gap: 14px; }
-  header { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  header { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  header button.ghost { padding: 6px 9px; }
   #flag { width: 10px; height: 38px; border-radius: 5px; background: var(--ghost); flex: none; }
   h1 { font-size: 20px; font-weight: 700; letter-spacing: -.015em; margin: 0; line-height: 1.15; }
   #host { color: var(--soft); font-size: 12px; }
@@ -139,12 +141,10 @@ DEBUG_PAGE = r"""<!doctype html>
   .fchip i { font-style: normal; opacity: .7; }
 
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-          box-shadow: var(--shadow); display: flex; flex-direction: column; min-width: 0; }
-  .card > h2 { margin: 0; padding: 13px 16px 11px; font-size: 13px; font-weight: 650;
+          display: flex; flex-direction: column; min-width: 0; }
+  .card > h2 { margin: 0; padding: 11px 14px 9px; font-size: 13px; font-weight: 650;
                display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
-  .card > h2 .count { font-size: 11.5px; font-weight: 600; color: var(--soft);
-                      background: var(--sunk); border: 1px solid var(--line);
-                      border-radius: 999px; padding: 0 8px; }
+  .card > h2 .count { font-size: 12px; font-weight: 600; color: var(--soft); }
   .card > h2 .note { margin-left: auto; font-weight: 400; color: var(--ghost); font-size: 11.5px; }
   .body { padding: 12px 14px; min-height: 0; }
   .scroll { overflow: auto; }
@@ -153,11 +153,16 @@ DEBUG_PAGE = r"""<!doctype html>
            font-weight: 600; }
 
   /* ---- vitals --------------------------------------------------------- */
-  #vitals { display: grid; gap: 12px; grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  /* One strip, divided, rather than six tiles: these are readings of one
+     machine, and boxing each one made them look like six separate things. */
+  #vitals { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr));
+            border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
   @media (max-width: 1200px) { #vitals { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   @media (max-width: 640px) { #vitals { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-  .vital { padding: 12px 14px 8px; position: relative; overflow: hidden; }
-  .vital .v { font-size: 26px; font-weight: 700; letter-spacing: -.02em; line-height: 1.1; margin-top: 4px; }
+  .vital { padding: 10px 14px 6px; position: relative; overflow: hidden; border: none;
+           border-radius: 0; background: transparent; border-left: 1px solid var(--line); }
+  .vital:first-child { border-left: none; }
+  .vital .v { font-size: 22px; font-weight: 650; letter-spacing: -.01em; line-height: 1.15; margin-top: 2px; }
   .vital .v small { font-size: 13px; font-weight: 500; color: var(--soft); margin-left: 3px; }
   .vital .f { font-size: 11.5px; color: var(--soft); margin-top: 1px; white-space: nowrap;
               overflow: hidden; text-overflow: ellipsis; }
@@ -181,15 +186,15 @@ DEBUG_PAGE = r"""<!doctype html>
 
   /* the queue */
   .qitem { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; padding: 8px 10px;
-           border: 1px solid var(--line); border-radius: 10px; margin-bottom: 7px; cursor: pointer;
-           background: color-mix(in srgb, var(--warn) 6%, var(--panel)); }
+           border: 1px solid var(--line); border-radius: 6px; margin-bottom: 6px; cursor: pointer;
+           background: color-mix(in srgb, var(--warn) 7%, transparent); }
   .qitem:hover { border-color: var(--warn); }
   .qitem .pos { width: 24px; height: 24px; border-radius: 50%; flex: none; display: grid;
                 place-items: center; font-size: 12px; font-weight: 700; color: #fff; background: var(--warn); }
   .qitem .n { font-weight: 650; font-size: 13.5px; }
   .qitem .m { font-size: 11.5px; color: var(--soft); }
-  .qitem.held { background: var(--sunk); border-style: dashed; }
-  .qitem.slot { background: var(--sunk); }
+  .qitem.held { background: transparent; border-style: dashed; }
+  .qitem.slot { background: transparent; }
   .qitem.slot .pos { background: var(--staging); }
   .qitem.held .pos { background: var(--ghost); }
   .rank { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; }
@@ -200,12 +205,10 @@ DEBUG_PAGE = r"""<!doctype html>
 
   /* running */
   .runs { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
-  .run { border: 1px solid var(--line); border-radius: 11px; padding: 11px 13px 12px;
-         background: var(--panel); cursor: pointer; position: relative; overflow: hidden;
-         transition: border-color .15s, transform .15s, box-shadow .15s; }
-  .run:hover { border-color: var(--accent); box-shadow: var(--shadow); transform: translateY(-1px); }
-  .run::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--ok); }
-  .run.q::before { background: var(--warn); } .run.s::before { background: var(--staging); }
+  .run { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px 11px;
+         background: var(--sunk); cursor: pointer; position: relative; overflow: hidden;
+         transition: border-color .15s; }
+  .run:hover { border-color: var(--accent); }
   .run .hd { display: flex; align-items: center; gap: 8px; }
   .run .nm { font-weight: 700; font-size: 15px; }
   .run .pc { margin-left: auto; font-size: 15px; font-weight: 700; color: var(--ok); }
@@ -223,7 +226,8 @@ DEBUG_PAGE = r"""<!doctype html>
   .chain .link.now { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); font-weight: 650; }
   .chain .sep { color: var(--ghost); }
   .cells { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 10px; }
-  .cell { background: var(--sunk); border-radius: 7px; padding: 4px 7px; }
+  .cell { border-left: 1px solid var(--line); padding: 1px 8px; }
+  .cell:first-child { border-left: none; padding-left: 0; }
   .cell u { display: block; font-size: 9.5px; letter-spacing: .06em; color: var(--ghost);
             text-transform: uppercase; text-decoration: none; }
   .cell b { font-size: 12.5px; font-weight: 600; }
@@ -251,9 +255,9 @@ DEBUG_PAGE = r"""<!doctype html>
 
   /* tools */
   #tools .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); }
-  .tool { border: 1px solid var(--line); border-radius: 11px; padding: 11px 13px; cursor: pointer;
-          background: var(--panel); transition: border-color .15s, box-shadow .15s, transform .15s; }
-  .tool:hover { border-color: var(--accent); box-shadow: var(--shadow); transform: translateY(-1px); }
+  .tool { border: 1px solid var(--line); border-radius: 6px; padding: 10px 12px; cursor: pointer;
+          background: var(--sunk); transition: border-color .15s; }
+  .tool:hover { border-color: var(--accent); }
   .tool .hd { display: flex; align-items: center; gap: 7px; }
   .tool .nm { font-weight: 700; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tool .badge { margin-left: auto; }
@@ -277,7 +281,7 @@ DEBUG_PAGE = r"""<!doctype html>
   .minibar i { display: block; height: 100%; }
 
   /* pills */
-  .pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 8px; border-radius: 999px;
+  .pill { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 4px;
           background: var(--sunk); color: var(--soft); white-space: nowrap; }
   .pill.running, .pill.done, .pill.packaging { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
   .pill.queued_gpu, .pill.paused { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
@@ -290,8 +294,8 @@ DEBUG_PAGE = r"""<!doctype html>
              background: color-mix(in srgb, #0b0e12 46%, transparent); backdrop-filter: blur(3px);
              opacity: 0; transition: opacity .16s ease; }
   #overlay.open { opacity: 1; }
-  #dialog { width: min(1180px, 100%); background: var(--panel); border: 1px solid var(--line);
-            border-radius: 16px; box-shadow: var(--shadow-lg); transform: translateY(10px) scale(.99);
+  #dialog { width: min(1180px, 100%); background: var(--bg); border: 1px solid var(--line);
+            border-radius: 10px; box-shadow: var(--shadow-lg); transform: translateY(10px) scale(.99);
             transition: transform .18s ease; }
   #overlay.open #dialog { transform: none; }
   .dhd { display: flex; align-items: flex-start; gap: 12px; padding: 18px 22px 14px;
@@ -303,7 +307,7 @@ DEBUG_PAGE = r"""<!doctype html>
   .section h4 { margin: 0 0 8px; font-size: 12px; letter-spacing: .06em; text-transform: uppercase;
                 color: var(--ghost); font-weight: 650; }
   .kpis { display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); }
-  .kpi { background: var(--sunk); border-radius: 10px; padding: 9px 12px; }
+  .kpi { border-left: 2px solid var(--line); padding: 2px 12px; }
   .kpi u { display: block; font-size: 10.5px; letter-spacing: .05em; color: var(--ghost);
            text-transform: uppercase; text-decoration: none; font-weight: 600; }
   .kpi b { font-size: 17px; font-weight: 700; }
@@ -313,7 +317,7 @@ DEBUG_PAGE = r"""<!doctype html>
   table.io tr { cursor: default; }
   table.io tr:hover td { background: none; }
   table.io td:first-child { color: var(--soft); white-space: nowrap; }
-  .con { background: var(--sunk); border: 1px solid var(--line); border-radius: 10px; padding: 9px 11px;
+  .con { background: var(--sunk); border: 1px solid var(--line); border-radius: 6px; padding: 9px 11px;
          max-height: 260px; overflow: auto; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .con .ln { display: flex; gap: 10px; }
   .con .ts { color: var(--ghost); flex: none; }
@@ -379,7 +383,7 @@ DEBUG_PAGE = r"""<!doctype html>
          padding-left: 34px; margin-top: -2px; }
   .ctl button { padding: 2px 7px; font-size: 12px; border-radius: 6px; line-height: 1.3; }
   .ctl button.star.on { background: var(--hot); border-color: var(--hot); color: #fff; }
-  .qitem.high { border-color: var(--hot); background: color-mix(in srgb, var(--hot) 8%, var(--panel)); }
+  .qitem.high { border-color: color-mix(in srgb, var(--hot) 55%, transparent); background: color-mix(in srgb, var(--hot) 8%, transparent); }
   .qitem.high .pos { background: var(--hot); }
   .prio { font-size: 10.5px; font-weight: 700; color: var(--hot); letter-spacing: .04em; }
   .adminbox { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
@@ -416,7 +420,7 @@ DEBUG_PAGE = r"""<!doctype html>
     </div>
     <span class="grow"></span>
     <span id="filters"></span>
-    <input id="find" style="min-width:290px" type="search" placeholder="Filter: run id, tool or address" autocomplete="off" spellcheck="false">
+    <input id="find" style="min-width:200px;width:220px" type="search" placeholder="Filter: run id, tool or address" autocomplete="off" spellcheck="false">
     <span id="live"><span class="dot" id="dot"></span><span id="livetext">live</span></span>
     <button id="toggle" type="button" class="ghost">Pause</button>
     <a class="navlink" href="benchmark" title="launch a benchmark preset on this server">Run a benchmark</a>
@@ -452,9 +456,7 @@ DEBUG_PAGE = r"""<!doctype html>
       <div class="body">
         <div id="m-tanks"></div>
         <div class="label" style="margin-top:4px">Last 30 minutes</div>
-        <div class="legend"><span><i style="background:var(--accent)"></i>cpu</span>
-          <span><i style="background:var(--violet)"></i>ram</span>
-          <span><i style="background:var(--ok)"></i>vram</span></div>
+        <div class="legend" id="m-legend"></div>
         <div id="m-chart"></div>
         <div class="legend" style="margin-top:8px"><span><i style="background:var(--ok)"></i>running</span>
           <span><i style="background:var(--warn)"></i>waiting</span></div>
@@ -724,7 +726,7 @@ DEBUG_PAGE = r"""<!doctype html>
     });
   }
   function vital(label, value, unit, foot, cls, sparkline) {
-    return '<div class="card vital ' + (cls || "") + '"><div class="label">' + esc(label) + "</div>" +
+    return '<div class="vital ' + (cls || "") + '"><div class="label">' + esc(label) + "</div>" +
       '<div class="v mono">' + value + (unit ? "<small>" + unit + "</small>" : "") + "</div>" +
       '<div class="f">' + foot + "</div>" + (sparkline || "") + "</div>";
   }
@@ -743,14 +745,14 @@ DEBUG_PAGE = r"""<!doctype html>
         spark(traceOf(d, "waiting"), "var(--warn)")) +
       vital("CPU", cpu == null ? "—" : cpu.toFixed(0), "%",
         (a.cpus_held == null ? "?" : a.cpus_held.toFixed(1)) + " of " + (b.cpus == null ? "?" : b.cpus.toFixed(0)) +
-        " cores held", cpu > 90 ? "hot" : "", spark(traceOf(d, "cpu"), "var(--accent)", 100)) +
+        " cores held", cpu > 90 ? "hot" : "", spark(traceOf(d, "cpu"), "var(--series-1)", 100)) +
       vital("RAM", ram ? (ram.used / 1073741824).toFixed(0) : "—", ram ? "/ " + (ram.total / 1073741824).toFixed(0) + " G" : "",
         gib(a.ram_held) + " held by runs", ram && pct(ram.used, ram.total) > 90 ? "hot" : "",
-        spark(traceOf(d, "ram", ram && ram.total), "var(--violet)", 100)) +
+        spark(traceOf(d, "ram", ram && ram.total), "var(--series-2)", 100)) +
       vital("VRAM", vramUsed == null ? "—" : (vramUsed / 1073741824).toFixed(1),
         card.total_bytes ? "/ " + (card.total_bytes / 1073741824).toFixed(0) + " G" : "",
         card.total_bytes ? gib(a.vram_held) + " held by runs" : "no card", "",
-        spark(traceOf(d, "vram", card.total_bytes), "var(--ok)", 100)) +
+        spark(traceOf(d, "vram", card.total_bytes), "var(--series-3)", 100)) +
       vital("Finished today", today.length, "",
         today.filter(function (r) { return r.outcome === "done"; }).length + " succeeded \u00b7 " +
         today.filter(function (r) { return r.outcome === "failed"; }).length + " failed", "", "");
@@ -770,7 +772,8 @@ DEBUG_PAGE = r"""<!doctype html>
     // apart), then room on the machine ("queued_gpu").
     // The order admission will actually admit in, which an operator may have
     // changed; runs still waiting for a slot follow, oldest first.
-    var adm = d.admission || {}, prios = adm.priorities || {}, position = {};
+    var adm = d.admission || {}, prios = adm.priorities || {}, position = {}, serialClients = {};
+    (d.clients || []).forEach(function (c) { if (c.batches === "serial") { serialClients[c.client] = true; } });
     (adm.queue || []).forEach(function (entry) { if (entry.run_id) { position[entry.run_id] = entry.position; } });
     var waiting = (d.runs || []).filter(function (r) {
       return inFlight(r) && (r.phase === "queued_gpu" || r.phase === "received") && matches(r, byId[r.run_id]);
@@ -781,6 +784,17 @@ DEBUG_PAGE = r"""<!doctype html>
     el("q-count").textContent = waiting.length;
     el("q-list").innerHTML = waiting.length ? waiting.map(function (r, i) {
       var slot = r.phase === "received", high = prios[r.run_id] === "high";
+      // A serial cohort's later batches wait at the batch gate, before any
+      // slot: say which batch they are waiting for rather than "a slot".
+      var sibling = null;
+      if (slot && r.batch && serialClients[r.client]) {
+        (d.runs || []).forEach(function (o) {
+          if (o.run_id !== r.run_id && o.batch && o.batch.id === r.batch.id && o.client === r.client &&
+              inFlight(o) && o.batch.index < r.batch.index && (!sibling || o.batch.index < sibling)) {
+            sibling = o.batch.index;
+          }
+        });
+      }
       var ctl = admin.ok ? '<span class="ctl">' +
         (slot ? "" : '<button data-move="top" data-id="' + esc(r.run_id) + '" title="to the top">\u2912</button>' +
           '<button data-move="up" data-id="' + esc(r.run_id) + '" title="up one">\u2191</button>' +
@@ -790,7 +804,7 @@ DEBUG_PAGE = r"""<!doctype html>
       return '<div class="qitem' + (slot ? " slot" : "") + (high ? " high" : "") + '" data-run="' + esc(r.run_id) + '"><span class="pos">' + (i + 1) + "</span>" +
         '<div style="min-width:0;flex:1"><div class="n">' + esc(r.tool || "?") + (high ? ' <span class="prio">PRIORITY</span>' : "") +
           (r.batch ? ' <span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") + "</div>" +
-        '<div class="m mono">' + (slot ? "waiting for a slot " : "waiting for room ") + ago(r.started_at) +
+        '<div class="m mono">' + (sibling ? "waiting for batch " + sibling + " " : slot ? "waiting for a slot " : "waiting for room ") + ago(r.started_at) +
         (r.client ? " \u00b7 " + esc(r.client) : "") + "</div></div>" + ctl + "</div>";
     }).join("") : '<div class="empty">' + (anyFilter() ? "Nothing waiting matches this filter." : "Nothing waiting.") + "</div>";
 
@@ -888,15 +902,23 @@ DEBUG_PAGE = r"""<!doctype html>
     var tr = d.trace || [], t1 = now(), t0 = Math.max(t1 - 1800, tr.length ? tr[0].at : t1 - 1800);
     var ramTotal = ram && ram.total, vramTotal = card.total_bytes;
     el("m-chart").innerHTML = tr.length > 1 ? timeChart([
-      { values: tr.map(function (p) { return [p.at, p.cpu]; }), color: "var(--accent)" },
-      { values: tr.map(function (p) { return [p.at, p.ram == null || !ramTotal ? null : pct(p.ram, ramTotal)]; }), color: "var(--violet)" },
-      { values: tr.map(function (p) { return [p.at, p.vram == null || !vramTotal ? null : pct(p.vram, vramTotal)]; }), color: "var(--ok)" },
+      { values: tr.map(function (p) { return [p.at, p.cpu]; }), color: "var(--series-1)" },
+      { values: tr.map(function (p) { return [p.at, p.ram == null || !ramTotal ? null : pct(p.ram, ramTotal)]; }), color: "var(--series-2)" },
+      { values: tr.map(function (p) { return [p.at, p.vram == null || !vramTotal ? null : pct(p.vram, vramTotal)]; }), color: "var(--series-3)" },
     ], t0, t1, { height: 120 }) : '<div class="empty">The trace starts with the server; a point every 5 s.</div>';
     var maxLoad = Math.max.apply(null, tr.map(function (p) { return Math.max(p.running || 0, p.waiting || 0); }).concat([2]));
     el("m-load").innerHTML = tr.length > 1 ? timeChart([
       { values: tr.map(function (p) { return [p.at, p.running]; }), color: "var(--ok)", step: true },
       { values: tr.map(function (p) { return [p.at, p.waiting]; }), color: "var(--warn)", step: true },
     ], t0, t1, { height: 74, max: maxLoad, maxLabel: maxLoad + " runs" }) : "";
+    // The current value beside each name: the legend is how a series is
+    // identified, and the light aqua is too pale to be read from its line alone.
+    var lastP = tr.length ? tr[tr.length - 1] : {};
+    function now_(v) { return v == null ? "\u2014" : v.toFixed(0) + "%"; }
+    el("m-legend").innerHTML =
+      '<span><i style="background:var(--series-1)"></i>cpu <b class="mono">' + now_(lastP.cpu) + "</b></span>" +
+      '<span><i style="background:var(--series-2)"></i>ram <b class="mono">' + now_(lastP.ram == null || !ramTotal ? null : pct(lastP.ram, ramTotal)) + "</b></span>" +
+      '<span><i style="background:var(--series-3)"></i>vram <b class="mono">' + now_(lastP.vram == null || !vramTotal ? null : pct(lastP.vram, vramTotal)) + "</b></span>";
     el("m-note").textContent = "trace kept in memory, resets with the server";
     el("m-disk").innerHTML = Object.keys(d.disk || {}).map(function (name) {
       var e = d.disk[name];
@@ -1200,9 +1222,9 @@ DEBUG_PAGE = r"""<!doctype html>
     var ramTotal = latest && latest.ram ? latest.ram.total : null;
     var vramTotal = latest && latest.card ? latest.card.total_bytes : null;
     var machine = tr.length > 1 ? timeChart([
-      { values: tr.map(function (p) { return [p.at, p.cpu]; }), color: "var(--accent)" },
-      { values: tr.map(function (p) { return [p.at, p.ram == null || !ramTotal ? null : pct(p.ram, ramTotal)]; }), color: "var(--violet)" },
-      { values: tr.map(function (p) { return [p.at, p.vram == null || !vramTotal ? null : pct(p.vram, vramTotal)]; }), color: "var(--ok)" },
+      { values: tr.map(function (p) { return [p.at, p.cpu]; }), color: "var(--series-1)" },
+      { values: tr.map(function (p) { return [p.at, p.ram == null || !ramTotal ? null : pct(p.ram, ramTotal)]; }), color: "var(--series-2)" },
+      { values: tr.map(function (p) { return [p.at, p.vram == null || !vramTotal ? null : pct(p.vram, vramTotal)]; }), color: "var(--series-3)" },
     ], tr[0].at, Math.max(tr[tr.length - 1].at, tr[0].at + 1), { height: 130, marks: marks })
       : '<div class="empty" style="text-align:left">The machine trace covers the last six hours of this process only.</div>';
 
@@ -1211,8 +1233,8 @@ DEBUG_PAGE = r"""<!doctype html>
       '<div class="two">' +
       section("Duration of each run", '<div class="legend"><span><i style="background:var(--accent)"></i>took</span>' +
         '<span><i style="background:var(--warn)"></i>waited</span></div>' + durations) +
-      section("The machine while it ran", '<div class="legend"><span><i style="background:var(--accent)"></i>cpu</span>' +
-        '<span><i style="background:var(--violet)"></i>ram</span><span><i style="background:var(--ok)"></i>vram</span>' +
+      section("The machine while it ran", '<div class="legend"><span><i style="background:var(--series-1)"></i>cpu</span>' +
+        '<span><i style="background:var(--series-2)"></i>ram</span><span><i style="background:var(--series-3)"></i>vram</span>' +
         '<span>shaded: this tool running</span></div>' + machine) +
       "</div></div>";
   }
