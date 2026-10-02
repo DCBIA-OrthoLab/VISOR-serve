@@ -4,7 +4,7 @@
 #
 # From anywhere, without cloning:
 #
-#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-testfiles.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-testfiles.sh | sh
 #
 # To fetch one tool's test files only, pass arguments through `sh -s --`:
 #

@@ -3,7 +3,7 @@
 #
 # From a machine with nothing checked out:
 #
-#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-server.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-server.sh | sh
 #
 # Options reach this script through `sh -s --` when piping:
 #
@@ -26,8 +26,13 @@
 #   --auto-update MODE   off | notify | apply. Written to .env as
 #                   SADT_AUTO_UPDATE, which `server_ctl.py watch` reads. See
 #                   scripts/visor-update.service for the unit that runs it.
-#   --branch NAME   the branch this deployment follows (default: main). Both
-#                   what is cloned and what `watch` fast-forwards to.
+#   --branch NAME   the branch this deployment follows (default: deploy). Both
+#                   what is cloned and what `watch` fast-forwards to. `deploy`
+#                   is a commit of `main` whose CI went green and which was
+#                   then promoted on purpose, so a deployment never picks up
+#                   whatever landed on `main` an hour ago. Pass `main` to
+#                   follow the tip instead. A fork carrying no such branch
+#                   falls back to its default one, saying so.
 #   --tools URL     also clone a TOOLS repository and point this deployment at
 #                   it, so the server serves real tools instead of the two
 #                   built-in demos. A git URL, and there is deliberately no
@@ -37,7 +42,12 @@
 #                   operator says which tools this deployment serves.
 #   --tools-dir DIR where to clone it (default: beside the server clone)
 #   --tools-ref REF which branch of the tools repository to clone (default:
-#                   its own default branch). The counterpart of --branch.
+#                   the same name as --branch if that repository has it, its
+#                   own default branch otherwise). The counterpart of
+#                   --branch, and defaulted to the same name on purpose: the
+#                   two sides are promoted together, and a server following
+#                   `deploy` while the tools follow their tip is how a schema
+#                   and the server that reads it come apart.
 #   --build-tools   build each tool's virtualenv after cloning, which is what
 #                   makes them actually RUN. ~25 GB and well over an hour, it
 #                   downloads two CUDA torch runtimes. Implied by --full.
@@ -45,7 +55,7 @@
 #   --yes           never ask anything; take the defaults and the options given
 #
 # Environment:
-#   REPO/REF        fork / branch to clone (default: this repo, main)
+#   REPO/REF        fork / branch to clone (default: this repo, deploy)
 #   REPO_URL        the clone URL outright, when REPO's github.com/<owner>/<name>
 #                   shape does not fit (a mirror, an ssh remote, a local path)
 #   INSTALL_DIR     same as --dir
@@ -57,7 +67,7 @@
 set -eu
 
 REPO="${REPO:-DCBIA-OrthoLab/VISOR-serve}"
-REF="${REF:-main}"
+REF="${REF:-deploy}"
 REPO_URL="${REPO_URL:-https://github.com/${REPO}.git}"
 INSTALL_DIR="${INSTALL_DIR:-./VISOR-serve}"
 TOOLS=""
@@ -71,7 +81,7 @@ AUTO_UPDATE=""
 ASK=1
 TOOLS_REPO=""
 TOOLS_DIR_OPT=""
-TOOLS_REF=""
+TOOLS_REF="${TOOLS_REF:-}"
 BUILD_TOOLS=0
 
 while [ $# -gt 0 ]; do
@@ -163,6 +173,21 @@ if [ "$BUILD_TOOLS" -eq 0 ] && [ -n "$TOOLS_REPO" ] && [ "$ASK" -eq 1 ] && [ -r 
     case "$_bt" in y|Y|yes|YES) BUILD_TOOLS=1 ;; esac
 fi
 
+# A branch name is a DEFAULT here, not a demand: this script is curl-piped at
+# forks and mirrors, and `git clone --branch deploy` against one that promotes
+# nothing exits 128 with the whole install undone. Asking the remote first
+# turns that into one printed line and the default branch.
+remote_branch_or_default() {
+    # $1 remote URL, $2 wanted branch. Echoes the branch to clone, or nothing
+    # for "let git pick", and explains itself on stderr when it gives up.
+    if [ -z "$2" ]; then return 0; fi
+    if git ls-remote --exit-code --heads "$1" "$2" >/dev/null 2>&1; then
+        echo "$2"
+    else
+        echo "setup-server: $1 has no '$2' branch; taking its default one." >&2
+    fi
+}
+
 for tool in git python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         echo "setup-server: $tool is required but was not found in PATH." >&2
@@ -188,14 +213,38 @@ elif [ -e "$INSTALL_DIR" ]; then
     echo "  or pass --dir with somewhere else." >&2
     exit 1
 else
-    echo "Cloning ${REPO_URL}@${REF} into $INSTALL_DIR ..."
-    git clone --branch "$REF" "$REPO_URL" "$INSTALL_DIR"
+    CLONE_REF="$(remote_branch_or_default "$REPO_URL" "$REF")"
+    if [ -n "$CLONE_REF" ]; then
+        echo "Cloning ${REPO_URL}@${CLONE_REF} into $INSTALL_DIR ..."
+        git clone --branch "$CLONE_REF" "$REPO_URL" "$INSTALL_DIR"
+    else
+        echo "Cloning ${REPO_URL} into $INSTALL_DIR ..."
+        git clone "$REPO_URL" "$INSTALL_DIR"
+        REF="$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD)"
+    fi
 fi
 
 CTL="$INSTALL_DIR/scripts/server_ctl.py"
 if [ ! -f "$CTL" ]; then
     echo "setup-server: $CTL is missing -- ${REPO}@${REF} does not carry it." >&2
     exit 1
+fi
+
+# --- how far behind the tip this deployment is ---------------------------
+# A deployment branch is behind `main` on purpose; the failure mode is silence
+# about HOW far. A `deploy` nobody promoted for three months reads exactly
+# like one promoted this morning, and the operator who has to decide whether a
+# fix is in their deployment has no way to tell. Reported, never enforced:
+# whether to promote is the maintainer's call, not this script's.
+if [ "$REF" != "main" ]; then
+    git -C "$INSTALL_DIR" fetch --quiet origin main 2>/dev/null || true
+    BEHIND="$(git -C "$INSTALL_DIR" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || true)"
+    TIP_DATE="$(git -C "$INSTALL_DIR" log -1 --format=%cs FETCH_HEAD 2>/dev/null || true)"
+    case "$BEHIND" in
+        ''|*[!0-9]*) ;;
+        0) echo "Following '${REF}', which is level with main." ;;
+        *) echo "Following '${REF}', ${BEHIND} commit(s) behind main (tip ${TIP_DATE})." ;;
+    esac
 fi
 
 # --- docker --------------------------------------------------------------
@@ -251,8 +300,10 @@ if [ -n "$TOOLS_REPO" ]; then
         exit 1
     else
         echo "Cloning the tools from $TOOLS_REPO into $TOOLS_ROOT ..."
-        if [ -n "$TOOLS_REF" ]; then
-            git clone --branch "$TOOLS_REF" "$TOOLS_REPO" "$TOOLS_ROOT"
+        # Unset means "follow the server", not "follow the tip".
+        TOOLS_CLONE_REF="$(remote_branch_or_default "$TOOLS_REPO" "${TOOLS_REF:-$REF}")"
+        if [ -n "$TOOLS_CLONE_REF" ]; then
+            git clone --branch "$TOOLS_CLONE_REF" "$TOOLS_REPO" "$TOOLS_ROOT"
         else
             git clone "$TOOLS_REPO" "$TOOLS_ROOT"
         fi
@@ -351,14 +402,14 @@ fi
 
 # --- start ---------------------------------------------------------------
 if [ "$START" -eq 0 ]; then
-    python3 "$CTL" status --device "$DEVICE"
+    python3 "$CTL" status --device "$DEVICE" --branch "$REF"
     exit 0
 fi
 
 if [ -n "$PORT" ]; then
-    python3 "$CTL" up --device "$DEVICE" --bind "$BIND" --port "$PORT"
+    python3 "$CTL" up --device "$DEVICE" --bind "$BIND" --port "$PORT" --branch "$REF"
 else
-    python3 "$CTL" up --device "$DEVICE" --bind "$BIND"
+    python3 "$CTL" up --device "$DEVICE" --bind "$BIND" --branch "$REF"
 fi
 
 echo
