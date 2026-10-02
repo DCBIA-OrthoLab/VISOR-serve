@@ -36,17 +36,20 @@ data_dir = "AREG"
 # picker still offered whole cohorts -- `<name>/{T1,T2}/` -- so the baseline
 # field listed entries holding the follow-up too, and the intraoral field
 # listed entries holding a CBCT. The per-argument folders are hardlinked views
-# of the same cohorts (`cp -al`), so they cost directory entries and no data.
+# of the same cohorts, built by the tools repository's fetch script (`split`
+# in its data manifest), so they cost directory entries and no data. Scoped to
+# a folder no script built, a fresh deployment had empty pickers.
 #
 # `t1`/`t2` draw from DATA/AREG/testfiles/CBCT_T1|CBCT_T2 only. This tool registers
 # volumes; the intraoral cohorts staged beside them for the other two engines
 # cannot be a baseline, and offering them put a folder of `.vtk` one click away
 # from a CBCT picker.
-server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:T1", t2 = "testfile:T2" }
+server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:CBCT_T1", t2 = "testfile:CBCT_T2" }
 
 [tools.AREG_IOS]
 data_dir = "AREG"
-# The intraoral cohorts, for the same reason AREG_CBCT takes only the CBCT ones.
+# The intraoral cohorts, IOS_T1|IOS_T2, for the same reason AREG_CBCT takes only
+# the CBCT ones.
 # `crown_model` opts out here too: a name has to mean ONE thing across the
 # engines the AREG facade composes, and IOSCBCT having opted its own out is
 # what made the facade refuse to publish at all.
@@ -65,7 +68,7 @@ data_dir = "AREG"
 # clinical choice -- Frankfurt or Occlusal -- and keeps its dropdown. Opting out
 # under the shared name would have changed what that name means between two
 # engines of one facade, which is what the note above is about.
-server_selectable = { t1 = "testfile:T1", t2 = "testfile:T2", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none" }
+server_selectable = { t1 = "testfile:IOS_T1", t2 = "testfile:IOS_T2", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none" }
 
 # Orchestrates four tools and computes almost nothing itself; see the rule in
 # deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
