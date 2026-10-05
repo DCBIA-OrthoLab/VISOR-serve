@@ -81,6 +81,10 @@ def schema_cache(tmp_path, monkeypatch):
     # one; a test about its absence sets it back to "".
     monkeypatch.setattr(settings, "ADMIN_TOKEN", "test-admin-token")
     monkeypatch.setattr(settings, "UPDATE_DIR", str(tmp_path / "update"))
+    # Reading the admin panel's update report starts a background check that
+    # calls git and GitHub; never from a test.
+    from wire import update_check
+    monkeypatch.setattr(update_check, "_background", lambda: None)
 
 
 @pytest.fixture(scope="session")

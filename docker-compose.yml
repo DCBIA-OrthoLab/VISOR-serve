@@ -20,6 +20,10 @@ x-inference-base: &inference-base
     - ./server:/workspace/server
     - ./DATA:/data:ro
     - ./scripts:/workspace/scripts:ro
+    # The checkout's history, read-only, for the admin panel's "Check for
+    # updates": it says which commit is deployed. Nothing in the container can
+    # change it -- pulling is the host's (scripts/update_agent.py).
+    - ./.git:/workspace/.git:ro
     # The tools, when a deployment has them. Mounted at THEIR OWN PATH, not at
     # a tidy /tools: each tool is a virtualenv, and a virtualenv's
     # `pyvenv.cfg` and script shebangs hold absolute paths -- moved anywhere

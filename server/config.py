@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     # leave each other notes: what can be updated, and an operator's request
     # to do it. In the bind-mounted checkout, so both sides see the same files.
     UPDATE_DIR: str = os.path.join(_SERVER_DIR, ".update")
+    # The server's own checkout, for "Check for updates": its `.git` is what
+    # says which commit is deployed. The parent of `server/`, which in the
+    # container is /workspace, where docker-compose.yml mounts `.git` read-only.
+    SERVER_REPO: str = os.path.dirname(_SERVER_DIR)
     DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
     SADT_API: str = "http://127.0.0.1:8000"  # reaches this server from a tool
     # How many runs may be inside a tool at once, whatever their size: a bound
