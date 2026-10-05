@@ -251,6 +251,7 @@ DEBUG_PAGE = r"""<!doctype html>
   .cell { border-left: 1px solid var(--line); padding: 1px 8px; }
   .cells.nested { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
   .cells.nested .cell b { color: var(--accent); }
+  .lent { font-size: 10.5px; color: var(--soft); margin-top: 3px; }
   .cell:first-child { border-left: none; padding-left: 0; }
   .cell u { display: block; font-size: 9.5px; letter-spacing: .06em; color: var(--ghost);
             text-transform: uppercase; text-decoration: none; }
@@ -923,11 +924,16 @@ DEBUG_PAGE = r"""<!doctype html>
   function callCells(list) {
     if (!list || !list.length) { return ""; }
     return list.sort(function (a, b) { return a.depth - b.depth; }).map(function (g) {
+      // What the call holds in all: its own reservation plus what it borrowed
+      // from its parent's, which the parent was not using while it waited.
+      var b = g.borrowed || {}, lent = (b.ram_bytes || 0) + (b.vram_bytes || 0) + (b.cpus || 0) > 0;
       return '<div class="cells nested"><div class="cell"><u>call</u><b>' + esc(g.tool || "?") + "</b></div>" +
         '<div class="cell"><u>chan</u><b>' + (g.channels == null ? "—" : g.channels) + "</b></div>" +
         '<div class="cell"><u>cpu</u><b>' + (g.cores == null ? "—" : g.cores) + "</b></div>" +
-        '<div class="cell"><u>ram</u><b>' + gib(g.ram_bytes) + "</b></div>" +
-        '<div class="cell"><u>vram</u><b>' + gib(g.vram_bytes) + "</b></div></div>";
+        '<div class="cell"><u>ram</u><b>' + gib((g.ram_bytes || 0) + (b.ram_bytes || 0)) + "</b></div>" +
+        '<div class="cell"><u>vram</u><b>' + gib((g.vram_bytes || 0) + (b.vram_bytes || 0)) + "</b></div></div>" +
+        (lent ? '<div class="lent mono">borrowed from its caller: ' + gib(b.ram_bytes) + " ram \u00b7 " +
+          gib(b.vram_bytes) + " vram \u00b7 " + Math.round(b.cpus || 0) + " cpu</div>" : "");
     }).join("");
   }
   function drawRunning(d) {

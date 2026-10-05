@@ -628,11 +628,18 @@ none stuck. Learned per tool: AREG alone 14.5 GiB of host and no card (its
 card was its children's), ASO 2.2 GiB, ALI_CBCT 0.83 GiB of card per channel
 over 6.
 
-**Not done:** a parent waiting for its child still holds its full
-reservation; lowering it to what it actually occupies while blocked is the next
-step. An out-of-memory in a child is not retried on its own.
+**A waiting parent LENDS what it does not use.** AREG reserves 17.5 GiB and
+10 cores for its own registration and, blocked in `sup.run`, occupies a few
+hundred MB and one core. The supervisor sends what its level occupies with each
+request (`holding`); the parent's reservation minus that, minus what it has
+already lent, covers the call first, and only the rest is asked of the machine.
+Nothing is taken back: the parent keeps its whole reservation, the loan returns
+when the call ends, so there is no re-admission to wait for. A parent that says
+nothing lends nothing; an unmeasured call borrows nothing.
 
-**Tests:** 1178 server (+27), including the four deadlocks an adversarial
+**Not done:** an out-of-memory in a child is not retried on its own.
+
+**Tests:** 1182 server (+31), including the four deadlocks an adversarial
 review reproduced; the two between chains hang without the breaker.
 
 ### 2026-09-21 - Three tools faster, a model with an intercept, and three regressions of my own

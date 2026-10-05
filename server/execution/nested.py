@@ -206,7 +206,7 @@ class Desk:
             with admission.budget().reserve(
                     candidates, on_wait=announce, is_cancelled=given_up,
                     run_id=job.get("job_id"), ancestors=chain, parent=self.run_id,
-                    tool=tool_name) as grant:
+                    tool=tool_name, holding=_holding(request.get("holding"))) as grant:
                 with self._lock:
                     self._chains[child_dir] = chain + (grant,)
                 try:
@@ -241,6 +241,20 @@ class Desk:
             return  # killed before it wrote anything: nothing to learn
         if isinstance(payload, dict):
             self._learn(tool_name, payload, solo)
+
+
+def _holding(reported):
+    """What the caller says it occupies while it waits, as `(cpus, ram, vram)`,
+    or None -- which lends nothing -- when it said nothing usable. At least one
+    core: a blocked process still holds the one it is blocked on."""
+    if not isinstance(reported, dict) or "ram_bytes" not in reported:
+        return None
+    try:
+        return (max(1.0, float(reported.get("cpus") or 1)),
+                max(0, int(reported.get("ram_bytes") or 0)),
+                max(0, int(reported.get("vram_bytes") or 0)))
+    except (TypeError, ValueError):
+        return None
 
 
 def _send(connection: socket.socket, message: dict) -> None:

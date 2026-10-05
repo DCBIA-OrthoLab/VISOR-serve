@@ -797,7 +797,8 @@ def _admission_lease(job_path: str, caller_dir: str, log):
         connection.connect(path)
         connection.sendall((json.dumps(
             {"key": key, "job": os.path.abspath(job_path),
-             "caller": os.path.abspath(caller_dir)}) + "\n").encode("utf-8"))
+             "caller": os.path.abspath(caller_dir),
+             "holding": _holding_now()}) + "\n").encode("utf-8"))
         reader = connection.makefile("r", encoding="utf-8")
         for line in reader:
             message = json.loads(line)
@@ -814,6 +815,32 @@ def _admission_lease(job_path: str, caller_dir: str, log):
     except (OSError, UnboundLocalError):
         pass
     return None, None
+
+
+def _holding_now() -> dict:
+    """What this level occupies right now, while it waits for a nested call.
+
+    The server LENDS the rest of this level's reservation to the call: an
+    orchestrator reserved for its own heaviest phase, and blocked in `sup.run`
+    it uses almost none of it. Resident memory of this level's own processes
+    (admitted calls' subtrees excluded), one core, and what torch holds on the
+    card if it was ever loaded here.
+    """
+    try:
+        ram = _sampler._rss(_sampler._group())
+    except Exception:  # noqa: BLE001 - instrumentation never fails a run
+        ram = None
+    if not ram:
+        return {}
+    vram = 0
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            if torch.cuda.is_available():
+                vram = int(torch.cuda.memory_reserved())
+        except Exception:  # noqa: BLE001
+            vram = 0
+    return {"cpus": 1, "ram_bytes": int(ram), "vram_bytes": vram}
 
 
 def _close_lease(lease) -> None:

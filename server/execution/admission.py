@@ -215,7 +215,8 @@ class Grant:
     process has written result.json.
     """
 
-    __slots__ = ("cores", "channels", "solo", "demand", "ancestors", "run_id", "tool", "parent")
+    __slots__ = ("cores", "channels", "solo", "demand", "ancestors", "run_id", "tool", "parent",
+                 "loan", "lent")
 
     def __init__(self, cores: int, channels: int = 1, solo: bool = False,
                  demand: Optional["Demand"] = None, ancestors=()):
@@ -235,6 +236,11 @@ class Grant:
         self.run_id = None
         self.tool = None
         self.parent = None
+        # `(cpus, ram, vram)` this nested call BORROWED from its parent's
+        # reservation, on top of `demand`, which is only what it took from the
+        # machine. And what this grant has lent out to calls of its own, now.
+        self.loan = (0.0, 0, 0)
+        self.lent = [0.0, 0, 0]
 
     def __iter__(self):
         return iter((self.cores, self.channels))
@@ -366,7 +372,10 @@ class Budget:
                      "cores": grant.cores,
                      "cpus": grant.demand.cpus if grant.demand else None,
                      "ram_bytes": grant.demand.ram_bytes if grant.demand else None,
-                     "vram_bytes": grant.demand.vram_bytes if grant.demand else None}
+                     "vram_bytes": grant.demand.vram_bytes if grant.demand else None,
+                     # Borrowed from the parent's reservation, on top of the above.
+                     "borrowed": {"cpus": grant.loan[0], "ram_bytes": grant.loan[1],
+                                  "vram_bytes": grant.loan[2]}}
                     for grant in self._live if grant.ancestors
                 ],
             }
@@ -544,6 +553,37 @@ class Budget:
                 return fitted
         return None
 
+    @staticmethod
+    def _lendable(ancestors, holding):
+        """`(cpus, ram, vram)` of the immediate parent's reservation that it is
+        not using while it waits for its call, and has not already lent.
+
+        Nothing without `holding`: a parent that did not say what it occupies
+        lends nothing, which is how a call was admitted before loans existed.
+        """
+        if not ancestors or holding is None:
+            return (0.0, 0, 0)
+        parent = ancestors[-1]
+        if parent.demand is None:
+            return (0.0, 0, 0)
+        reserved = (parent.demand.cpus, parent.demand.ram_bytes, parent.demand.vram_bytes)
+        return tuple(max(0, held - used - lent)
+                     for held, used, lent in zip(reserved, holding, parent.lent))
+
+    @staticmethod
+    def _net(demand: Demand, lend) -> Demand:
+        """What `demand` still asks of the machine once the loan covers what
+        it can. An unmeasured demand is never netted: it is the whole machine
+        minus the chain already, and its numbers are not ones to trust."""
+        if not demand.measured or not any(lend):
+            return demand
+        return dataclasses.replace(
+            demand,
+            cpus=max(0.0, demand.cpus - lend[0]),
+            ram_bytes=max(0, demand.ram_bytes - lend[1]),
+            vram_bytes=max(0, demand.vram_bytes - lend[2]),
+        )
+
     def _stuck(self, ancestors) -> bool:
         """Would waiting never end for a nested call under `ancestors`?
 
@@ -641,7 +681,7 @@ class Budget:
 
     @contextlib.contextmanager
     def reserve(self, candidates, on_wait=None, is_cancelled=None, run_id=None,
-                ancestors=(), parent=None, tool=None):
+                ancestors=(), parent=None, tool=None, holding=None):
         """Hold room for the duration of the block, taking the widest that fits.
 
         `candidates` is `[(channels, Demand), ...]`, widest FIRST. They are the
@@ -671,7 +711,10 @@ class Budget:
 
         `ancestors` makes this a NESTED call: the grants of the chain that
         called it, outermost first, `parent` the run id it belongs to and
-        `tool` its name, for whoever reads the queue. It
+        `tool` its name, for whoever reads the queue. `holding` is what the
+        immediate parent actually occupies while it waits for this call,
+        `(cpus, ram, vram)`: the rest of its reservation is LENT to the call,
+        which asks the machine only for what the loan does not cover. It
         queues in its own band, ahead of runs not yet started, and is judged
         against everything outside its chain -- see `_would_fit`.
         """
@@ -695,7 +738,11 @@ class Budget:
                     self._queue.remove(waiter)
                     self._condition.notify_all()
                     raise Cancelled("The client cancelled this run.")
-                channels, demand = candidates[-1]
+                # Re-read on every pass: a sibling call may have borrowed, or
+                # given back, part of the same parent's reservation meanwhile.
+                lend = self._lendable(ancestors, holding)
+                net = [(count, self._net(want, lend)) for count, want in candidates]
+                channels, demand = net[-1]
                 position = self._queue.index(waiter)
                 # The head may try; so may any nested call with only nested
                 # calls ahead of it. One that fits goes past one that does not:
@@ -712,14 +759,14 @@ class Budget:
                     behind = 0 if rank == 1 else sum(
                         1 for other in self._queue[position + 1:]
                         if self._rank(other) <= max(rank, 0))
-                    fitted = self._widest_that_fits(candidates, behind, ancestors)
+                    fitted = self._widest_that_fits(net, behind, ancestors)
                     if fitted is not None:
                         channels, demand = fitted
                         break
                     if position == 0 and waiter.nested and self._stuck(ancestors):
                         # Nothing running outside this chain can ever free
                         # room: see `_stuck`. Admitted on its narrowest shape.
-                        channels, demand = candidates[-1]
+                        channels, demand = net[-1]
                         break
                 if not announced and on_wait is not None:
                     announced = True
@@ -757,6 +804,16 @@ class Budget:
                           solo=(self._running - len(ancestors) == 0),
                           demand=demand, ancestors=ancestors)
             grant.run_id, grant.tool, grant.parent = run_id, tool, parent
+            # The asked-for shape this net one came from, by position: several
+            # shapes share a channel count (one channel at fewer cores).
+            gross = next((want for (_, want), (_, chosen) in zip(candidates, net)
+                          if chosen is demand), None)
+            if ancestors and demand.measured and gross is not None and gross is not demand:
+                grant.loan = (max(0.0, gross.cpus - demand.cpus),
+                              max(0, gross.ram_bytes - demand.ram_bytes),
+                              max(0, gross.vram_bytes - demand.vram_bytes))
+                lender = ancestors[-1]
+                lender.lent = [held + lent for held, lent in zip(lender.lent, grant.loan)]
             # A newcomer ends every live run's solitude -- its own parents'
             # included, whose card-wide window now holds the child's work.
             if not grant.solo or ancestors:
@@ -775,6 +832,9 @@ class Budget:
                 # Discarded from the live set, never mutated: the caller reads
                 # `solo` AFTER this block, from the run's result file.
                 self._live.discard(grant)
+                if ancestors and any(grant.loan):
+                    lender = ancestors[-1]
+                    lender.lent = [max(0, held - lent) for held, lent in zip(lender.lent, grant.loan)]
                 self._held_cpus -= demand.cpus
                 self._held_ram -= demand.ram_bytes
                 self._held_vram -= demand.vram_bytes

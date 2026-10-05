@@ -606,3 +606,73 @@ def test_a_desk_that_cannot_be_built_never_fails_the_run(budget, tmp_path):
         desk = nested.open_desk("root", str(tmp_path / "missing"), grant,
                                 lambda *a: None, lambda *a: {}, lambda *a: None)
     assert desk is None
+
+
+# ---------------------------------------------------------------------------
+# Lending a parent's unused reservation to its call
+# ---------------------------------------------------------------------------
+
+def test_a_call_borrows_what_its_waiting_parent_does_not_use():
+    """The parent reserved 6 GiB for its own heaviest phase and occupies 1 GiB
+    while it waits: the 5 GiB call fits in the loan, though the machine alone
+    could not take it, and the machine's figures do not move."""
+    budget = _budget(ram=12 * GiB)
+    with budget.reserve(_demand(ram=4 * GiB)):
+        with budget.reserve(_demand(ram=6 * GiB)) as parent:
+            before = budget.snapshot()["ram_held"]
+            with budget.reserve(_demand(ram=5 * GiB), ancestors=(parent,),
+                                holding=(1.0, 1 * GiB, 0)) as child:
+                assert child.loan[1] == 5 * GiB
+                assert budget.snapshot()["ram_held"] == before
+                assert parent.lent[1] == 5 * GiB
+            assert parent.lent[1] == 0
+
+
+def test_a_parent_that_says_nothing_lends_nothing():
+    budget = _budget(ram=12 * GiB)
+    with budget.reserve(_demand(ram=4 * GiB)):
+        with budget.reserve(_demand(ram=6 * GiB)) as parent:
+            waiting = threading.Event()
+            with pytest.raises(admission.Cancelled):
+                with budget.reserve(_demand(ram=5 * GiB), ancestors=(parent,),
+                                    on_wait=waiting.set,
+                                    is_cancelled=lambda: waiting.is_set()):
+                    pass
+            assert waiting.is_set()
+
+
+def test_two_calls_at_once_share_one_loan():
+    budget = _budget(ram=20 * GiB)
+    with budget.reserve(_demand(ram=6 * GiB)) as parent:
+        holding = (1.0, 1 * GiB, 0)
+        with budget.reserve(_demand(ram=4 * GiB), ancestors=(parent,), holding=holding) as first:
+            with budget.reserve(_demand(ram=4 * GiB), ancestors=(parent,), holding=holding) as second:
+                assert first.loan[1] == 4 * GiB
+                assert second.loan[1] == 1 * GiB
+                assert budget.snapshot()["ram_held"] == (6 + 3) * GiB
+
+
+def test_the_supervisor_says_what_its_level_occupies(budget, tools_dir, tmp_path):
+    make_tool(tools_dir, "Leaf", LEAF_HEAVY)
+    make_tool(tools_dir, "Caller", CALLER)
+    job_dir = tmp_path / "job"
+    root = _Root(budget, job_dir, demand=_demand(ram=4 * GiB))
+    seen = []
+
+    def watch():
+        deadline = time.monotonic() + _TIMEOUT
+        while time.monotonic() < deadline and not seen:
+            seen.extend(budget.snapshot()["nested"])
+            time.sleep(0.05)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+    completed, _result = run_job(tools_dir, "Caller", job_dir, {"scans": "x"},
+                                 env=root.desk.environment())
+    watcher.join(_TIMEOUT)
+
+    assert completed.returncode == 0, completed.stderr
+    # The 1 GiB call fitted entirely in what the 4 GiB root was not using.
+    assert seen and seen[0]["borrowed"]["ram_bytes"] == 1 * GiB
+    assert seen[0]["ram_bytes"] == 0
+    root.finish()
