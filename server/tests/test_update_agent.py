@@ -249,3 +249,20 @@ def test_a_data_request_runs_the_download_for_that_tool_only(agent_module, repos
     # with the engine's own output in the log.
     assert last["kind"] == "data" and last["tool"] == "AMASSS" and last["ok"] is False
     assert any("AMASSS" in line for line in last["log"])
+
+
+def test_a_change_to_a_shared_package_rebuilds_every_environment_that_copies_it(agent_module, repos):
+    """A package installed from a folder of the library is a COPY in each
+    dependent environment: changing it must reinstall it there."""
+    writer, checkout = repos
+    _commit(writer, {
+        "tools/Shared/common/pyproject.toml": "[project]\nname = 'shared-common'\n",
+        "tools/User/pyproject.toml": "[project]\nname='user'\n[tool.uv.sources]\n"
+                                     "shared-common = { path = \"../Shared/common\" }\n",
+    }, "ADD: a shared package")
+    agent_module.git(str(checkout), ["pull", "-q", "--ff-only"])
+    _commit(writer, {"tools/Shared/common/src/x.py": "v2"}, "FIX: shared")
+    changes = agent_module.inspect(str(checkout), "tools")["changes"]
+    assert "tools/User" in changes["environments"]
+    assert changes["reinstall"] == {"tools/User": ["shared-common"]}
+    assert {t["tool"]: t["environment"] for t in changes["tools"]}["User"] is True

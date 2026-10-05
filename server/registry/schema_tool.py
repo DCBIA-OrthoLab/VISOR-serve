@@ -162,6 +162,8 @@ OUTPUT_DIR_ARGUMENT = conventions.OUTPUT_DIR_ARGUMENT
 _TOP_LEVEL_KEYS = (
     "name", "description", "arguments", "returns", "source_hash", "supervisor",
     "calls", "injected_layout", "quality_controls",
+    # Which inputs hold the same subjects; see conventions.paired_batch_plan.
+    "paired",
 )
 
 
@@ -757,6 +759,7 @@ class SchemaTool(Tool):
         # the schema and on deployment.toml, and neither moves under a
         # running server.
         self.batch = deployment.batch
+        self.paired_batch = deployment.paired_batch
         # The runner builds one when it sees `*, sup` in the signature; this is
         # the same fact, published, so `/tools` can say a chain is involved and
         # a deployment check can verify the siblings are actually installed.
@@ -932,6 +935,7 @@ def load_tool(folder: str, config, name: str = None) -> SchemaTool:
         arguments if isinstance(arguments, dict) else {},
         config.for_tool(name),
         config.batch_defaults,
+        paired=schema.get("paired"),
     )
     tool = SchemaTool(folder, schema, deployment)
     try:

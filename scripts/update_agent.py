@@ -165,7 +165,7 @@ def inspect(repo: str, kind: str, fetch: bool = True) -> dict:
         "ahead": int(ahead) if ahead.isdigit() else 0,
         "dirty": bool(dirty),
         "commits": commits,
-        "changes": classify_server(paths) if kind == "server" else classify_tools(paths),
+        "changes": release_diff.classify(kind, paths, repo),
     })
     return info
 
@@ -447,7 +447,12 @@ class Agent:
                             continue
                         self.phase(f"Rebuilding the environment of {folder}.")
                         self.door(False, "updating")
-                        done = subprocess.run(["uv", "sync", "--frozen", "--quiet"],
+                        # A local package installed by copy is reinstalled, or
+                        # the environment keeps the version it was built with.
+                        reinstall = []
+                        for package in info["changes"].get("reinstall", {}).get(folder, []):
+                            reinstall += ["--reinstall-package", package]
+                        done = subprocess.run(["uv", "sync", "--frozen", "--quiet"] + reinstall,
                                               cwd=os.path.join(info["path"], folder),
                                               capture_output=True, text=True, timeout=3600)
                         if done.returncode != 0:

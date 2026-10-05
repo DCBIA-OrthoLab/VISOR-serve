@@ -2442,6 +2442,11 @@ def _load_job(job_path: str) -> dict:
     return job
 
 
+# A job may ask a tool's `pairs()` instead of its `run()`: which listed file
+# names belong together, for splitting a paired cohort. See main().
+PAIRS_ENTRY = "pairs"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Run one SADT tool job.")
     parser.add_argument("--job", required=True, help="Path to the job.json written by the server")
@@ -2457,6 +2462,16 @@ def main(argv=None) -> int:
     try:
         job = _load_job(arguments.job)
         module = _import_tool(job["tool"], os.path.join(_tool_dir(), SRC_DIR_NAME))
+        if job.get("entry") == PAIRS_ENTRY:
+            # Not a run: the tool is asked which of the listed file NAMES go
+            # together, so a client can split a paired cohort into batches.
+            # Nothing is supervised, measured for admission or written but the
+            # answer.
+            answer = getattr(module, PAIRS_ENTRY, None)
+            if not callable(answer):
+                raise RunnerError(f"Tool '{job['tool']}' defines no {PAIRS_ENTRY}().")
+            _write_result(job["job_dir"], answer(**dict(job["params"])))
+            return 0
         run = _run_function(module, job["tool"])
         params = dict(job["params"])
         # Taken back out before the tool ever sees it: no tool declares this
