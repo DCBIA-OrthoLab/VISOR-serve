@@ -283,7 +283,7 @@ def _admitted(candidates, run_id: Optional[str]):
 
     try:
         with admission.budget().reserve(candidates, on_wait=announce,
-                                        is_cancelled=cancelled) as granted:
+                                        is_cancelled=cancelled, run_id=run_id) as granted:
             yield granted
     except admission.Cancelled as exc:
         raise RunCancelled(str(exc))

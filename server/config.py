@@ -71,9 +71,31 @@ class Settings(BaseSettings):
     # A .schema.json is a cache, and the tool folders are read-only to the
     # process serving them, so a regenerated one cannot live beside its tool.
     SCHEMA_CACHE_DIR: str = os.path.join(_SERVER_DIR, ".schema-cache")
+    # Where finished runs are kept for the operator page, so its history and
+    # per-tool graphs survive an update. Beside the code by default, which in
+    # the `inference` service is the bind-mounted checkout and therefore
+    # outlives the container; empty keeps the history in memory only.
+    HISTORY_DIR: str = os.path.join(_SERVER_DIR, ".history")
+    # Where this server and the host's update agent (scripts/update_agent.py)
+    # leave each other notes: what can be updated, and an operator's request
+    # to do it. In the bind-mounted checkout, so both sides see the same files.
+    UPDATE_DIR: str = os.path.join(_SERVER_DIR, ".update")
     DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
     SADT_API: str = "http://127.0.0.1:8000"  # reaches this server from a tool
-    MAX_CONCURRENT_TOOLS: int = 4
+    # How many runs may be inside a tool at once, whatever their size: a bound
+    # on worker threads, not on the machine. Admission decides what each of
+    # them may hold, so this only has to be high enough not to be the binding
+    # limit on a server whose budget has room. Fixed, not derived from cores.
+    MAX_CONCURRENT_TOOLS: int = 6
+    # The operator dashboard's controls -- reordering the queue, giving a run
+    # priority -- answer only to this token, never to API_TOKEN: every
+    # workstation holds that one, and a control any of them can use is one any
+    # of them will use to put itself first. Empty disables the controls.
+    ADMIN_TOKEN: str = ""
+    # Whether a workstation's cohort batches run one at a time ("serial") or
+    # side by side ("parallel") until an operator says otherwise for that
+    # workstation (wire/clients.py). Serial is what every client did before.
+    DEFAULT_BATCH_POLICY: str = "serial"
     TOOL_TIMEOUT_SECONDS: float = 0  # 0 = none; a cohort legitimately takes hours
     # How many times a run that died for want of memory is started again, with
     # more room reserved each time. A clinician who asked for a segmentation
@@ -227,18 +249,26 @@ class Settings(BaseSettings):
     # no client identity anywhere, so the server cannot tell ten workstations
     # from one clicking ten times.
     #
-    # Defaulted to MAX_CONCURRENT_TOOLS rather than to 1 so an untouched
-    # deployment keeps the concurrency it already had: at 1 a single job would
-    # reserve the whole budget and every run on the machine would serialise
-    # behind it, which is stricter than the four tool slots that exist today.
+    # Defaulted to 4 rather than to 1 so an untouched deployment keeps the
+    # concurrency it already had: at 1 a single job would reserve the whole
+    # budget and every run on the machine would serialise behind it. It was
+    # equal to MAX_CONCURRENT_TOOLS until that rose to 6; it stays at 4 because
+    # it sets each run's share of the cores, which the thread measurements in
+    # CLAUDE.md were taken against, and raising it would narrow every run.
     SADT_EXPECTED_CLIENTS: int = 4
     SADT_CPU_PER_JOB: str = ""
     SADT_RAM_PER_JOB: str = ""
     SADT_VRAM_PER_JOB: str = ""
 
     # --- uploads and results ------------------------------------------
-    MAX_UPLOAD_MB: int = 500  # over this, 413
-    MAX_EXTRACTED_MB: int = 2000  # zip-bomb cap on an extracted archive, 400
+    # Per file, not per request: AREG's two folders are two uploads, each
+    # checked on its own. 2 GB so a whole CBCT cohort sent as one archive --
+    # a tool that cannot be split into batches -- is not refused.
+    MAX_UPLOAD_MB: int = 2048  # over this, 413
+    # The uncompressed size an archive may expand to. Kept well above the
+    # upload cap: a 2 GB archive of compressed volumes legitimately unpacks
+    # to several times that, and this is a zip-bomb guard, not a quota.
+    MAX_EXTRACTED_MB: int = 8192  # zip-bomb cap on an extracted archive, 400
     UPLOAD_CHUNK_MB: int = 8  # default part size, clamped to [1, 64]
     # Idle timeout, not an age limit: every part written and every range read
     # stamps its directory. Bounds how long an uncollected result stays on disk.

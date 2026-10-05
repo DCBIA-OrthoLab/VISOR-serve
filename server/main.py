@@ -22,6 +22,7 @@ import anyio.to_thread
 import uvicorn
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, UploadFile, status
 from fastapi.responses import (
+    RedirectResponse,
     FileResponse,
     HTMLResponse,
     JSONResponse,
@@ -56,7 +57,8 @@ from config import settings
 from data_store import DataNotFoundError, data_store
 from registry.deployment import deployment_config
 from registry import TOOLS, get_tool
-from wire.security import verify_token
+from wire import clients, updates
+from wire.security import verify_admin, verify_token
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger("inference_server")
@@ -85,6 +87,25 @@ async def _reaper_loop() -> None:
                 logger.exception("reaper sweep failed")
 
 
+async def _trace_loop() -> None:
+    """Sample the machine for the operator page's graphs, for as long as the
+    server runs. One point every `telemetry.TRACE_SECONDS`, off the event loop
+    because reading the card is a subprocess."""
+    def take() -> None:
+        try:
+            card = resources.detect_vram_bytes()
+        except Exception:  # noqa: BLE001 - no card is a missing line, not an error
+            card = (None, None)
+        telemetry.sample_trace(admission.budget().snapshot(), card)
+
+    while True:
+        try:
+            await anyio.to_thread.run_sync(take)
+        except Exception:  # noqa: BLE001 - one bad sample must not end the loop
+            logger.exception("trace sample failed")
+        await anyio.sleep(telemetry.TRACE_SECONDS)
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
     # Said out loud, once, before anything runs. A budget that did not take
@@ -101,8 +122,14 @@ async def _lifespan(_app: FastAPI):
     # than what this one will cost.
     for line in costs.banner().splitlines():
         logger.info("%s", line)
+    clients.configure(settings.HISTORY_DIR)
+    restored = telemetry.configure_history(settings.HISTORY_DIR)
+    if restored:
+        logger.info("Run history: %d finished run(s) read back from %s",
+                    restored, settings.HISTORY_DIR)
     async with anyio.create_task_group() as task_group:
         task_group.start_soon(_reaper_loop)
+        task_group.start_soon(_trace_loop)
         try:
             yield
         finally:
@@ -119,7 +146,7 @@ app = FastAPI(lifespan=_lifespan)
 # counting its own poll made the chip read "1 request" on a completely idle
 # machine -- the observer appearing in its own observation, and a claim the
 # page could not support. Health checks are excluded for the same reason.
-_UNCOUNTED_PATHS = ("/server-debug", "/status", "/health", "/runs/")
+_UNCOUNTED_PATHS = ("/admin-panel", "/server-debug", "/status", "/health", "/runs/")
 
 
 def _is_observer(path: str) -> bool:
@@ -129,7 +156,7 @@ def _is_observer(path: str) -> bool:
 
 @app.middleware("http")
 async def _count_inflight(request: Request, call_next):
-    """How many requests are being served at this instant, for `/server-debug`.
+    """How many requests are being served at this instant, for `/admin-panel`.
 
     A counter and not a log: what the page needs is the CONCURRENT figure, and
     that is knowable only from inside the request's own lifetime. The
@@ -211,6 +238,11 @@ _RUN_DETACHED = "detached"
 # gets exactly the behaviour it always got, and one that sends it to an older
 # server simply finds no /runs endpoints.
 _RUN_ID_HEADER = "X-Run-Id"
+# A run that is one batch of a divided cohort says which, so the server can
+# group them and decide whether they run side by side (wire/clients.py).
+_BATCH_ID_HEADER = "X-Batch-Id"
+_BATCH_INDEX_HEADER = "X-Batch-Index"
+_BATCH_TOTAL_HEADER = "X-Batch-Total"
 
 # nginx's, and non-standard on purpose: no standard code means "the caller
 # withdrew this". The client has to tell a cancellation from a failure without
@@ -230,6 +262,76 @@ def _get_tool_limiter() -> anyio.CapacityLimiter:
     if _tool_limiter is None:
         _tool_limiter = anyio.CapacityLimiter(settings.MAX_CONCURRENT_TOOLS)
     return _tool_limiter
+
+
+
+
+async def _run_in_slot(call):
+    """`call` in a worker thread, inside a tool slot (see `_tool_slot`)."""
+    async with _tool_slot(runs.CURRENT_RUN.get()):
+        return await anyio.to_thread.run_sync(call)
+
+
+# How often a run waiting for a slot checks whether an operator has given it
+# priority. Half a second is invisible next to a wait for a slot, which is a
+# wait for a whole other run to finish.
+_PRIORITY_POLL_SECONDS = 0.5
+
+
+@contextlib.asynccontextmanager
+async def _tool_slot(run_id: Optional[str]):
+    """One of the MAX_CONCURRENT_TOOLS slots, or none for a run given priority.
+
+    The slot is the FIRST queue a run meets, before admission's, and it is
+    anyio's own FIFO: a run an operator marks HIGH while it waits here would
+    otherwise sit behind every run that arrived first, which is the opposite
+    of what the mark means. So the wait is raced against the mark, and a
+    marked run goes through without a slot. Admission still decides what it
+    may hold -- the slot bounds worker threads, the budget bounds the machine.
+    """
+    limiter = _get_tool_limiter()
+    borrower = object()
+    acquired = False
+    budget = admission.budget()
+    # A batch of a cohort first waits its turn among its siblings, when its
+    # workstation's rule is serial (wire/clients.py). Before the slot, so a
+    # batch waiting on a sibling holds no slot another workstation could use.
+    # Priority goes past this gate too.
+    info = runs.meta(run_id) if run_id else {}
+    batch, address = info.get("batch"), info.get("client")
+    if batch:
+        clients.wait(address, batch, run_id)
+        while not clients.may_start(address, batch, run_id):
+            if budget.priority_of(run_id) == admission.PRIORITY_HIGH:
+                clients.leave(address, batch, run_id)
+                break
+            if runs.is_cancelled(run_id):
+                clients.leave(address, batch, run_id)
+                raise HTTPException(status_code=CLIENT_CLOSED_REQUEST, detail="The client cancelled this run.")
+            await anyio.sleep(_PRIORITY_POLL_SECONDS)
+    if run_id is None or budget.priority_of(run_id) != admission.PRIORITY_HIGH:
+        async with anyio.create_task_group() as group:
+            async def take() -> None:
+                nonlocal acquired
+                await limiter.acquire_on_behalf_of(borrower)
+                acquired = True
+                group.cancel_scope.cancel()
+
+            async def watch() -> None:
+                while budget.priority_of(run_id) != admission.PRIORITY_HIGH:
+                    await anyio.sleep(_PRIORITY_POLL_SECONDS)
+                group.cancel_scope.cancel()
+
+            group.start_soon(take)
+            if run_id is not None:
+                group.start_soon(watch)
+    try:
+        yield
+    finally:
+        if acquired:
+            limiter.release_on_behalf_of(borrower)
+        if batch:
+            clients.leave(address, batch, run_id)
 
 
 def _extract_extension(filename: str) -> str:
@@ -687,7 +789,164 @@ def set_maintenance(wanted: _Maintenance) -> dict:
     return maintenance.snapshot()
 
 
-@app.get("/server-debug.json", dependencies=[Depends(verify_token)])
+class _Move(BaseModel):
+    to: str
+
+
+class _Priority(BaseModel):
+    priority: str
+
+
+class _ClientRule(BaseModel):
+    batches: str
+
+
+@app.get("/clients/me", dependencies=[Depends(verify_token)])
+def client_me(request: Request) -> dict:
+    """How this workstation's cohort batches will be run, so the client can
+    send them accordingly: one at a time when serial, together when parallel
+    -- the server enforcing it either way."""
+    address = _client_address(request)
+    batches = clients.policy_for(address)
+    return {
+        "client": address,
+        "batches": batches,
+        "max_parallel": settings.MAX_CONCURRENT_TOOLS if batches == clients.PARALLEL else 1,
+    }
+
+
+@app.post("/admin/clients/{address}/policy", dependencies=[Depends(verify_admin)])
+def admin_client_policy(address: str, wanted: _ClientRule) -> dict:
+    """Let one workstation's batches run side by side, or one at a time."""
+    try:
+        answer = clients.set_policy(address, wanted.batches)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    logger.info("Operator set the batch rule of %s to %s", address, wanted.batches)
+    return answer
+
+
+class _Door(BaseModel):
+    accepting: bool
+    # How long to stay closed, when closing. Bounded by the maintenance module.
+    hours: float = 2.0
+    reason: str = ""
+
+
+class _UpdateRequest(BaseModel):
+    target: str = "all"
+
+
+@app.post("/admin/door", dependencies=[Depends(verify_admin)])
+def admin_door(wanted: _Door) -> dict:
+    """Stop accepting new runs, or start again -- the operator's own switch.
+
+    Closing refuses new runs with a 503 that says why; every run already
+    received finishes as it would have. What an operator does before an update
+    or a restart they are about to make by hand.
+    """
+    if wanted.accepting:
+        maintenance.reopen()
+        logger.info("Operator reopened the server to new work")
+    else:
+        granted = maintenance.close_by_operator(
+            wanted.hours * 3600, wanted.reason or "closed by an operator before maintenance")
+        logger.info("Operator closed the server to new work for %.0fs", granted)
+    return maintenance.snapshot()
+
+
+@app.get("/admin-panel/updates.json", dependencies=[Depends(verify_admin)])
+def panel_updates() -> dict:
+    """What the host's update agent says can be updated, and what it is doing."""
+    report = updates.overview()
+    report["maintenance"] = maintenance.snapshot()
+    report["load"] = {
+        "running": admission.budget().snapshot()["running"],
+        "in_flight": sum(1 for r in runs.active() if r.get("state") in ("running", "pending")),
+    }
+    return report
+
+
+@app.post("/admin/update", dependencies=[Depends(verify_admin)])
+def admin_update(wanted: _UpdateRequest) -> dict:
+    """Ask the host's update agent to apply what is waiting.
+
+    It stops new runs, waits for those in flight to finish, pulls, rebuilds
+    what has to be rebuilt and restarts the server. The request is a file the
+    agent picks up (wire/updates.py); without an agent running, nothing happens
+    and the panel says so.
+    """
+    try:
+        request = updates.request_update(wanted.target, by="admin panel")
+    except updates.UpdateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    logger.info("Operator requested an update (%s)", wanted.target)
+    return request
+
+
+class _DataRequest(BaseModel):
+    tool: str
+    force: bool = False
+
+
+@app.post("/admin/data", dependencies=[Depends(verify_admin)])
+def admin_data(wanted: _DataRequest) -> dict:
+    """Ask the host's agent to download a tool's models and test files.
+
+    `DATA/` is read-only inside the container, so the download happens on the
+    host, from the tools library's manifest -- what is missing, or everything
+    again with `force`. Nothing is stopped: a tool reads its data when it runs.
+    """
+    try:
+        request = updates.request_data(wanted.tool, wanted.force, by="admin panel")
+    except updates.UpdateError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    logger.info("Operator requested the data of %s (force=%s)", wanted.tool, wanted.force)
+    return request
+
+
+@app.delete("/admin/update", dependencies=[Depends(verify_admin)])
+def admin_update_withdraw() -> dict:
+    """Withdraw a pending update, while the agent is still waiting on runs."""
+    return {"withdrawn": updates.withdraw()}
+
+
+@app.get("/admin/check", dependencies=[Depends(verify_admin)])
+def admin_check() -> dict:
+    """Whether the admin token the dashboard holds is the right one."""
+    return {"admin": True}
+
+
+@app.post("/admin/queue/{run_id}/move", dependencies=[Depends(verify_admin)])
+def admin_move(run_id: str, wanted: _Move) -> dict:
+    """Move a run waiting for room: `top`, `up`, `down` or `bottom`."""
+    try:
+        snapshot = admission.budget().move(run_id, wanted.to)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    except admission.NotQueued as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    logger.info("Operator moved run %s %s", run_id, wanted.to)
+    return snapshot
+
+
+@app.post("/admin/runs/{run_id}/priority", dependencies=[Depends(verify_admin)])
+def admin_priority(run_id: str, wanted: _Priority) -> dict:
+    """Mark a run `high` or back to `normal`, whether it is queued yet or not.
+
+    HIGH puts it ahead of every normal run waiting for room, lets it past the
+    wait for a tool slot, and admits it on the widest shape that fits. A run
+    already admitted keeps what it was given.
+    """
+    try:
+        snapshot = admission.budget().set_priority(run_id, wanted.priority)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    logger.info("Operator set run %s to %s priority", run_id, wanted.priority)
+    return snapshot
+
+
+@app.get("/admin-panel.json", dependencies=[Depends(verify_admin)])
 def server_debug_data() -> dict:
     """Everything `/status` reports, plus what the machine says about itself.
 
@@ -730,7 +989,15 @@ def server_debug_data() -> dict:
         # leaving a reader to wonder whether it is stuck forever.
         "run_ttl_seconds": settings.RUN_TTL_SECONDS,
         "paused_ttl_seconds": settings.PAUSED_RUN_TTL_SECONDS,
+        # Whether the operator controls exist here at all, so the page can
+        # offer them or say why it does not. Never the token itself.
+        "admin_enabled": bool(settings.ADMIN_TOKEN),
     }
+    # The live listing again, with each run's open nested calls: `/status`
+    # keeps the narrower one it always had, and only this page needs to say
+    # that an AREG is, right now, inside ASO inside ALI_CBCT.
+    report["runs"] = runs.active(with_chain=True)
+    report["trace"] = telemetry.trace(since=time.time() - TRACE_WINDOW_SECONDS)
     report["cpu_percent"] = telemetry.cpu_percent()
     report["ram"] = telemetry.ram()
     report["inflight"] = telemetry.inflight()
@@ -742,6 +1009,7 @@ def server_debug_data() -> dict:
     # present in one and not the other is a fact worth being able to see.
     report["ledger"] = telemetry.run_ledger()
     report["uptime"] = telemetry.tool_uptime()
+    report["clients"] = _client_activity(report["runs"], telemetry.run_ledger(limit=telemetry.LEDGER_SIZE))
     # TEMP_DIR is where uploads, results and run directories live -- the space a
     # download actually costs this machine. DATA_DIR is mounted read-only and
     # cannot grow, but it is the other half of "what is this disk holding".
@@ -776,7 +1044,159 @@ _ACTIVITY_TEXT = {
 }
 
 
-@app.get("/server-debug/runs/{run_id}.json", dependencies=[Depends(verify_token)])
+# How long a workstation stays on the dashboard after its last run, and how
+# long a finished cohort stays listed under it.
+_CLIENT_SEEN_SECONDS = 24 * 3600
+_BATCH_SHOWN_SECONDS = 15 * 60
+
+
+def _client_activity(live: list, ledger: list) -> list:
+    """Per workstation: its batch rule, what it has in flight, and its cohorts.
+
+    A cohort is every run sharing a batch id from one address. Its `done` and
+    `failed` come from the ledger, its `running` and `waiting` from the live
+    listing, and `total` is what the client said it would send -- so a serial
+    cohort shows "3 of 12" before batches 4 to 12 have even been sent.
+    """
+    now = time.time()
+    rules = clients.policies()
+    rows: dict = {}
+
+    def row(address):
+        return rows.setdefault(address, {
+            "client": address, "batches": clients.policy_for(address),
+            "custom": address in rules, "last_seen": 0.0,
+            "running": 0, "waiting": 0, "runs_today": 0, "cohorts": {},
+        })
+
+    def cohort(entry, batch, tool):
+        return entry["cohorts"].setdefault(batch["id"], {
+            "id": batch["id"], "tool": tool, "total": batch.get("total"),
+            "done": 0, "failed": 0, "running": 0, "waiting": 0,
+            "started_at": None, "last_at": 0.0,
+        })
+
+    for record in ledger:
+        address = record.get("client")
+        seen = record.get("ended_at") or record.get("started_at") or 0
+        if not address or now - seen > _CLIENT_SEEN_SECONDS:
+            continue
+        entry = row(address)
+        entry["last_seen"] = max(entry["last_seen"], seen)
+        if record.get("started_at") and now - record["started_at"] < 24 * 3600:
+            entry["runs_today"] += 1
+        batch = record.get("batch")
+        if batch and record.get("ended_at"):
+            group = cohort(entry, batch, record.get("tool"))
+            group["done" if record.get("outcome") == "done" else "failed"] += 1
+            group["last_at"] = max(group["last_at"], record["ended_at"])
+            start = record.get("started_at")
+            if start and (group["started_at"] is None or start < group["started_at"]):
+                group["started_at"] = start
+    for run in live:
+        address = run.get("client")
+        if not address or run.get("state") not in ("running", "pending"):
+            continue
+        entry = row(address)
+        entry["last_seen"] = max(entry["last_seen"], run.get("updated_at") or now)
+        waiting = run.get("phase") in (runs.PHASE_QUEUED_GPU, runs.PHASE_RECEIVED)
+        entry["waiting" if waiting else "running"] += 1
+        batch = run.get("batch")
+        if batch:
+            group = cohort(entry, batch, run.get("tool"))
+            group["waiting" if waiting else "running"] += 1
+            group["last_at"] = now
+            start = run.get("started_at")
+            if start and (group["started_at"] is None or start < group["started_at"]):
+                group["started_at"] = start
+    for address in rules:
+        row(address)
+    result = []
+    for entry in rows.values():
+        groups = [g for g in entry["cohorts"].values()
+                  if g["running"] or g["waiting"] or now - g["last_at"] < _BATCH_SHOWN_SECONDS]
+        groups.sort(key=lambda g: g["started_at"] or 0, reverse=True)
+        entry["cohorts"] = groups
+        entry["active_cohorts"] = sum(1 for g in groups if g["running"] or g["waiting"])
+        result.append(entry)
+    result.sort(key=lambda e: (-(e["running"] + e["waiting"]), -e["last_seen"]))
+    return result
+
+
+# How much of the resource trace rides every poll of the operator page. The
+# per-tool view asks for its own, wider window.
+TRACE_WINDOW_SECONDS = 30 * 60
+
+
+@app.get("/admin-panel/history.json", dependencies=[Depends(verify_admin)])
+def panel_history(limit: int = 500) -> dict:
+    """Every finished run the history holds, newest first, for the panel's full
+    history window. The same records the dashboard's strip shows, more of them:
+    timings, shapes, the tools each run called -- never a value or a file name."""
+    limit = max(1, min(int(limit), telemetry.LEDGER_SIZE))
+    records = [r for r in telemetry.run_ledger(limit=telemetry.LEDGER_SIZE) if r.get("ended_at")]
+    return {"runs": records[:limit], "held": len(records), "capacity": telemetry.LEDGER_SIZE}
+
+
+@app.get("/admin-panel/tools/{tool_name}.json", dependencies=[Depends(verify_admin)])
+def server_debug_tool(tool_name: str, limit: int = 120) -> dict:
+    """One tool over its recent runs: what the operator page draws when a tool
+    is clicked.
+
+    Built from the ledger, which keeps finished runs across restarts, so the
+    graphs have a past: each run's phases and nested calls for the Gantt, the
+    mean time spent in each phase, and the machine's trace over the window
+    those runs cover. The same rule as the rest of the page: timings, shapes
+    and tool names, never an argument value or a file name.
+    """
+    limit = max(1, min(int(limit), telemetry.LEDGER_SIZE))
+    records = telemetry.run_ledger(limit=limit, tool=tool_name)
+    phases = {}
+    for record in records:
+        for span in record.get("spans") or []:
+            if span.get("end") is None or span.get("start") is None:
+                continue
+            row = phases.setdefault(span["phase"], {"phase": span["phase"], "seconds": 0.0, "runs": 0})
+            row["seconds"] += max(0.0, span["end"] - span["start"])
+            row["runs"] += 1
+    for row in phases.values():
+        row["mean"] = round(row["seconds"] / row["runs"], 2) if row["runs"] else 0.0
+        row["seconds"] = round(row["seconds"], 1)
+    finished = [r for r in records if r.get("seconds") is not None]
+    since = min((r["started_at"] for r in records), default=time.time()) if records else None
+    learned = costs.known().get(tool_name)
+    # What this deployment holds for the tool, as a workstation would see it.
+    # A tool in the history that is no longer served has none.
+    try:
+        hosted = list_tool_data(tool_name)
+        hosted["folder"] = deployment_config.data_slug(get_tool(tool_name).name)
+    except HTTPException:
+        hosted = None
+    return {
+        "tool": tool_name,
+        "runs": records,
+        "phases": sorted(phases.values(), key=lambda row: row["seconds"], reverse=True),
+        "summary": {
+            "runs": len(records),
+            "ok": sum(1 for r in records if r.get("outcome") == "done"),
+            "failed": sum(1 for r in records if r.get("outcome") == "failed"),
+            "running": sum(1 for r in records if r.get("ended_at") is None),
+            "mean_seconds": round(sum(r["seconds"] for r in finished) / len(finished), 1)
+            if finished else None,
+            "mean_wait": round(sum(r.get("waited") or 0 for r in finished) / len(finished), 2)
+            if finished else None,
+        },
+        "cost": {
+            "vram_bytes": learned.vram_bytes,
+            "ram_bytes": learned.ram_bytes,
+            "samples": learned.samples,
+        } if learned else None,
+        "trace": telemetry.trace(since=since, max_points=900),
+        "data": hosted,
+    }
+
+
+@app.get("/admin-panel/runs/{run_id}.json", dependencies=[Depends(verify_admin)])
 def server_debug_run(run_id: str) -> dict:
     """One run's activity, COMPOSED by this server rather than quoted from the
     tool.
@@ -795,10 +1215,21 @@ def server_debug_run(run_id: str) -> dict:
     alone, so a chatty tool produces a busier console than a silent one without
     a character of its text being republished.
     """
+    record = telemetry.ledger_record(run_id)
     try:
         events = runs.read_events(run_id)
     except runs.RunError as exc:
-        raise _run_error(exc)
+        # Reaped, which is the normal state of a run that finished more than a
+        # few minutes ago. Its timeline survives in the ledger, so the page can
+        # still draw it; only the console is gone.
+        if record is None:
+            raise _run_error(exc)
+        return {
+            "run_id": run_id, "lines": [], "reaped": True, "record": record,
+            "timeline": {"spans": record.get("spans") or [],
+                         "nested": record.get("nested") or [],
+                         "chain": [], "measured": record.get("measured")},
+        }
     lines = []
     for event in events:
         phase = event.get("phase") or runs.PHASE_RUNNING
@@ -816,7 +1247,8 @@ def server_debug_run(run_id: str) -> dict:
             "level": _ACTIVITY_LEVEL.get(phase, "info"),
             "text": text,
         })
-    return {"run_id": run_id, "lines": lines}
+    return {"run_id": run_id, "lines": lines, "reaped": False, "record": record,
+            "timeline": runs.timeline(events)}
 
 
 def _benchmark_resolution() -> dict:
@@ -955,11 +1387,20 @@ def benchmark_stop() -> dict:
     return {"stopped": benchmark_jobs.stop()}
 
 
-@app.get("/server-debug", include_in_schema=False)
-def server_debug() -> HTMLResponse:
-    """The live view of this machine. Unauthenticated like the other pages: it
-    holds no reading, it fetches them with the token the reader types in."""
+@app.get("/admin-panel", include_in_schema=False)
+def admin_panel() -> HTMLResponse:
+    """The operator's panel. The page itself holds no reading and is served to
+    anyone; everything it shows comes from `/admin-panel*.json`, which answers
+    only to the ADMIN token. A clinician's workstation holds the API token,
+    which opens nothing here."""
     return HTMLResponse(debug_page.DEBUG_PAGE)
+
+
+@app.get("/server-debug", include_in_schema=False)
+@app.get("/panel-admin", include_in_schema=False)
+def server_debug_moved() -> RedirectResponse:
+    """The panel's earlier addresses: both land on it rather than on a 404."""
+    return RedirectResponse(url="admin-panel", status_code=status.HTTP_308_PERMANENT_REDIRECT)
 
 
 @app.get("/tools")
@@ -1731,8 +2172,14 @@ def _registered_run(request: Request, tool_name: str) -> Optional[str]:
     raw = request.headers.get(_RUN_ID_HEADER)
     if not raw:
         return None
+    # Which batch of a divided cohort this is, when the client says so. Read
+    # here, with the id, so the dashboard can group the runs from the moment
+    # they exist and the gate in `_tool_slot` can order them.
+    batch = runs.parse_batch(request.headers.get(_BATCH_ID_HEADER),
+                             request.headers.get(_BATCH_INDEX_HEADER),
+                             request.headers.get(_BATCH_TOTAL_HEADER))
     try:
-        return runs.register(raw, tool=tool_name, client=_client_address(request))
+        return runs.register(raw, tool=tool_name, client=_client_address(request), batch=batch)
     except runs.RunError as exc:
         raise _run_error(exc)
 
@@ -1750,7 +2197,7 @@ def _client_address(request: Request) -> Optional[str]:
     is a deployment decision, so it lives there and not in this function.
 
     An address is not patient data, but it does identify a person's machine, so
-    it travels no further than `/status` and `/server-debug` already do: behind
+    it travels no further than `/status` and `/admin-panel` already do: behind
     the shared token, for an operator asking "who is hammering this server".
     """
     client = request.client
@@ -2323,11 +2770,8 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             # wants a number.
             size=0,
             work_dir=None, scratch_dirs=file_utils.track_scratch_dirs(),
-            result=await anyio.to_thread.run_sync(
-                functools.partial(dispatch.dispatch, tool, {},
-                                  resume_from=resume_from),
-                limiter=_get_tool_limiter(),
-            ),
+            result=await _run_in_slot(
+                functools.partial(dispatch.dispatch, tool, {}, resume_from=resume_from)),
         )
 
     # Generic argument collection: whatever scalar fields and/or files the
@@ -2560,9 +3004,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # bounded by MAX_CONCURRENT_TOOLS and safe: tools are stateless
         # (everything arrives via args), each request gets its own work_dir,
         # and DATA_DIR is read-only.
-        result = await anyio.to_thread.run_sync(
-            tool.invoke, args, limiter=_get_tool_limiter()
-        )
+        result = await _run_in_slot(functools.partial(tool.invoke, args))
     except ToolArgumentError as exc:
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))

@@ -40,3 +40,8 @@ local-server.log
 # Local dev servers: a second instance's schema cache and its log.
 .schema-cache-*/
 local-server-*.log
+
+# The operator page's run history (server/.history, HISTORY_DIR)
+.history/
+# The update agent and the server leave each other notes here (UPDATE_DIR)
+.update/

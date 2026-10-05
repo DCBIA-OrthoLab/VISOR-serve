@@ -177,7 +177,7 @@ def run_directory(run_id: str) -> str:
 
 
 def register(run_id: str, tool: Optional[str] = None,
-             client: Optional[str] = None) -> str:
+             client: Optional[str] = None, batch: Optional[dict] = None) -> str:
     """Claim an id and open its directory. Returns the id.
 
     Called as the FIRST thing `POST /run` does, before `await request.form()`,
@@ -204,18 +204,48 @@ def register(run_id: str, tool: Optional[str] = None,
     # SADT_PROGRESS_FILE would otherwise litter whatever it points at.
     with open(os.path.join(directory, EVENTS_FILE), "wb"):
         pass
-    if tool or client:
+    if tool or client or batch:
         # Best effort: a run whose name could not be written is still a run.
         try:
             with open(os.path.join(directory, META_FILE), "w", encoding="utf-8") as handle:
                 json.dump({"tool": str(tool)[:100] if tool else None,
                            "client": str(client)[:64] if client else None,
+                           "batch": batch,
                            "at": time.time()}, handle)
         except OSError:
             pass
-    telemetry.record_run_start(run_id, tool, client)
+    telemetry.record_run_start(run_id, tool, client, batch=batch)
     reap_expired()
     return run_id
+
+
+# A batch as the client names it: which cohort split this run is one part of.
+# The id is minted by the client per Apply and means nothing outside it.
+_BATCH_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
+_MAX_BATCHES = 10000
+
+
+def parse_batch(batch_id, index, total) -> Optional[dict]:
+    """`{id, index, total}` from the three headers, or None if any is absent
+    or implausible. Never raises: a run with a malformed batch is a run."""
+    if not batch_id or not _BATCH_ID.fullmatch(str(batch_id)):
+        return None
+    try:
+        index, total = int(index), int(total)
+    except (TypeError, ValueError):
+        return None
+    if not (1 <= index <= total <= _MAX_BATCHES):
+        return None
+    return {"id": str(batch_id), "index": index, "total": total}
+
+
+def meta(run_id: str) -> dict:
+    """What `register` wrote for this run, or {}."""
+    try:
+        with open(os.path.join(run_directory(run_id), META_FILE), encoding="utf-8") as handle:
+            return json.load(handle) or {}
+    except (RunError, OSError, ValueError):
+        return {}
 
 
 def discard(run_id: str) -> None:
@@ -474,7 +504,15 @@ def finish(run_id: str, phase: str, message: str = "", result=None) -> None:
     # sixth ending added later is recorded without anybody remembering to. The
     # phase is all that travels -- never `message`, which on a failure carries
     # a tool's own words and can name the file it died on.
-    telemetry.record_run_end(run_id, phase, phase)
+    #
+    # The timeline is taken now because this is the last moment the events
+    # exist: the directory is discarded right after, and the ledger is what
+    # the operator page draws a finished run from.
+    try:
+        shape = timeline(read_events(run_id))
+    except Exception:  # noqa: BLE001 - the ledger must not fail a run's ending
+        shape = None
+    telemetry.record_run_end(run_id, phase, phase, timeline=shape)
 
 
 # ----------------------------------------------------------------------
@@ -658,6 +696,71 @@ class EventReader:
 def read_events(run_id: str) -> List[dict]:
     """Every event so far, oldest first. `404` for an unknown id."""
     return EventReader(run_directory(run_id)).read()
+
+
+# What a timeline keeps at most. A run that reports progress every second for
+# hours is still one span; these bound the pathological cases, a tool calling
+# a sibling thousands of times or a phase flapping, so a ledger record stays
+# a few kilobytes.
+_MAX_SPANS = 60
+_MAX_NESTED = 200
+_TERMINAL_PHASES = (PHASE_DONE, PHASE_FAILED, PHASE_CANCELLED)
+
+
+def timeline(events: List[dict]) -> dict:
+    """A run's shape over time, built from its events: `{spans, nested, chain,
+    measured}`.
+
+    * `spans` -- the server's phases at the root, `[{phase, start, end}]`, the
+      bars a Gantt draws. A terminal phase closes the last span and is not a
+      span itself; an open span (a live run) has `end: None`.
+    * `nested` -- every call a tool made to another one through the
+      supervisor, `[{tool, depth, start, end}]`. The supervisor brackets each
+      call with two identical markers at the child's depth, so they pair by
+      `(tool, depth)` in file order; an unclosed one is still running.
+    * `chain` -- the calls open right now, outermost first: what the root is
+      waiting on at this instant, `["ASO", "ALI_CBCT"]` under an AREG.
+    * `measured` -- the run's own peaks, from its last `measured` event.
+
+    Only the phase, the time, the depth and the tool name are read. A message
+    is a tool's free text and can name a patient's file, so nothing here is
+    built from one.
+    """
+    spans, nested, open_calls, measured = [], [], {}, None
+    for event in events:
+        at = event.get("at")
+        if event.get("measured"):
+            measured = event["measured"]
+        tool = event.get("tool")
+        if tool:
+            key = (tool, event.get("depth", 0))
+            started = open_calls.pop(key, None)
+            if started is None:
+                open_calls[key] = at
+            elif len(nested) < _MAX_NESTED:
+                nested.append({"tool": tool, "depth": key[1], "start": started, "end": at})
+            continue
+        if event.get("depth", 0) != 0:
+            continue
+        phase = event.get("phase")
+        if spans and spans[-1]["end"] is None:
+            if spans[-1]["phase"] == phase:
+                continue
+            spans[-1]["end"] = at
+        if phase in _TERMINAL_PHASES or len(spans) >= _MAX_SPANS:
+            continue
+        spans.append({"phase": phase, "start": at, "end": None})
+    still_open = sorted(open_calls.items(), key=lambda item: (item[0][1], item[1]))
+    for (tool, depth), started in still_open:
+        if len(nested) < _MAX_NESTED:
+            nested.append({"tool": tool, "depth": depth, "start": started, "end": None})
+    nested.sort(key=lambda call: (call["start"] or 0, call["depth"]))
+    return {
+        "spans": spans,
+        "nested": nested,
+        "chain": [tool for (tool, _depth), _started in still_open],
+        "measured": measured,
+    }
 
 
 def snapshot(run_id: str) -> dict:
@@ -864,7 +967,7 @@ def progress_file(run_id: Optional[str]) -> Optional[str]:
     return os.path.abspath(os.path.join(directory, EVENTS_FILE))
 
 
-def active(limit: int = 500) -> list:
+def active(limit: int = 500, with_chain: bool = False) -> list:
     """Every run the registry still holds, newest first, without its events.
 
     For an operator looking at a live server: what is on it, how far along, and
@@ -896,6 +999,7 @@ def active(limit: int = 500) -> list:
         except OSError:
             continue
         latest = None
+        events = []
         try:
             # keep_alive=False: LOOKING at a run is not the run being alive.
             # Reading stamps the directory, and the TTL is an idle timeout, so
@@ -907,11 +1011,13 @@ def active(limit: int = 500) -> list:
             pass
         tool = None
         client = None
+        batch = None
         try:
             with open(os.path.join(directory, META_FILE), encoding="utf-8") as handle:
                 meta = json.load(handle) or {}
             tool = meta.get("tool")
             client = meta.get("client")
+            batch = meta.get("batch")
             # The registration stamp, not the directory's ctime. ctime is the
             # INODE CHANGE time: every `touch` moves it, so a run that reported
             # progress -- or that anything stat'd and stamped -- claimed to have
@@ -922,7 +1028,7 @@ def active(limit: int = 500) -> list:
                 started_at = float(recorded)
         except (OSError, ValueError):
             pass
-        found.append({
+        entry = {
             "run_id": name,
             "tool": tool,
             "client": client,
@@ -932,6 +1038,14 @@ def active(limit: int = 500) -> list:
             "depth": latest["depth"] if latest else 0,
             "started_at": started_at,
             "updated_at": updated_at,
-        })
+        }
+        if batch:
+            entry["batch"] = batch
+        if with_chain:
+            # Tool names only, which `_clean_tool_name` already restricted to
+            # identifiers: the operator page may say a run is inside ALI_CBCT
+            # without anything a tool wrote reaching it.
+            entry["chain"] = timeline(events)["chain"]
+        found.append(entry)
     found.sort(key=lambda entry: entry["started_at"], reverse=True)
     return found[:limit]

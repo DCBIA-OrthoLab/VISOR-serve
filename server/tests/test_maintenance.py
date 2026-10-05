@@ -43,7 +43,7 @@ def door_open_again():
 
 def test_a_server_starts_accepting_work():
     assert maintenance.accepting() is True
-    assert maintenance.snapshot() == {"accepting": True, "closed_for": None, "reason": ""}
+    assert maintenance.snapshot() == {"accepting": True, "closed_for": None, "reason": "", "by_operator": False}
 
 
 def test_the_door_reopens_on_its_own_when_nobody_comes_back():
@@ -156,7 +156,11 @@ def test_every_endpoint_that_starts_work_is_gated():
     # Endpoints that legitimately answer while the door is shut. Each one is
     # something a client needs to FINISH work it already started, or the
     # control that opens the door again.
-    ALLOWED_OPEN = {"/maintenance"}
+    # The operator's controls start nothing: they reorder or mark runs, or
+    # set how a workstation's batches run, which is exactly what an operator
+    # may need to do while an update is draining the server.
+    ALLOWED_OPEN = {"/maintenance", "/admin/queue/{run_id}/move", "/admin/runs/{run_id}/priority",
+                    "/admin/clients/{address}/policy", "/admin/door", "/admin/update", "/admin/data"}
     # This is also what catches a route that does not exist yet. A benchmark
     # battery is a run too, and the day `POST /benchmark/run` lands it arrives
     # here ungated and fails this test until somebody decides.
