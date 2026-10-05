@@ -566,7 +566,13 @@ class Budget:
         parent = ancestors[-1]
         if parent.demand is None:
             return (0.0, 0, 0)
-        reserved = (parent.demand.cpus, parent.demand.ram_bytes, parent.demand.vram_bytes)
+        # What it holds in all: its own reservation AND what it borrowed from
+        # its own caller. ASO borrows all of its room from AREG and holds
+        # nothing of its own; counting only the latter, ALI_CBCT under it
+        # could borrow nothing and asked the machine for everything.
+        reserved = (parent.demand.cpus + parent.loan[0],
+                    parent.demand.ram_bytes + parent.loan[1],
+                    parent.demand.vram_bytes + parent.loan[2])
         return tuple(max(0, held - used - lent)
                      for held, used, lent in zip(reserved, holding, parent.lent))
 

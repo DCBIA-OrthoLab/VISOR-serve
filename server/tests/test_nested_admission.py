@@ -676,3 +676,17 @@ def test_the_supervisor_says_what_its_level_occupies(budget, tools_dir, tmp_path
     assert seen and seen[0]["borrowed"]["ram_bytes"] == 1 * GiB
     assert seen[0]["ram_bytes"] == 0
     root.finish()
+
+
+def test_a_grandchild_borrows_what_its_borrowing_parent_holds():
+    """ASO holds nothing of its own -- it borrowed all of its room from AREG --
+    and ALI_CBCT under it still borrows from that room."""
+    budget = _budget(ram=12 * GiB)
+    with budget.reserve(_demand(ram=8 * GiB)) as root:
+        with budget.reserve(_demand(ram=4 * GiB), ancestors=(root,),
+                            holding=(1.0, 1 * GiB, 0)) as middle:
+            assert middle.demand.ram_bytes == 0
+            with budget.reserve(_demand(ram=3 * GiB), ancestors=(root, middle),
+                                holding=(1.0, 1 * GiB, 0)) as leaf:
+                assert leaf.loan[1] == 3 * GiB
+                assert budget.snapshot()["ram_held"] == 8 * GiB
