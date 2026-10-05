@@ -57,7 +57,7 @@ from config import settings
 from data_store import DataNotFoundError, data_store
 from registry.deployment import deployment_config
 from registry import TOOLS, get_tool
-from wire import clients, updates
+from wire import clients, update_check, updates
 from wire.security import verify_admin, verify_token
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -859,12 +859,22 @@ def admin_door(wanted: _Door) -> dict:
 def panel_updates() -> dict:
     """What the host's update agent says can be updated, and what it is doing."""
     report = updates.overview()
+    # The server's own read-only check, which needs no agent; refreshed in the
+    # background when stale, so this poll never waits on the network.
+    report["check"] = update_check.last()
     report["maintenance"] = maintenance.snapshot()
     report["load"] = {
         "running": admission.budget().snapshot()["running"],
         "in_flight": sum(1 for r in runs.active() if r.get("state") in ("running", "pending")),
     }
     return report
+
+
+@app.post("/admin/updates/check", dependencies=[Depends(verify_admin)])
+def admin_updates_check() -> dict:
+    """Check now, from the server itself, what is waiting for the server and
+    the tools library. Read-only; applying still needs the host."""
+    return update_check.run_check()
 
 
 @app.post("/admin/update", dependencies=[Depends(verify_admin)])

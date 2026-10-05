@@ -35,6 +35,7 @@ import os
 import secrets
 import shutil
 import socket
+import signal
 import subprocess
 import sys
 import time
@@ -1359,6 +1360,84 @@ def _watch_once(branch: str, url: str, service: str, token: str, args,
         set_accepting(url, token, True)
 
 
+# ---------------------------------------------------------------------------
+# The update agent
+# ---------------------------------------------------------------------------
+#
+# scripts/update_agent.py, kept running beside the server so the admin panel
+# can apply updates and download data in one click. Started by `up` and
+# `update` themselves, so nobody has to remember it; detached from this shell,
+# so it outlives the ssh session that started it. Not a system service: a
+# reboot stops it until the next `up` or `update`, and the panel says so --
+# its own "Check for updates" needs no agent at all.
+
+AGENT_SCRIPT = os.path.join(_SCRIPT_DIR, "update_agent.py")
+AGENT_PID = os.path.join(REPO_ROOT, "server", ".update", "agent.pid")
+AGENT_LOG = os.path.join(REPO_ROOT, "update_agent.log")
+
+
+def agent_pid():
+    """The running agent's pid, or None."""
+    try:
+        with open(AGENT_PID, encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            if b"update_agent.py" not in handle.read():
+                return None
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def ensure_agent() -> dict:
+    """Start the agent unless it is already running. Never raises."""
+    pid = agent_pid()
+    if pid:
+        return {"running": True, "pid": pid, "started": False}
+    if not os.path.isfile(AGENT_SCRIPT):
+        return {"running": False, "error": "scripts/update_agent.py is missing"}
+    env = dict(os.environ)
+    # uv, which the agent runs to rebuild a tool's environment, is usually in
+    # ~/.local/bin -- on PATH in a login shell, not always in this one.
+    env["PATH"] = os.pathsep.join([os.path.expanduser("~/.local/bin"), env.get("PATH", "")])
+    try:
+        with open(AGENT_LOG, "a", encoding="utf-8") as log_file:
+            process = subprocess.Popen([sys.executable, AGENT_SCRIPT], cwd=REPO_ROOT, env=env,
+                                       stdin=subprocess.DEVNULL, stdout=log_file,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError as exc:
+        return {"running": False, "error": str(exc)}
+    log(f"Update agent started (pid {process.pid}); its log is {AGENT_LOG}.")
+    return {"running": True, "pid": process.pid, "started": True}
+
+
+def stop_agent() -> dict:
+    pid = agent_pid()
+    if not pid:
+        return {"running": False, "stopped": False}
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        return {"running": True, "stopped": False, "error": str(exc)}
+    return {"running": False, "stopped": True, "pid": pid}
+
+
+def cmd_agent(args) -> dict:
+    if args.stop:
+        return stop_agent()
+    return ensure_agent()
+
+
+def _with_agent(command):
+    """`up` and `update`, followed by making sure the agent runs."""
+    def wrapped(args):
+        result = command(args)
+        if not getattr(args, "no_agent", False):
+            result["agent"] = ensure_agent()
+        return result
+    return wrapped
+
+
 def cmd_down(args) -> dict:
     service = pick_service(args.device)
     # No port argument: stopping never binds anything, so the conflict check
@@ -1545,7 +1624,8 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--force-recreate", action="store_true", help="Recreate the container from scratch.")
     up.add_argument("--no-wait", dest="wait", action="store_false", help="Return without waiting for /health.")
     up.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
-    up.set_defaults(func=cmd_up, printer=None)
+    up.add_argument("--no-agent", action="store_true", help="Do not start the update agent.")
+    up.set_defaults(func=_with_agent(cmd_up), printer=None)
 
     update = subparsers.add_parser("update", help="Pull new commits and relaunch if anything changed.")
     add_common(update)
@@ -1555,7 +1635,12 @@ def build_parser() -> argparse.ArgumentParser:
     update.add_argument("--bind", default=None, help="See 'up --bind'.")
     update.add_argument("--force", action="store_true", help="Recreate even when nothing changed.")
     update.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
-    update.set_defaults(func=cmd_update, printer=None)
+    update.add_argument("--no-agent", action="store_true", help="Do not start the update agent.")
+    update.set_defaults(func=_with_agent(cmd_update), printer=None)
+
+    agent = subparsers.add_parser("agent", help="Start the update agent the admin panel uses (or --stop it).")
+    agent.add_argument("--stop", action="store_true", help="Stop it instead.")
+    agent.set_defaults(func=cmd_agent, printer=None)
 
     watch = subparsers.add_parser(
         "watch",

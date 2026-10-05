@@ -357,3 +357,43 @@ def test_notify_classifies_but_never_touches_the_clone(monkeypatch):
 
     assert outcome["would_apply"]["sha"] == "bbbbbbb"
     assert not git.pulled
+
+
+# ---------------------------------------------------------------------------
+# Keeping the update agent running
+# ---------------------------------------------------------------------------
+
+def test_the_agent_is_started_once_found_after_and_stopped(tmp_path, monkeypatch):
+    """`up` and `update` start it; a second call finds it rather than starting
+    a twin; `agent --stop` ends it."""
+    import signal
+    import time as _time
+    fake = tmp_path / "update_agent.py"
+    pid_path = tmp_path / "agent.pid"
+    # Stands in for the agent: records its pid where the real one does, then waits.
+    fake.write_text(f"import os, time\nopen({str(pid_path)!r}, 'w').write(str(os.getpid()))\ntime.sleep(60)\n")
+    monkeypatch.setattr(ctl, "AGENT_SCRIPT", str(fake))
+    monkeypatch.setattr(ctl, "AGENT_PID", str(pid_path))
+    monkeypatch.setattr(ctl, "AGENT_LOG", str(tmp_path / "agent.log"))
+    first = ctl.ensure_agent()
+    assert first["started"] is True
+    for _ in range(100):
+        if ctl.agent_pid():
+            break
+        _time.sleep(0.05)
+    assert ctl.agent_pid() == first["pid"]
+    second = ctl.ensure_agent()
+    assert second == {"running": True, "pid": first["pid"], "started": False}
+    assert ctl.stop_agent()["stopped"] is True
+    try:
+        os.waitpid(first["pid"], 0)
+    except ChildProcessError:
+        pass
+    assert ctl.agent_pid() is None
+
+
+def test_a_stale_pid_file_is_not_mistaken_for_a_running_agent(tmp_path, monkeypatch):
+    pid_path = tmp_path / "agent.pid"
+    pid_path.write_text(str(os.getpid()))        # this process is not the agent
+    monkeypatch.setattr(ctl, "AGENT_PID", str(pid_path))
+    assert ctl.agent_pid() is None

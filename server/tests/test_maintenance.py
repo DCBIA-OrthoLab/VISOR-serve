@@ -160,7 +160,8 @@ def test_every_endpoint_that_starts_work_is_gated():
     # set how a workstation's batches run, which is exactly what an operator
     # may need to do while an update is draining the server.
     ALLOWED_OPEN = {"/maintenance", "/admin/queue/{run_id}/move", "/admin/runs/{run_id}/priority",
-                    "/admin/clients/{address}/policy", "/admin/door", "/admin/update", "/admin/data"}
+                    "/admin/clients/{address}/policy", "/admin/door", "/admin/update", "/admin/data",
+                    "/admin/updates/check"}
     # This is also what catches a route that does not exist yet. A benchmark
     # battery is a run too, and the day `POST /benchmark/run` lands it arrives
     # here ungated and fails this test until somebody decides.

@@ -45,3 +45,5 @@ local-server-*.log
 .history/
 # The update agent and the server leave each other notes here (UPDATE_DIR)
 .update/
+# The update agent's log (scripts/server_ctl.py agent)
+update_agent.log

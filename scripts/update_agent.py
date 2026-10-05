@@ -38,6 +38,7 @@ installed and must not need anything that an update could break.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import subprocess
@@ -50,7 +51,6 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 
 import server_ctl  # noqa: E402 - beside this file, and stdlib only too
-import importlib.util  # noqa: E402
 
 REPO_ROOT = server_ctl.REPO_ROOT
 STATUS_FILE = "status.json"
@@ -64,11 +64,20 @@ REQUEST_POLL_SECONDS = 2
 DOOR_LEASE_SECONDS = 90
 LOG_LINES = 40
 
-# What a change to the SERVER repository asks for.
-RESTART, RECREATE, IMAGE = "restart", "recreate", "image"
-_RECREATE_PATHS = ("docker-compose.yml",)
-_RECREATE_PREFIXES = ("server/requirements",)
-_IMAGE_PREFIXES = ("docker/",)
+def _load_release_diff():
+    """The classification the server's own "Check for updates" uses, loaded by
+    path so the panel and this agent can never disagree about a commit."""
+    path = os.path.join(REPO_ROOT, "server", "wire", "release_diff.py")
+    spec = importlib.util.spec_from_file_location("release_diff_for_agent", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+release_diff = _load_release_diff()
+RESTART, RECREATE, IMAGE = release_diff.RESTART, release_diff.RECREATE, release_diff.IMAGE
+classify_server = release_diff.classify_server
+classify_tools = release_diff.classify_tools
 
 
 def log(message: str) -> None:
@@ -116,51 +125,8 @@ def refresh(repo: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# What a set of commits touches
+# One checkout
 # ---------------------------------------------------------------------------
-
-def classify_server(paths) -> dict:
-    """`{action, paths}` for the server repository: the heaviest of restart,
-    recreate and image that any changed path asks for."""
-    action = RESTART if paths else None
-    heavy = []
-    for path in paths:
-        if path.startswith(_IMAGE_PREFIXES):
-            action = IMAGE
-            heavy.append(path)
-        elif path in _RECREATE_PATHS or path.startswith(_RECREATE_PREFIXES):
-            if action != IMAGE:
-                action = RECREATE
-            heavy.append(path)
-    return {"action": action, "heavy": heavy}
-
-
-def classify_tools(paths) -> dict:
-    """Per tool, whether only its code changed or its environment must be
-    rebuilt -- and which environments, as the folders to `uv sync` in.
-
-    A tool is `tools/<Name>/`; an environment is any folder holding a changed
-    `pyproject.toml` or `uv.lock`, which for AREG's engines is a level deeper
-    (`tools/AREG/AREG_CBCT/`). Anything outside `tools/` -- the data manifest,
-    the scripts -- is listed separately: it changes no running tool.
-    """
-    tools, environments, other = {}, set(), []
-    for path in paths:
-        parts = path.split("/")
-        if len(parts) < 3 or parts[0] != "tools" or parts[1].startswith(("_", ".")):
-            other.append(path)
-            continue
-        entry = tools.setdefault(parts[1], {"tool": parts[1], "files": 0, "environment": False})
-        entry["files"] += 1
-        if parts[-1] in ("pyproject.toml", "uv.lock"):
-            entry["environment"] = True
-            environments.add("/".join(parts[:-1]))
-    return {
-        "tools": sorted(tools.values(), key=lambda t: t["tool"]),
-        "environments": sorted(environments),
-        "other": other[:20],
-    }
-
 
 def inspect(repo: str, kind: str, fetch: bool = True) -> dict:
     """Everything the panel shows about one checkout."""
@@ -524,7 +490,27 @@ class Agent:
             log(message)
             self.survey(fetch=False)
 
+    def claim(self) -> bool:
+        """One agent per deployment: refuse to start beside a live one."""
+        os.makedirs(self.update_dir, exist_ok=True)
+        pid_path = self._path("agent.pid")
+        try:
+            with open(pid_path, encoding="utf-8") as handle:
+                other = int(handle.read().strip())
+            if other != os.getpid():
+                with open(f"/proc/{other}/cmdline", "rb") as handle:
+                    if b"update_agent.py" in handle.read():
+                        log(f"Another update agent is already running (pid {other}).")
+                        return False
+        except (OSError, ValueError):
+            pass
+        with open(pid_path, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+        return True
+
     def run(self):
+        if not self.args.once and not self.claim():
+            return
         self.survey()
         if self.args.once:
             return
@@ -536,6 +522,13 @@ class Agent:
                     self.apply_data(request)
                 else:
                     self.apply(request)
+                    last = self.state["last"] or {}
+                    if last.get("ok") and last.get("target") in ("all", "server") \
+                            and "server" in (last.get("message") or ""):
+                        # This file may have been updated with the rest: run the
+                        # new one rather than go on with the code it replaced.
+                        log("Restarting the agent on the updated code.")
+                        os.execv(sys.executable, [sys.executable] + sys.argv)
                 next_survey = time.monotonic() + self.args.poll
             elif time.monotonic() >= next_survey:
                 self.survey()

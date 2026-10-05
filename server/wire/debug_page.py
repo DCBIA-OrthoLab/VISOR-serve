@@ -1208,7 +1208,7 @@ DEBUG_PAGE = r"""<!doctype html>
   }
 
   // ---- maintenance & updates ------------------------------------------
-  var upd = null, updFetchedAt = 0, doorHours = "2";
+  var upd = null, updFetchedAt = 0, doorHours = "2", checking = false;
   function loadUpdates(force) {
     if (!token || (!force && Date.now() - updFetchedAt < 4000)) { return; }
     updFetchedAt = Date.now();
@@ -1266,20 +1266,24 @@ DEBUG_PAGE = r"""<!doctype html>
       el("m-tools").innerHTML = ""; el("m-act").innerHTML = ""; el("m-progress").innerHTML = "";
       return;
     }
-    var st = upd.status || {};
-    if (!upd.agent.alive) {
-      el("m-server").innerHTML = '<div class="t"><span class="sdot off"></span>Update agent not running</div>' +
-        '<div class="s">' + (upd.agent.seen ? "Last heard from " + ago(upd.agent.heartbeat) + " ago. " : "") +
-        "Start it on the host: <code>python3 scripts/update_agent.py</code></div>";
-      el("m-tools").innerHTML = ""; el("m-act").innerHTML = "";
+    // With an agent on the host, its report (and its one-click apply). Without
+    // one, the server's own read-only check: what is waiting, and how to apply.
+    var alive = upd.agent.alive, st = upd.status || {};
+    var view = alive ? st : (upd.check || {});
+    if (!alive && !upd.check) {
+      el("m-server").innerHTML = '<div class="t"><span class="sdot off"></span>Checking for updates\u2026</div>';
+      el("m-tools").innerHTML = "";
     } else {
-      el("m-server").innerHTML = repoSummary(st.server, "Server");
-      el("m-tools").innerHTML = repoSummary(st.tools, "Tools library");
-      var waiting = ((st.server || {}).behind || 0) + ((st.tools || {}).behind || 0);
-      el("m-act").innerHTML = '<button class="' + (waiting ? "primary" : "") + '" data-updates="1">' +
-        (waiting ? "Review &amp; update" : "Details") + "</button>" +
-        '<span class="s" style="font-size:11.5px;color:var(--ghost)">checked ' + ago(upd.agent.heartbeat) + " ago</span>";
+      el("m-server").innerHTML = repoSummary(view.server, "Server");
+      el("m-tools").innerHTML = repoSummary(view.tools, "Tools library");
     }
+    var waiting = ((view.server || {}).behind || 0) + ((view.tools || {}).behind || 0);
+    var checkedAt = alive ? upd.agent.heartbeat : (upd.check || {}).at;
+    el("m-act").innerHTML = '<button class="' + (waiting ? "primary" : "") + '" data-updates="1">' +
+      (waiting ? "Review" + (alive ? " &amp; update" : "") : "Details") + "</button>" +
+      '<button class="ghost" data-check="1">' + ((upd.check || {}).running || checking ? "Checking\u2026" : "Check now") + "</button>" +
+      '<span class="s" style="font-size:11.5px;color:var(--ghost)">' + (checkedAt ? "checked " + ago(checkedAt) + " ago" : "") +
+      (alive ? "" : " \u00b7 no update agent") + "</span>";
     var progress = "";
     if (st.applying) {
       progress = '<b>Updating</b> \u00b7 ' + esc(st.applying.phase || "starting") +
@@ -1301,7 +1305,10 @@ DEBUG_PAGE = r"""<!doctype html>
     }).join("");
   }
   function updatesDialog() {
-    var st = (upd && upd.status) || {}, srv = st.server || {}, tl = st.tools || {};
+    var alive = upd && upd.agent.alive;
+    var st = (upd && upd.status) || {};
+    var view = alive ? st : ((upd && upd.check) || {});
+    var srv = view.server || {}, tl = view.tools || {};
     function block(info, label, target) {
       var reasons = info.blockers || [];
       var detail = "";
@@ -1319,11 +1326,14 @@ DEBUG_PAGE = r"""<!doctype html>
       return section(label + (info.branch ? " \u00b7 " + info.branch + " @ " + (info.local || "") : ""),
         (reasons.length ? '<div class="warnbox">Cannot be updated from here: ' + esc(reasons.join("; ")) + "</div>" : "") +
         detail + commitsHtml(info) +
-        (info.behind && !reasons.length ? '<div style="margin-top:8px"><button class="primary" data-update="' + target +
+        (info.behind && !reasons.length && alive ? '<div style="margin-top:8px"><button class="primary" data-update="' + target +
           '">Update ' + label.toLowerCase() + "</button></div>" : ""));
     }
     var busy = st.applying || (upd && upd.request);
-    var both = (srv.behind && tl.behind && !(srv.blockers || []).length && !(tl.blockers || []).length);
+    var both = alive && (srv.behind && tl.behind && !(srv.blockers || []).length && !(tl.blockers || []).length);
+    var howto = alive ? "" : '<div class="warnbox">Applying an update needs the host, where the code lives. Either run ' +
+      "<code>python3 scripts/server_ctl.py update</code> there, or start the update agent " +
+      "(<code>python3 scripts/server_ctl.py agent</code>) to update from this panel in one click.</div>";
     var last = st.last ? (st.last.ok ? '<div class="okbox">' : '<div class="warnbox">') + esc(st.last.message) +
       " \u00b7 " + ago(st.last.at) + " ago" + ((st.last.log || []).length
         ? '<div class="con" style="margin-top:8px;max-height:180px">' + st.last.log.map(function (l) {
@@ -1335,7 +1345,7 @@ DEBUG_PAGE = r"""<!doctype html>
     var progress = busy ? '<div class="warnbox"><b>In progress:</b> ' + esc((st.applying || {}).phase || "requested, waiting for the agent") +
       ((st.applying || {}).log ? '<div class="con" style="margin-top:8px;max-height:160px">' + st.applying.log.map(function (l) {
         return '<div class="ln"><span class="tx">' + esc(l) + "</span></div>"; }).join("") + "</div>" : "") + "</div>" : "";
-    return head + '<div class="dbody">' + progress + (busy ? "" : '<div class="two">' + block(srv, "Server", "server") +
+    return head + '<div class="dbody">' + howto + progress + (busy ? "" : '<div class="two">' + block(srv, "Server", "server") +
       block(tl, "Tools library", "tools") + "</div>") + (last ? section("Last update", last) : "") + "</div>";
   }
 
@@ -1490,7 +1500,7 @@ DEBUG_PAGE = r"""<!doctype html>
     var manifest = "";
     if (!upd || !upd.agent.alive) {
       manifest = '<div class="warnbox">The update agent is not running on the host, so the manifest cannot be compared ' +
-        "and nothing can be downloaded from here. Start it with <code>python3 scripts/update_agent.py</code>.</div>";
+        "and nothing can be downloaded from here. Start it on the host with <code>python3 scripts/server_ctl.py agent</code>.</div>";
     } else if (!m) {
       manifest = '<div class="empty" style="text-align:left">The tools library\'s manifest lists nothing for this tool.</div>';
     } else {
@@ -1730,6 +1740,15 @@ DEBUG_PAGE = r"""<!doctype html>
     if (t.closest("[data-close]") || t === el("overlay")) { closeDialog(); return; }
     if (t.closest("[data-history]")) { openDialog("history", null); return; }
     if (t.closest("[data-updates]")) { openDialog("updates", null); return; }
+    if (t.closest("[data-check]")) {
+      if (checking) { return; }
+      checking = true; drawMaint();
+      fetch("admin/updates/check", { method: "POST", headers: { "X-Admin-Token": token } })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function () { checking = false; updFetchedAt = 0; loadUpdates(true); })
+        .catch(function () { checking = false; drawMaint(); });
+      return;
+    }
     var dr = t.closest("[data-door]");
     if (dr) {
       var opening = dr.getAttribute("data-door") === "open";
