@@ -850,8 +850,10 @@ DEBUG_PAGE = r"""<!doctype html>
     // Nested calls waiting for room: a tool another tool called, queued like a
     // run of its own. Shown under the run that called it.
     var nestedWaiting = (adm.queue || []).filter(function (e) {
-      var parent = runOf[e.parent];
-      return e.nested && (!parent || matches(parent, byId[parent.run_id]));
+      var parent = runOf[e.parent] || {};
+      // Shown when either it or the run that called it matches the filter.
+      return e.nested && (matches({ tool: e.tool, run_id: e.run_id, client: parent.client }, null) ||
+        (parent.run_id && matches(parent, byId[parent.run_id])));
     }).map(function (e) {
       var parent = runOf[e.parent] || {};
       return { run_id: e.run_id, tool: e.tool, phase: "queued_gpu", nested: true, started_at: e.since,
@@ -883,7 +885,9 @@ DEBUG_PAGE = r"""<!doctype html>
           '<button data-move="down" data-id="' + esc(r.run_id) + '" title="down one">\u2193</button>') +
         '<button class="star' + (high ? " on" : "") + '" data-prio="' + (high ? "normal" : "high") + '" data-id="' +
         esc(r.run_id) + '" title="' + (high ? "back to normal" : "give priority") + '">\u2605</button></span>' : "";
-      return '<div class="qitem' + (slot ? " slot" : "") + (high ? " high" : "") + '" data-run="' + esc(r.run_id) + '"><span class="pos">' + (i + 1) + "</span>" +
+      // A nested call is not a run of its own: no run dialog to open.
+      return '<div class="qitem' + (slot ? " slot" : "") + (high ? " high" : "") + '"' +
+        (r.nested ? "" : ' data-run="' + esc(r.run_id) + '"') + '><span class="pos">' + (i + 1) + "</span>" +
         '<div style="min-width:0;flex:1"><div class="n">' + esc(r.tool || "?") + (high ? ' <span class="prio">PRIORITY</span>' : "") +
           (r.batch ? ' <span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") + "</div>" +
         '<div class="m mono">' + (r.nested ? "called by " + esc(r.calledBy || "?") + " \u00b7 " : "") +

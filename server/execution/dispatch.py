@@ -696,7 +696,16 @@ def _execute(command: list, job_dir: str, environment: dict, timeout: Optional[f
                 _kill_group(process)
                 raise RunCancelled("The client cancelled this run.")
 
-        return _wait(process, timeout, tool_name, run_id)
+        try:
+            return _wait(process, timeout, tool_name, run_id)
+        finally:
+            # Nothing in the run's group outlives the run, however it ended.
+            # A nested level killed out from under its child -- by the
+            # kernel's out-of-memory killer, say -- releases that child's
+            # reservation when its socket closes, while the child, in this
+            # group, goes on running: the budget would then believe memory is
+            # free that is not.
+            _kill_leftovers(process)
 
 
 def _wait(process: subprocess.Popen, timeout: Optional[float], tool_name: str,
@@ -772,6 +781,21 @@ def _kill_group(process: subprocess.Popen) -> None:
         # Unreapable after SIGKILL means the process is stuck in the kernel
         # (uninterruptible I/O). Nothing further is possible from here.
         logger.error("Tool process %s survived SIGKILL; it is now a zombie.", process.pid)
+
+
+def _kill_leftovers(process: subprocess.Popen) -> None:
+    """SIGKILL whatever is left in a finished run's process group.
+
+    By the group id, which is the leader's pid (`start_new_session`): once the
+    leader is reaped `os.getpgid` cannot find it, but the group goes on
+    existing for as long as anything is left in it.
+    """
+    if not process.pid or process.pid <= 1:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
 
 
 def kill_process_group(pgid: int) -> None:

@@ -637,7 +637,29 @@ Nothing is taken back: the parent keeps its whole reservation, the loan returns
 when the call ends, so there is no re-admission to wait for. A parent that says
 nothing lends nothing; an unmeasured call borrows nothing.
 
-**Not done:** an out-of-memory in a child is not retried on its own.
+**A second adversarial review**, of the loans, found five more, all fixed:
+
+- a loan skipped the card's REAL free memory: `_card_has_room` was asked about
+  the net demand, so a call whose VRAM the loan covered was admitted onto a
+  card another process had filled. It is asked about the gross demand now;
+- a stream of small calls from other chains kept a big one at the head for as
+  long as they ran, and everything behind it. A call may pass the head only
+  with what the head does not need: nothing at all on a resource the head is
+  short of;
+- a level killed by the out-of-memory killer closed its socket and released
+  its child's reservation while the child, in the root's group, ran on.
+  Nothing in a run's group outlives the run now, and a nested call that times
+  out or raises is killed with its whole subtree;
+- a call NOT admitted had its width records excluded from its parent's, while
+  its peak was still folded in: the parent was recorded too wide;
+- a parent's reported holding left out the CUDA context (about 0.5 GiB), and a
+  level with another call already in flight still lent as if idle. It lends
+  nothing then.
+
+**Not done:** an out-of-memory in a child is not retried on its own. Width
+records are attributed by where they sit in the shared progress file, which
+assumes one writer at a time per chain; per-level ids in a tool's own progress
+records would remove that, and are a change to the tools.
 
 **Tests:** 1182 server (+31), including the four deadlocks an adversarial
 review reproduced; the two between chains hang without the breaker.

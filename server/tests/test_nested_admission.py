@@ -690,3 +690,102 @@ def test_a_grandchild_borrows_what_its_borrowing_parent_holds():
                                 holding=(1.0, 1 * GiB, 0)) as leaf:
                 assert leaf.loan[1] == 3 * GiB
                 assert budget.snapshot()["ram_held"] == 8 * GiB
+
+
+# ---------------------------------------------------------------------------
+# Second review
+# ---------------------------------------------------------------------------
+
+def test_a_loan_does_not_skip_the_card_s_real_free_memory():
+    """A loan covers the parent's reservation, not memory another process took
+    on the card: the card is still asked whether the whole call fits."""
+    free = {"vram": 48 * GiB}
+    budget = admission.Budget(
+        resources.Allocation(cpus=16.0, ram_bytes=64 * GiB, vram_bytes=48 * GiB, cpus_per_job=2,
+                             ram_per_job=16 * GiB, vram_per_job=12 * GiB, expected_clients=4),
+        free_vram=lambda: free["vram"])
+    with budget.reserve(_demand(ram=1 * GiB)):
+        with budget.reserve(_demand(ram=1 * GiB, vram=10 * GiB)) as parent:
+            free["vram"] = 8 * GiB  # another process took 40 GiB of the card
+            waited = threading.Event()
+            with pytest.raises(admission.Cancelled):
+                with budget.reserve(_demand(ram=1 * GiB, vram=9 * GiB), ancestors=(parent,),
+                                    holding=(1.0, 0, 0), on_wait=waited.set,
+                                    is_cancelled=waited.is_set):
+                    pass
+            assert waited.is_set()
+
+
+def test_small_calls_from_other_chains_cannot_starve_a_big_one():
+    """A 6 GiB call heads the queue. A 3 GiB call of another chain fits, but
+    taking it would leave the head no room, so it waits behind; one that
+    leaves the head its room goes."""
+    budget = _budget(ram=10 * GiB)
+    with budget.reserve(_demand(ram=1 * GiB)) as root_a, \
+            budget.reserve(_demand(ram=1 * GiB)) as root_b, \
+            budget.reserve(_demand(ram=3 * GiB)):
+        admitted = []
+
+        def call(name, ram, root):
+            with budget.reserve(_demand(ram=ram), run_id=name, ancestors=(root,)):
+                admitted.append(name)
+
+        threading.Thread(target=call, args=("big", 6 * GiB, root_a), daemon=True).start()
+        assert _until(lambda: budget.snapshot()["waiting"] == 1)
+        threading.Thread(target=call, args=("small", 3 * GiB, root_b), daemon=True).start()
+        assert _until(lambda: budget.snapshot()["waiting"] == 2)
+        time.sleep(0.3)
+        assert admitted == []
+        threading.Thread(target=call, args=("tiny", 0, root_b), daemon=True).start()
+        assert _until(lambda: "tiny" in admitted)
+
+
+def test_nothing_in_a_run_s_group_outlives_it(tmp_path):
+    import signal
+    import subprocess
+    from execution import dispatch
+
+    marker = tmp_path / "orphan.pid"
+    process = subprocess.Popen(
+        ["sh", "-c", f"sleep 60 & echo $! > {marker}; exit 0"], start_new_session=True)
+    process.wait()
+    assert _until(lambda: marker.exists() and marker.read_text().strip())
+    orphan = int(marker.read_text())
+    dispatch._kill_leftovers(process)
+    assert _until(lambda: not os.path.exists(f"/proc/{orphan}") or
+                  open(f"/proc/{orphan}/stat").read().split()[2] == "Z")
+
+
+CALLER_FOUR_WIDE = WIDTH_RECORD + """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _declare(4)
+        produced = sup.run("Leaf", scans=scans, tag="x")
+        (output_dir / "chained.txt").write_text("ok")
+        return output_dir
+"""
+
+LEAF_ONE_WIDE = WIDTH_RECORD + """
+    def run(scans: Path, output_dir: Path, tag: str = "leaf") -> Path:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _declare(1)
+        return output_dir
+"""
+
+
+def test_a_call_run_inside_its_parent_keeps_its_width_in_the_parent_s(tools_dir, tmp_path):
+    """Not admitted, a call is folded into its parent's figure -- so its
+    narrower width has to stay part of the parent's too, or the parent's peak
+    would be divided by a width that was not in force."""
+    make_tool(tools_dir, "Leaf", LEAF_ONE_WIDE)
+    make_tool(tools_dir, "Caller", CALLER_FOUR_WIDE)
+    progress = tmp_path / "progress.jsonl"
+    progress.write_text("")
+
+    completed, result = run_job(tools_dir, "Caller", tmp_path / "job", {"scans": "x"},
+                                env={"SADT_PROGRESS_FILE": str(progress)})
+
+    assert completed.returncode == 0, completed.stderr
+    assert result["channels"] == 1

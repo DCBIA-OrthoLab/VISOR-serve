@@ -522,7 +522,7 @@ class _TreeSampler:
             except (OSError, IndexError, ValueError):
                 continue  # it exited between the listing and the read
         found = _subtree(os.getpid(), children) & group if self.subtree_only else group
-        for pid in self._excluded:
+        for pid in tuple(self._excluded):
             found -= _subtree(pid, children)
         return found
 
@@ -778,7 +778,7 @@ def _peak_rss_bytes():
         return None
 
 
-def _admission_lease(job_path: str, caller_dir: str, log):
+def _admission_lease(job_path: str, caller_dir: str, log, lend: bool = True):
     """Ask the server to admit the child whose job file is `job_path`.
 
     Returns `(connection, environment)`: the connection to keep open while the
@@ -798,7 +798,7 @@ def _admission_lease(job_path: str, caller_dir: str, log):
         connection.sendall((json.dumps(
             {"key": key, "job": os.path.abspath(job_path),
              "caller": os.path.abspath(caller_dir),
-             "holding": _holding_now()}) + "\n").encode("utf-8"))
+             "holding": _holding_now() if lend else {}}) + "\n").encode("utf-8"))
         reader = connection.makefile("r", encoding="utf-8")
         for line in reader:
             message = json.loads(line)
@@ -817,6 +817,11 @@ def _admission_lease(job_path: str, caller_dir: str, log):
     return None, None
 
 
+# What a process's CUDA context holds on the card, which torch's own counters
+# leave out: measured at 524 MiB for one process on the deployment card.
+_CUDA_CONTEXT_BYTES = 768 * 1024 * 1024
+
+
 def _holding_now() -> dict:
     """What this level occupies right now, while it waits for a nested call.
 
@@ -824,7 +829,13 @@ def _holding_now() -> dict:
     orchestrator reserved for its own heaviest phase, and blocked in `sup.run`
     it uses almost none of it. Resident memory of this level's own processes
     (admitted calls' subtrees excluded), one core, and what torch holds on the
-    card if it was ever loaded here.
+    card if it was ever loaded here -- plus the CUDA context, which
+    `memory_reserved()` does not count and which is about half a GiB on a
+    current driver.
+
+    It assumes the level is IDLE while it waits, which is what `sup.run`
+    blocking means. A level with another call already in flight sends nothing,
+    and lends nothing (see `_Supervisor.run`).
     """
     try:
         ram = _sampler._rss(_sampler._group())
@@ -836,8 +847,8 @@ def _holding_now() -> dict:
     torch = sys.modules.get("torch")
     if torch is not None:
         try:
-            if torch.cuda.is_available():
-                vram = int(torch.cuda.memory_reserved())
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                vram = int(torch.cuda.memory_reserved()) + _CUDA_CONTEXT_BYTES
         except Exception:  # noqa: BLE001
             vram = 0
     return {"cpus": 1, "ram_bytes": int(ram), "vram_bytes": vram}
@@ -851,6 +862,37 @@ def _close_lease(lease) -> None:
             handle.close()
         except OSError:
             pass
+
+
+def _kill_tree(process) -> None:
+    """SIGKILL a child and every process descended from it, then reap it.
+
+    Not the group: nested levels share the root's, and killing it would take
+    this level down too. The tree is read from /proc's parent links.
+    """
+    import signal
+    children = {}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/stat" % entry, "rb") as handle:
+                    fields = handle.read().rsplit(b")", 1)[-1].split()
+                children.setdefault(int(fields[1]), []).append(int(entry))
+            except (OSError, IndexError, ValueError):
+                continue
+    except OSError:
+        pass
+    for pid in _subtree(process.pid, children):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        process.wait()
+    except OSError:
+        pass
 
 
 def _subtree(root: int, children: dict) -> set:
@@ -1982,6 +2024,8 @@ class _Supervisor:
         # which judges a child against everything outside its own chain.
         self._root = root or job_id
         self._calls = 0
+        self._in_flight = 0
+        self._flight_lock = threading.Lock()
         self.out = Path(job_dir) / "output"
         # Removed with the job directory, by whoever owns it. The tool is held
         # to writing only under `output/`, so its scratch sits beside it rather
@@ -2134,7 +2178,18 @@ class _Supervisor:
             os.remove(os.path.join(nested_dir, RESULT_FILE))
         except OSError:
             pass
-        lease, granted = _admission_lease(job_path, self._job_dir, self.log)
+        # Lends only when no other call of this level is in flight: the loan
+        # assumes the level sits idle in `sup.run`, and a level already
+        # running a call from another thread is not.
+        with self._flight_lock:
+            alone = self._in_flight == 0
+            self._in_flight += 1
+        try:
+            lease, granted = _admission_lease(job_path, self._job_dir, self.log, lend=alone)
+        except BaseException:
+            with self._flight_lock:
+                self._in_flight -= 1
+            raise
         admitted = granted is not None
         if admitted:
             environment.update({str(k): str(v) for k, v in granted.items()})
@@ -2147,6 +2202,8 @@ class _Supervisor:
             remaining = self._remaining_seconds()
         except BaseException:
             _close_lease(lease)
+            with self._flight_lock:
+                self._in_flight -= 1
             raise
 
         # The nested call declares itself, at the CHILD's depth.
@@ -2178,11 +2235,16 @@ class _Supervisor:
                 admitted
             )
         finally:
-            # Everything the callee wrote is the callee's: see `_written_here`.
-            _FOREIGN_RANGES.append((foreign_from, _progress_size()))
+            # Everything an ADMITTED callee wrote is the callee's: see
+            # `_written_here`. One that ran inside this level is folded into
+            # it, and its width has to stay this level's too.
+            if admitted:
+                _FOREIGN_RANGES.append((foreign_from, _progress_size()))
             # Hung up once the child has exited and written its result: that
             # is what releases its reservation, and what the server reads.
             _close_lease(lease)
+            with self._flight_lock:
+                self._in_flight -= 1
             _append_progress(None, "", self._depth + 1, tool=tool)
 
         self._remember(nested_dir, tool, produced)
@@ -2328,8 +2390,7 @@ class _Supervisor:
         try:
             completed = subprocess.CompletedProcess(process.args, process.wait(timeout=remaining))
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+            _kill_tree(process)
             raise RunnerError(
                 "Supervised tool '{}' ran out of the job's remaining time after "
                 "{:.0f}s. The chain is {} -> {}; raise the ROOT tool's "
@@ -2338,10 +2399,10 @@ class _Supervisor:
                 )
             )
         except BaseException:
-            # What subprocess.run did on ANY exception: a child left running
-            # would go on holding memory after its lease was closed.
-            process.kill()
-            process.wait()
+            # What subprocess.run did on ANY exception -- and the whole
+            # subtree, not the one pid: a grandchild left running would go on
+            # holding memory after the lease covering it was closed.
+            _kill_tree(process)
             raise
         if completed.returncode != 0:
             # Its own result file is where the useful half is. The child's

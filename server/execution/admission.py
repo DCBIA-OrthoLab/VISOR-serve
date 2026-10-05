@@ -272,12 +272,16 @@ class _Waiter:
     through its supervisor -- and holds the grants of the chain above it.
     """
 
-    __slots__ = ("run_id", "since", "ancestors", "parent", "tool")
+    __slots__ = ("run_id", "since", "ancestors", "parent", "tool", "candidates", "holding")
 
     def __init__(self, run_id: Optional[str], ancestors=(), parent: Optional[str] = None,
                  tool: Optional[str] = None):
         self.run_id = run_id
         self.tool = tool
+        # What it asks for and what its parent occupies, so a call passing it
+        # can check it would still leave this one its room.
+        self.candidates = ()
+        self.holding = None
         self.since = time.time()
         self.ancestors = tuple(ancestors)
         self.parent = parent
@@ -469,7 +473,7 @@ class Budget:
 
     # -- the decision --------------------------------------------------
     def _would_fit(self, demand: Demand, last_resort: bool = True,
-                   among: int = 1, ancestors=()) -> bool:
+                   among: int = 1, ancestors=(), card: Optional[Demand] = None) -> bool:
         """Is there room for this demand right now?
 
         `last_resort` says whether this is the narrowest way the run could be
@@ -513,9 +517,12 @@ class Budget:
             return False
         if self.vram_bytes and demand.vram_bytes * share + self._held_vram > self.vram_bytes:
             return False
-        return self._card_has_room(demand)
+        # `card` is the GROSS demand of a call whose net one a loan reduced:
+        # what is lent is reserved, not free on the card, and the card's real
+        # free memory is what has to hold the allocation.
+        return self._card_has_room(card if card is not None else demand)
 
-    def _widest_that_fits(self, candidates, waiting: int, ancestors=()):
+    def _widest_that_fits(self, candidates, waiting: int, ancestors=(), gross=None):
         """The shape to admit, given what is running AND what is queued.
 
         Two passes, and the order is the policy:
@@ -546,6 +553,7 @@ class Budget:
                      last_resort=(among == 1 and index == len(candidates) - 1),
                      among=among,
                      ancestors=ancestors,
+                     card=gross[index][1] if gross else None,
                  )),
                 None,
             )
@@ -589,6 +597,32 @@ class Budget:
             ram_bytes=max(0, demand.ram_bytes - lend[1]),
             vram_bytes=max(0, demand.vram_bytes - lend[2]),
         )
+
+    def _leaves_room_for_head(self, demand: Demand) -> bool:
+        """May `demand` be admitted past the head of the queue?
+
+        Only if it takes nothing the head is waiting for: on every resource,
+        no more than what would be left once the head had its narrowest
+        share -- which is nothing at all on a resource the head is already
+        short of. So a call that does not compete with the head goes, and one
+        that would eat into the room the head is waiting for does not, however
+        often such calls arrive. Caller holds the condition.
+        """
+        head = self._queue[0]
+        if not head.candidates:
+            return False
+        wanted = self._net(head.candidates[-1][1], self._lendable(head.ancestors, head.holding))
+        if not wanted.measured:
+            return False  # an unmeasured head runs alone: nothing may pass it
+        for size, held, need, take in (
+                (self.cpus, self._held_cpus, wanted.cpus, demand.cpus),
+                (self.ram_bytes, self._held_ram, wanted.ram_bytes, demand.ram_bytes),
+                (self.vram_bytes, self._held_vram, wanted.vram_bytes, demand.vram_bytes)):
+            if not size:
+                continue  # an axis this machine does not budget
+            if take > max(0, size - held - need):
+                return False
+        return True
 
     def _stuck(self, ancestors) -> bool:
         """Would waiting never end for a nested call under `ancestors`?
@@ -733,6 +767,7 @@ class Budget:
         candidates = list(candidates) or [(1, whole_machine(self))]
         ancestors = tuple(ancestors)
         waiter = _Waiter(run_id, ancestors, parent, tool)
+        waiter.candidates, waiter.holding = tuple(candidates), holding
         announced = False
         with self._condition:
             self._place(waiter)
@@ -751,9 +786,11 @@ class Budget:
                 channels, demand = net[-1]
                 position = self._queue.index(waiter)
                 # The head may try; so may any nested call with only nested
-                # calls ahead of it. One that fits goes past one that does not:
-                # the one ahead may be waiting for the very chain this one
-                # would finish.
+                # calls ahead of it -- but only into room the head would still
+                # have after it (`_leaves_room_for_head`). Passing freely let a
+                # stream of small calls from other chains keep a big one at the
+                # head for as long as those chains ran, and everything behind
+                # it with it. A chain stuck on its own is the breaker's case.
                 if position == 0 or (waiter.nested and all(
                         other.nested for other in self._queue[:position])):
                     # A HIGH run is not asked to leave room for the runs
@@ -765,8 +802,9 @@ class Budget:
                     behind = 0 if rank == 1 else sum(
                         1 for other in self._queue[position + 1:]
                         if self._rank(other) <= max(rank, 0))
-                    fitted = self._widest_that_fits(net, behind, ancestors)
-                    if fitted is not None:
+                    fitted = self._widest_that_fits(net, behind, ancestors, gross=candidates)
+                    if fitted is not None and (position == 0 or
+                                               self._leaves_room_for_head(fitted[1])):
                         channels, demand = fitted
                         break
                     if position == 0 and waiter.nested and self._stuck(ancestors):
