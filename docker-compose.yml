@@ -106,6 +106,8 @@ services:
     <<: *inference-base
     environment:
       - API_TOKEN=${API_TOKEN:-dev-token}
+      # The admin panel and its controls answer only to this. Unset, the panel stays closed.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DATA_DIR=/data
       - DEVICE=${DEVICE:-cuda}
       # Resolve to the fixtures when SADT_TOOLS is unset, which is the same
@@ -152,6 +154,8 @@ services:
     profiles: ["cpu"]
     environment:
       - API_TOKEN=${API_TOKEN:-dev-token}
+      # The admin panel and its controls answer only to this. Unset, the panel stays closed.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DATA_DIR=/data
       - DEVICE=cpu
       # Resolve to the fixtures when SADT_TOOLS is unset, which is the same
@@ -254,6 +258,8 @@ services:
         tools: ${TOOLS_CONTEXT:-docker/fixtures}
     environment:
       - API_TOKEN=${API_TOKEN:-dev-token}
+      # The admin panel and its controls answer only to this. Unset, the panel stays closed.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DEVICE=${DEVICE:-cuda}
       # Trusted proxies for `X-Forwarded-For`; see the `inference` service.
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
