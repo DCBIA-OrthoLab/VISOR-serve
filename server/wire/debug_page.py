@@ -70,6 +70,7 @@ DEBUG_PAGE = r"""<!doctype html>
     --shadow: 0 1px 1px rgba(0,0,0,.03), 0 8px 28px rgba(30,40,60,.08);
     --shadow-lg: 0 30px 80px rgba(20,30,50,.28);
     --blur: blur(28px) saturate(180%);
+    --menu: #ffffff;
     --radius: 16px;
   }
   @media (prefers-color-scheme: dark) {
@@ -84,6 +85,7 @@ DEBUG_PAGE = r"""<!doctype html>
       --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
       --shadow: 0 1px 1px rgba(0,0,0,.2), 0 8px 28px rgba(0,0,0,.35);
       --shadow-lg: 0 30px 80px rgba(0,0,0,.7);
+      --menu: #1f232b;
     }
   }
   :root[data-theme="dark"] {
@@ -97,6 +99,7 @@ DEBUG_PAGE = r"""<!doctype html>
     --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
     --shadow: 0 1px 1px rgba(0,0,0,.2), 0 8px 28px rgba(0,0,0,.35);
     --shadow-lg: 0 30px 80px rgba(0,0,0,.7);
+    --menu: #1f232b;
   }
   * { box-sizing: border-box; }
   /* Scrollbars in the page's own colours: the browser's default is a light
@@ -393,8 +396,6 @@ DEBUG_PAGE = r"""<!doctype html>
   .chip2 { font-size: 11.5px; padding: 1px 8px; border-radius: 6px; background: var(--sunk); border: 1px solid var(--line); }
   .chip2.env { border-color: var(--warn); color: var(--warn); }
   .doorctl { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
-  .doorctl select { font-size: 12.5px; padding: 4px 8px; border-radius: 8px; border: 1px solid var(--line);
-                    background: var(--sunk); color: var(--ink); }
   button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
   button.primary:disabled { opacity: .45; cursor: default; }
   #m-progress:not(:empty) { border-top: 1px solid var(--line); padding: 10px 16px; font-size: 13px; }
@@ -410,6 +411,10 @@ DEBUG_PAGE = r"""<!doctype html>
   .hfilters select, .hfilters input { font-size: 13px; padding: 6px 9px; border-radius: 9px;
       border: 1px solid var(--line); background: var(--sunk); color: var(--ink); min-width: 0; }
   .hfilters input { width: 220px; }
+  /* A native menu draws its options on an opaque sheet of its own, so a
+     see-through background turns into white rows in the dark theme. */
+  select { color-scheme: inherit; }
+  select option { background: var(--menu); color: var(--ink); }
   .htable { max-height: 58vh; overflow: auto; border: 1px solid var(--line); border-radius: 12px; }
   .htable td.calls { white-space: normal; color: var(--soft); max-width: 260px; }
   .htable td small { color: var(--ghost); }
@@ -1252,9 +1257,10 @@ DEBUG_PAGE = r"""<!doctype html>
     var door = m.accepting
       ? '<div class="t"><span class="sdot"></span>Accepting new runs</div>' +
         '<div class="s">New runs are admitted as usual.</div>' +
-        '<div class="doorctl"><select id="doorhours">' + ["1", "2", "4", "12"].map(function (h) {
-          return '<option value="' + h + '"' + (doorHours === h ? " selected" : "") + ">for " + h + " h</option>";
-        }).join("") + "</select>" +
+        '<div class="doorctl"><span class="seg2" style="margin-top:0" title="how long to stay closed">' +
+        ["1", "2", "4", "12"].map(function (h) {
+          return '<button type="button" data-hours="' + h + '" class="' + (doorHours === h ? "on" : "") + '">' + h + " h</button>";
+        }).join("") + "</span>" +
         '<button data-door="close">Stop accepting new runs</button></div>'
       : '<div class="t"><span class="sdot closed"></span>Closed to new runs</div>' +
         '<div class="s">' + esc(m.reason || "") + " \u00b7 reopens by itself in " + dur(m.closed_for) +
@@ -1705,7 +1711,6 @@ DEBUG_PAGE = r"""<!doctype html>
   });
   // The history window's own filters, applied in the browser to what it holds.
   document.addEventListener("change", function (event) {
-    if (event.target.id === "doorhours") { doorHours = event.target.value; return; }
     var key = event.target.getAttribute && event.target.getAttribute("data-hf");
     if (key && dlg.kind === "history" && event.target.tagName === "SELECT") {
       dlg.hf[key] = event.target.value;
@@ -1749,10 +1754,12 @@ DEBUG_PAGE = r"""<!doctype html>
         .catch(function () { checking = false; drawMaint(); });
       return;
     }
+    var hb = t.closest("[data-hours]");
+    if (hb) { doorHours = hb.getAttribute("data-hours"); drawMaint(); return; }
     var dr = t.closest("[data-door]");
     if (dr) {
       var opening = dr.getAttribute("data-door") === "open";
-      var hours = opening ? 0 : parseFloat((el("doorhours") || {}).value || "2");
+      var hours = opening ? 0 : parseFloat(doorHours);
       adminAction("admin/door", { accepting: opening, hours: hours },
         opening ? "Accepting new runs again." : "No new runs will be accepted; the ones already in will finish.");
       updFetchedAt = 0;
