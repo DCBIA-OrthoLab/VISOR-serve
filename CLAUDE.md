@@ -621,10 +621,17 @@ own records from its callees' by byte offset: read by depth alone the root
 took its callee's width (AREG was recorded at AMASSS's two channels) and the
 callee found none.
 
-**Measured on a real AREG -> ASO -> ALI_CBCT chain, occlusal orientation:**
-547 s -> 340 s alone, ALI_CBCT admitted at 6 channels and AMASSS at 2. Two
-chains at once: 390 s and 422 s, nested calls queueing behind each other and
-none stuck. Learned per tool: AREG alone 14.5 GiB of host and no card (its
+**Measured on a real AREG -> ASO -> ALI_CBCT chain, occlusal orientation,
+alone, three runs each, old and new code alternated:** 354.6 +/- 1.0 s ->
+337.1 +/- 3.2 s (-5 %). Nearly all of it is AMASSS, 77.2 -> 57.8 s at two
+channels; ALI_CBCT at six channels is 2.5 s SLOWER than at one (27.5 -> 30.0
+s), and AREG's own registration does not move. A single earlier run at 547 s
+had been taken as the baseline and overstated the gain sevenfold. The gain
+that matters is under load: a chain no longer reserves its worst step for its
+whole life, and three AREG launched 20 s apart went from the third waiting
+~115 s to 34 s once loans landed (one demo each, not a controlled measure).
+Two chains at once: 390 s and 422 s, nested calls queueing behind each other
+and none stuck. Learned per tool: AREG alone 14.5 GiB of host and no card (its
 card was its children's), ASO 2.2 GiB, ALI_CBCT 0.83 GiB of card per channel
 over 6.
 
