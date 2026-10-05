@@ -39,7 +39,7 @@ from typing import Any, Optional
 import file_utils
 import resources
 import telemetry
-from execution import admission, concurrency, costs, reports
+from execution import admission, concurrency, costs, nested, reports
 from base import ToolUnavailableError
 from config import settings
 from registry.deployment import deployment_config
@@ -59,6 +59,9 @@ RESULT_FILE = "result.json"
 # imported, exactly as RESULT_FILE is: runner.py is executed by a tool's
 # interpreter and this module never imports it.
 VRAM_SOURCE_KEY = "vram_source"
+# Set by the runner when this run's nested calls were admitted and measured on
+# their own; mirrors `runner.NESTED_ADMITTED_KEY`.
+NESTED_ADMITTED_KEY = "nested_admitted"
 VRAM_FROM_CARD = "card"
 # How long a TERMed process group gets before SIGKILL.
 _KILL_GRACE_SECONDS = 10.0
@@ -240,6 +243,34 @@ def _demand_for(tool, params: dict, channels: int = 1, cores=None):
         channels=channels,
         cpus=cores,
     )
+
+
+def _nested_candidates(tool_name: str, params: dict):
+    """What a nested call queues on: the same widths and the same prices a run
+    of that tool arriving over HTTP would get. None for a tool this server does
+    not serve, whose call then runs inside its parent's room as it always did."""
+    try:
+        import registry
+        tool = registry.get_tool(tool_name)
+    except Exception:  # noqa: BLE001 - unknown, failed or unimportable: not ours to price
+        return None
+    return [(channels, _demand_for(tool, params, channels, cores))
+            for channels, cores in _shapes(tool, params)]
+
+
+def _nested_environment(tool_name: str, grant) -> dict:
+    """The variables a nested call is started with: exactly what a run of the
+    same tool admitted at the same width over HTTP would be given."""
+    import registry
+    tool = registry.get_tool(tool_name)
+    granted = concurrency.granted(tool, grant.channels)
+    concurrency.log_grant(tool_name, granted)
+    return concurrency.child_budget(_thread_limits(grant.cores, granted.channels), granted)
+
+
+def _learn_nested(tool_name: str, payload: dict, solo: bool) -> None:
+    """A nested call's measurements, kept under the nested tool's own name."""
+    _keep_measurements(tool_name, payload, solo)
 
 
 def _log_grant(tool_name: str, cpus) -> None:
@@ -900,8 +931,12 @@ def _keep_measurements(tool_name: str, payload: dict, solo: bool = False) -> Non
     # `vram_known=False` on a refusal, NOT a zero. Zero is "this tool costs the
     # card nothing" and lets it share with anything; absence is "nobody knows",
     # and a tool nobody knows runs alone until one solo run measures it.
+    # `own_only` when the run's nested calls were admitted as runs of their own:
+    # this figure is then the tool alone, and its children were each recorded
+    # under their own names by the desk that admitted them.
     costs.record(tool_name, vram, rss, channels=channels, cpu_cores=cores,
-                 vram_known=not refused)
+                 vram_known=not refused,
+                 own_only=bool(payload.get(NESTED_ADMITTED_KEY)))
     # And on the run's own event stream, not only in the table. `costs` keeps a
     # high-water mark per TOOL, which is what admission needs and what a reader
     # of ONE run cannot use: six runs sharing a card make the card's trace line
@@ -1264,8 +1299,18 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None,
                          **_thread_limits(cpu_grant, granted.channels)},
                         granted,
                     )
-                    exit_code = _execute(command, job_dir, granted_environment,
-                                         timeout, tool.name, run_id)
+                    # The desk admits this run's nested calls for as long as
+                    # its process lives, and is closed with it.
+                    desk = nested.open_desk(run_id, job_dir, grant, _nested_candidates,
+                                            _nested_environment, _learn_nested)
+                    try:
+                        exit_code = _execute(
+                            command, job_dir,
+                            {**granted_environment, **(desk.environment() if desk else {})},
+                            timeout, tool.name, run_id)
+                    finally:
+                        if desk is not None:
+                            desk.close()
                 if exit_code != 0:
                     # A tool that recorded WHICH exception it was gets to say
                     # so; the tail of stderr is the fallback for one that died

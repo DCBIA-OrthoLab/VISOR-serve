@@ -842,9 +842,21 @@ DEBUG_PAGE = r"""<!doctype html>
     var adm = d.admission || {}, prios = adm.priorities || {}, position = {}, serialClients = {};
     (d.clients || []).forEach(function (c) { if (c.batches === "serial") { serialClients[c.client] = true; } });
     (adm.queue || []).forEach(function (entry) { if (entry.run_id) { position[entry.run_id] = entry.position; } });
+    var runOf = {};
+    (d.runs || []).forEach(function (r) { runOf[r.run_id] = r; });
+    // Nested calls waiting for room: a tool another tool called, queued like a
+    // run of its own. Shown under the run that called it.
+    var nestedWaiting = (adm.queue || []).filter(function (e) {
+      var parent = runOf[e.parent];
+      return e.nested && (!parent || matches(parent, byId[parent.run_id]));
+    }).map(function (e) {
+      var parent = runOf[e.parent] || {};
+      return { run_id: e.run_id, tool: e.tool, phase: "queued_gpu", nested: true, started_at: e.since,
+               client: parent.client, calledBy: parent.tool };
+    });
     var waiting = (d.runs || []).filter(function (r) {
       return inFlight(r) && (r.phase === "queued_gpu" || r.phase === "received") && matches(r, byId[r.run_id]);
-    }).sort(function (x, y) {
+    }).concat(nestedWaiting).sort(function (x, y) {
       var px = position[x.run_id] || 1e6, py = position[y.run_id] || 1e6;
       return px - py || x.started_at - y.started_at;
     });
@@ -862,7 +874,7 @@ DEBUG_PAGE = r"""<!doctype html>
           }
         });
       }
-      var ctl = admin.ok ? '<span class="ctl">' +
+      var ctl = r.nested ? "" : admin.ok ? '<span class="ctl">' +
         (slot ? "" : '<button data-move="top" data-id="' + esc(r.run_id) + '" title="to the top">\u2912</button>' +
           '<button data-move="up" data-id="' + esc(r.run_id) + '" title="up one">\u2191</button>' +
           '<button data-move="down" data-id="' + esc(r.run_id) + '" title="down one">\u2193</button>') +
@@ -871,7 +883,8 @@ DEBUG_PAGE = r"""<!doctype html>
       return '<div class="qitem' + (slot ? " slot" : "") + (high ? " high" : "") + '" data-run="' + esc(r.run_id) + '"><span class="pos">' + (i + 1) + "</span>" +
         '<div style="min-width:0;flex:1"><div class="n">' + esc(r.tool || "?") + (high ? ' <span class="prio">PRIORITY</span>' : "") +
           (r.batch ? ' <span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") + "</div>" +
-        '<div class="m mono">' + (sibling ? "waiting for batch " + sibling + " " : slot ? "waiting for a slot " : "waiting for room ") + ago(r.started_at) +
+        '<div class="m mono">' + (r.nested ? "called by " + esc(r.calledBy || "?") + " \u00b7 " : "") +
+        (sibling ? "waiting for batch " + sibling + " " : slot ? "waiting for a slot " : "waiting for room ") + ago(r.started_at) +
         (r.client ? " \u00b7 " + esc(r.client) : "") + "</div></div>" + ctl + "</div>";
     }).join("") : '<div class="empty">' + (anyFilter() ? "Nothing waiting matches this filter." : "Nothing waiting.") + "</div>";
 

@@ -572,6 +572,69 @@ concurrently in worker threads, capped by `MAX_CONCURRENT_TOOLS`).
 
 ## Changelog
 
+### 2026-10-05 - A nested call is admitted like a run of its own
+
+A tool calling another through `sup.run` used to run the callee inside its own
+reservation. Two costs followed. The root reserved its whole chain's worst case
+for the whole run -- AREG held its segmentation step's card through an hour of
+CPU registration -- and a callee could never be wider than the share it
+inherited, however empty the machine was.
+
+**`execution/nested.py`: one admission desk per root run.** A Unix socket in
+the job directory, with a key only the run's processes hold. Before starting a
+child, the supervisor names the child's `job.json` and blocks; the desk prices
+the child with the same `_shapes`/`_demand_for` an HTTP run of that tool gets,
+queues it in the same `Budget`, and answers with the environment the child is
+started with (width, threads, room). **The connection is the reservation**:
+closed when the child returns, or by the kernel when a process dies, so nothing
+can leak past the process that held it. Children stay in the root's process
+group, so one `killpg` still stops a whole chain. Without a desk -- a tool run
+outside a server, or one the server does not serve -- a child runs inside its
+parent's room exactly as before.
+
+**Admission rules for nested calls**, each one pinned by a reproduction:
+
+- A nested call is never counted against `MAX_CONCURRENT_TOOLS`; it never
+  passes through a slot.
+- It is judged against everything OUTSIDE its own chain: the idle escape,
+  "an unmeasured job is running" and `solo` ignore its ancestors. An unmeasured
+  child holds the whole machine minus its parents.
+- It queues ahead of everything, the deepest first, then HIGH, then normal.
+  HIGH now means "the next run to START": a HIGH run that does not fit,
+  queued ahead of a running chain's child, froze that chain for good.
+- Any nested call that fits goes, not only the head: a shallower call can be
+  waiting for the very chain a deeper one would finish.
+- **The breaker.** When every run holding room outside a chain is itself a
+  parent waiting for a queued child, nothing can ever free room, and the head
+  nested call is admitted anyway. Two 4 GiB chains on 10 GiB each calling a
+  3 GiB child deadlocked without it; parents blocked in `sup.run` are idle, so
+  the overcommit is in the budget, not on the machine.
+
+**Each tool is measured for itself.** The parent's sampler leaves the admitted
+child's process subtree out, an admitted child samples only its own subtree,
+`RUSAGE_CHILDREN` and the card fallback are dropped once a child was admitted,
+and nothing is folded. The desk records the child under its OWN name; the
+parent reports `nested_admitted` and `costs.record(own_only=True)` clears its
+window once, the old figures holding its worst child too. Tool progress records
+carry no depth and the whole chain writes one file, so a level now tells its
+own records from its callees' by byte offset: read by depth alone the root
+took its callee's width (AREG was recorded at AMASSS's two channels) and the
+callee found none.
+
+**Measured on a real AREG -> ASO -> ALI_CBCT chain, occlusal orientation:**
+547 s -> 340 s alone, ALI_CBCT admitted at 6 channels and AMASSS at 2. Two
+chains at once: 390 s and 422 s, nested calls queueing behind each other and
+none stuck. Learned per tool: AREG alone 14.5 GiB of host and no card (its
+card was its children's), ASO 2.2 GiB, ALI_CBCT 0.83 GiB of card per channel
+over 6.
+
+**Not done:** a parent waiting for its child still holds its full
+reservation; lowering it to what it actually occupies while blocked is the next
+step. An out-of-memory in a child is not retried on its own.
+
+**Tests:** 1178 server (+27), including the four deadlocks an adversarial
+review reproduced; the two between chains hang without the breaker.
+
 ### 2026-09-21 - Three tools faster, a model with an intercept, and three regressions of my own
 
 **The cost model has an intercept.** It priced a run as `per_channel x width`,

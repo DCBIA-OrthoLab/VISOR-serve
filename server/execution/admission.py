@@ -31,6 +31,7 @@ Three rules make it safe to be optimistic:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import time
 import logging
 import threading
@@ -214,15 +215,22 @@ class Grant:
     process has written result.json.
     """
 
-    __slots__ = ("cores", "channels", "solo")
+    __slots__ = ("cores", "channels", "solo", "demand", "ancestors")
 
-    def __init__(self, cores: int, channels: int = 1, solo: bool = False):
+    def __init__(self, cores: int, channels: int = 1, solo: bool = False,
+                 demand: Optional["Demand"] = None, ancestors=()):
         self.cores = int(cores)
         self.channels = int(channels)
         # False by default, and that is the safe direction: a grant nobody
         # admitted through `reserve` has no evidence the machine was idle, and
         # absence of evidence must never read as evidence of absence.
         self.solo = bool(solo)
+        # What this grant holds, so a nested call admitted under it can tell
+        # its own chain's holdings from everybody else's.
+        self.demand = demand
+        # The grants of the runs this one was called from, outermost first.
+        # Empty for a run admitted over HTTP.
+        self.ancestors = tuple(ancestors)
 
     def __iter__(self):
         return iter((self.cores, self.channels))
@@ -248,13 +256,25 @@ class NotQueued(Exception):
 
 class _Waiter:
     """One run in the queue. Identity is the object; `run_id` may be None for
-    a run whose client sent no id, which an operator then cannot address."""
+    a run whose client sent no id, which an operator then cannot address.
 
-    __slots__ = ("run_id", "since")
+    `ancestors` is non-empty for a NESTED call -- a tool another tool called
+    through its supervisor -- and holds the grants of the chain above it.
+    """
 
-    def __init__(self, run_id: Optional[str]):
+    __slots__ = ("run_id", "since", "ancestors", "parent", "tool")
+
+    def __init__(self, run_id: Optional[str], ancestors=(), parent: Optional[str] = None,
+                 tool: Optional[str] = None):
         self.run_id = run_id
+        self.tool = tool
         self.since = time.time()
+        self.ancestors = tuple(ancestors)
+        self.parent = parent
+
+    @property
+    def nested(self) -> bool:
+        return bool(self.ancestors)
 
 
 class Budget:
@@ -328,7 +348,8 @@ class Budget:
                 "queue": [
                     {"run_id": waiter.run_id, "position": index + 1,
                      "priority": self._priority.get(waiter.run_id, PRIORITY_NORMAL),
-                     "since": waiter.since}
+                     "since": waiter.since, "nested": waiter.nested,
+                     "parent": waiter.parent, "tool": waiter.tool}
                     for index, waiter in enumerate(self._queue)
                 ],
                 "priorities": {run_id: level for run_id, level in self._priority.items()},
@@ -338,13 +359,30 @@ class Budget:
     def _is_high(self, waiter: _Waiter) -> bool:
         return self._priority.get(waiter.run_id) == PRIORITY_HIGH
 
+    def _rank(self, waiter: _Waiter) -> int:
+        """Which band a waiter queues in. Lower goes first.
+
+        Nested calls first, the DEEPEST first (-depth), then HIGH (1), then
+        every other run (2). A nested call belongs to a chain already
+        admitted, whose parents are holding their room while they wait for
+        it; anything allowed ahead of it can wait on that very room and
+        freeze the chain for good -- a HIGH run that does not fit, or a
+        shallower call waiting for the chain this one would finish. So HIGH
+        means "the next run to START", and a chain already started finishes
+        first. Deepest first for the same reason one level down.
+        """
+        if waiter.nested:
+            return -len(waiter.ancestors)
+        return 1 if self._is_high(waiter) else 2
+
     def _place(self, waiter: _Waiter) -> None:
-        """Put a HIGH waiter behind the HIGH ones already there and ahead of
-        every normal one. Caller holds the condition."""
+        """Put a waiter behind every waiter of its own band or a better one,
+        and ahead of every worse one. Caller holds the condition."""
         if waiter in self._queue:
             self._queue.remove(waiter)
+        rank = self._rank(waiter)
         index = 0
-        while index < len(self._queue) and self._is_high(self._queue[index]):
+        while index < len(self._queue) and self._rank(self._queue[index]) <= rank:
             index += 1
         self._queue.insert(index, waiter)
 
@@ -366,12 +404,14 @@ class Budget:
                     if level == PRIORITY_HIGH:
                         self._place(waiter)
                     else:
-                        # Back among the normal runs, in arrival order.
+                        # Back into its own band, in arrival order.
                         self._queue.remove(waiter)
+                        rank = self._rank(waiter)
                         index = 0
                         while index < len(self._queue) and (
-                                self._is_high(self._queue[index]) or
-                                self._queue[index].since <= waiter.since):
+                                self._rank(self._queue[index]) < rank or
+                                (self._rank(self._queue[index]) == rank and
+                                 self._queue[index].since <= waiter.since)):
                             index += 1
                         self._queue.insert(index, waiter)
             self._condition.notify_all()
@@ -380,9 +420,9 @@ class Budget:
     def move(self, run_id: str, where: str) -> dict:
         """Move a waiting run `top`, `up`, `down` or `bottom`.
 
-        Within its own band: a normal run is never moved ahead of a HIGH one,
-        and a HIGH one never behind a normal one -- marking it is how a run
-        changes band.
+        Within its own band: a normal run is never moved ahead of a HIGH one
+        or of a nested call, and a HIGH one never behind a normal one --
+        marking it is how a run changes band.
         """
         if where not in MOVES:
             raise ValueError(f"Unknown move {where!r}. Expected one of: {', '.join(MOVES)}")
@@ -391,20 +431,20 @@ class Budget:
             if not current:
                 raise NotQueued(f"Run {run_id} is not waiting for room on this machine.")
             waiter = current[0]
-            band = [w for w in self._queue if self._is_high(w) == self._is_high(waiter)]
+            rank = self._rank(waiter)
+            band = [w for w in self._queue if self._rank(w) == rank]
             index = band.index(waiter)
             target = {"top": 0, "up": max(0, index - 1),
                       "down": min(len(band) - 1, index + 1), "bottom": len(band) - 1}[where]
             band.insert(target, band.pop(index))
-            high = [w for w in self._queue if self._is_high(w)]
-            normal = [w for w in self._queue if not self._is_high(w)]
-            self._queue = band + normal if self._is_high(waiter) else high + band
+            self._queue = ([w for w in self._queue if self._rank(w) < rank] + band +
+                           [w for w in self._queue if self._rank(w) > rank])
             self._condition.notify_all()
         return self.snapshot()
 
     # -- the decision --------------------------------------------------
     def _would_fit(self, demand: Demand, last_resort: bool = True,
-                   among: int = 1) -> bool:
+                   among: int = 1, ancestors=()) -> bool:
         """Is there room for this demand right now?
 
         `last_resort` says whether this is the narrowest way the run could be
@@ -415,8 +455,21 @@ class Budget:
         the run is runnable either way, and letting an idle machine swallow
         eight channels' worth of a budget it does not have is how the escape
         turns from a safety net into the thing it was protecting against.
+
+        **A nested call does not count its own chain.** `ancestors` are the
+        grants of the runs it was called from. They hold room -- that room is
+        still counted against the budget -- but "the machine is idle" and
+        "an unmeasured job is running" are both asked about everybody ELSE.
+        Counting the chain would deadlock it: a child that may only start on
+        an idle machine waits for its own parent to finish, and the parent is
+        waiting for the child. So an unmeasured child takes the whole machine
+        minus its parents, and a child too big for what its parents left free
+        still runs once nothing outside its chain is.
         """
-        if self._running == 0 and last_resort:
+        others_running = self._running - len(ancestors)
+        others_unmeasured = self._unmeasured - sum(
+            1 for grant in ancestors if grant.demand is not None and not grant.demand.measured)
+        if others_running == 0 and last_resort:
             return True
         # `among` is how many runs the free room is being divided between: this
         # one and everything already queued behind it. At 1 the question is the
@@ -425,7 +478,7 @@ class Budget:
         # a long queue from taking the widest shape that happens to fit and
         # leaving forty runs behind it with nothing.
         share = max(1, int(among))
-        if not demand.measured or self._unmeasured:
+        if not demand.measured or others_unmeasured:
             # Either side of the pairing is enough: an unmeasured job runs
             # alone, so it neither joins nor is joined.
             return False
@@ -437,7 +490,7 @@ class Budget:
             return False
         return self._card_has_room(demand)
 
-    def _widest_that_fits(self, candidates, waiting: int):
+    def _widest_that_fits(self, candidates, waiting: int, ancestors=()):
         """The shape to admit, given what is running AND what is queued.
 
         Two passes, and the order is the policy:
@@ -467,12 +520,29 @@ class Budget:
                      # on the pass that is no longer trying to be fair.
                      last_resort=(among == 1 and index == len(candidates) - 1),
                      among=among,
+                     ancestors=ancestors,
                  )),
                 None,
             )
             if fitted is not None:
                 return fitted
         return None
+
+    def _stuck(self, ancestors) -> bool:
+        """Would waiting never end for a nested call under `ancestors`?
+
+        True when every run holding room outside this chain is itself an
+        ancestor of some nested call still queued -- a parent waiting for its
+        own child. None of them can finish before something queued is
+        admitted, so nothing will ever free room, and the head nested call is
+        admitted anyway rather than holding every chain for good. Over the
+        budget, but not over the machine: what those parents hold is what
+        they were priced at, and a parent blocked in `sup.run` is idle.
+        """
+        mine = set(ancestors)
+        waiting_on = {grant for other in self._queue for grant in other.ancestors}
+        outside = [grant for grant in self._live if grant not in mine]
+        return all(grant in waiting_on for grant in outside)
 
     def _card_has_room(self, demand: Demand) -> bool:
         """What the card actually has free, not what history says it should.
@@ -554,7 +624,8 @@ class Budget:
         return max(1, int(openable or self.cpus_per_job))
 
     @contextlib.contextmanager
-    def reserve(self, candidates, on_wait=None, is_cancelled=None, run_id=None):
+    def reserve(self, candidates, on_wait=None, is_cancelled=None, run_id=None,
+                ancestors=(), parent=None, tool=None):
         """Hold room for the duration of the block, taking the widest that fits.
 
         `candidates` is `[(channels, Demand), ...]`, widest FIRST. They are the
@@ -581,6 +652,12 @@ class Budget:
 
         `run_id` is what an operator addresses the waiting run by (`move`,
         `set_priority`); without one the run queues exactly as before.
+
+        `ancestors` makes this a NESTED call: the grants of the chain that
+        called it, outermost first, `parent` the run id it belongs to and
+        `tool` its name, for whoever reads the queue. It
+        queues in its own band, ahead of runs not yet started, and is judged
+        against everything outside its chain -- see `_would_fit`.
         """
         # A bare Demand is one candidate at one channel. Accepted because most
         # callers -- and every test that predates channels -- have exactly one
@@ -589,26 +666,44 @@ class Budget:
         if isinstance(candidates, Demand):
             candidates = [(1, candidates)]
         candidates = list(candidates) or [(1, whole_machine(self))]
-        waiter = _Waiter(run_id)
+        ancestors = tuple(ancestors)
+        waiter = _Waiter(run_id, ancestors, parent, tool)
         announced = False
         with self._condition:
-            if self._is_high(waiter):
-                self._place(waiter)
-            else:
-                self._queue.append(waiter)
+            self._place(waiter)
+            # A new nested waiter can be what makes a chain stuck (`_stuck`),
+            # so the waiters already queued look again.
+            self._condition.notify_all()
             while True:
                 if is_cancelled is not None and is_cancelled():
                     self._queue.remove(waiter)
                     self._condition.notify_all()
                     raise Cancelled("The client cancelled this run.")
                 channels, demand = candidates[-1]
-                if self._queue[0] is waiter:
+                position = self._queue.index(waiter)
+                # The head may try; so may any nested call with only nested
+                # calls ahead of it. One that fits goes past one that does not:
+                # the one ahead may be waiting for the very chain this one
+                # would finish.
+                if position == 0 or (waiter.nested and all(
+                        other.nested for other in self._queue[:position])):
                     # A HIGH run is not asked to leave room for the runs
                     # behind it: it takes the widest shape that fits now.
-                    behind = 0 if self._is_high(waiter) else len(self._queue) - 1
-                    fitted = self._widest_that_fits(candidates, behind)
+                    # A nested call leaves room for the nested calls behind
+                    # it, and only for those: the runs not yet started are
+                    # what it was put ahead of.
+                    rank = self._rank(waiter)
+                    behind = 0 if rank == 1 else sum(
+                        1 for other in self._queue[position + 1:]
+                        if self._rank(other) <= max(rank, 0))
+                    fitted = self._widest_that_fits(candidates, behind, ancestors)
                     if fitted is not None:
                         channels, demand = fitted
+                        break
+                    if position == 0 and waiter.nested and self._stuck(ancestors):
+                        # Nothing running outside this chain can ever free
+                        # room: see `_stuck`. Admitted on its narrowest shape.
+                        channels, demand = candidates[-1]
                         break
                 if not announced and on_wait is not None:
                     announced = True
@@ -629,9 +724,25 @@ class Budget:
             # permanently. It is never regained, because the window a card-wide
             # measurement covers is the whole run: a neighbour that came and
             # went still allocated inside it.
+            if ancestors and not demand.measured:
+                # The whole machine minus what its own chain holds: what an
+                # unmeasured child is admitted against, and what it holds.
+                demand = dataclasses.replace(
+                    demand,
+                    cpus=max(1.0, self.cpus - sum(g.demand.cpus for g in ancestors if g.demand)),
+                    ram_bytes=max(0, self.ram_bytes - sum(
+                        g.demand.ram_bytes for g in ancestors if g.demand)),
+                    vram_bytes=max(0, self.vram_bytes - sum(
+                        g.demand.vram_bytes for g in ancestors if g.demand)),
+                )
+            # Alone means alone apart from its own chain: a child admitted
+            # under a parent that holds no card still has the card to itself.
             grant = Grant(self._cpu_grant(demand.threads), channels,
-                          solo=(self._running == 0))
-            if not grant.solo:
+                          solo=(self._running - len(ancestors) == 0),
+                          demand=demand, ancestors=ancestors)
+            # A newcomer ends every live run's solitude -- its own parents'
+            # included, whose card-wide window now holds the child's work.
+            if not grant.solo or ancestors:
                 for other in self._live:
                     other.solo = False
             self._live.add(grant)
