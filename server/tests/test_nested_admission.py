@@ -131,8 +131,12 @@ def test_a_child_is_admitted_holds_room_and_gives_it_back(budget, tmp_path):
 
     assert environment == {"SADT_CHANNELS": "1", "GRANTED_TO": "Leaf"}
     assert budget.snapshot()["running"] == 2
+    # Listed under the run that made it, for the panel's running cards.
+    [held] = budget.snapshot()["nested"]
+    assert (held["tool"], held["parent"], held["channels"]) == ("Leaf", "root", 1)
     runner_module._close_lease(lease)
     assert _until(lambda: budget.snapshot()["running"] == 1)
+    assert budget.snapshot()["nested"] == []
     root.finish()
 
 

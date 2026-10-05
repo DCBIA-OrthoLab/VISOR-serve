@@ -215,7 +215,7 @@ class Grant:
     process has written result.json.
     """
 
-    __slots__ = ("cores", "channels", "solo", "demand", "ancestors")
+    __slots__ = ("cores", "channels", "solo", "demand", "ancestors", "run_id", "tool", "parent")
 
     def __init__(self, cores: int, channels: int = 1, solo: bool = False,
                  demand: Optional["Demand"] = None, ancestors=()):
@@ -231,6 +231,10 @@ class Grant:
         # The grants of the runs this one was called from, outermost first.
         # Empty for a run admitted over HTTP.
         self.ancestors = tuple(ancestors)
+        # Who holds it, for whoever reads the budget: set by `reserve`.
+        self.run_id = None
+        self.tool = None
+        self.parent = None
 
     def __iter__(self):
         return iter((self.cores, self.channels))
@@ -353,6 +357,18 @@ class Budget:
                     for index, waiter in enumerate(self._queue)
                 ],
                 "priorities": {run_id: level for run_id, level in self._priority.items()},
+                # Nested calls holding room right now, under the run that made
+                # them: what a chain holds changes call by call, and the root's
+                # own grant no longer says it.
+                "nested": [
+                    {"run_id": grant.run_id, "parent": grant.parent, "tool": grant.tool,
+                     "depth": len(grant.ancestors), "channels": grant.channels,
+                     "cores": grant.cores,
+                     "cpus": grant.demand.cpus if grant.demand else None,
+                     "ram_bytes": grant.demand.ram_bytes if grant.demand else None,
+                     "vram_bytes": grant.demand.vram_bytes if grant.demand else None}
+                    for grant in self._live if grant.ancestors
+                ],
             }
 
     # -- operator controls ---------------------------------------------
@@ -740,6 +756,7 @@ class Budget:
             grant = Grant(self._cpu_grant(demand.threads), channels,
                           solo=(self._running - len(ancestors) == 0),
                           demand=demand, ancestors=ancestors)
+            grant.run_id, grant.tool, grant.parent = run_id, tool, parent
             # A newcomer ends every live run's solitude -- its own parents'
             # included, whose card-wide window now holds the child's work.
             if not grant.solo or ancestors:

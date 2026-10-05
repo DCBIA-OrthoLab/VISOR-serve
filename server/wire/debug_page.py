@@ -249,6 +249,8 @@ DEBUG_PAGE = r"""<!doctype html>
   .chain .sep { color: var(--ghost); }
   .cells { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 10px; }
   .cell { border-left: 1px solid var(--line); padding: 1px 8px; }
+  .cells.nested { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
+  .cells.nested .cell b { color: var(--accent); }
   .cell:first-child { border-left: none; padding-left: 0; }
   .cell u { display: block; font-size: 9.5px; letter-spacing: .06em; color: var(--ghost);
             text-transform: uppercase; text-decoration: none; }
@@ -916,8 +918,25 @@ DEBUG_PAGE = r"""<!doctype html>
     });
     return '<div class="chain">' + links.join("") + "</div>";
   }
+  // What the nested calls of one run hold right now: the root's own grant
+  // above, each call it is waiting on below, admitted and sized on its own.
+  function callCells(list) {
+    if (!list || !list.length) { return ""; }
+    return list.sort(function (a, b) { return a.depth - b.depth; }).map(function (g) {
+      return '<div class="cells nested"><div class="cell"><u>call</u><b>' + esc(g.tool || "?") + "</b></div>" +
+        '<div class="cell"><u>chan</u><b>' + (g.channels == null ? "—" : g.channels) + "</b></div>" +
+        '<div class="cell"><u>cpu</u><b>' + (g.cores == null ? "—" : g.cores) + "</b></div>" +
+        '<div class="cell"><u>ram</u><b>' + gib(g.ram_bytes) + "</b></div>" +
+        '<div class="cell"><u>vram</u><b>' + gib(g.vram_bytes) + "</b></div></div>";
+    }).join("");
+  }
   function drawRunning(d) {
     var byId = ledgerById(d);
+    // Nested calls holding room now, by the run that made them.
+    var calls = {};
+    ((d.admission || {}).nested || []).forEach(function (g) {
+      (calls[g.parent] = calls[g.parent] || []).push(g);
+    });
     var rows = (d.runs || []).filter(function (r) {
       return inFlight(r) && r.phase !== "paused" && r.phase !== "queued_gpu" && r.phase !== "received" &&
         matches(r, byId[r.run_id]);
@@ -948,7 +967,7 @@ DEBUG_PAGE = r"""<!doctype html>
         '<div class="cell"><u>ram</u><b>' + gib(led.ram_bytes) + "</b></div>" +
         '<div class="cell"><u>vram</u><b>' + gib(led.vram_bytes) + "</b></div>" +
         '<div class="cell"><u>files</u><b>' + (led.files == null ? "—" : led.files) + "</b></div>" +
-        "</div></div>";
+        "</div>" + callCells(calls[r.run_id]) + "</div>";
     }).join("");
   }
 
