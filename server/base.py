@@ -427,6 +427,9 @@ class Tool(ABC):
     # schema and deployment.toml; an in-process tool declares none, and the
     # two demos have no folder argument to split anyway.
     batch: Optional[dict] = None
+    # A tool whose inputs are paired publishes this instead: see
+    # registry/conventions.paired_batch_plan.
+    paired_batch: Optional[dict] = None
 
     def check_schema(self) -> None:
         """Reject an invalid `arguments` declaration. Called by registry.py at

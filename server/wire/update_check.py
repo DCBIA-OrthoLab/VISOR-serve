@@ -103,7 +103,8 @@ def check_repo(repo: str, kind: str) -> dict:
         "author": (((c.get("commit") or {}).get("author")) or {}).get("name", ""),
         "at": _epoch(((c.get("commit") or {}).get("author") or {}).get("date")),
     } for c in reversed(compared.get("commits") or [])][:30]
-    info["changes"] = release_diff.classify(kind, [f.get("filename", "") for f in compared.get("files") or []])
+    info["changes"] = release_diff.classify(kind, [f.get("filename", "") for f in compared.get("files") or []],
+                                            repo)
     return info
 
 

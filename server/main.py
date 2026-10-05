@@ -13,6 +13,7 @@ import mimetypes
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import zlib
@@ -1517,9 +1518,112 @@ def list_tools() -> list:
             # published shape byte for byte, and a tool that cannot be split
             # must publish what it published before the field existed.
             **({"batch": tool.batch} if tool.batch else {}),
+            # Under its own key: a client that knows only `batch` must not
+            # split one of a pair of folders and send the other whole.
+            **({"paired_batch": tool.paired_batch} if getattr(tool, "paired_batch", None) else {}),
         }
         for tool in TOOLS.values()
     ]
+
+
+class _PairsRequest(BaseModel):
+    # {argument: [relative file path, ...]} -- names only, as a client lists a
+    # folder it is about to split.
+    inputs: dict
+    # What else the client has chosen; a facade needs its mode to know which
+    # engine's pairing to ask.
+    arguments: dict = {}
+
+
+# Bounds on a pairing request: it carries names, not files, and a cohort of a
+# few thousand scans is a few hundred kilobytes of them.
+_PAIRS_MAX_NAMES = 50000
+_PAIRS_MAX_NAME = 1024
+_PAIRS_TIMEOUT_SECONDS = 120
+
+
+def _pairs_target(tool_name: str, arguments: dict):
+    """The tool whose `pairs()` answers, and its plan; a facade resolves to the
+    engine of the chosen mode."""
+    try:
+        tool = get_tool(tool_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    if isinstance(tool, FacadeTool):
+        mode = arguments.get(facade.MODE_ARGUMENT)
+        if not mode:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                detail=f"{tool.name} needs its '{facade.MODE_ARGUMENT}' to pair inputs.")
+        try:
+            tool = get_tool(tool.target_for(str(mode)))
+        except (ToolArgumentError, KeyError) as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
+    plan = getattr(tool, "paired_batch", None)
+    if not plan:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"{tool.name} does not pair its inputs.")
+    return tool, plan
+
+
+@app.post("/tools/{tool_name}/pairs", dependencies=[Depends(verify_token)])
+def tool_pairs(tool_name: str, wanted: _PairsRequest) -> dict:
+    """Which of these file names go together, answered by the tool itself.
+
+    For a client splitting a cohort for a tool whose inputs are paired: every
+    batch has to carry the same subjects on every axis, and only the tool knows
+    how it pairs them. This runs the tool's own `pairs()` in its own
+    interpreter, on NAMES only -- no file is uploaded, read or kept -- and
+    hands back its groups. The server knows nothing of the rule.
+
+    The names are a patient's file names, so they are never logged.
+    """
+    tool, plan = _pairs_target(tool_name, wanted.arguments or {})
+    axes = plan["axes"]
+    if sorted(wanted.inputs) != sorted(axes):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                            detail=f"{tool.name} pairs {', '.join(axes)}; send exactly those.")
+    inputs = {}
+    for axis in axes:
+        names = wanted.inputs[axis]
+        if not isinstance(names, list) or len(names) > _PAIRS_MAX_NAMES or not all(
+                isinstance(n, str) and 0 < len(n) <= _PAIRS_MAX_NAME and not os.path.isabs(n)
+                and ".." not in n.replace("\\", "/").split("/") for n in names):
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                detail=f"'{axis}' must be a list of relative file names.")
+        inputs[axis] = names
+    interpreter = dispatch.tool_interpreter(tool.name)
+    if not os.path.isfile(interpreter):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"{tool.name} is not installed on this server.")
+    job_dir = tempfile.mkdtemp(prefix="pairs_", dir=settings.TEMP_DIR)
+    try:
+        with open(os.path.join(job_dir, "job.json"), "w", encoding="utf-8") as handle:
+            json.dump({"tool": tool.name, "job_dir": job_dir, "params": inputs,
+                       "entry": runner.PAIRS_ENTRY}, handle)
+        try:
+            completed = subprocess.run(
+                [interpreter, settings.RUNNER_PATH, "--job", os.path.join(job_dir, "job.json")],
+                capture_output=True, text=True, timeout=_PAIRS_TIMEOUT_SECONDS, cwd=job_dir,
+            )
+        except subprocess.TimeoutExpired:
+            raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+                                detail=f"{tool.name} took too long to pair these names.")
+        try:
+            with open(os.path.join(job_dir, "result.json"), encoding="utf-8") as handle:
+                body = json.load(handle)
+        except (OSError, ValueError):
+            logger.error("pairs for %s failed without a result: %s", tool.name, completed.stderr[-2000:])
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                                detail=f"{tool.name} could not pair these inputs.")
+        if "error" in body:
+            error = body["error"] or {}
+            code = TOOL_ERROR_STATUS.get(error.get("type"), status.HTTP_500_INTERNAL_SERVER_ERROR)
+            detail = error.get("message") if code < 500 else f"{tool.name} could not pair these inputs."
+            raise HTTPException(status_code=code, detail=detail)
+        answer = body.get("result") or {}
+        return {"tool": tool.name, "axes": axes, **answer}
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 @app.get("/tools/{tool_name}/data", dependencies=[Depends(verify_token)])

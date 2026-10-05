@@ -207,6 +207,11 @@ class ToolDeployment:
     # those declarations came to once the conventions and the server's numbers
     # had their say.
     batch: Optional[dict] = None
+    # The plan for a tool whose inputs are PAIRED (`{axes, max_mb, max_files}`),
+    # resolved from what the tool's schema declares. Kept apart from `batch`
+    # because a client that knows only `batch` would split one axis and send
+    # the others whole, which unpairs the cohort.
+    paired_batch: Optional[dict] = None
 
 
 _NOTHING_DECLARED = ToolDeployment()

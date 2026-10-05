@@ -161,7 +161,9 @@ def test_every_endpoint_that_starts_work_is_gated():
     # may need to do while an update is draining the server.
     ALLOWED_OPEN = {"/maintenance", "/admin/queue/{run_id}/move", "/admin/runs/{run_id}/priority",
                     "/admin/clients/{address}/policy", "/admin/door", "/admin/update", "/admin/data",
-                    "/admin/updates/check"}
+                    "/admin/updates/check",
+                    # Answers which file NAMES go together; starts no run.
+                    "/tools/{tool_name}/pairs"}
     # This is also what catches a route that does not exist yet. A benchmark
     # battery is a run too, and the day `POST /benchmark/run` lands it arrives
     # here ungated and fails this test until somebody decides.

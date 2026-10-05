@@ -216,7 +216,39 @@ def batch_plan(arguments: dict, declared: ToolDeployment, defaults: tuple) -> Op
     return {"axis": axis, "max_mb": max_mb, "max_files": max_files}
 
 
-def derive(arguments: dict, declared: ToolDeployment, batch_defaults: tuple) -> ToolDeployment:
+def paired_batch_plan(paired, arguments: dict, declared: ToolDeployment,
+                      defaults: tuple) -> Optional[dict]:
+    """How a client may split a cohort for a tool whose inputs are PAIRED, or
+    None.
+
+    Only what the tool itself declares (`"paired": {"axes": [...]}` in its
+    schema): which arguments hold the same subjects. HOW they pair is the
+    tool's and stays there -- a client asks `POST /tools/{tool}/pairs`, which
+    runs the tool's own answer. The caps are this server's, as for any batch,
+    and `batch = false` in deployment.toml turns it off the same way.
+    """
+    if not isinstance(paired, dict) or declared.batch_enabled is False:
+        return None
+    axes = paired.get("axes")
+    if not isinstance(axes, list) or len(axes) < 2:
+        return None
+    for axis in axes:
+        declaration = arguments.get(axis)
+        if not isinstance(declaration, dict) or declaration.get("type") != "path" \
+                or not declaration.get("required"):
+            return None
+    max_mb, max_files = defaults
+    if declared.batch_max_mb is not None:
+        max_mb = declared.batch_max_mb
+    if declared.batch_max_files is not None:
+        max_files = declared.batch_max_files
+    if max_mb <= 0 and max_files <= 0:
+        return None
+    return {"axes": list(axes), "max_mb": max_mb, "max_files": max_files}
+
+
+def derive(arguments: dict, declared: ToolDeployment, batch_defaults: tuple,
+           paired=None) -> ToolDeployment:
     """`declared` (from deployment.toml) merged over these conventions.
 
     Anything stated explicitly wins, per argument, so an exception costs one
@@ -253,4 +285,5 @@ def derive(arguments: dict, declared: ToolDeployment, batch_defaults: tuple) -> 
         server_selectable=selectable,
         hidden=tuple(sorted(hidden)),
         batch=batch_plan(arguments, declared, batch_defaults),
+        paired_batch=paired_batch_plan(paired, arguments, declared, batch_defaults),
     )
