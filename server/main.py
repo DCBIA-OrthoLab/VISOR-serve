@@ -204,6 +204,16 @@ _ACCEPT_ALL_EXTENSIONS = "*"
 #   without its `segmentation` extra), which no request can fix;
 #   anything else is opaque and answers 500 with a fixed message, because a
 #   crash inside a tool can name server-side paths.
+def _tool_error_status(kinds) -> int:
+    """The status for a tool's exception, from its class name or, failing
+    that, the nearest base class this table names -- a tool's own subclass of
+    `ToolInputError` is the caller's fault the way its base is. 500 otherwise."""
+    for kind in kinds or ():
+        if kind in TOOL_ERROR_STATUS:
+            return TOOL_ERROR_STATUS[kind]
+    return status.HTTP_500_INTERNAL_SERVER_ERROR
+
+
 TOOL_ERROR_STATUS = {
     "ToolInputError": status.HTTP_422_UNPROCESSABLE_CONTENT,
     "ValueError": status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -1778,7 +1788,8 @@ def tool_pairs(tool_name: str, wanted: _PairsRequest) -> dict:
                                 detail=f"{tool.name} could not pair these inputs.")
         if "error" in body:
             error = body["error"] or {}
-            code = TOOL_ERROR_STATUS.get(error.get("type"), status.HTTP_500_INTERNAL_SERVER_ERROR)
+            bases = error.get("bases") if isinstance(error.get("bases"), list) else []
+            code = _tool_error_status([error.get("type")] + bases)
             detail = error.get("message") if code < 500 else f"{tool.name} could not pair these inputs."
             raise HTTPException(status_code=code, detail=detail)
         answer = body.get("result") or {}
@@ -2509,7 +2520,7 @@ def _failure_message(exc: BaseException) -> str:
     if isinstance(exc, HTTPException):
         return str(exc.detail)
     if isinstance(exc, dispatch.ToolFailure):
-        if exc.error_type in TOOL_ERROR_STATUS:
+        if _tool_error_status(exc.kinds) != 500:
             return exc.message
         return "Tool execution failed."
     if isinstance(exc, (ToolArgumentError, ToolUnavailableError)):
@@ -3408,7 +3419,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # exception type to isinstance-check -- there is no shared package --
         # so the NAME decides, and only the names that mean "the caller can fix
         # this" let their message through.
-        code = TOOL_ERROR_STATUS.get(exc.error_type, 500)
+        code = _tool_error_status(exc.kinds)
         logger.warning("endpoint=/run/%s status=%d error=%s", tool_name, code, exc.error_type)
         if code == 500:
             # The ONLY place this exists. A 4xx carries its message to the

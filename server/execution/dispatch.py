@@ -128,10 +128,14 @@ class ToolFailure(RuntimeError):
     fault (422), this deployment's (503), or opaque (500).
     """
 
-    def __init__(self, error_type: str, message: str, origin: Optional[dict] = None):
+    def __init__(self, error_type: str, message: str, origin: Optional[dict] = None,
+                 bases=None):
         super().__init__(f"{error_type}: {message}")
         self.error_type = error_type
         self.message = message
+        # The names the class descends from, nearest first: what lets main.py
+        # map a tool's subclass of ToolInputError the way the tool meant it.
+        self.kinds = (error_type,) + tuple(str(name) for name in (bases or ()))
         # Where in the chain it broke, as the runner recorded it -- see
         # `runner._origin_of`. Raw: main.py redacts it before anyone sees it.
         self.origin = origin if isinstance(origin, dict) else None
@@ -868,8 +872,9 @@ def _read_result(job_dir: str, tool_name: str, solo: bool = False) -> Any:
     if isinstance(error, dict):
         # The tool raised and named its exception class. Which one it was is
         # the difference between "you sent the wrong thing" and "this broke".
+        bases = error.get("bases")
         raise ToolFailure(str(error.get("type", "")), str(error.get("message", "")),
-                          error.get("origin"))
+                          error.get("origin"), bases if isinstance(bases, list) else None)
 
     if "result" not in payload:
         raise ToolExecutionError(

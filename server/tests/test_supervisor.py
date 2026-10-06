@@ -1225,3 +1225,45 @@ def test_the_tools_own_log_lines_reach_the_run_and_nobody_elses_do(tools_dir, tm
         ("warning", "admin", "scan 2 has no header spacing; assuming 1 mm"),
         ("error", "admin", "scan 3 skipped (ValueError: bad affine)"),
     ]
+
+
+def test_a_tools_own_subclass_of_an_input_error_is_mapped_by_its_lineage(tools_dir, tmp_path):
+    """The server maps by class NAME. A tool's `SupervisorRequired(ToolInputError)`
+    used to reach it as an unknown name and answer 500; its lineage is now
+    recorded, and survives being relayed by a caller. A library's subclass of
+    ValueError is not given one: that is not the tool blaming the caller."""
+    make_tool(tools_dir, "Leaf", """
+    import json
+
+    class ToolInputError(ValueError):
+        pass
+
+    class MaskMissing(ToolInputError):
+        pass
+
+    def run(scans: Path, output_dir: Path, tag: str = "leaf", library: bool = False) -> Path:
+        \"\"\"Raise a subclass of the input error, or a library's ValueError.\"\"\"
+        if library:
+            json.loads("{")
+        raise MaskMissing("'t1_masks' holds no mask")
+    """)
+    make_tool(tools_dir, "Caller", CALLER)
+
+    _, own = run_job(tools_dir, "Leaf", tmp_path / "own",
+                     {"scans": "in", "output_dir": str(tmp_path / "own" / "output")})
+    _, relayed = run_job(tools_dir, "Caller", tmp_path / "relayed",
+                         {"scans": "in", "output_dir": str(tmp_path / "relayed" / "output")})
+    _, library = run_job(tools_dir, "Leaf", tmp_path / "lib",
+                         {"scans": "in", "output_dir": str(tmp_path / "lib" / "output"),
+                          "library": True})
+
+    assert own["error"]["type"] == "MaskMissing"
+    assert own["error"]["bases"][:2] == ["ToolInputError", "ValueError"]
+    assert relayed["error"]["type"] == "MaskMissing"
+    assert relayed["error"]["bases"][:2] == ["ToolInputError", "ValueError"]
+    assert library["error"]["type"] == "JSONDecodeError"
+    assert "bases" not in library["error"]
+
+    import main
+    assert main._tool_error_status(["MaskMissing", "ToolInputError", "ValueError"]) == 422
+    assert main._tool_error_status(["JSONDecodeError"]) == 500

@@ -1290,6 +1290,32 @@ def _write_result(job_dir: str, result) -> None:
 # own. An attribute rather than a class: the re-raised type has to keep the
 # callee's name, which is what the server maps to a status code.
 ORIGIN_ATTRIBUTE = "_sadt_origin"
+# The class names a nested failure descends from, carried across the re-raise
+# for the same reason as its origin: the class re-raised here is built from a
+# NAME and inherits from nothing of the child's.
+BASES_ATTRIBUTE = "_sadt_bases"
+
+
+def _bases_of(exc: BaseException) -> list:
+    """The names `exc`'s class descends from, nearest first, its own excluded.
+
+    The server maps a failure to a status code by class NAME, there being no
+    shared package to isinstance against -- so a tool's `SupervisorRequired
+    (ToolInputError)` or `ModelNotFoundError(FileNotFoundError)` reached it as
+    an unknown name and answered 500. Recording the lineage lets the server
+    take the first name it knows, which is what the tool meant by subclassing.
+    """
+    carried = getattr(exc, BASES_ATTRIBUTE, None)
+    if isinstance(carried, list):
+        return [str(name) for name in carried]
+    # Only a class a TOOL defined (every tool package is `sadt_*`). A library's
+    # subclass of ValueError -- `JSONDecodeError` on a corrupt bundle, numpy's
+    # `AxisError` -- is not the tool saying "the caller sent the wrong thing",
+    # and reading its lineage would answer a server fault with a 422.
+    if not str(type(exc).__module__ or "").startswith("sadt_"):
+        return []
+    return [klass.__name__ for klass in type(exc).__mro__[1:]
+            if klass not in (BaseException, Exception, object)]
 
 
 def _origin_of(exc: BaseException) -> dict:
@@ -1413,6 +1439,9 @@ def _write_error(job_dir: str, exc: Exception) -> None:
     failure.
     """
     payload = {"error": {"type": type(exc).__name__, "message": str(exc)}}
+    bases = _bases_of(exc)
+    if bases:
+        payload["error"]["bases"] = bases
     try:
         origin = _origin_of(exc)
     except Exception:  # noqa: BLE001 - a diagnosis must never cost the error itself
@@ -2737,7 +2766,7 @@ class _Supervisor:
             # traceback goes to stderr, which whatever runs the PARENT may be
             # capturing and trimming -- so "see above" is a promise this cannot
             # keep, and the message has to carry the reason itself.
-            kind, message, origin = self._failure_parts(tool, nested_dir)
+            kind, message, origin, bases = self._failure_parts(tool, nested_dir)
 
             # A child's answer to the CALLER is re-raised under the child's own
             # exception name, so the server maps it the way it would have if the
@@ -2748,8 +2777,9 @@ class _Supervisor:
             # execution failed", indistinguishable from a crash. The tool name is
             # prepended because in a chain the caller cannot otherwise tell which
             # step is talking.
-            if kind in CALLER_FACING_ERRORS:
+            if kind in CALLER_FACING_ERRORS or set(bases) & set(CALLER_FACING_ERRORS):
                 failure = type(kind, (Exception,), {})(f"{tool}: {message}")
+                setattr(failure, BASES_ATTRIBUTE, bases)
             else:
                 failure = RunnerError(
                     f"Supervised tool '{tool}' failed (exit {completed.returncode}). "
@@ -2765,17 +2795,19 @@ class _Supervisor:
         return self._result(tool, nested_dir, admitted)
 
     def _failure_parts(self, tool: str, nested_dir: str):
-        """`(exception class name, message, origin)` the callee recorded."""
+        """`(class name, message, origin, base class names)` the callee recorded."""
         path = os.path.join(nested_dir, RESULT_FILE)
         try:
             with open(path, encoding="utf-8") as handle:
                 error = json.load(handle).get("error") or {}
         except (OSError, ValueError):
             return ("Error", f"It wrote no readable result; see its output and {path}.",
-                    None)
+                    None, [])
         origin = error.get("origin")
+        bases = error.get("bases")
         return (error.get("type", "Error"), error.get("message", "").strip(),
-                origin if isinstance(origin, dict) else None)
+                origin if isinstance(origin, dict) else None,
+                [str(name) for name in bases] if isinstance(bases, list) else [])
 
     def channels(self, wanted: int = 0) -> int:
         """How many of `wanted` items this run may process at once. Never below 1.
