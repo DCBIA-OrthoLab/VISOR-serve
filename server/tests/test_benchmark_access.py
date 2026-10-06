@@ -109,3 +109,27 @@ def test_the_results_read_campaigns_and_batteries_together(admin, monkeypatch, t
     assert body["campaign"]["source"] == "preset-custom-20261006T000000Z.json"
     older = client.get("/benchmarks?campaign=b9-20261001T000000Z.json", headers=admin)
     assert older.status_code == 200 and older.json()["campaign"]["generated_at"] == 1
+
+
+def test_a_battery_reaches_this_server_on_its_own_socket_not_the_public_address(admin, monkeypatch, tmp_path):
+    """Behind the reverse proxy the request arrives as https://<public host>,
+    which the container the battery runs in cannot reach: its connect hung and
+    no run was ever sent. The battery is handed the socket uvicorn accepted the
+    request on, in plain HTTP, whatever Host the operator's browser sent."""
+    import benchmark_jobs
+    monkeypatch.setattr(settings, "SADT_BATTERY_DIR", str(tmp_path / "batteries"))
+    seen = {}
+    monkeypatch.setattr(benchmark_jobs, "start",
+                        lambda plan, summary_dir, base, *rest: seen.setdefault("base", base) and {"state": "running"})
+    response = client.post("/benchmark/run", json={"preset": "smoke"},
+                           headers={**admin, "Host": "public.example.org",
+                                    "X-Forwarded-Proto": "https"})
+    assert response.status_code == 200, response.text
+    assert seen["base"].startswith("http://")
+    assert "public.example.org" not in seen["base"]
+
+
+def test_an_ipv6_socket_is_bracketed():
+    class Request:
+        scope = {"server": ("::1", 8000)}
+    assert main._local_base(Request()) == "http://[::1]:8000"

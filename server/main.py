@@ -1461,6 +1461,21 @@ def _custom_plan(spec: dict) -> dict:
     return plan
 
 
+def _local_base(request: Request) -> str:
+    """`http://<host>:<port>` of the socket this request was accepted on.
+
+    Plain HTTP: TLS is the reverse proxy's, in front of uvicorn, and a server
+    serving TLS itself would be reached the same way it is reached here -- on
+    its own socket. Falls back to loopback on the configured port when the
+    server address is unknown.
+    """
+    server = request.scope.get("server") or ("127.0.0.1", 8000)
+    host, port = server[0] or "127.0.0.1", server[1]
+    if ":" in str(host):
+        host = f"[{host}]"  # an IPv6 address in a URL
+    return f"http://{host}:{port}" if port else f"http://{host}"
+
+
 @app.post("/benchmark/run", dependencies=[Depends(verify_admin), Depends(maintenance.require_accepting)])
 def benchmark_start(request: Request, body: BatteryRequest) -> dict:
     """Start a battery. One at a time, and never on the event loop.
@@ -1488,8 +1503,13 @@ def benchmark_start(request: Request, body: BatteryRequest) -> dict:
         f"{_gib(allocation.vram_bytes)} vram"
     )
     # The battery talks to this server over HTTP like any other client, so it
-    # needs an address to reach it at -- the one this very request arrived on.
-    base = f"{request.url.scheme}://{request.url.netloc}"
+    # needs an address to reach it at -- and it runs HERE, beside uvicorn, so
+    # that is the socket uvicorn itself accepted this request on, never the
+    # address the operator typed. Behind the reverse proxy those differ: the
+    # request arrives as https://<public address>, which the container cannot
+    # reach (its connect hung in SYN_SENT and the battery sent nothing), while
+    # uvicorn listens on plain HTTP on its own address and port.
+    base = _local_base(request)
     try:
         return benchmark_jobs.start(
             plan, _battery_dir(), base, settings.API_TOKEN,
