@@ -1461,6 +1461,21 @@ def _custom_plan(spec: dict) -> dict:
     return plan
 
 
+def _local_base(request: Request) -> str:
+    """`http://127.0.0.1:<port>`: this server, on its own loopback.
+
+    The battery runs in the same container as uvicorn, so it never needs to
+    leave it: loopback traffic does not reach the Docker network, the host or
+    anything beyond, which is the property that makes plain HTTP acceptable
+    here -- the same plain HTTP the reverse proxy already speaks to uvicorn
+    after terminating TLS, only shorter. The port is the one uvicorn accepted
+    this request on.
+    """
+    server = request.scope.get("server") or (None, 8000)
+    port = server[1] or 8000
+    return f"http://127.0.0.1:{port}"
+
+
 @app.post("/benchmark/run", dependencies=[Depends(verify_admin), Depends(maintenance.require_accepting)])
 def benchmark_start(request: Request, body: BatteryRequest) -> dict:
     """Start a battery. One at a time, and never on the event loop.
@@ -1488,8 +1503,13 @@ def benchmark_start(request: Request, body: BatteryRequest) -> dict:
         f"{_gib(allocation.vram_bytes)} vram"
     )
     # The battery talks to this server over HTTP like any other client, so it
-    # needs an address to reach it at -- the one this very request arrived on.
-    base = f"{request.url.scheme}://{request.url.netloc}"
+    # needs an address to reach it at -- and it runs HERE, beside uvicorn, so
+    # that is this server's own loopback, never the address the operator
+    # typed. Behind the reverse proxy those differ: the request arrives as
+    # https://<public address>, which the container cannot reach (its connect
+    # hung in SYN_SENT and the battery sent nothing). Loopback never leaves the
+    # container, so nothing a battery sends crosses any network.
+    base = _local_base(request)
     try:
         return benchmark_jobs.start(
             plan, _battery_dir(), base, settings.API_TOKEN,
