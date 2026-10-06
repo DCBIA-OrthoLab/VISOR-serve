@@ -18,6 +18,10 @@ land in proxy logs and browser history.
 
 And it shows no progress MESSAGE, for the same reason `GET /status` carries
 none: a message is free text a tool wrote and can name a patient's file.
+
+**No benchmark either.** This page opens with the API token every workstation
+holds; a campaign is behind the ADMIN token, with the rest of the operator's
+view, at `/benchmark`.
 """
 
 from __future__ import annotations
@@ -76,10 +80,6 @@ STATUS_PAGE = """<!doctype html>
   .varies { color: var(--warn); font-size: 11.5px; }
   .empty { color: var(--soft); font-size: 12.5px; padding: 6px 0; }
   a { color: var(--fill); }
-  .gain { color: var(--ok); font-weight: 600; }
-  .bad { color: var(--warn); }
-  .scroll { overflow-x: auto; }
-  .arm { color: var(--soft); font-size: 11.5px; }
   .gate { display: flex; gap: 8px; margin-top: 10px; }
   input { flex: 1; padding: 8px 10px; border: 1px solid var(--line);
           border-radius: 6px; background: var(--bg); color: var(--ink);
@@ -115,17 +115,6 @@ STATUS_PAGE = """<!doctype html>
   <section id="runs" hidden>
     <h2>Runs</h2>
     <div id="runbody"></div>
-  </section>
-
-  <section id="bench" hidden>
-    <h2>What this deployment was measured to do</h2>
-    <div class="empty" id="benchwhen"></div>
-    <div id="benchbody"></div>
-  </section>
-
-  <section id="cover" hidden>
-    <h2>Every tool, run once</h2>
-    <div id="coverbody"></div>
   </section>
 
   <section id="costs" hidden>
@@ -221,75 +210,6 @@ STATUS_PAGE = """<!doctype html>
     el("when").textContent = "updated " + new Date().toLocaleTimeString();
   }
 
-  function seconds(v) { return v == null ? "" : v.toFixed(0) + "s"; }
-
-  function drawCampaign(c) {
-    if (!c) {
-      show("bench", false);
-      show("cover", false);
-      return;
-    }
-    // Linked from here rather than from the header: this line already
-    // identifies the campaign the new page expands, and `drawCampaign(null)`
-    // hides this whole section -- so the link cannot appear on a deployment
-    // with nothing to draw. Relative, so it resolves behind a proxy prefix.
-    el("benchwhen").innerHTML =
-      escaped(c.source) + " — " + escaped(c.hardware || "") +
-      ' · <a href="benchmarks/view">see every run drawn</a>';
-
-    el("benchbody").innerHTML = '<div class="scroll"><table><thead><tr>' +
-      "<th>arm</th><th>load</th><th>clients</th><th>ok</th><th>wall</th>" +
-      "<th>median</th><th>slowest</th><th>at once</th><th>speedup</th><th>peak vram</th>" +
-      "</tr></thead><tbody>" +
-      (c.arms || []).map(function (a) {
-        var load = (a.tools || []).join("/") +
-          (a.transfer === "upload" ? " (upload)" : "") +
-          (a.detached === false ? " (blocking)" : "");
-        return '<tr><td class="arm">' + a.arm + "</td><td>" + load +
-          '</td><td class="n">' + a.clients +
-          '</td><td class="n' + (a.ok < a.total ? " bad" : "") + '">' +
-          a.ok + "/" + a.total +
-          '</td><td class="n">' + seconds(a.wall_seconds) +
-          '</td><td class="n">' + seconds(a.median_seconds) +
-          '</td><td class="n">' + seconds(a.slowest_seconds) +
-          '</td><td class="n">' + a.peak_running + " / " + a.mean_running.toFixed(1) +
-          '</td><td class="n gain">' + (a.speedup ? a.speedup.toFixed(1) + "×" : "—") +
-          '</td><td class="n">' + gib(a.peak_vram_bytes) + "</td></tr>";
-      }).join("") + "</tbody></table></div>";
-    show("bench", true);
-
-    var cov = c.coverage || [];
-    el("coverbody").innerHTML = cov.length
-      ? '<div class="scroll"><table><thead><tr><th>tool</th><th>result</th>' +
-        "<th>seconds</th><th>vram</th><th>ram</th></tr></thead><tbody>" +
-        cov.map(function (t) {
-          var ok = t.status === "ok";
-          return "<tr><td>" + t.tool + '</td><td><span class="tag ' +
-            (ok ? "run" : "wait") + '">' + t.status + "</span>" +
-            (t.error ? ' <span class="bad">' + t.error.slice(0, 90) + "</span>" : "") +
-            '</td><td class="n">' + seconds(t.seconds) +
-            '</td><td class="n">' + (t.vram_bytes == null ? "" : gib(t.vram_bytes)) +
-            '</td><td class="n">' + (t.ram_bytes == null ? "" : gib(t.ram_bytes)) +
-            "</td></tr>";
-        }).join("") + "</tbody></table></div>" +
-        ((c.out_of_scope || []).length
-          ? '<div class="empty">Not run, deliberately: ' +
-            c.out_of_scope.join(", ") + ".</div>"
-          : "")
-      : "";
-    show("cover", cov.length > 0);
-  }
-
-  function pollCampaign() {
-    if (!token) { return; }
-    // Its own request, and a failure here never disturbs the live view: a
-    // deployment that ran no campaign is the normal case, not a broken one.
-    fetch("benchmarks", { headers: { Authorization: "Bearer " + token } })
-      .then(function (r) { return r.ok ? r.json() : { campaign: null }; })
-      .then(function (d) { drawCampaign(d.campaign); })
-      .catch(function () { drawCampaign(null); });
-  }
-
   function poll() {
     if (!token) { show("gate", true); el("when").textContent = "waiting for a token"; return; }
     fetch("status", { headers: { Authorization: "Bearer " + token } })
@@ -311,18 +231,13 @@ STATUS_PAGE = """<!doctype html>
     try { window.localStorage.setItem(KEY, token); } catch (e) { /* private window */ }
     el("gateerr").textContent = "";
     poll();
-    pollCampaign();
   });
   el("token").addEventListener("keydown", function (e) {
     if (e.key === "Enter") { el("save").click(); }
   });
 
   poll();
-  pollCampaign();
   window.setInterval(poll, 2000);
-  // A campaign does not change while anyone is watching; re-read it rarely, so
-  // the page is not asking for a few kilobytes of history every two seconds.
-  window.setInterval(pollCampaign, 60000);
 }());
 </script>
 </body>

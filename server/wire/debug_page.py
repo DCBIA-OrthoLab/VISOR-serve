@@ -24,6 +24,12 @@ every call as a bar under the run's own timeline.
 dashboard rather than a drawer beside it: the timeline of a run and the graphs
 of a tool need the width, and the dashboard behind keeps polling.
 
+**Every chart opens enlarged.** A sparkline or a trace is drawn to be glanced
+at, too small to read a value off. A click opens it over everything, at the
+screen's real width rather than stretched, with a cursor that snaps to the
+nearest sample and reads every series at that instant. It keeps following the
+poll while open, and the arrow keys step through the samples.
+
 Rules carried over unchanged, each a thing the page deliberately does NOT do:
 
 * **No argument value and no file name, ever.** A value is a path and a path is
@@ -48,6 +54,8 @@ no token in the served HTML -- the reader types one and the browser keeps it.
 
 from __future__ import annotations
 
+from wire.glass_style import GLASS_BASE, GLASS_SELECT_JS
+
 DEBUG_PAGE = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -55,92 +63,7 @@ DEBUG_PAGE = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VISOR admin panel</title>
 <style>
-  /* Glass over light: frosted panels on a softly lit ground, after macOS.
-     The ground carries a few wide colour glows so the blur behind each panel
-     has something to pick up; the panels themselves stay neutral. */
-  :root {
-    --bg: #eef1f6;
-    --glow-1: rgba(120,170,255,.45); --glow-2: rgba(190,150,255,.35); --glow-3: rgba(110,220,200,.30);
-    --panel: rgba(255,255,255,.58); --panel-strong: rgba(255,255,255,.78);
-    --panel-edge: rgba(255,255,255,.75); --sunk: rgba(255,255,255,.55);
-    --line: rgba(60,60,67,.14); --ink: #1d1d1f; --soft: #5f6368; --ghost: #8e8e93;
-    --bar: rgba(120,120,128,.16); --accent: #007aff; --accent-soft: rgba(0,122,255,.12);
-    --ok: #28a745; --warn: #e8890c; --hot: #ff3b30; --violet: #8e5bd8; --staging: #8e8e93;
-    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a;
-    --shadow: 0 1px 1px rgba(0,0,0,.03), 0 8px 28px rgba(30,40,60,.08);
-    --shadow-lg: 0 30px 80px rgba(20,30,50,.28);
-    --blur: blur(28px) saturate(180%);
-    --menu: #ffffff;
-    --radius: 16px;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      --bg: #0b0d12;
-      --glow-1: rgba(40,90,200,.38); --glow-2: rgba(110,60,190,.30); --glow-3: rgba(20,140,120,.24);
-      --panel: rgba(30,32,38,.55); --panel-strong: rgba(36,38,44,.82);
-      --panel-edge: rgba(255,255,255,.09); --sunk: rgba(255,255,255,.05);
-      --line: rgba(235,235,245,.12); --ink: #f5f5f7; --soft: #a1a1a6; --ghost: #6e6e73;
-      --bar: rgba(120,120,128,.28); --accent: #0a84ff; --accent-soft: rgba(10,132,255,.18);
-      --ok: #30d158; --warn: #ff9f0a; --hot: #ff453a; --violet: #bf5af2; --staging: #8e8e93;
-      --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
-      --shadow: 0 1px 1px rgba(0,0,0,.2), 0 8px 28px rgba(0,0,0,.35);
-      --shadow-lg: 0 30px 80px rgba(0,0,0,.7);
-      --menu: #1f232b;
-    }
-  }
-  :root[data-theme="dark"] {
-    --bg: #0b0d12;
-    --glow-1: rgba(40,90,200,.38); --glow-2: rgba(110,60,190,.30); --glow-3: rgba(20,140,120,.24);
-    --panel: rgba(30,32,38,.55); --panel-strong: rgba(36,38,44,.82);
-    --panel-edge: rgba(255,255,255,.09); --sunk: rgba(255,255,255,.05);
-    --line: rgba(235,235,245,.12); --ink: #f5f5f7; --soft: #a1a1a6; --ghost: #6e6e73;
-    --bar: rgba(120,120,128,.28); --accent: #0a84ff; --accent-soft: rgba(10,132,255,.18);
-    --ok: #30d158; --warn: #ff9f0a; --hot: #ff453a; --violet: #bf5af2; --staging: #8e8e93;
-    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70;
-    --shadow: 0 1px 1px rgba(0,0,0,.2), 0 8px 28px rgba(0,0,0,.35);
-    --shadow-lg: 0 30px 80px rgba(0,0,0,.7);
-    --menu: #1f232b;
-  }
-  * { box-sizing: border-box; }
-  /* Scrollbars in the page's own colours: the browser's default is a light
-     gutter that sits on a dark theme like a stripe of paint. `color-scheme`
-     also gives form controls and the default bars the right palette. */
-  :root { color-scheme: light; --thumb: #c5cad2; --thumb-hover: #9aa1ab; }
-  :root[data-theme="dark"] { color-scheme: dark; --thumb: #343c47; --thumb-hover: #4a5462; }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) { color-scheme: dark; --thumb: #343c47; --thumb-hover: #4a5462; }
-  }
-  * { scrollbar-width: thin; scrollbar-color: var(--thumb) transparent; }
-  ::-webkit-scrollbar { width: 10px; height: 10px; }
-  ::-webkit-scrollbar-track { background: transparent; }
-  ::-webkit-scrollbar-thumb { background: var(--thumb); border-radius: 999px;
-                              border: 2px solid transparent; background-clip: padding-box; }
-  ::-webkit-scrollbar-thumb:hover { background: var(--thumb-hover); background-clip: padding-box; }
-  ::-webkit-scrollbar-corner { background: transparent; }
-  [hidden] { display: none !important; }
-  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
-  html, body { min-height: 100%; }
-  body {
-    margin: 0; color: var(--ink); background-color: var(--bg);
-    background-image:
-      radial-gradient(60vw 50vh at 8% -5%, var(--glow-1), transparent 70%),
-      radial-gradient(55vw 55vh at 100% 15%, var(--glow-2), transparent 70%),
-      radial-gradient(60vw 50vh at 45% 110%, var(--glow-3), transparent 70%);
-    background-attachment: fixed;
-    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", system-ui, "Segoe UI", Roboto, sans-serif;
-    -webkit-font-smoothing: antialiased; letter-spacing: -.003em;
-  }
-  body.locked { overflow: hidden; }
-  .mono { font-variant-numeric: tabular-nums; }
-  button, input, select { font: inherit; color: inherit; }
-  button { background: var(--sunk); border: 1px solid var(--line); border-radius: 8px;
-           padding: 6px 12px; cursor: pointer; transition: border-color .15s, background .15s; }
-  button:hover { border-color: var(--soft); }
-  button.ghost { border-color: transparent; background: transparent; }
-  button.ghost:hover { background: var(--sunk); border-color: var(--line); }
-  input { background: var(--sunk); border: 1px solid var(--line); border-radius: 9px;
-          padding: 7px 11px; min-width: 220px; outline: none; }
-  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+""" + GLASS_BASE + r"""  body.locked { overflow: hidden; }
 
   /* ---- shell ---------------------------------------------------------- */
   #shell { max-width: 1680px; margin: 0 auto; padding: 10px 20px 28px;
@@ -157,9 +80,6 @@ DEBUG_PAGE = r"""<!doctype html>
          box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
   .dot.off { background: var(--ghost); box-shadow: none; }
   #filters { display: flex; gap: 6px; flex-wrap: wrap; }
-  .navlink { color: var(--accent); text-decoration: none; font-size: 13px; font-weight: 600;
-             padding: 6px 10px; border-radius: 8px; white-space: nowrap; }
-  .navlink:hover { background: var(--accent-soft); }
   .fchip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
            padding: 4px 9px 4px 11px; border-radius: 999px; background: var(--accent-soft);
            color: var(--accent); cursor: pointer; }
@@ -399,8 +319,6 @@ DEBUG_PAGE = r"""<!doctype html>
   .chip2 { font-size: 11.5px; padding: 1px 8px; border-radius: 6px; background: var(--sunk); border: 1px solid var(--line); }
   .chip2.env { border-color: var(--warn); color: var(--warn); }
   .doorctl { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-  button.primary:disabled { opacity: .45; cursor: default; }
   #m-progress:not(:empty) { border-top: 1px solid var(--line); padding: 10px 16px; font-size: 13px; }
   .commit { display: grid; grid-template-columns: 80px minmax(0, 1fr) 120px; gap: 10px; font-size: 12.5px;
             padding: 4px 0; border-bottom: 1px solid var(--line); }
@@ -411,7 +329,8 @@ DEBUG_PAGE = r"""<!doctype html>
            padding: 8px 12px; font-size: 12.5px; background: color-mix(in srgb, var(--ok) 8%, transparent); }
   /* full history */
   .hfilters { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-  .hfilters select, .hfilters input { font-size: 13px; padding: 6px 9px; border-radius: 9px;
+  .hfilters select { font-size: 13px; padding-top: 6px; padding-bottom: 6px; }
+  .hfilters input { font-size: 13px; padding: 6px 9px; border-radius: 9px;
       border: 1px solid var(--line); background: var(--sunk); color: var(--ink); min-width: 0; }
   .hfilters input { width: 220px; }
   /* A native menu draws its options on an opaque sheet of its own, so a
@@ -457,6 +376,43 @@ DEBUG_PAGE = r"""<!doctype html>
            font-size: 13px; box-shadow: var(--shadow-lg); }
   #gate { max-width: 520px; margin: 14vh auto; }
   .err { color: var(--hot); font-size: 12.5px; margin-top: 8px; }
+
+  /* ---- a chart, enlarged ------------------------------------------------ */
+  /* Every chart is a button: a click opens it full width with a cursor that
+     reads every series at the instant under the pointer. */
+  .zoomable { position: relative; cursor: zoom-in; border-radius: 8px; transition: background .15s; }
+  .zoomable:hover { background: var(--sunk); }
+  .zoomable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .zoomable::after { content: "\2922"; position: absolute; top: 4px; right: 6px; font-size: 12px;
+                     color: var(--ghost); opacity: 0; transition: opacity .15s; pointer-events: none; }
+  .zoomable:hover::after, .zoomable:focus-visible::after { opacity: 1; }
+  #zoom { position: fixed; inset: 0; z-index: 30; display: flex; align-items: center;
+          justify-content: center; padding: 3vh 20px; overflow: auto;
+          background: rgba(0,0,0,.22); -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+          opacity: 0; transition: opacity .16s ease; }
+  #zoom.open { opacity: 1; }
+  #zbox { width: min(1500px, 100%); background: var(--panel-strong); border: 1px solid var(--panel-edge);
+          -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+          border-radius: 20px; box-shadow: var(--shadow-lg); transform: translateY(10px) scale(.99);
+          transition: transform .18s ease; }
+  #zoom.open #zbox { transform: none; }
+  #zbox .dhd { align-items: center; }
+  #zlegend { display: flex; gap: 16px; flex-wrap: wrap; font-size: 12.5px; color: var(--soft); margin-top: 6px; }
+  #zlegend i { display: inline-block; width: 14px; height: 2px; border-radius: 1px; margin-right: 6px; vertical-align: middle; }
+  #zlegend b { color: var(--ink); font-weight: 650; }
+  #zchart { position: relative; padding: 14px 18px 6px; touch-action: none; cursor: crosshair; outline: none; }
+  #zchart svg { display: block; width: 100%; }
+  #zchart svg text { font: 11px -apple-system, system-ui, sans-serif; fill: var(--ghost); }
+  .ztip { position: absolute; z-index: 2; pointer-events: none; min-width: 170px; padding: 9px 12px;
+          background: var(--panel-strong); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+          border: 1px solid var(--panel-edge); border-radius: 11px; box-shadow: var(--shadow); font-size: 12.5px; }
+  .ztip .tm { color: var(--soft); font-size: 11.5px; margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+  .ztip .zr { display: flex; align-items: center; gap: 8px; line-height: 1.7; white-space: nowrap; }
+  .ztip .zr i { width: 12px; height: 2px; border-radius: 1px; flex: none; }
+  .ztip .zr b { font-weight: 700; font-variant-numeric: tabular-nums; }
+  .ztip .zr span { color: var(--soft); }
+  .ztip .zm { margin-top: 4px; padding-top: 4px; border-top: 1px solid var(--line); color: var(--soft); font-size: 11.5px; }
+  .zfoot { padding: 0 22px 16px; font-size: 11.5px; color: var(--ghost); }
 </style>
 </head>
 <body>
@@ -488,8 +444,7 @@ DEBUG_PAGE = r"""<!doctype html>
     <input id="find" style="min-width:200px;width:220px" type="search" placeholder="Filter: run id, tool or address" autocomplete="off" spellcheck="false">
     <span id="live"><span class="dot" id="dot"></span><span id="livetext">live</span></span>
     <button id="toggle" type="button" class="ghost">Pause</button>
-    <a class="navlink" href="benchmark" title="launch a benchmark preset on this server">Run a benchmark</a>
-    <a class="navlink" href="benchmarks/view" title="the campaigns already measured, drawn on one time axis">Benchmark results</a>
+    <a class="navlink" href="benchmark" title="the campaigns already measured, and the presets to measure next">Benchmarks</a>
     <button id="adminbtn" type="button" class="ghost" title="forget the admin token in this browser">Lock</button>
     <button id="theme" type="button" class="ghost" title="theme">Theme</button>
   </header>
@@ -559,7 +514,15 @@ DEBUG_PAGE = r"""<!doctype html>
 </div>
 
 <div id="overlay" hidden><div id="dialog" role="dialog" aria-modal="true"></div></div>
+<div id="zoom" hidden><div id="zbox" role="dialog" aria-modal="true" aria-labelledby="ztitle">
+  <div class="dhd"><div style="min-width:0"><h3 id="ztitle"></h3><div class="rid" id="zsub"></div>
+    <div id="zlegend"></div></div>
+    <div class="acts"><button data-zclose="1">Close &#x2715;</button></div></div>
+  <div id="zchart" tabindex="0" aria-label="enlarged chart: move the pointer, or use the arrow keys, to read a value"></div>
+  <div class="zfoot">Point at the chart, or use &larr; &rarr; (Shift for ten steps), to read every series at one instant. Esc closes.</div>
+</div></div>
 <div id="toast" class="toast" hidden></div>
+""" + GLASS_SELECT_JS + r"""
 
 <script>
 (function () {
@@ -787,6 +750,244 @@ DEBUG_PAGE = r"""<!doctype html>
     return html + '<div class="axis"><span></span><div class="ticks">' + ticks + "</div><span></span></div></div>";
   }
 
+  // ---- a chart, enlarged --------------------------------------------------
+  // A chart registers what it draws under an id every time it is drawn, so the
+  // enlarged copy follows the poll like the small one. A spec is
+  // {title, sub, t0, t1, max, yfmt, series, marks, markLabel}; a series is
+  // {name, color, values: [[t, v, raw?]], step, dots, fmt(point)}, `v` being
+  // what is plotted and `raw` what the readout may want to say instead.
+  var charts = {};
+  var zoom = { id: null, at: null, view: null };
+  function zoomable(id, spec, inner, extraClass) {
+    charts[id] = spec;
+    return '<div class="zoomable' + (extraClass ? " " + extraClass : "") + '" data-zoom="' + id +
+      '" tabindex="0" role="button" title="Click to enlarge">' + inner + "</div>";
+  }
+  function within(a, b) {
+    var span = Math.abs(b - a);
+    return function (t) {
+      var d = new Date(t * 1000), day = (d.getMonth() + 1) + "/" + d.getDate() + " ";
+      if (span > 20 * 3600) { return day + clock(t).slice(0, 5); }
+      return span < 900 ? clock(t) : clock(t).slice(0, 5);
+    };
+  }
+  function stamp(t) {
+    var d = new Date(t * 1000);
+    return (d.toDateString() === new Date().toDateString() ? "" : d.toLocaleDateString() + " ") + clock(t);
+  }
+  // A series' points with a value, in time order: what the cursor snaps to.
+  function samples(s) {
+    return s.values.filter(function (p) { return p[1] != null; }).slice().sort(function (a, b) { return a[0] - b[0]; });
+  }
+  function nearest(points, t) {
+    var lo = 0, hi = points.length - 1;
+    if (hi < 0) { return -1; }
+    while (hi - lo > 1) {
+      var mid = (lo + hi) >> 1;
+      if (points[mid][0] < t) { lo = mid; } else { hi = mid; }
+    }
+    return Math.abs(points[lo][0] - t) <= Math.abs(points[hi][0] - t) ? lo : hi;
+  }
+  function lastAtOrBefore(points, t) {
+    var i = nearest(points, t);
+    if (i < 0) { return -1; }
+    if (points[i][0] > t) { i -= 1; }
+    return i;
+  }
+  function bigChart(spec, w, h) {
+    var padL = 58, padR = 18, padT = 12, padB = 28, max = spec.max || 100;
+    var t0 = spec.t0, t1 = spec.t1 > spec.t0 ? spec.t1 : spec.t0 + 1;
+    var pw = w - padL - padR, ph = h - padT - padB;
+    function X(t) { return padL + ((t - t0) / (t1 - t0)) * pw; }
+    function Y(v) { return padT + ph * (1 - Math.max(0, Math.min(v, max)) / max); }
+    var yfmt = spec.yfmt || function (v) { return v.toFixed(0) + "%"; };
+    var out = '<svg viewBox="0 0 ' + w + " " + h + '" style="height:' + h + 'px">';
+    [0, 0.25, 0.5, 0.75, 1].forEach(function (f) {
+      var y = Y(max * f).toFixed(1);
+      out += '<line x1="' + padL + '" x2="' + (w - padR) + '" y1="' + y + '" y2="' + y +
+        '" stroke="var(--line)"' + (f ? ' stroke-dasharray="3 4"' : "") + "/>" +
+        '<text x="' + (padL - 8) + '" y="' + (+y + 4) + '" text-anchor="end">' + esc(yfmt(max * f)) + "</text>";
+    });
+    (spec.marks || []).forEach(function (m) {
+      var a = X(Math.max(m.start, t0)), b = X(Math.min(m.end == null ? t1 : m.end, t1));
+      if (b > a) {
+        out += '<rect x="' + a.toFixed(1) + '" y="' + padT + '" width="' + Math.max(1, b - a).toFixed(1) +
+          '" height="' + ph + '" fill="' + (m.color || "var(--accent)") + '" opacity=".09"/>';
+      }
+    });
+    // Ticks on round local times -- 16:00, 16:05 -- as many as the width holds.
+    var room = Math.max(2, Math.floor(pw / 110)), tf = within(t0, t1), i;
+    var steps = [5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400];
+    var tick = steps[steps.length - 1];
+    for (i = 0; i < steps.length; i++) { if ((t1 - t0) / steps[i] <= room) { tick = steps[i]; break; } }
+    var tz = new Date(t0 * 1000).getTimezoneOffset() * 60;
+    for (var t = Math.ceil((t0 - tz) / tick) * tick + tz; t <= t1; t += tick) {
+      var x = X(t);
+      out += '<line x1="' + x.toFixed(1) + '" x2="' + x.toFixed(1) + '" y1="' + (padT + ph) + '" y2="' + (padT + ph + 4) +
+        '" stroke="var(--line)"/><text x="' + x.toFixed(1) + '" y="' + (h - 8) + '" text-anchor="' +
+        (x < padL + 20 ? "start" : x > w - padR - 20 ? "end" : "middle") + '">' + esc(tf(t)) + "</text>";
+    }
+    spec.series.forEach(function (s) {
+      var d = "", started = false;
+      s.values.forEach(function (p) {
+        if (p[1] == null) { started = false; return; }
+        var px = X(p[0]), py = Y(p[1]);
+        d += s.step && started ? "H" + px.toFixed(1) + "V" + py.toFixed(1) : (started ? "L" : "M") + px.toFixed(1) + "," + py.toFixed(1);
+        started = true;
+      });
+      out += '<path d="' + d + '" fill="none" stroke="' + s.color + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+      if (s.dots) {
+        s.values.forEach(function (p) {
+          if (p[1] != null) { out += '<circle cx="' + X(p[0]).toFixed(1) + '" cy="' + Y(p[1]).toFixed(1) + '" r="2.5" fill="' + s.color + '"/>'; }
+        });
+      }
+    });
+    // The cursor, hidden until there is something under the pointer.
+    out += '<g id="zcross" style="display:none"><line id="zline" y1="' + padT + '" y2="' + (padT + ph) +
+      '" stroke="var(--soft)" stroke-width="1" stroke-dasharray="2 3"/>' +
+      spec.series.map(function (s, k) {
+        return '<circle id="zdot' + k + '" r="4.5" fill="' + s.color + '" stroke="var(--panel-strong)" stroke-width="2"/>';
+      }).join("") + "</g>";
+    zoom.view = { X: X, Y: Y, padL: padL, pw: pw, padT: padT, w: w, t0: t0, t1: t1,
+                  pts: spec.series.map(samples) };
+    return out + "</svg>";
+  }
+  // Every instant any series was sampled at: what the arrow keys step over.
+  function instants() {
+    var all = [];
+    (zoom.view ? zoom.view.pts : []).forEach(function (pts) { pts.forEach(function (p) { all.push(p[0]); }); });
+    all.sort(function (a, b) { return a - b; });
+    return all.filter(function (t, i) { return i === 0 || t !== all[i - 1]; });
+  }
+  function placeCursor(t) {
+    var spec = charts[zoom.id], v = zoom.view, cross = document.getElementById("zcross"), tip = el("ztip");
+    if (!spec || !v || !cross) { return; }
+    // Snap to the sample closest to the pointer, across every series: a reader
+    // aims at an instant, never at a two-pixel line.
+    var snap = null;
+    v.pts.forEach(function (pts) {
+      var i = nearest(pts, t);
+      if (i >= 0 && (snap === null || Math.abs(pts[i][0] - t) < Math.abs(snap - t))) { snap = pts[i][0]; }
+    });
+    if (snap === null) { cross.style.display = "none"; if (tip) { tip.hidden = true; } return; }
+    zoom.at = snap;
+    var x = v.X(snap);
+    cross.style.display = "";
+    document.getElementById("zline").setAttribute("x1", x.toFixed(1));
+    document.getElementById("zline").setAttribute("x2", x.toFixed(1));
+    var rows = "";
+    spec.series.forEach(function (s, k) {
+      var pts = v.pts[k], dot = document.getElementById("zdot" + k);
+      var i = s.step ? lastAtOrBefore(pts, snap) : nearest(pts, snap);
+      // A line with no sample near this instant has a gap there, not a value.
+      var spacing = pts.length > 1 ? (pts[pts.length - 1][0] - pts[0][0]) / (pts.length - 1) : Infinity;
+      var p = i >= 0 && (s.step || Math.abs(pts[i][0] - snap) <= Math.max(1, spacing * 2.5)) ? pts[i] : null;
+      if (p) {
+        dot.style.display = "";
+        dot.setAttribute("cx", (s.step ? x : v.X(p[0])).toFixed(1));
+        dot.setAttribute("cy", v.Y(p[1]).toFixed(1));
+      } else {
+        dot.style.display = "none";
+      }
+      rows += '<div class="zr"><i style="background:' + s.color + '"></i><b>' +
+        esc(p ? (s.fmt ? s.fmt(p) : String(p[1])) : "—") + "</b><span>" + esc(s.name) + "</span></div>";
+    });
+    var inside = (spec.marks || []).some(function (m) { return snap >= m.start && snap <= (m.end == null ? now() : m.end); });
+    if (!tip) {
+      tip = document.createElement("div");
+      tip.id = "ztip"; tip.className = "ztip";
+      el("zchart").appendChild(tip);
+    }
+    tip.innerHTML = '<div class="tm">' + esc(stamp(snap)) + "</div>" + rows +
+      (spec.markLabel && inside ? '<div class="zm">' + esc(spec.markLabel) + "</div>" : "");
+    tip.hidden = false;
+    // Beside the cursor, on whichever side has the room.
+    var left = 18 + x, width = tip.offsetWidth || 180;
+    tip.style.left = (x > v.w * 0.62 ? left - width - 14 : left + 14) + "px";
+    tip.style.top = (14 + v.padT + 6) + "px";
+  }
+  function drawZoom() {
+    var spec = charts[zoom.id];
+    if (!spec) { closeZoom(); return; }
+    var box = el("zchart");
+    var w = Math.max(320, box.clientWidth - 36);
+    var h = Math.round(Math.max(260, Math.min(560, window.innerHeight * 0.6)));
+    el("ztitle").textContent = spec.title;
+    el("zsub").textContent = spec.sub || "";
+    el("zlegend").innerHTML = spec.series.map(function (s) {
+      var pts = samples(s), last = pts[pts.length - 1];
+      return '<span><i style="background:' + s.color + '"></i>' + esc(s.name) +
+        (last && spec.live ? ' <b class="mono">' + esc(s.fmt ? s.fmt(last) : String(last[1])) + "</b>" : "") + "</span>";
+    }).join("") + (spec.markLabel ? '<span><i style="background:var(--accent);opacity:.35;height:8px"></i>shaded: ' +
+      esc(spec.markLabel) + "</span>" : "");
+    box.innerHTML = bigChart(spec, w, h);
+    if (zoom.at != null) { placeCursor(Math.max(zoom.view.t0, Math.min(zoom.view.t1, zoom.at))); }
+  }
+  function openZoom(id) {
+    if (!charts[id]) { return; }
+    zoom = { id: id, at: null, view: null };
+    el("zoom").hidden = false;
+    document.body.classList.add("locked");
+    window.requestAnimationFrame(function () {
+      el("zoom").classList.add("open");
+      drawZoom();
+      el("zchart").focus({ preventScroll: true });
+    });
+  }
+  function closeZoom() {
+    zoom = { id: null, at: null, view: null };
+    el("zoom").classList.remove("open");
+    if (!dlg.kind) { document.body.classList.remove("locked"); }
+    window.setTimeout(function () { if (!zoom.id) { el("zoom").hidden = true; el("zchart").innerHTML = ""; } }, 170);
+  }
+  el("zchart").addEventListener("pointermove", function (event) {
+    var v = zoom.view;
+    if (!v) { return; }
+    var svg = el("zchart").querySelector("svg");
+    if (!svg) { return; }
+    var r = svg.getBoundingClientRect();
+    var x = (event.clientX - r.left) * (v.w / r.width);
+    placeCursor(v.t0 + Math.max(0, Math.min(1, (x - v.padL) / v.pw)) * (v.t1 - v.t0));
+  });
+  el("zchart").addEventListener("keydown", function (event) {
+    var keys = { ArrowLeft: -1, ArrowRight: 1, Home: -1e9, End: 1e9 };
+    if (!(event.key in keys) || !zoom.view) { return; }
+    event.preventDefault();
+    var all = instants();
+    if (!all.length) { return; }
+    var at = zoom.at == null ? null : all.indexOf(zoom.at);
+    var step = keys[event.key] * (event.shiftKey ? 10 : 1);
+    var next = at === null || at < 0 ? (step > 0 ? 0 : all.length - 1) : at + step;
+    placeCursor(all[Math.max(0, Math.min(all.length - 1, next))]);
+  });
+  window.addEventListener("resize", function () { if (zoom.id) { drawZoom(); } });
+
+  // Specs shared by several charts: the machine as percentages of what it
+  // has, with the absolute figure kept for the readout.
+  function machineSeries(tr, ramTotal, vramTotal) {
+    function share(key, total) {
+      return tr.map(function (p) { return [p.at, p[key] == null || !total ? null : pct(p[key], total), p[key]]; });
+    }
+    function withBytes(p) { return gib(p[2]) + " · " + p[1].toFixed(0) + "%"; }
+    return [
+      { name: "cpu", color: "var(--series-1)", values: tr.map(function (p) { return [p.at, p.cpu]; }),
+        fmt: function (p) { return p[1].toFixed(0) + "%"; } },
+      { name: "ram", color: "var(--series-2)", values: share("ram", ramTotal), fmt: withBytes },
+      { name: "vram", color: "var(--series-3)", values: share("vram", vramTotal), fmt: withBytes },
+    ];
+  }
+  function loadSeries(tr) {
+    function runs(p) { return p[1] + (p[1] === 1 ? " run" : " runs"); }
+    return [
+      { name: "running", color: "var(--ok)", step: true, values: tr.map(function (p) { return [p.at, p.running]; }), fmt: runs },
+      { name: "waiting", color: "var(--warn)", step: true, values: tr.map(function (p) { return [p.at, p.waiting]; }), fmt: runs },
+    ];
+  }
+  function loadMax(tr) {
+    return Math.max.apply(null, tr.map(function (p) { return Math.max(p.running || 0, p.waiting || 0); }).concat([2]));
+  }
+  function countAxis(v) { return v.toFixed(v % 1 ? 1 : 0); }
+
   function phaseKeys() {
     return '<div class="keys">' + ["received", "staging", "queued_gpu", "running", "packaging"].map(function (p) {
       return '<span><i style="background:' + PHASE_COLOR[p] + '"></i>' + PHASE_LABEL[p] + "</span>";
@@ -800,10 +1001,13 @@ DEBUG_PAGE = r"""<!doctype html>
       return total ? pct(p[key], total) : p[key];
     });
   }
-  function vital(label, value, unit, foot, cls, sparkline) {
-    return '<div class="vital ' + (cls || "") + '"><div class="label">' + esc(label) + "</div>" +
+  // A tile with a sparkline opens the whole trace behind it, enlarged.
+  function vital(label, value, unit, foot, cls, sparkline, zoomId) {
+    var body = '<div class="label">' + esc(label) + "</div>" +
       '<div class="v mono">' + value + (unit ? "<small>" + unit + "</small>" : "") + "</div>" +
-      '<div class="f">' + foot + "</div>" + (sparkline || "") + "</div>";
+      '<div class="f">' + foot + "</div>" + (sparkline || "");
+    return zoomId ? zoomable(zoomId, charts[zoomId], body, "vital " + (cls || ""))
+      : '<div class="vital ' + (cls || "") + '">' + body + "</div>";
   }
   function drawVitals(d) {
     var a = d.admission || {}, b = d.budget || {}, card = d.card || {}, ram = d.ram, f = d.inflight || {};
@@ -813,21 +1017,33 @@ DEBUG_PAGE = r"""<!doctype html>
     var today = (d.ledger || []).filter(function (r) {
       return r.ended_at && new Date(r.ended_at * 1000).toDateString() === new Date().toDateString();
     });
+    // Each sparkline is the whole trace the server holds; enlarged, it gets
+    // the clock it is drawn against and a value for every point.
+    var tr = d.trace || [], machine = machineSeries(tr, ram && ram.total, card.total_bytes);
+    var t0 = tr.length ? tr[0].at : now() - 60, t1 = tr.length ? Math.max(tr[tr.length - 1].at, t0 + 1) : now();
+    var sub = "every point the server has kept since it started \u00b7 one every 5 s";
+    var load = { title: "Runs on the machine", sub: sub, t0: t0, t1: t1, max: loadMax(tr), yfmt: countAxis,
+                 series: loadSeries(tr), live: true };
+    charts["v-running"] = load; charts["v-waiting"] = load;
+    ["CPU", "RAM", "VRAM"].forEach(function (name, k) {
+      charts["v-" + name.toLowerCase()] = { title: name, sub: sub + " \u00b7 share of what this machine has",
+        t0: t0, t1: t1, max: 100, series: [machine[k]], live: true };
+    });
     el("vitals").innerHTML =
       vital("Running", a.running == null ? "?" : a.running, "", f.now + " request" + (f.now === 1 ? "" : "s") +
-        " in flight", a.running ? "busy" : "", spark(traceOf(d, "running"), "var(--ok)")) +
+        " in flight", a.running ? "busy" : "", spark(traceOf(d, "running"), "var(--ok)"), "v-running") +
       vital("Waiting", a.waiting == null ? "?" : a.waiting, "", paused + " paused", a.waiting ? "wait" : "",
-        spark(traceOf(d, "waiting"), "var(--warn)")) +
+        spark(traceOf(d, "waiting"), "var(--warn)"), "v-waiting") +
       vital("CPU", cpu == null ? "—" : cpu.toFixed(0), "%",
         (a.cpus_held == null ? "?" : a.cpus_held.toFixed(1)) + " of " + (b.cpus == null ? "?" : b.cpus.toFixed(0)) +
-        " cores held", cpu > 90 ? "hot" : "", spark(traceOf(d, "cpu"), "var(--series-1)", 100)) +
+        " cores held", cpu > 90 ? "hot" : "", spark(traceOf(d, "cpu"), "var(--series-1)", 100), "v-cpu") +
       vital("RAM", ram ? (ram.used / 1073741824).toFixed(0) : "—", ram ? "/ " + (ram.total / 1073741824).toFixed(0) + " G" : "",
         gib(a.ram_held) + " held by runs", ram && pct(ram.used, ram.total) > 90 ? "hot" : "",
-        spark(traceOf(d, "ram", ram && ram.total), "var(--series-2)", 100)) +
+        spark(traceOf(d, "ram", ram && ram.total), "var(--series-2)", 100), "v-ram") +
       vital("VRAM", vramUsed == null ? "—" : (vramUsed / 1073741824).toFixed(1),
         card.total_bytes ? "/ " + (card.total_bytes / 1073741824).toFixed(0) + " G" : "",
         card.total_bytes ? gib(a.vram_held) + " held by runs" : "no card", "",
-        spark(traceOf(d, "vram", card.total_bytes), "var(--series-3)", 100)) +
+        spark(traceOf(d, "vram", card.total_bytes), "var(--series-3)", 100), "v-vram") +
       vital("Finished today", today.length, "",
         today.filter(function (r) { return r.outcome === "done"; }).length + " succeeded \u00b7 " +
         today.filter(function (r) { return r.outcome === "failed"; }).length + " failed", "", "");
@@ -1015,16 +1231,14 @@ DEBUG_PAGE = r"""<!doctype html>
     // a sliver at its right edge.
     var tr = d.trace || [], t1 = now(), t0 = Math.max(t1 - 1800, tr.length ? tr[0].at : t1 - 1800);
     var ramTotal = ram && ram.total, vramTotal = card.total_bytes;
-    el("m-chart").innerHTML = tr.length > 1 ? timeChart([
-      { values: tr.map(function (p) { return [p.at, p.cpu]; }), color: "var(--series-1)" },
-      { values: tr.map(function (p) { return [p.at, p.ram == null || !ramTotal ? null : pct(p.ram, ramTotal)]; }), color: "var(--series-2)" },
-      { values: tr.map(function (p) { return [p.at, p.vram == null || !vramTotal ? null : pct(p.vram, vramTotal)]; }), color: "var(--series-3)" },
-    ], t0, t1, { height: 120 }) : '<div class="empty">The trace starts with the server; a point every 5 s.</div>';
-    var maxLoad = Math.max.apply(null, tr.map(function (p) { return Math.max(p.running || 0, p.waiting || 0); }).concat([2]));
-    el("m-load").innerHTML = tr.length > 1 ? timeChart([
-      { values: tr.map(function (p) { return [p.at, p.running]; }), color: "var(--ok)", step: true },
-      { values: tr.map(function (p) { return [p.at, p.waiting]; }), color: "var(--warn)", step: true },
-    ], t0, t1, { height: 74, max: maxLoad, maxLabel: maxLoad + " runs" }) : "";
+    var machine = machineSeries(tr, ramTotal, vramTotal);
+    el("m-chart").innerHTML = tr.length > 1 ? zoomable("m-chart", { title: "Machine, last 30 minutes",
+      sub: "share of what this machine has \u00b7 a point every 5 s", t0: t0, t1: t1, max: 100, series: machine, live: true },
+      timeChart(machine, t0, t1, { height: 120 })) : '<div class="empty">The trace starts with the server; a point every 5 s.</div>';
+    var maxLoad = loadMax(tr), load = loadSeries(tr);
+    el("m-load").innerHTML = tr.length > 1 ? zoomable("m-load", { title: "Runs, last 30 minutes",
+      sub: "running and waiting for room \u00b7 a point every 5 s", t0: t0, t1: t1, max: maxLoad, yfmt: countAxis,
+      series: load, live: true }, timeChart(load, t0, t1, { height: 74, max: maxLoad, maxLabel: maxLoad + " runs" })) : "";
     // The current value beside each name: the legend is how a series is
     // identified, and the light aqua is too pale to be read from its line alone.
     var lastP = tr.length ? tr[tr.length - 1] : {};
@@ -1632,18 +1846,29 @@ DEBUG_PAGE = r"""<!doctype html>
     var done = runsOf.filter(function (r) { return r.ended_at && r.seconds != null; }).slice().reverse();
     var t0 = done.length ? done[0].started_at : now() - 3600, t1 = now();
     var maxDur = Math.max.apply(null, done.map(function (r) { return r.seconds; }).concat([1]));
-    var durations = done.length > 1 ? timeChart([
-      { values: done.map(function (r) { return [r.ended_at, r.seconds]; }), color: "var(--accent)" },
-      { values: done.map(function (r) { return [r.ended_at, r.waited || 0]; }), color: "var(--warn)" },
-    ], t0, t1, { height: 120, max: maxDur, maxLabel: dur(maxDur) }) : '<div class="empty" style="text-align:left">Needs two finished runs.</div>';
+    // Each point is one finished run, placed where it ended.
+    var byEnd = done.slice().sort(function (a, b) { return a.ended_at - b.ended_at; });
+    function seconds(p) { return dur(p[1]); }
+    var durSeries = [
+      { name: "took", color: "var(--accent)", dots: true, fmt: seconds,
+        values: byEnd.map(function (r) { return [r.ended_at, r.seconds]; }) },
+      { name: "waited", color: "var(--warn)", dots: true, fmt: seconds,
+        values: byEnd.map(function (r) { return [r.ended_at, r.waited || 0]; }) },
+    ];
+    var durations = done.length > 1 ? zoomable("t-durations", { title: name + " \u00b7 duration of each run",
+      sub: "one point per finished run, at the time it ended", t0: t0, t1: t1, max: maxDur,
+      yfmt: function (v) { return dur(v); }, series: durSeries },
+      timeChart(durSeries, t0, t1, { height: 120, max: maxDur, maxLabel: dur(maxDur) }))
+      : '<div class="empty" style="text-align:left">Needs two finished runs.</div>';
     var tr = data.trace || [], marks = runsOf.map(function (r) { return { start: r.started_at, end: r.ended_at }; });
     var ramTotal = latest && latest.ram ? latest.ram.total : null;
     var vramTotal = latest && latest.card ? latest.card.total_bytes : null;
-    var machine = tr.length > 1 ? timeChart([
-      { values: tr.map(function (p) { return [p.at, p.cpu]; }), color: "var(--series-1)" },
-      { values: tr.map(function (p) { return [p.at, p.ram == null || !ramTotal ? null : pct(p.ram, ramTotal)]; }), color: "var(--series-2)" },
-      { values: tr.map(function (p) { return [p.at, p.vram == null || !vramTotal ? null : pct(p.vram, vramTotal)]; }), color: "var(--series-3)" },
-    ], tr[0].at, Math.max(tr[tr.length - 1].at, tr[0].at + 1), { height: 130, marks: marks })
+    var mSeries = machineSeries(tr, ramTotal, vramTotal);
+    var mt0 = tr.length ? tr[0].at : 0, mt1 = tr.length ? Math.max(tr[tr.length - 1].at, tr[0].at + 1) : 1;
+    var machine = tr.length > 1 ? zoomable("t-machine", { title: name + " \u00b7 the machine while it ran",
+      sub: "share of what this machine has \u00b7 the last six hours of this process", t0: mt0, t1: mt1, max: 100,
+      series: mSeries, marks: marks, markLabel: name + " running" },
+      timeChart(mSeries, mt0, mt1, { height: 130, marks: marks }))
       : '<div class="empty" style="text-align:left">The machine trace covers the last six hours of this process only.</div>';
 
     return head + '<div class="dbody">' + kpis + dataSection(name, data.data) + section("Where the time goes, on average", stack) +
@@ -1700,6 +1925,7 @@ DEBUG_PAGE = r"""<!doctype html>
     drawTools(d);
     drawHistory(d);
     drawFilters();
+    if (zoom.id) { window.requestAnimationFrame(drawZoom); }
     if (dlg.kind === "updates") {
       // Redrawn when the updates report arrives (loadUpdates).
     } else if (dlg.kind === "history") {
@@ -1784,6 +2010,12 @@ DEBUG_PAGE = r"""<!doctype html>
 
   document.addEventListener("click", function (event) {
     var t = event.target;
+    if (zoom.id) {
+      if (t.closest("[data-zclose]") || t === el("zoom")) { closeZoom(); }
+      return;
+    }
+    var zn = t.closest("[data-zoom]");
+    if (zn) { openZoom(zn.getAttribute("data-zoom")); return; }
     if (t.closest("[data-close]") || t === el("overlay")) { closeDialog(); return; }
     if (t.closest("[data-history]")) { openDialog("history", null); return; }
     if (t.closest("[data-updates]")) { openDialog("updates", null); return; }
@@ -1884,7 +2116,12 @@ DEBUG_PAGE = r"""<!doctype html>
     }
   });
   document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && zoom.id) { closeZoom(); return; }
     if (event.key === "Escape" && dlg.kind) { closeDialog(); }
+    // A chart is a button: Enter or Space opens it like a click.
+    var zn = (event.key === "Enter" || event.key === " ") && !zoom.id && event.target.closest &&
+      event.target.closest("[data-zoom]");
+    if (zn) { event.preventDefault(); openZoom(zn.getAttribute("data-zoom")); }
   });
   window.addEventListener("hashchange", function () { readUrl(); if (latest) { draw(latest); } });
 

@@ -100,6 +100,21 @@ class DataStore(ABC):
                 for name in (self.list_models(tool_name, scope) if kind == "models"
                              else self.list_testfiles(tool_name, scope))]
 
+    # Benchmark inputs, `DATA/<tool>/bench/`: the cases an operator stages to
+    # measure a tool on something harder than its test file. Deliberately NOT
+    # testfiles: a test file can be downloaded by any API token holder
+    # (`GET /tools/{tool}/testfiles/{name}`), and `/run` resolves it by name for
+    # anyone. A bench entry is reachable by neither -- only the benchmark
+    # launcher, behind the admin token, lists it, and only the battery process
+    # on this machine reads it. Defaults rather than abstract, so a backend
+    # with no such folder simply offers none.
+    def describe_bench(self, tool_name: str) -> list:
+        """`[{"name", "kind", "size"}]` for the tool's bench folder."""
+        return []
+
+    def resolve_bench(self, tool_name: str, filename: str) -> ResolvedFile:
+        raise DataNotFoundError(f"No bench input '{filename}' for tool '{tool_name}'")
+
     @abstractmethod
     def resolve_model(self, tool_name: str, filename: str, scope: str = "") -> ResolvedFile:
         ...
@@ -134,6 +149,15 @@ class LocalDataStore(DataStore):
 
     def resolve_testfile(self, tool_name: str, filename: str, scope: str = "") -> ResolvedFile:
         return ResolvedFile(path=self._resolve(tool_name, "testfiles", filename, scope))
+
+    def describe_bench(self, tool_name: str) -> list:
+        return self.describe(tool_name, "bench")
+
+    def resolve_bench(self, tool_name: str, filename: str) -> ResolvedFile:
+        try:
+            return ResolvedFile(path=self._resolve(tool_name, "bench", filename))
+        except DataNotFoundError:
+            raise DataNotFoundError(f"No bench input '{filename}' for tool '{tool_name}'")
 
     def describe(self, tool_name: str, kind: str, scope: str = "") -> list:
         directory = self._directory(tool_name, kind, scope)

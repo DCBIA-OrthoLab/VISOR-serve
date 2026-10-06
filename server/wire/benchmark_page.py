@@ -1,7 +1,7 @@
 """The page `GET /benchmarks/view` serves: how this server coped under load.
 
-`GET /benchmarks` answers the campaign as JSON, and the status page shows the
-headline of it in one table. That table says an arm took 95 seconds; it cannot
+`GET /benchmarks` answers the campaign as JSON. Its headline says an arm took
+95 seconds; it cannot
 say WHERE the seconds went -- and the whole reason a campaign is run is that
 `queued_gpu` and `running` cost the same wall clock while meaning opposite
 things. One is a machine computing, the other is admission making a client
@@ -38,10 +38,12 @@ The Gantt is DOM elements positioned in percent and every trace is inline SVG,
 so they share one axis exactly and neither needs a script it cannot fetch.
 
 **It holds no token.** The shell says nothing; the numbers live behind
-`GET /benchmarks`, which is Bearer-protected. The token is read from (and
-written to) `localStorage` under the SAME key the status page uses, so someone
-who authenticated on one page is never asked twice. It is sent as a header and
-never put in the URL, where it would land in proxy logs and browser history.
+`GET /benchmarks`, which answers to the ADMIN token only: a campaign is a
+developer's and an operator's reading, and the API token every workstation
+holds opens nothing here. The token is read from (and written to)
+`localStorage` under the SAME key the admin panel uses, so someone who
+unlocked the panel is never asked twice. It is sent as a header and never put
+in the URL, where it would land in proxy logs and browser history.
 
 **Every URL it fetches is relative** (`../benchmarks`, resolved against
 `/benchmarks/view`), so the page works unchanged behind a reverse proxy serving
@@ -82,6 +84,8 @@ not.
 
 from __future__ import annotations
 
+from wire.glass_style import GLASS_BASE, GLASS_SELECT_JS
+
 BENCHMARK_PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -89,36 +93,27 @@ BENCHMARK_PAGE = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>VISOR benchmarks</title>
 <style>
-  /* Three theme states, and each one is a complete palette.
-
-     A token whose sole definition lived inside a media query would be an
-     undefined colour for half the readers, so the full light palette is
-     defined on bare :root. The dark palette is then declared TWICE on
-     purpose: once for the reader whose system says dark and who has not
-     chosen otherwise, and once for the reader who picked dark here. Without
-     the second block the toggle can only ever darken a light system; without
-     the `:not([data-theme="light"])` guard it can never lighten a dark one. */
+""" + GLASS_BASE + """  /* The shared glass tokens above; what follows is what only this page
+     draws. Every phase wears the admin panel's colour for it, so a run that
+     is green there is green here, and every alias below follows the theme
+     because it is written in terms of a token the theme switches. */
   :root {
-    color-scheme: light;
-    --bg: #fbfbfa; --panel: #ffffff; --line: #e4e2dd; --ink: #1c1b19;
-    --soft: #6f6b63; --faint: #908b82;
-    --track: #efedea; --grid: #e6e4df; --fill: #3d6b8e;
-    --warn: #9c5b2a; --ok: #4a7c59; --chip: #f1efeb; --sunk: #f7f6f4;
-    --p-transfer: #4a7fa8;
-    --p-received: #97a2aa;
-    --p-staging: #6d7b86;
-    --p-queued: #c9821f;
-    --p-queued-alt: #eec489;
-    --p-running: #2f6b55;
-    --p-packaging: #7d5f9e;
-    --p-fetch: #9cc5e2;
-    --nest: #e3d5ae; --nest-edge: rgba(0, 0, 0, .42);
-    --vram-fill: #d3dde8; --vram-line: #3d6b8e;
-    --conc-fill: #d7e5dd; --conc-line: #2f6b55;
-    --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
-                 "Helvetica Neue", sans-serif;
+    --faint: var(--ghost); --chip: var(--sunk); --fill: var(--accent);
+    --track: var(--bar); --grid: var(--line);
+    --p-transfer: var(--series-1);
+    --p-received: color-mix(in srgb, var(--staging) 55%, transparent);
+    --p-staging: var(--staging);
+    --p-queued: var(--warn);
+    --p-queued-alt: color-mix(in srgb, var(--warn) 30%, transparent);
+    --p-running: var(--ok);
+    --p-packaging: var(--violet);
+    --p-fetch: color-mix(in srgb, var(--series-1) 45%, transparent);
+    --nest: #e2c25e; --nest-edge: rgba(0, 0, 0, .4);
+    --vram-fill: color-mix(in srgb, var(--series-3) 22%, transparent); --vram-line: var(--series-3);
+    --conc-fill: color-mix(in srgb, var(--ok) 18%, transparent); --conc-line: var(--ok);
     --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas,
                  "Liberation Mono", monospace;
+    --pad: clamp(14px, 1.2vw, 20px);
     /* The Gantt's fixed columns. Named here so the run rows, the two traces
        and the axis cannot drift apart, and so a wide screen spends its pixels
        on the track rather than on the label beside it. */
@@ -127,118 +122,74 @@ BENCHMARK_PAGE = """<!doctype html>
     --sel: 132px;
     --cost: 96px;
   }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      color-scheme: dark;
-      --bg: #17181a; --panel: #1e2023; --line: #2e3135; --ink: #e8e6e3;
-      --soft: #93908a; --faint: #7d7a74;
-      --track: #26292c; --grid: #2b2e32; --fill: #6ea8d4;
-      --warn: #d89a63; --ok: #7fb08c; --chip: #26292c; --sunk: #202326;
-      --p-transfer: #4f93c4;
-      --p-received: #7d878f;
-      --p-staging: #a2aeb6;
-      --p-queued: #d89a3f;
-      --p-queued-alt: #7a531a;
-      --p-running: #4e9c7c;
-      --p-packaging: #a382c9;
-      --p-fetch: #a9d0ea;
-      --nest: #e3d5ae; --nest-edge: rgba(0, 0, 0, .55);
-      --vram-fill: #2b3a4a; --vram-line: #6ea8d4;
-      --conc-fill: #22362d; --conc-line: #4e9c7c;
-    }
-  }
-  :root[data-theme="dark"] {
-    color-scheme: dark;
-    --bg: #17181a; --panel: #1e2023; --line: #2e3135; --ink: #e8e6e3;
-    --soft: #93908a; --faint: #7d7a74;
-    --track: #26292c; --grid: #2b2e32; --fill: #6ea8d4;
-    --warn: #d89a63; --ok: #7fb08c; --chip: #26292c; --sunk: #202326;
-    --p-transfer: #4f93c4;
-    --p-received: #7d878f;
-    --p-staging: #a2aeb6;
-    --p-queued: #d89a3f;
-    --p-queued-alt: #7a531a;
-    --p-running: #4e9c7c;
-    --p-packaging: #a382c9;
-    --p-fetch: #a9d0ea;
-    --nest: #e3d5ae; --nest-edge: rgba(0, 0, 0, .55);
-    --vram-fill: #2b3a4a; --vram-line: #6ea8d4;
-    --conc-fill: #22362d; --conc-line: #4e9c7c;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 13.5px/1.55 var(--font-sans);
-    -webkit-font-smoothing: antialiased;
-  }
+  /* Inside the Launch page's frame the ground is the parent's: drawing a
+     second set of glows would put a seam where the frame begins. */
+  html.framed body { background: none; }
+  html.framed #flag, html.framed .navlink, html.framed #theme { display: none; }
+  html.framed header#bar { background: none; border-color: transparent; box-shadow: none;
+                           -webkit-backdrop-filter: none; backdrop-filter: none; padding: 2px 4px; }
+
   /* Wide, but not unbounded: past ~2400px a timeline stops gaining resolution
      a reader can use and the page starts needing a head turn. */
   main { width: 100%; max-width: 2400px; margin: 0 auto;
-         padding: 20px clamp(14px, 1.6vw, 30px) 80px; }
+         padding: 10px clamp(14px, 1.6vw, 30px) 60px;
+         display: flex; flex-direction: column; gap: 14px; }
 
-  /* Typography roles. Five, and every element on the page takes one of them:
-     page title, section label, claim, figure, micro-label. */
-  h1 { font-size: 15px; font-weight: 600; letter-spacing: .07em;
-       text-transform: uppercase; margin: 0 0 3px; }
-  h2 { font-size: 11px; font-weight: 600; letter-spacing: .09em;
-       text-transform: uppercase; color: var(--soft); margin: 0 0 12px; }
-  .sub { color: var(--soft); font-size: 12.5px;
-         font-variant-numeric: tabular-nums; }
+  /* Typography roles, the admin panel's: page title, card title, claim,
+     figure, micro-label. */
+  h1 { font-size: 20px; font-weight: 700; letter-spacing: -.015em; margin: 0; line-height: 1.15; }
+  h2 { margin: 0 calc(-1 * var(--pad)) 14px; padding: 13px var(--pad) 10px;
+       font-size: 15px; font-weight: 600; letter-spacing: -.01em; color: var(--ink);
+       border-bottom: 1px solid var(--line); }
+  .sub { color: var(--soft); font-size: 12px; font-variant-numeric: tabular-nums; }
   /* Prose is capped at a readable measure even on a 2400px screen. The width
      buys timeline resolution; a 300-character line buys nothing. */
   .empty, .note { color: var(--soft); font-size: 12.5px; max-width: 74ch; }
   .empty { padding: 6px 0; }
-  .err { color: var(--warn); font-size: 12.5px; }
+  .err { color: var(--hot); font-size: 12.5px; margin-top: 8px; }
   .bad { color: var(--warn); }
   .gain { color: var(--ok); font-weight: 600; }
   .scroll { overflow-x: auto; }
 
-  /* Header: identity on the left, the two pieces of chrome on the right. The
-     picker labels the page, it is not the subject of it. */
-  .top { display: flex; flex-wrap: wrap; align-items: flex-end;
-         justify-content: space-between; gap: 12px 20px; margin-bottom: 16px; }
-  .chrome { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  /* The bar: the admin panel's, so the two pages read as one product. */
+  header#bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+               padding: 10px 14px; border-radius: var(--radius); }
+  #flag { width: 10px; height: 38px; border-radius: 5px; background: var(--ghost); flex: none; }
+  .spacer { flex: 1; }
   .pick { display: inline-flex; align-items: center; gap: 7px;
-          font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
-          color: var(--soft); }
-  select { font: inherit; font-size: 12.5px; text-transform: none;
-           letter-spacing: 0; color: var(--ink); background: var(--panel);
-           border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px;
-           max-width: min(46vw, 380px); }
-  .stamp { font-size: 12px; color: var(--faint);
-           font-variant-numeric: tabular-nums; }
-  .ghost { background: transparent; color: var(--soft); border: 1px solid
-           var(--line); border-radius: 6px; padding: 5px 10px; font: inherit;
-           font-size: 12px; cursor: pointer; min-width: 62px; }
-  .ghost:hover { color: var(--ink); }
+          font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+          color: var(--ghost); font-weight: 600; }
+  .pick select { font-size: 12.5px; text-transform: none; letter-spacing: 0; font-weight: 500;
+                 max-width: min(46vw, 380px); }
+  .stamp { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
 
-  section { background: var(--panel); border: 1px solid var(--line);
-            border-radius: 9px; padding: 15px clamp(14px, 1.2vw, 20px);
-            margin-bottom: 14px; }
+  header#bar, section, .legend {
+    background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+    border: 1px solid var(--panel-edge); box-shadow: var(--shadow); }
+  section { border-radius: var(--radius); padding: 0 var(--pad) 16px; min-width: 0; }
 
   /* Summary strip */
-  .strip { display: grid; gap: 11px;
+  .strip { display: grid; gap: 10px;
            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
-  .tile { border: 1px solid var(--line); border-radius: 7px; padding: 9px 12px;
+  .tile { border: 1px solid var(--panel-edge); border-radius: 12px; padding: 10px 14px;
           background: var(--sunk); }
-  .tile .k { font-size: 10.5px; letter-spacing: .09em; text-transform: uppercase;
-             color: var(--soft); }
-  .tile .v { font-size: 21px; font-weight: 600; font-variant-numeric: tabular-nums;
-             line-height: 1.25; margin-top: 3px; letter-spacing: -.01em; }
+  .tile .k { font-size: 11px; letter-spacing: .06em; text-transform: uppercase;
+             color: var(--ghost); font-weight: 600; }
+  .tile .v { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums;
+             line-height: 1.2; margin-top: 2px; letter-spacing: -.02em; }
   .tile .v.small { font-size: 12.5px; font-weight: 500; line-height: 1.35;
                    word-break: break-word; letter-spacing: 0; }
-  .tile .n { font-size: 11px; color: var(--faint); margin-top: 2px;
+  .tile .n { font-size: 11.5px; color: var(--soft); margin-top: 2px;
              font-variant-numeric: tabular-nums; }
 
-  /* The legend: every phase named, so colour is never the only carrier. */
-  .legend { position: sticky; top: 0; z-index: 5; background: var(--bg);
-            border-bottom: 1px solid var(--line); padding: 8px 0 9px;
-            margin-bottom: 14px; display: flex; flex-wrap: wrap; gap: 6px 14px;
-            align-items: center; }
+  /* The legend: every phase named, so colour is never the only carrier. It
+     floats over the arms as they scroll by, frosted like the bar. */
+  .legend { position: sticky; top: 10px; z-index: 5; border-radius: 12px;
+            background: var(--panel-strong); padding: 8px 14px;
+            display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
   .lg { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px;
         color: var(--soft); }
-  .sw { width: 22px; height: 10px; border-radius: 2px; flex: none;
-        border: 1px solid var(--nest-edge); }
+  .sw { width: 22px; height: 10px; border-radius: 3px; flex: none; }
 
   /* Phase colours. queued_gpu is hatched as well as coloured: it is the one
      phase that must never be mistaken for work, and a hatch survives both a
@@ -251,8 +202,8 @@ BENCHMARK_PAGE = """<!doctype html>
   .ph-running   { background: var(--p-running); }
   .ph-packaging { background: var(--p-packaging); }
   .ph-fetch     { background: var(--p-fetch); }
-  .ph-nest      { background: var(--nest); }
-  .ph-conc      { background: var(--conc-fill); }
+  .ph-nest      { background: var(--nest); box-shadow: inset 0 0 0 1px var(--nest-edge); }
+  .ph-conc      { background: var(--conc-fill); box-shadow: inset 0 0 0 1px var(--conc-line); }
   .ph-wait      { background: var(--p-queued-alt); }
 
   /* Arms at a glance. The one place the page goes multi-column: a family of
@@ -260,30 +211,29 @@ BENCHMARK_PAGE = """<!doctype html>
      wide screen and A1/A2/A3 can be read against each other instead of
      scrolled between. */
   .fams { display: grid; gap: 12px;
-          grid-template-columns: repeat(auto-fit, minmax(560px, 1fr)); }
-  .fam { border: 1px solid var(--line); border-radius: 8px; padding: 11px 13px;
+          grid-template-columns: repeat(auto-fit, minmax(min(560px, 100%), 1fr)); }
+  .fam { border: 1px solid var(--panel-edge); border-radius: 12px; padding: 11px 13px;
          background: var(--sunk); }
   .fhead { display: flex; align-items: baseline; gap: 9px; margin-bottom: 9px; }
-  .fkey { font-family: var(--font-mono); font-size: 12px; font-weight: 600;
-          letter-spacing: .04em; color: var(--ink); }
+  .fkey { font-size: 14px; font-weight: 700; color: var(--ink); }
   .fwhat { font-size: 12px; color: var(--soft); overflow: hidden;
            text-overflow: ellipsis; white-space: nowrap; }
   .frow { display: grid; align-items: center; gap: 4px 10px; margin-top: 5px;
-          grid-template-columns: 30px minmax(84px, auto) 1fr 54px 62px 46px; }
+          grid-template-columns: minmax(34px, max-content) minmax(84px, auto) 1fr 54px 62px 46px; }
   .flab { font-size: 11.5px; color: var(--soft); white-space: nowrap;
           overflow: hidden; text-overflow: ellipsis; }
   .ftrack { position: relative; height: 15px; background: var(--track);
-            border-radius: 3px; overflow: hidden; }
+            border-radius: 5px; overflow: hidden; }
   /* Outer band: the wall clock. Inner bar: the median run inside it. The
      ratio between them IS the concurrency -- six runs in the time of one and
      a half is the arm working; six in the time of six is a queue. */
-  .fwall { position: absolute; left: 0; top: 0; height: 100%;
-           background: var(--vram-fill); }
+  .fwall { position: absolute; left: 0; top: 0; height: 100%; border-radius: 5px;
+           background: color-mix(in srgb, var(--accent) 22%, transparent); }
   .fmed { position: absolute; left: 0; top: 3px; height: 9px;
-          border-radius: 2px; background: var(--p-running); }
+          border-radius: 3px; background: var(--p-running); }
   .fn, .fc, .fs { font-size: 11.5px; text-align: right;
                   font-variant-numeric: tabular-nums; }
-  .fn { color: var(--ink); }
+  .fn { color: var(--ink); font-weight: 600; }
   .fc { color: var(--soft); }
   .fs { color: var(--faint); }
   .fs.gain { color: var(--ok); }
@@ -296,23 +246,24 @@ BENCHMARK_PAGE = """<!doctype html>
   .fdiv:first-child { margin-top: 0; }
   .arm { padding-top: 15px; margin-top: 4px; }
   .armhead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; }
-  .code { font-family: var(--font-mono); font-size: 12px; font-weight: 600;
-          letter-spacing: .04em; background: var(--chip);
-          border: 1px solid var(--line); border-radius: 5px; padding: 1px 6px; }
-  .name { font-size: 13.5px; font-weight: 600; }
+  .code { font-family: var(--font-mono); font-size: 11.5px; font-weight: 650;
+          letter-spacing: .02em; background: var(--accent-soft); color: var(--accent);
+          border-radius: 6px; padding: 1px 7px; text-align: center; }
+  .name { font-size: 15px; font-weight: 700; letter-spacing: -.01em; }
   .at { margin-left: auto; font-size: 11.5px; color: var(--faint);
         font-variant-numeric: tabular-nums; }
   /* The sentence the whole arm exists to answer, in the reader's own words. */
   .claim { display: flex; align-items: baseline; gap: 8px; margin: 9px 0 2px;
-           font-size: 14.5px; font-variant-numeric: tabular-nums; }
-  .claim b { font-weight: 600; }
-  .dot { width: 9px; height: 9px; border-radius: 2px; flex: none;
-         background: var(--p-running); transform: translateY(-1px); }
+           font-size: 15px; font-variant-numeric: tabular-nums; }
+  .claim b { font-weight: 650; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none;
+         background: var(--p-running); transform: translateY(-1px);
+         box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 22%, transparent); }
   .claimx { color: var(--soft); font-size: 12.5px; }
   .metrics { display: flex; flex-wrap: wrap; gap: 4px 18px; margin: 7px 0 4px;
              font-size: 12px; color: var(--soft);
              font-variant-numeric: tabular-nums; }
-  .metrics b { color: var(--ink); font-weight: 600; }
+  .metrics b { color: var(--ink); font-weight: 650; }
   .setup { font-size: 12px; color: var(--soft); margin: 4px 0 12px;
            font-variant-numeric: tabular-nums; }
   /* Its own line, always: the capture date beside it is pushed to the right
@@ -335,25 +286,26 @@ BENCHMARK_PAGE = """<!doctype html>
   .gantt.sel.cost .grow { grid-template-columns:
           var(--lab) 1fr var(--sel) var(--val) var(--cost); }
   .ghead { margin-bottom: 6px; }
-  .ghead > div { font-size: 10px; letter-spacing: .09em; text-transform: uppercase;
-                 color: var(--faint); }
+  .ghead > div { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+                 color: var(--ghost); font-weight: 600; }
   .ghead .rv, .ghead .rc { text-align: right; }
   .rl { font-size: 11.5px; color: var(--soft); white-space: nowrap;
         overflow: hidden; text-overflow: ellipsis;
         font-variant-numeric: tabular-nums; }
   .rl .who { font-family: var(--font-mono); font-size: 11px; }
-  .rl b { color: var(--ink); font-weight: 500; }
+  .rl b { color: var(--ink); font-weight: 600; }
   /* A row that has something to open IS a control: a real button, reachable
      by keyboard, carrying its own aria-expanded. A row whose record has no
      invocation stays a plain label -- an affordance that does nothing is
      worse than one that was never offered. */
-  button.rl { background: none; border: 0; padding: 0; margin: 0; font: inherit;
-              font-size: 11.5px; color: var(--soft); text-align: left;
-              cursor: pointer; display: block; width: 100%; }
-  button.rl:hover b, button.rl:focus-visible b { color: var(--fill); }
+  button.rl { background: none; border: 0; padding: 2px 4px; margin: 0 -4px; font: inherit;
+              font-size: 11.5px; color: var(--soft); text-align: left; border-radius: 6px;
+              cursor: pointer; display: block; width: calc(100% + 8px); }
+  button.rl:hover { background: var(--sunk); }
+  button.rl:hover b, button.rl:focus-visible b { color: var(--accent); }
   .caret { display: inline-block; width: 9px; color: var(--faint); }
   .rt { position: relative; height: 16px; background: var(--track);
-        border-radius: 3px; overflow: hidden;
+        border-radius: 5px; overflow: hidden;
         background-image: linear-gradient(to right, var(--grid) 0,
                           var(--grid) 1px, transparent 1px);
         background-repeat: repeat-x; }
@@ -362,7 +314,7 @@ BENCHMARK_PAGE = """<!doctype html>
   .rc { text-align: right; font-size: 11.5px; color: var(--faint);
         font-variant-numeric: tabular-nums; white-space: nowrap; }
   .ph { position: absolute; top: 0; height: 100%; min-width: 2px;
-        border-radius: 2px; }
+        border-radius: 3px; }
   /* A nested call is drawn INSIDE the parent's running span, because that is
      literally what the parent was doing: waiting inside sup.run(). A thin
      strip along the bottom keeps the row from turning into noise. */
@@ -370,13 +322,13 @@ BENCHMARK_PAGE = """<!doctype html>
         border-radius: 2px; background: var(--nest);
         box-shadow: 0 0 0 1px var(--nest-edge); }
   .nb.d2 { bottom: 5px; }
-  .rerr { grid-column: 2 / -1; font-size: 11px; color: var(--warn);
+  .rerr { grid-column: 2 / -1; font-size: 11px; color: var(--hot);
           white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
           margin: -1px 0 4px; }
   .axis { position: relative; height: 17px; background-repeat: repeat-x;
           background-image: linear-gradient(to right, var(--grid) 0,
                             var(--grid) 1px, transparent 1px); }
-  .tick { position: absolute; top: 6px; font-size: 10.5px; color: var(--soft);
+  .tick { position: absolute; top: 6px; font-size: 10.5px; color: var(--ghost);
           transform: translateX(-50%); font-variant-numeric: tabular-nums; }
   .tick.first { transform: none; }
   .tick.last { transform: translateX(-100%); }
@@ -389,12 +341,12 @@ BENCHMARK_PAGE = """<!doctype html>
      476 s one, and a page readable at rest has to carry it. */
   .sc { display: flex; align-items: center; gap: 7px; font-size: 11px;
         color: var(--soft); font-variant-numeric: tabular-nums; }
-  .sbar { position: relative; flex: 1; min-width: 28px; height: 7px;
-          border-radius: 4px; background: var(--track); overflow: hidden; }
+  .sbar { position: relative; flex: 1; min-width: 28px; height: 6px;
+          border-radius: 3px; background: var(--track); overflow: hidden; }
   .sfill { position: absolute; left: 0; top: 0; height: 100%;
-           background: var(--p-transfer); border-radius: 4px; }
+           background: var(--accent); border-radius: 3px; }
   .sn { white-space: nowrap; }
-  .sn b { color: var(--ink); font-weight: 600; }
+  .sn b { color: var(--ink); font-weight: 650; }
 
   /* A limit test. This kind of arm is not read for speed: it is read for
      whether anything broke, and that answer comes before the arm's own
@@ -403,21 +355,22 @@ BENCHMARK_PAGE = """<!doctype html>
      and the card is drawn against the budget the arm was built to reach --
      because an arm that never got near its budget did not test what it
      claimed to, and a green zero there is a false pass. */
-  .stress { border: 1px solid var(--line); border-radius: 8px;
+  .stress { border: 1px solid var(--panel-edge); border-radius: 12px;
             background: var(--sunk); padding: 11px 13px; margin: 10px 0 2px; }
   .verdict { display: flex; align-items: baseline; gap: 8px;
-             font-size: 14.5px; font-variant-numeric: tabular-nums; }
-  .verdict b { font-weight: 600; }
+             font-size: 15px; font-variant-numeric: tabular-nums; }
+  .verdict b { font-weight: 650; }
   .dot.ok { background: var(--ok); }
-  .dot.warn { background: var(--warn); }
+  .dot.warn { background: var(--warn);
+              box-shadow: 0 0 0 3px color-mix(in srgb, var(--warn) 22%, transparent); }
   .sgrid { display: grid; gap: 13px 20px; margin-top: 11px;
            grid-template-columns: repeat(auto-fit, minmax(245px, 1fr)); }
   .sfig { display: flex; align-items: baseline; gap: 8px; margin-top: 4px;
           font-size: 12px; color: var(--soft);
           font-variant-numeric: tabular-nums; }
-  .sfig .num { font-size: 15px; font-weight: 600; color: var(--ink);
+  .sfig .num { font-size: 15px; font-weight: 700; color: var(--ink);
                min-width: 1.7em; text-align: right; flex: none; }
-  .sfig .num.bad { color: var(--warn); }
+  .sfig .num.bad { color: var(--hot); }
   .sfig .num.zero { color: var(--faint); font-weight: 500; }
   /* Said in the page's own words: a reader meeting "retried" for the first
      time has no way to know it means an out-of-memory that recovered. */
@@ -425,30 +378,30 @@ BENCHMARK_PAGE = """<!doctype html>
             max-width: 48ch; }
   /* Budget is the track, the peak is the fill. Amber when the fill is short:
      the arm did not reach the limit it names. */
-  .meter { position: relative; height: 11px; border-radius: 4px;
+  .meter { position: relative; height: 10px; border-radius: 5px;
            background: var(--track); overflow: hidden; margin: 8px 0 2px; }
-  .mfill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 4px;
+  .mfill { position: absolute; left: 0; top: 0; height: 100%; border-radius: 5px;
            background: var(--vram-line); }
   .mfill.shy { background: var(--p-queued); }
 
   /* What one run was asked to do, opened in place. Not a modal: the reader is
      comparing runs, and a dialog over the Gantt defeats the comparison. */
   .det { grid-column: 2 / -1; margin: 2px 0 9px; padding: 11px 13px;
-         border: 1px solid var(--line); border-left: 3px solid var(--fill);
-         border-radius: 7px; background: var(--sunk); display: grid; gap: 14px;
+         border: 1px solid var(--panel-edge); border-left: 3px solid var(--accent);
+         border-radius: 10px; background: var(--sunk); display: grid; gap: 14px;
          grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
   .det[hidden] { display: none; }
-  .dk { font-size: 10px; letter-spacing: .09em; text-transform: uppercase;
-        color: var(--faint); margin-bottom: 6px; }
+  .dk { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+        color: var(--ghost); margin-bottom: 6px; font-weight: 650; }
   .sline { display: grid; grid-template-columns: 1fr; gap: 3px;
            margin-bottom: 9px; }
   .sline .sk { font-size: 11.5px; color: var(--soft); }
   .sline .sbig { display: flex; align-items: center; gap: 9px; }
-  .sline .sbar { height: 11px; }
+  .sline .sbar { height: 10px; border-radius: 5px; }
   .sline .sn { font-size: 13px; }
   .dio { font-size: 12px; color: var(--soft); line-height: 1.6;
          font-variant-numeric: tabular-nums; }
-  .dio b { color: var(--ink); font-weight: 500; }
+  .dio b { color: var(--ink); font-weight: 600; }
   .dpar { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px;
           font-size: 11.5px; align-items: baseline; }
   .dpar .pk { color: var(--faint); white-space: nowrap; }
@@ -459,63 +412,101 @@ BENCHMARK_PAGE = """<!doctype html>
   .means { margin-top: 13px; display: grid;
            grid-template-columns: 100px minmax(120px, 1fr) 58px; gap: 4px 10px;
            align-items: center; max-width: 520px; }
-  .mk { font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase;
-        color: var(--soft); }
-  .mt { height: 7px; background: var(--track); border-radius: 4px;
+  .mk { font-size: 10.5px; letter-spacing: .06em; text-transform: uppercase;
+        color: var(--ghost); font-weight: 600; }
+  .mt { height: 6px; background: var(--track); border-radius: 3px;
         overflow: hidden; }
-  .mf { height: 100%; border-radius: 4px; }
+  .mf { height: 100%; border-radius: 3px; }
   .mv { text-align: right; font-size: 11.5px; color: var(--soft);
         font-variant-numeric: tabular-nums; }
   .inside { font-size: 12px; color: var(--soft); margin-top: 11px;
             font-variant-numeric: tabular-nums; max-width: 74ch; }
-  .inside b { color: var(--ink); font-weight: 600; }
+  .inside b { color: var(--ink); font-weight: 650; }
 
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; font-weight: 500; color: var(--soft); font-size: 10.5px;
-       letter-spacing: .08em; text-transform: uppercase; padding: 0 10px 8px 0;
-       white-space: nowrap; }
-  td { padding: 5px 10px 5px 0; border-top: 1px solid var(--line);
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th { text-align: left; font-weight: 600; color: var(--ghost); font-size: 11px;
+       letter-spacing: .05em; text-transform: uppercase; padding: 8px 10px;
+       border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 7px 10px; border-bottom: 1px solid var(--line);
        font-variant-numeric: tabular-nums; vertical-align: middle; }
+  tbody tr:hover td { background: var(--sunk); }
   td.n { text-align: right; white-space: nowrap; }
   td.tbar { width: 34%; min-width: 120px; }
-  .tag { font-size: 11px; padding: 1px 7px; border-radius: 10px;
-         border: 1px solid var(--line); color: var(--soft); white-space: nowrap; }
-  .tag.run { color: var(--ok); border-color: var(--ok); }
-  .tag.wait { color: var(--warn); border-color: var(--warn); }
+  .tag { display: inline-block; font-size: 11px; font-weight: 600; padding: 1px 7px;
+         border-radius: 4px; background: var(--sunk); color: var(--soft); white-space: nowrap; }
+  .tag.run { background: color-mix(in srgb, var(--ok) 14%, transparent); color: var(--ok); }
+  .tag.wait { background: color-mix(in srgb, var(--hot) 14%, transparent); color: var(--hot); }
 
-  .gate { display: flex; gap: 8px; margin-top: 10px; max-width: 520px; }
-  input { flex: 1; padding: 8px 10px; border: 1px solid var(--line);
-          border-radius: 6px; background: var(--bg); color: var(--ink);
-          font: inherit; }
-  button.primary { padding: 8px 14px; border: 1px solid var(--line);
-           border-radius: 6px; background: var(--fill); color: #fff;
-           font: inherit; cursor: pointer; }
+  /* Each arm is a pane of glass of its own, not a stretch of one long sheet:
+     the arms are what a reader compares, and a card each is what lets the
+     ground show between them. The section around them steps back to a title. */
+  section#arms { background: none; border: none; box-shadow: none; padding: 0;
+                 -webkit-backdrop-filter: none; backdrop-filter: none; }
+  section#arms > h2 { margin: 2px 4px 0; padding: 0; border: none; font-size: 17px; font-weight: 700; }
+  #arms .fdiv { margin: 18px 4px 10px; padding: 0; border: none; }
+  #arms .fdiv:first-child { margin-top: 10px; }
+  #arms .fdiv .fkey { font-size: 15px; }
+  .arm { background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+         border: 1px solid var(--panel-edge); box-shadow: var(--shadow); border-radius: var(--radius);
+         padding: 0 var(--pad) 16px; margin: 0 0 14px; transition: box-shadow .2s, border-color .2s; }
+  .arm:hover { box-shadow: var(--shadow), 0 0 0 1px var(--accent-soft); }
+  .arm .armhead { margin: 0 calc(-1 * var(--pad)) 12px; padding: 13px var(--pad) 11px;
+                  border-bottom: 1px solid var(--line); }
+  /* The runs sit in a well: a lighter inset pane inside the card, the way a
+     macOS sidebar sits inside its window. */
+  .arm .scroll { background: var(--sunk); border: 1px solid var(--panel-edge);
+                 border-radius: 12px; padding: 10px 12px 6px; margin-top: 10px;
+                 box-shadow: inset 0 1px 2px rgba(0,0,0,.04); }
+  .arm .rt { box-shadow: inset 0 0 0 1px var(--panel-edge); }
+  .arm .means { background: var(--sunk); border: 1px solid var(--panel-edge); border-radius: 12px;
+                padding: 10px 12px; }
+
+  /* A custom battery's comparison: each configuration's own numbers, and
+     what separates them, before the runs they come from. */
+  .cfgl { display: inline-grid; place-items: center; width: 17px; height: 17px; border-radius: 50%;
+          background: var(--accent); color: #fff; font-size: 10px; font-weight: 700; margin-left: 4px;
+          vertical-align: 1px; }
+  .cfgl.b { background: var(--series-2); } .cfgl.c { background: var(--violet); } .cfgl.d { background: var(--series-3); }
+  .cmp { background: var(--sunk); border: 1px solid var(--panel-edge); border-radius: 12px;
+         padding: 10px 12px; margin: 10px 0 2px; overflow-x: auto; }
+  .cmp table { font-size: 12.5px; }
+  .cmp td, .cmp th { border-bottom-color: var(--line); padding: 6px 10px; }
+  .cmp td.n { font-variant-numeric: tabular-nums; }
+  .cmp .faster { color: var(--ok); font-weight: 650; } .cmp .slower { color: var(--hot); font-weight: 650; }
+  .cmp .diff { font-size: 12px; color: var(--soft); margin-top: 8px; line-height: 1.6; }
+  .cmp .diff b { color: var(--ink); font-weight: 600; }
+  .cmp .diff code { font-family: var(--font-mono); font-size: 11.5px; }
+
+  .gate { display: flex; gap: 8px; margin-top: 10px; max-width: 520px; flex-wrap: wrap; }
+  .gate input { flex: 1; }
 </style>
 </head>
 <body>
 <main>
-  <header class="top">
+  <header id="bar">
+    <span id="flag" title="derived from this page's own origin"></span>
     <div>
-      <h1>VISOR benchmarks</h1>
+      <h1>Benchmark results</h1>
       <div class="sub" id="when">loading&hellip;</div>
     </div>
-    <div class="chrome">
-      <label class="pick" id="pickwrap" hidden>campaign
-        <select id="pick"></select>
-      </label>
-      <div class="stamp" id="stamp"></div>
-      <button class="ghost" id="theme" type="button"
-              title="Follow the system, or force light or dark">auto</button>
-    </div>
+    <span class="spacer"></span>
+    <label class="pick" id="pickwrap" hidden>campaign
+      <select id="pick"></select>
+    </label>
+    <div class="stamp" id="stamp"></div>
+    <button class="ghost" id="theme" type="button"
+            title="Follow the system, or force light or dark">Auto</button>
   </header>
 
   <section id="gate" hidden>
-    <h2>API token</h2>
-    <div class="empty">This campaign is Bearer-protected: it names every tool
-      this deployment serves and how hard it can be pushed. The token is kept
-      in this browser only and sent as a header, never in the URL.</div>
+    <h2>Admin token</h2>
+    <div class="empty">Benchmarks open with the server's admin token
+      (<code>ADMIN_TOKEN</code>), the one the admin panel asks for: a campaign
+      names every tool this deployment serves and how hard it can be pushed.
+      The API token a workstation uses does not open it. The token is kept in
+      this browser only and sent as a header, never in the URL.</div>
     <div class="gate">
-      <input id="token" type="password" placeholder="API token" autocomplete="off">
+      <input id="token" type="password" placeholder="Admin token" autocomplete="off">
       <button class="primary" id="save">Connect</button>
     </div>
     <div class="err" id="gateerr"></div>
@@ -554,9 +545,18 @@ BENCHMARK_PAGE = """<!doctype html>
 <script>
 (function () {
   "use strict";
-  // The SAME key the status page writes: a reader who authenticated there is
-  // not asked again here.
-  var KEY = "visor.token";
+  // One door to the benchmarks: this page is the Results tab of /benchmark,
+  // and opened on its own it goes there, carrying the campaign asked for. Two
+  // ways in had grown two looks for the same page.
+  try {
+    if (window.self === window.top) {
+      window.location.replace("../benchmark" + window.location.search + "#results");
+      return;
+    }
+  } catch (e) { /* a frame we cannot inspect is a frame: render */ }
+  // The SAME key the admin panel writes: a reader who unlocked it is not
+  // asked again here.
+  var KEY = "visor.admin";
   var THEME_KEY = "visor.theme";
   var token = "";
   try { token = window.localStorage.getItem(KEY) || ""; } catch (e) { token = ""; }
@@ -741,8 +741,29 @@ BENCHMARK_PAGE = """<!doctype html>
     var root = document.documentElement;
     if (theme === "auto") { root.removeAttribute("data-theme"); }
     else { root.setAttribute("data-theme", theme); }
-    el("theme").textContent = theme;
+    el("theme").textContent = theme === "dark" ? "Dark" : theme === "light" ? "Light" : "Auto";
   }
+  // The admin panel and the Launch page write the same key. Another page
+  // choosing a theme -- the Launch page around this one, above all -- repaints
+  // this one too, rather than leaving a light frame inside a dark page.
+  window.addEventListener("storage", function (event) {
+    if (event.key !== THEME_KEY) { return; }
+    theme = event.newValue === "light" || event.newValue === "dark" ? event.newValue : "auto";
+    applyTheme();
+  });
+
+  // Framed by the Launch page, which already carries the bar's chrome.
+  try {
+    if (window.self !== window.top) { document.documentElement.classList.add("framed"); }
+  } catch (e) { document.documentElement.classList.add("framed"); }
+
+  // A stable hue per origin, so two deployments open side by side never look
+  // alike -- the same hue the admin panel paints for this origin.
+  (function () {
+    var key = window.location.host || "local", hash = 0, i;
+    for (i = 0; i < key.length; i++) { hash = (hash * 31 + key.charCodeAt(i)) % 360; }
+    el("flag").style.background = "hsl(" + hash + " 60% 52%)";
+  })();
 
   // ------------------------------------------------------------------
   // The summary strip
@@ -1330,7 +1351,7 @@ BENCHMARK_PAGE = """<!doctype html>
     var inner = (failed ? CROSS + " " : "") +
       (canOpen ? '<span class="caret">' + (isOpen ? OPEN : SHUT) + "</span>" : "") +
       '<span class="who">' + esc(label) + "</span> <b>" +
-      esc(r.tool || "?") + "</b>";
+      esc(r.tool || "?") + "</b>" + cfgBadge(r.config);
     var head = canOpen
       ? '<button type="button" class="rl" data-open="' + esc(key) +
         '" aria-expanded="' + (isOpen ? "true" : "false") + '" title="' +
@@ -1559,6 +1580,69 @@ BENCHMARK_PAGE = """<!doctype html>
       }).join(", and ") + ".</div>";
   }
 
+  // The configurations of a custom battery, by letter, from the campaign.
+  var campaignConfigs = [];
+
+  function cfgBadge(letter) {
+    if (!letter || String(letter).length !== 1) { return ""; }
+    return '<span class="cfgl ' + esc(String(letter).toLowerCase()) + '">' + esc(letter) + "</span>";
+  }
+
+  function meanSd(st) {
+    st = obj(st);
+    if (fig(st.mean) == null) { return DASH; }
+    return secs(st.mean) + (fig(st.sd) != null ? " ± " + secs(st.sd) : "");
+  }
+
+  // What separates the configurations: every argument whose value is not the
+  // same in all of them. A comparison whose difference is not written next to
+  // its numbers is read as a comparison of something else.
+  function diffLine() {
+    var cfgs = list(campaignConfigs);
+    if (cfgs.length < 2) { return ""; }
+    var keys = {}, out = [];
+    cfgs.forEach(function (c) { Object.keys(obj(c.params)).forEach(function (k) { keys[k] = true; }); });
+    Object.keys(keys).sort().forEach(function (k) {
+      var vals = cfgs.map(function (c) { var v = obj(c.params)[k]; return v == null ? "default" : String(v); });
+      if (vals.every(function (v) { return v === vals[0]; })) { return; }
+      out.push("<b>" + esc(k) + "</b> " + cfgs.map(function (c, i) {
+        return esc(c.label) + " <code>" + esc(vals[i].slice(0, 60)) + "</code>";
+      }).join(" · "));
+    });
+    var tools = cfgs.map(function (c) { return c.tool; });
+    if (!tools.every(function (t) { return t === tools[0]; })) {
+      out.unshift("<b>tool</b> " + cfgs.map(function (c) { return esc(c.label) + " " + esc(c.tool); }).join(" · "));
+    }
+    var benched = cfgs.filter(function (c) { return list(c.bench).length; });
+    if (benched.length) {
+      out.push("bench input on " + benched.map(function (c) { return esc(c.label) + " (" + esc(list(c.bench).join(", ")) + ")"; }).join(" · ") +
+        ", recorded by size only");
+    }
+    return '<div class="diff">' + (out.length ? "What differs: " + out.join("  ·  ")
+      : "The configurations send the same values: any difference is the machine.") + "</div>";
+  }
+
+  function compareBlock(a) {
+    var rows = list(a.compare);
+    if (rows.length < 2) { return ""; }
+    var base = fig(obj(obj(rows[0]).running).mean);
+    return '<div class="cmp"><table><thead><tr><th>config</th><th>tool</th><th class="r">ok</th>' +
+      '<th class="r">computing, mean ± sd</th><th class="r">vs ' + esc(obj(rows[0]).config) + "</th>" +
+      '<th class="r">whole run, mean ± sd</th><th class="r">median</th><th class="r">range</th></tr></thead><tbody>' +
+      rows.map(function (row, i) {
+        row = obj(row);
+        var run = obj(row.running), all = obj(row.seconds), m = fig(run.mean), delta = "";
+        if (i > 0 && base && m != null) {
+          var pctv = (m - base) / base * 100;
+          delta = '<span class="' + (pctv < 0 ? "faster" : "slower") + '">' + (pctv > 0 ? "+" : "") + pctv.toFixed(1) + "%</span>";
+        }
+        return "<tr><td>" + cfgBadge(row.config) + "</td><td>" + esc(row.tool) + '</td><td class="n">' +
+          count(row.ok) + "/" + count(row.runs) + '</td><td class="n">' + meanSd(run) + '</td><td class="n">' +
+          (delta || DASH) + '</td><td class="n">' + meanSd(all) + '</td><td class="n">' + esc(secs(all.median)) +
+          '</td><td class="n">' + (fig(all.min) == null ? DASH : esc(secs(all.min) + " – " + secs(all.max))) + "</td></tr>";
+      }).join("") + "</tbody></table>" + diffLine() + "</div>";
+  }
+
   function armCard(a) {
     var d = duration(a), tick = step(d), cols = columns(a);
     var runs = (a.runs || []).slice().sort(function (p, q) {
@@ -1585,7 +1669,7 @@ BENCHMARK_PAGE = """<!doctype html>
     return '<div class="arm"><div class="armhead"><span class="code">' +
       esc(a.arm || "?") + '</span><span class="name">' + esc(a.label || "") +
       "</span>" + setupLine(a) + "</div>" + stressPanel(a) + claim(a) +
-      metrics(a) + gantt + insideLine(a) + meansRows(a) + "</div>";
+      metrics(a) + compareBlock(a) + gantt + insideLine(a) + meansRows(a) + "</div>";
   }
 
   // ------------------------------------------------------------------
@@ -1642,6 +1726,14 @@ BENCHMARK_PAGE = """<!doctype html>
       window.history.replaceState(null, "",
         name ? "?campaign=" + encodeURIComponent(name) :
           window.location.pathname);
+      // The address a reader copies is the Benchmarks page's, around this
+      // frame: write the campaign there too, keeping its tab.
+      var outer = window.parent;
+      if (outer && outer !== window) {
+        outer.history.replaceState(null, "",
+          (name ? "?campaign=" + encodeURIComponent(name) : outer.location.pathname) +
+          outer.location.hash);
+      }
     } catch (e) { /* a browser with history disabled still renders */ }
   }
 
@@ -1692,6 +1784,7 @@ BENCHMARK_PAGE = """<!doctype html>
       return;
     }
     show("none", false);
+    campaignConfigs = list(c.configs);
     drawSummary(c);
     var arms = c.arms || [];
     var groups = families(arms);
@@ -1720,9 +1813,10 @@ BENCHMARK_PAGE = """<!doctype html>
     // /benchmarks, and it stays correct behind a proxy on a sub-path.
     var where = "../benchmarks" +
       (wanted ? "?campaign=" + encodeURIComponent(wanted) : "");
-    fetch(where, { headers: { Authorization: "Bearer " + token } })
+    fetch(where, { headers: { "X-Admin-Token": token } })
       .then(function (r) {
-        if (r.status === 401) { throw new Error("That token was refused."); }
+        if (r.status === 401) { throw new Error("That is not this server's admin token."); }
+        if (r.status === 403) { throw new Error("This server has no admin token: set ADMIN_TOKEN in its .env and recreate it."); }
         if (r.status === 404) {
           // The server deliberately does not fall back to the newest: a reader
           // who asked for yesterday and silently got today would compare two
@@ -1771,7 +1865,7 @@ BENCHMARK_PAGE = """<!doctype html>
     load();
   });
   el("theme").addEventListener("click", function () {
-    theme = theme === "auto" ? "light" : theme === "light" ? "dark" : "auto";
+    theme = theme === "auto" ? "dark" : theme === "dark" ? "light" : "auto";
     try { window.localStorage.setItem(THEME_KEY, theme); } catch (e) { }
     applyTheme();
   });
@@ -1806,6 +1900,7 @@ BENCHMARK_PAGE = """<!doctype html>
   load();
 }());
 </script>
+""" + GLASS_SELECT_JS + """
 </body>
 </html>
 """

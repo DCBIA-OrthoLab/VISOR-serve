@@ -20,10 +20,11 @@ services:
     volumes:
       - ./DATA:/DATA:ro
       - ./server:/opt/sadt/server:ro
-      # What a benchmark campaign measured, for GET /benchmarks and the status
-      # page. Read-only, and absent on a deployment that ran none -- the
-      # endpoint answers "nothing measured here" rather than failing.
-      - ./benchmarks/results/summary:/benchmarks:ro
+      # What a benchmark campaign measured, for GET /benchmarks. Writable:
+      # a battery launched from /benchmark writes its summary here, beside the
+      # campaigns, so the Results tab draws it with them. Read-only, every
+      # battery died on its first write and reported only "failed".
+      - ./benchmarks/results/summary:/benchmarks
       # Each tool's SOURCE from the checkout, over the image's -- the same
       # bargain `server/` gets one line above, and for the same reason: the
       # image exists for the 22 virtualenvs, which are not what changes while a

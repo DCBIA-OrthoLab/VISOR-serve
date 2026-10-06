@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -99,6 +100,10 @@ def start(plan: dict, summary_dir: str, base_url: str, token: str,
         name = _summary_name(plan["preset"])
         out_path = os.path.join(summary_dir, name)
         plan_path = os.path.join(scratch_dir, name.replace(".json", ".plan.json"))
+        # Where the battery packs a bench FOLDER into the archive it uploads.
+        # One per battery, removed with the plan whatever way the battery ends:
+        # what lands in it is a copy of a clinical case.
+        plan = dict(plan, scratch=os.path.join(scratch_dir, name.replace(".json", "-inputs")))
         with open(plan_path, "w", encoding="utf-8") as handle:
             json.dump(plan, handle)
 
@@ -130,13 +135,13 @@ def start(plan: dict, summary_dir: str, base_url: str, token: str,
                     plan["preset"], plan.get("total_runs", 0), process.pid)
         job = dict(_current)
 
-    _watch(process, plan_path)
+    _watch(process, plan_path, plan["scratch"])
     job.pop("_process", None)
     job.pop("_plan_path", None)
     return job
 
 
-def _watch(process: subprocess.Popen, plan_path: str) -> None:
+def _watch(process: subprocess.Popen, plan_path: str, inputs_dir: str) -> None:
     """Enforce the ceiling, and clean up after the child, off the event loop."""
     def wait() -> None:
         try:
@@ -149,6 +154,7 @@ def _watch(process: subprocess.Popen, plan_path: str) -> None:
                 os.remove(plan_path)
             except OSError:
                 pass
+            shutil.rmtree(inputs_dir, ignore_errors=True)
     threading.Thread(target=wait, daemon=True).start()
 
 
