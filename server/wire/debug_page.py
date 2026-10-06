@@ -1398,8 +1398,26 @@ DEBUG_PAGE = r"""<!doctype html>
 
   function drawDialog() {
     if (!dlg.kind) { return; }
+    // Every poll rebuilds the dialog, which recreated each scrolling box at
+    // the top: reading a console meant being thrown back to its first line
+    // every two seconds. Where each one stood is taken before the rebuild and
+    // put back after -- and a console read to its END stays at its end, so it
+    // follows the lines a live run keeps adding.
+    var boxes = function () {
+      return [el("overlay"), el("dialog")].concat(
+        Array.prototype.slice.call(el("dialog").querySelectorAll(".con")));
+    };
+    var kept = boxes().map(function (node) {
+      return { top: node.scrollTop, end: node.scrollHeight - node.scrollTop - node.clientHeight < 4 };
+    });
     el("dialog").innerHTML = dlg.kind === "run" ? runDialog() : dlg.kind === "history" ? historyDialog()
       : dlg.kind === "updates" ? updatesDialog() : toolDialog();
+    boxes().forEach(function (node, index) {
+      var was = kept[index];
+      if (!was) { return; }
+      var isConsole = node.classList && node.classList.contains("con");
+      node.scrollTop = isConsole && was.end ? node.scrollHeight : was.top;
+    });
   }
 
   function runDialog() {
