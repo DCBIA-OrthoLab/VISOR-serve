@@ -808,6 +808,20 @@ def _kill_leftovers(process: subprocess.Popen) -> None:
         pass
 
 
+def cancel_run(run_id: str) -> Optional[int]:
+    """Cancel one run the way `DELETE /runs/{id}` does; the group signalled.
+
+    The marker first, then the signal, for the reasons the endpoint gives. One
+    function so that every path that stops a run -- the endpoint, and a
+    benchmark battery stopping the runs it started -- stops it the same way.
+    Raises `runs.RunError` for an id the registry does not hold.
+    """
+    pgid = runs.request_cancel(run_id)
+    if pgid is not None:
+        kill_process_group(pgid)
+    return pgid
+
+
 def kill_process_group(pgid: int) -> None:
     """SIGTERM a process group named only by its id. What `DELETE /runs/{id}`
     does with the pgid the run directory recorded.
