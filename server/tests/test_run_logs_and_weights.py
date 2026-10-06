@@ -312,6 +312,8 @@ def test_a_location_that_is_not_one_is_dropped():
     ("scan 14 of 40, mesh 3/40", "scan 14 of 40, mesh 3/40"),
     ("CUDA out of memory. Tried to allocate 2.00 GiB", "CUDA out of memory. Tried to allocate 2.00 GiB"),
     ("two\nlines", "two lines"),
+    ("scan 1/1: preprocessed in 4.21s, ~35s left, 512MB", "scan 1/1: preprocessed in 4.21s, ~35s left, 512MB"),
+    ("case P05 took 12s", "case <id> took 12s"),
 ])
 def test_redaction_keeps_the_sentence_and_drops_the_names(text, expected):
     assert scrub(text) == expected

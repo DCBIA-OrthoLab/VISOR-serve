@@ -34,7 +34,7 @@ _EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 # Any whitespace-delimited token holding a separator, minus a ratio like 3/40
 # which is a position in a batch and the most useful thing a line can say.
 _PATH = re.compile(r"""[^\s'"()\[\]{}<>,;]*[/\\][^\s'"()\[\]{}<>,;]*""")
-_RATIO = re.compile(r"\d+/\d+")
+_RATIO = re.compile(r"\d+/\d+[:.,;]?")
 _FILE = re.compile(
     r"[\w.+-]+\.(?:nii|gz|nrrd|nhdr|mha|mhd|dcm|dicom|vtk|vtp|stl|obj|ply|off|"
     r"json|csv|tsv|xlsx|xls|txt|pkl|pickle|pth|pt|ckpt|npy|npz|zip|tar|tgz|"
@@ -45,6 +45,17 @@ _IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b")
 _IDENTIFIER = re.compile(
     r"\b(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{3,}\b"
 )
+# A number with its unit -- `4.21s`, `512MB`, `0.5mm`, `16GiB` -- is a
+# measurement, the thing a log line is most often FOR. Kept whole; the
+# identifier rule above would otherwise read `35s` as a patient code.
+_MEASURE = re.compile(
+    r"\d+(?:\.\d+)?(?:ms|s|min|h|mm|cm|m|[KMGT]i?B|B|px|vox|%|x)\b|\d+(?:\.\d+)?(?=s\b)"
+)
+
+
+def _identifier(match) -> str:
+    text = match.group(0)
+    return text if _MEASURE.fullmatch(text) else "<id>"
 
 
 def _path_or_ratio(match) -> str:
@@ -61,6 +72,6 @@ def scrub(text) -> str:
     value = _PATH.sub(_path_or_ratio, value)
     value = _FILE.sub("<file>", value)
     value = _IPV4.sub("<address>", value)
-    value = _IDENTIFIER.sub("<id>", value)
+    value = _IDENTIFIER.sub(_identifier, value)
     value = re.sub(r"\s+", " ", value).strip()
     return value[:MAX_REDACTED_CHARS]
