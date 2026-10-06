@@ -73,3 +73,39 @@ def test_the_pages_send_the_admin_token_under_the_panels_key():
 
 def test_the_status_page_no_longer_asks_for_a_campaign():
     assert 'fetch("benchmarks"' not in client.get("/").text
+
+
+# --- where a battery writes, on a deployment that mounts nothing for it -------
+
+def test_a_battery_writes_beside_the_cache_when_the_campaign_folder_is_not_writable(admin, monkeypatch, tmp_path):
+    """The released compose mounts nothing at /benchmarks, and the server runs
+    as a user who cannot create it: every battery failed to start with
+    `Permission denied: '/benchmarks'`. It now lands under SCHEMA_CACHE_DIR,
+    which the image gives the server and a volume keeps."""
+    import benchmark_jobs
+    monkeypatch.setattr(settings, "SADT_BENCHMARK_DIR", str(tmp_path / "not-mounted" / "benchmarks"))
+    monkeypatch.setattr(settings, "SADT_BATTERY_DIR", "")
+    monkeypatch.setattr(settings, "SCHEMA_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(main, "_writable", lambda directory: False)
+    seen = {}
+    monkeypatch.setattr(benchmark_jobs, "start",
+                        lambda plan, summary_dir, *rest: seen.setdefault("dir", summary_dir) and {"state": "running"})
+    response = client.post("/benchmark/run", headers=admin, json={"preset": "smoke"})
+    assert response.status_code == 200, response.text
+    assert seen["dir"] == str(tmp_path / "cache" / "batteries")
+
+
+def test_the_results_read_campaigns_and_batteries_together(admin, monkeypatch, tmp_path):
+    campaigns, batteries = tmp_path / "campaigns", tmp_path / "cache" / "batteries"
+    campaigns.mkdir()
+    batteries.mkdir(parents=True)
+    (campaigns / "b9-20261001T000000Z.json").write_text('{"generated_at": 1, "arms": []}')
+    (batteries / "preset-custom-20261006T000000Z.json").write_text('{"generated_at": 2, "arms": [{}]}')
+    monkeypatch.setattr(settings, "SADT_BENCHMARK_DIR", str(campaigns))
+    monkeypatch.setattr(settings, "SADT_BATTERY_DIR", str(batteries))
+    body = client.get("/benchmarks", headers=admin).json()
+    assert [c["source"] for c in body["campaigns"]] == [
+        "preset-custom-20261006T000000Z.json", "b9-20261001T000000Z.json"]
+    assert body["campaign"]["source"] == "preset-custom-20261006T000000Z.json"
+    older = client.get("/benchmarks?campaign=b9-20261001T000000Z.json", headers=admin)
+    assert older.status_code == 200 and older.json()["campaign"]["generated_at"] == 1
