@@ -1891,7 +1891,30 @@ DEBUG_PAGE = r"""<!doctype html>
       timeChart(mSeries, mt0, mt1, { height: 130, marks: marks }))
       : '<div class="empty" style="text-align:left">The machine trace covers the last six hours of this process only.</div>';
 
-    return head + '<div class="dbody">' + kpis + dataSection(name, data.data) + section("Where the time goes, on average", stack) +
+    // What the tool said, and why it failed, run by run: the failure and the
+    // lines its history kept, already redacted by the server. A row opens the
+    // run itself.
+    var talked = runsOf.filter(function (r) { return r.failure || (r.logs || []).length; }).slice(0, 12);
+    var messages = talked.length ? '<div class="con">' + talked.map(function (r) {
+        var rows = '<div class="ln ' + (r.outcome === "failed" ? "error" : "info") + ' click" data-run="' + esc(r.run_id) +
+          '"><span class="ts">' + clock(r.started_at || 0) + '</span><span class="tx"><b>' + esc(r.outcome || "running") +
+          "</b> \u00b7 " + esc(r.client || "") + " \u00b7 " + esc(r.run_id.slice(0, 8)) + "</span></div>";
+        (r.logs || []).forEach(function (l) {
+          rows += '<div class="ln ' + (l.level === "error" ? "error" : l.level === "warning" ? "warn" : "info") +
+            '"><span class="ts">' + clock(l.at || 0) + '</span><span class="tx">' +
+            esc("  " + (l.source ? "[" + l.source + "] " : "") + l.message) + "</span></div>";
+        });
+        if (r.failure) {
+          rows += '<div class="ln error"><span class="ts">' + clock(r.ended_at || 0) + '</span><span class="tx">' +
+            esc("  failed in " + (r.failure.chain || []).join(" \u203a ") + ": " + r.failure.error_type +
+                (r.failure.where ? " at " + r.failure.where : "") + (r.failure.reason ? " \u2014 " + r.failure.reason : "")) +
+            "</span></div>";
+        }
+        return rows;
+      }).join("") + "</div>"
+      : '<div class="empty" style="text-align:left">No message or failure recorded for this tool yet.</div>';
+
+    return head + '<div class="dbody">' + kpis + section("Recent messages", messages) + dataSection(name, data.data) + section("Where the time goes, on average", stack) +
       section("Recent runs, each from its own start", runsGantt) +
       '<div class="two">' +
       section("Duration of each run", '<div class="legend"><span><i style="background:var(--accent)"></i>took</span>' +

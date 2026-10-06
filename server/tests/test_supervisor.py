@@ -1186,3 +1186,42 @@ def test_a_failure_two_levels_down_is_attributed_to_the_tool_that_raised(tools_d
     assert origin["error_type"] == "KeyError"
     assert origin["where"].startswith("sadt_leaf/__init__.py:")
     assert origin["stage"] == "scan 2 of 4" and origin["fraction"] == 0.5
+
+
+def test_the_tools_own_log_lines_reach_the_run_and_nobody_elses_do(tools_dir, tmp_path):
+    """A tool logs through a module logger, and that used to reach stderr only.
+    Its own loggers are copied into the run for the operator; a library's are
+    not, and neither is debug."""
+    make_tool(tools_dir, "Leaf", """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    def run(scans: Path, output_dir: Path) -> Path:
+        \"\"\"Log at every level, and as a library would.\"\"\"
+        logger.debug("too fine")
+        logger.info("reading 4 scans")
+        logger.warning("scan 2 has no header spacing; assuming 1 mm")
+        try:
+            raise ValueError("bad affine")
+        except ValueError:
+            logger.exception("scan 3 skipped")
+        logging.getLogger("nnunetv2.inference").warning("predicting case 7")
+        return Path(output_dir)
+    """)
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text("", encoding="utf-8")
+
+    completed, _ = run_job(
+        tools_dir, "Leaf", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env={"SADT_PROGRESS_FILE": str(events_file)},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    logs = [(r["level"], r["audience"], r["message"]) for r in _records(events_file)
+            if r.get("kind") == "log"]
+    assert logs == [
+        ("info", "admin", "reading 4 scans"),
+        ("warning", "admin", "scan 2 has no header spacing; assuming 1 mm"),
+        ("error", "admin", "scan 3 skipped (ValueError: bad affine)"),
+    ]

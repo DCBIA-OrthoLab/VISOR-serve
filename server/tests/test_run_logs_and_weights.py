@@ -241,7 +241,8 @@ def test_warnings_and_errors_outlive_the_run_redacted(run_id):
     runs.discard(run_id)
 
     record = telemetry.ledger_record(run_id)
-    assert [line["message"] for line in record["logs"]] == ["skipped <id>", "cannot read <path>"]
+    assert [line["message"] for line in record["logs"]] == [
+        "chatter", "skipped <id>", "cannot read <path>"]
     assert record["failure"]["error_type"] == "KeyError"
     payload = client.get(f"/admin-panel/runs/{run_id}.json", headers=_panel()).json()
     assert payload["reaped"] is True
@@ -314,3 +315,12 @@ def test_a_location_that_is_not_one_is_dropped():
 ])
 def test_redaction_keeps_the_sentence_and_drops_the_names(text, expected):
     assert scrub(text) == expected
+
+
+def test_a_chatty_tool_cannot_push_its_error_out_of_the_history(run_id):
+    _write(run_id, _log("the one error", "error"), *[_log(f"step {i}") for i in range(60)])
+    runs.finish(run_id, runs.PHASE_DONE)
+
+    kept = telemetry.ledger_record(run_id)["logs"]
+    assert kept[0]["message"] == "the one error"
+    assert len(kept) == 21 and kept[-1]["message"] == "step 59"

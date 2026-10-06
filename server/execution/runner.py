@@ -1380,7 +1380,11 @@ def _last_stage():
             record = json.loads(line.decode("utf-8", errors="replace"))
         except ValueError:
             continue
-        if not isinstance(record, dict) or record.get("kind") or record.get("tool"):
+        # A log line, a nested-call marker, or one of the SERVER's own records
+        # ("input 2 of 2" while staging) is not something this level said it
+        # was doing.
+        if (not isinstance(record, dict) or record.get("kind") or record.get("tool")
+                or record.get("src")):
             continue
         if "call" in record:
             mine = record.get("call") == own
@@ -1525,6 +1529,63 @@ def _append_log(message, level: str, user: bool, depth: int) -> None:
     if call:
         record["call"] = call
     _write_record(record)
+
+
+class _RunLogHandler(logging.Handler):
+    """Every line the TOOL logs, copied into the run's events for the operator.
+
+    Tools log through a plain module logger (`logging.getLogger(__name__)`),
+    and that went to stderr -- a file kept for the life of the job directory
+    and read by nobody. Copied here, it reaches the operator console with no
+    change to any tool, redacted on the way like any `admin` line (the server
+    runs `redact.scrub` over every one), and the warnings and errors outlive
+    the run in its history.
+
+    Only the tool's OWN loggers: its package (`sadt_aso.dispatch`) or its
+    name. Third-party libraries -- nnUNet printing every case, torch's
+    warnings -- would drown the tool's lines and name more files than they
+    would explain. INFO and above; `debug` stays on stderr.
+    """
+
+    def __init__(self, prefixes):
+        super().__init__(logging.INFO)
+        self._prefixes = tuple(prefix for prefix in prefixes if prefix)
+
+    def _ours(self, name: str) -> bool:
+        return any(name == prefix or name.startswith(prefix + ".") for prefix in self._prefixes)
+
+    def emit(self, record):
+        if not self._ours(record.name):
+            return
+        try:
+            text = record.getMessage()
+            if record.exc_info and record.exc_info[1] is not None:
+                # The class and the message, never the traceback: the server
+                # records where a FAILURE happened by itself, and a traceback
+                # is a page of paths.
+                error = record.exc_info[1]
+                text = "{} ({}: {})".format(text, type(error).__name__, error)
+            if record.levelno >= logging.ERROR:
+                level = "error"
+            elif record.levelno >= logging.WARNING:
+                level = "warning"
+            else:
+                level = "info"
+            try:
+                depth = int(os.environ.get(SUPERVISOR_DEPTH_ENV, "0") or 0)
+            except ValueError:
+                depth = 0
+            _append_log(text, level, False, depth)
+        except Exception:  # noqa: BLE001 - a log line must never break a run
+            pass
+
+
+def _forward_tool_logs(module, tool_name) -> None:
+    """Attach `_RunLogHandler` for this tool, when a run is listening."""
+    if not os.environ.get(PROGRESS_FILE_ENV):
+        return
+    package = (getattr(module, "__name__", "") or "").split(".")[0]
+    logging.getLogger().addHandler(_RunLogHandler((package, tool_name)))
 
 
 def _append_progress(fraction, message, depth: int, tool: str = "",
@@ -3053,6 +3114,7 @@ def main(argv=None) -> int:
         job = _load_job(arguments.job)
         _JOB_TOOL = job.get("tool")
         module = _import_tool(job["tool"], os.path.join(_tool_dir(), SRC_DIR_NAME))
+        _forward_tool_logs(module, job["tool"])
         if job.get("entry") == PAIRS_ENTRY:
             # Not a run: the tool is asked which of the listed file NAMES go
             # together, so a client can split a paired cohort into batches.

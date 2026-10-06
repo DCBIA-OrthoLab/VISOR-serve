@@ -163,8 +163,8 @@ LOG_LEVELS = ("debug", "info", "warning", "error")
 # Per reader, apart from MAX_RUN_EVENTS: a chatty log must not be able to use
 # up the progress budget and leave a client's bar frozen.
 MAX_RUN_LOGS = 500
-# What a run's ledger record keeps of its log once the run is gone: the lines
-# worth reading afterwards, redacted, and only the latest few.
+# What a run's ledger record keeps of its log once the run is gone, redacted:
+# the latest warnings and errors, and as many of the latest info lines.
 _KEPT_LOG_LEVELS = ("warning", "error")
 _MAX_KEPT_LOGS = 20
 
@@ -567,10 +567,18 @@ def finish(run_id: str, phase: str, message: str = "", result=None,
 
 
 def notable_logs(events: List[dict]) -> List[dict]:
-    """The warning and error lines among `events`, redacted, latest last."""
+    """What a run's history keeps of its log, redacted, in the order written:
+    the latest warnings and errors, and the latest info lines beside them --
+    apart, so a chatty tool's info cannot push its one error out."""
+    serious, chatter = [], []
+    for event in events:
+        if event.get("kind") != LOG_KIND or event.get("level") == "debug":
+            continue
+        (serious if event.get("level") in _KEPT_LOG_LEVELS else chatter).append(event)
+    chosen = {id(event) for event in serious[-_MAX_KEPT_LOGS:] + chatter[-_MAX_KEPT_LOGS:]}
     kept = []
     for event in events:
-        if event.get("kind") != LOG_KIND or event.get("level") not in _KEPT_LOG_LEVELS:
+        if id(event) not in chosen:
             continue
         line = {"at": event.get("at"), "level": event["level"],
                 "audience": event.get("audience"), "depth": event.get("depth", 0),
@@ -578,7 +586,7 @@ def notable_logs(events: List[dict]) -> List[dict]:
         if event.get("source"):
             line["source"] = event["source"]
         kept.append(line)
-    return kept[-_MAX_KEPT_LOGS:]
+    return kept
 
 
 # ----------------------------------------------------------------------
