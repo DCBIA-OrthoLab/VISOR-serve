@@ -252,6 +252,9 @@ DEBUG_PAGE = r"""<!doctype html>
   .chain .sep { color: var(--ghost); }
   .cells { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; margin-top: 10px; }
   .cell { border-left: 1px solid var(--line); padding: 1px 8px; }
+  .cells.nested { margin-top: 6px; padding-top: 6px; border-top: 1px dashed var(--line); }
+  .cells.nested .cell b { color: var(--accent); }
+  .lent { font-size: 10.5px; color: var(--soft); margin-top: 3px; }
   .cell:first-child { border-left: none; padding-left: 0; }
   .cell u { display: block; font-size: 9.5px; letter-spacing: .06em; color: var(--ghost);
             text-transform: uppercase; text-decoration: none; }
@@ -847,9 +850,23 @@ DEBUG_PAGE = r"""<!doctype html>
     var adm = d.admission || {}, prios = adm.priorities || {}, position = {}, serialClients = {};
     (d.clients || []).forEach(function (c) { if (c.batches === "serial") { serialClients[c.client] = true; } });
     (adm.queue || []).forEach(function (entry) { if (entry.run_id) { position[entry.run_id] = entry.position; } });
+    var runOf = {};
+    (d.runs || []).forEach(function (r) { runOf[r.run_id] = r; });
+    // Nested calls waiting for room: a tool another tool called, queued like a
+    // run of its own. Shown under the run that called it.
+    var nestedWaiting = (adm.queue || []).filter(function (e) {
+      var parent = runOf[e.parent] || {};
+      // Shown when either it or the run that called it matches the filter.
+      return e.nested && (matches({ tool: e.tool, run_id: e.run_id, client: parent.client }, null) ||
+        (parent.run_id && matches(parent, byId[parent.run_id])));
+    }).map(function (e) {
+      var parent = runOf[e.parent] || {};
+      return { run_id: e.run_id, tool: e.tool, phase: "queued_gpu", nested: true, started_at: e.since,
+               client: parent.client, calledBy: parent.tool };
+    });
     var waiting = (d.runs || []).filter(function (r) {
       return inFlight(r) && (r.phase === "queued_gpu" || r.phase === "received") && matches(r, byId[r.run_id]);
-    }).sort(function (x, y) {
+    }).concat(nestedWaiting).sort(function (x, y) {
       var px = position[x.run_id] || 1e6, py = position[y.run_id] || 1e6;
       return px - py || x.started_at - y.started_at;
     });
@@ -867,16 +884,19 @@ DEBUG_PAGE = r"""<!doctype html>
           }
         });
       }
-      var ctl = admin.ok ? '<span class="ctl">' +
+      var ctl = r.nested ? "" : admin.ok ? '<span class="ctl">' +
         (slot ? "" : '<button data-move="top" data-id="' + esc(r.run_id) + '" title="to the top">\u2912</button>' +
           '<button data-move="up" data-id="' + esc(r.run_id) + '" title="up one">\u2191</button>' +
           '<button data-move="down" data-id="' + esc(r.run_id) + '" title="down one">\u2193</button>') +
         '<button class="star' + (high ? " on" : "") + '" data-prio="' + (high ? "normal" : "high") + '" data-id="' +
         esc(r.run_id) + '" title="' + (high ? "back to normal" : "give priority") + '">\u2605</button></span>' : "";
-      return '<div class="qitem' + (slot ? " slot" : "") + (high ? " high" : "") + '" data-run="' + esc(r.run_id) + '"><span class="pos">' + (i + 1) + "</span>" +
+      // A nested call is not a run of its own: no run dialog to open.
+      return '<div class="qitem' + (slot ? " slot" : "") + (high ? " high" : "") + '"' +
+        (r.nested ? "" : ' data-run="' + esc(r.run_id) + '"') + '><span class="pos">' + (i + 1) + "</span>" +
         '<div style="min-width:0;flex:1"><div class="n">' + esc(r.tool || "?") + (high ? ' <span class="prio">PRIORITY</span>' : "") +
           (r.batch ? ' <span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") + "</div>" +
-        '<div class="m mono">' + (sibling ? "waiting for batch " + sibling + " " : slot ? "waiting for a slot " : "waiting for room ") + ago(r.started_at) +
+        '<div class="m mono">' + (r.nested ? "called by " + esc(r.calledBy || "?") + " \u00b7 " : "") +
+        (sibling ? "waiting for batch " + sibling + " " : slot ? "waiting for a slot " : "waiting for room ") + ago(r.started_at) +
         (r.client ? " \u00b7 " + esc(r.client) : "") + "</div></div>" + ctl + "</div>";
     }).join("") : '<div class="empty">' + (anyFilter() ? "Nothing waiting matches this filter." : "Nothing waiting.") + "</div>";
 
@@ -908,8 +928,30 @@ DEBUG_PAGE = r"""<!doctype html>
     });
     return '<div class="chain">' + links.join("") + "</div>";
   }
+  // What the nested calls of one run hold right now: the root's own grant
+  // above, each call it is waiting on below, admitted and sized on its own.
+  function callCells(list) {
+    if (!list || !list.length) { return ""; }
+    return list.sort(function (a, b) { return a.depth - b.depth; }).map(function (g) {
+      // What the call holds in all: its own reservation plus what it borrowed
+      // from its parent's, which the parent was not using while it waited.
+      var b = g.borrowed || {}, lent = (b.ram_bytes || 0) + (b.vram_bytes || 0) + (b.cpus || 0) > 0;
+      return '<div class="cells nested"><div class="cell"><u>call</u><b>' + esc(g.tool || "?") + "</b></div>" +
+        '<div class="cell"><u>chan</u><b>' + (g.channels == null ? "—" : g.channels) + "</b></div>" +
+        '<div class="cell"><u>cpu</u><b>' + (g.cores == null ? "—" : g.cores) + "</b></div>" +
+        '<div class="cell"><u>ram</u><b>' + gib((g.ram_bytes || 0) + (b.ram_bytes || 0)) + "</b></div>" +
+        '<div class="cell"><u>vram</u><b>' + gib((g.vram_bytes || 0) + (b.vram_bytes || 0)) + "</b></div></div>" +
+        (lent ? '<div class="lent mono">borrowed from its caller: ' + gib(b.ram_bytes) + " ram \u00b7 " +
+          gib(b.vram_bytes) + " vram \u00b7 " + Math.round(b.cpus || 0) + " cpu</div>" : "");
+    }).join("");
+  }
   function drawRunning(d) {
     var byId = ledgerById(d);
+    // Nested calls holding room now, by the run that made them.
+    var calls = {};
+    ((d.admission || {}).nested || []).forEach(function (g) {
+      (calls[g.parent] = calls[g.parent] || []).push(g);
+    });
     var rows = (d.runs || []).filter(function (r) {
       return inFlight(r) && r.phase !== "paused" && r.phase !== "queued_gpu" && r.phase !== "received" &&
         matches(r, byId[r.run_id]);
@@ -940,7 +982,7 @@ DEBUG_PAGE = r"""<!doctype html>
         '<div class="cell"><u>ram</u><b>' + gib(led.ram_bytes) + "</b></div>" +
         '<div class="cell"><u>vram</u><b>' + gib(led.vram_bytes) + "</b></div>" +
         '<div class="cell"><u>files</u><b>' + (led.files == null ? "—" : led.files) + "</b></div>" +
-        "</div></div>";
+        "</div>" + callCells(calls[r.run_id]) + "</div>";
     }).join("");
   }
 

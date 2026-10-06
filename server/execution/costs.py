@@ -83,6 +83,9 @@ UPDATED_KEY = "updated_at"
 RECENT_KEY = "recent"
 # How many channels the most recent run opened, for a human reading the file.
 CHANNELS_KEY = "channels"
+# Set once a tool's nested calls are measured as runs of their own: from then on
+# its figures are the tool alone, not the tool plus its worst child.
+OWN_ONLY_KEY = "own_only"
 
 # Above this ratio between a tool's largest and smallest recorded run -- once
 # the width each of them ran at has been accounted for -- its memory is
@@ -625,7 +628,7 @@ def _spread(points, one: int, marginal: int, widths: int) -> float:
 
 def record(tool_name: str, vram_bytes: Optional[int], ram_bytes: Optional[int],
            channels: int = 1, cpu_cores: float = 0.0,
-           vram_known: bool = True) -> None:
+           vram_known: bool = True, own_only: bool = False) -> None:
     """Fold one run's peaks into the table, keeping the larger of each.
 
     `vram_known=False` says this run measured RAM and cores but that its VRAM
@@ -639,6 +642,13 @@ def record(tool_name: str, vram_bytes: Optional[int], ram_bytes: Optional[int],
     workers can still interleave and lose one update between them; that costs a
     high-water mark one run late, never a corrupt file, and the next run of that
     tool restores it. A lock file would buy exactness this does not need.
+
+    `own_only` says the run's nested calls were admitted, and measured, as runs
+    of their own, so this figure is the tool ALONE. The first such run clears
+    the window once: everything recorded before it held the tool's worst child
+    too, and a window that kept the larger of each would go on reserving the
+    whole chain for twenty runs after the chain stopped being this tool's to pay
+    for.
     """
     if not vram_bytes and not ram_bytes:
         return
@@ -651,6 +661,10 @@ def record(tool_name: str, vram_bytes: Optional[int], ram_bytes: Optional[int],
             window = []
         else:
             window = _window(entry)
+        if own_only and not entry.get(OWN_ONLY_KEY):
+            window = []
+        if own_only:
+            entry[OWN_ONLY_KEY] = True
         # Stored PER CHANNEL, beside the width it was measured at, which is
         # what makes the two recoverable from each other: `_fit` multiplies
         # them straight back into the run's total, and the intercept can only

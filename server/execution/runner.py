@@ -66,6 +66,19 @@ VRAM_FROM_TORCH = "torch"   # this process's own allocator, exact
 VRAM_FROM_CARD = "card"     # the whole card's growth, contaminated by neighbours
 VRAM_FROM_NONE = "none"     # no figure at all
 
+# Nested admission (the server's `execution/nested.py`). The root run's process
+# is handed a socket and a key; every level passes both down, and a supervisor
+# about to start a child asks through them for the child to be admitted like a
+# run of its own. Absent -- a tool run outside a server, or an older server --
+# and a child runs inside its parent's room, as it always did.
+ADMISSION_SOCKET_ENV = "SADT_ADMISSION_SOCKET"
+ADMISSION_KEY_ENV = "SADT_ADMISSION_KEY"
+# Set on a child the server admitted, which then measures its own subtree only.
+ADMITTED_ENV = "SADT_ADMITTED"
+# In result.json: this level's nested calls were admitted and measured on their
+# own, so its figures are the tool alone.
+NESTED_ADMITTED_KEY = "nested_admitted"
+
 # The supervisor: how a tool calls ANOTHER tool. Keyword-only and unannotated,
 # which is what `describe.py` reads to keep it out of the published schema -- a
 # client never sends one, because it is not data.
@@ -466,19 +479,35 @@ class _TreeSampler:
         self._per_process_worked = False
         self._stop = threading.Event()
         self._thread = None
+        # Nested calls admitted as runs of their own. Their processes share
+        # this group -- that is what lets one kill stop a whole chain -- but
+        # they are measured by their own runner and recorded under their own
+        # name, so their subtrees are left out of this one.
+        self._excluded = set()
+        # An admitted nested call measures its own subtree only: the group it
+        # sits in is the ROOT's, and holds its parents too.
+        self.subtree_only = False
+
+    def exclude(self, pid: int) -> None:
+        """Leave `pid` and everything it starts out of this run's figures."""
+        self._excluded.add(int(pid))
 
     # -- one sample ----------------------------------------------------
     def _group(self) -> set:
-        """Every pid in this run's process group."""
+        """Every pid this run is measured over.
+
+        Its process group, or -- for an admitted nested call -- its own subtree;
+        either way minus the subtrees of the nested calls it admitted.
+        """
         try:
             mine = os.getpgrp()
         except OSError:
             return set()
-        found = set()
         try:
             entries = os.listdir("/proc")
         except OSError:
-            return found  # not Linux, or /proc not mounted
+            return set()  # not Linux, or /proc not mounted
+        group, children = set(), {}
         for entry in entries:
             if not entry.isdigit():
                 continue
@@ -487,9 +516,14 @@ class _TreeSampler:
                     fields = handle.read().rsplit(b")", 1)[-1].split()
                 # After the comm field: state, ppid, pgrp, ...
                 if int(fields[2]) == mine:
-                    found.add(int(entry))
+                    pid = int(entry)
+                    group.add(pid)
+                    children.setdefault(int(fields[1]), []).append(pid)
             except (OSError, IndexError, ValueError):
                 continue  # it exited between the listing and the read
+        found = _subtree(os.getpid(), children) & group if self.subtree_only else group
+        for pid in tuple(self._excluded):
+            found -= _subtree(pid, children)
         return found
 
     def _cpu_ticks(self, pids) -> int:
@@ -730,15 +764,147 @@ def _peak_rss_bytes():
     try:
         import resource as _resource
 
-        peak_kb = max(
-            _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss,
-            _resource.getrusage(_resource.RUSAGE_CHILDREN).ru_maxrss,
-        )
+        peak_kb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        # Not once a nested call has been admitted on its own: the children
+        # this process waited for then include that call, which is measured and
+        # recorded under its own name. The sampler still covers this level's
+        # own workers, its admitted children's subtrees left out.
+        if not _nested_admitted:
+            peak_kb = max(peak_kb, _resource.getrusage(_resource.RUSAGE_CHILDREN).ru_maxrss)
         # Linux reports kilobytes; macOS reports bytes. Only Linux runs here,
         # but a benchmark harness on a laptop should not record a 1000x figure.
         return int(peak_kb) if sys.platform == "darwin" else int(peak_kb) * 1024
     except Exception:  # noqa: BLE001 - instrumentation never fails a run
         return None
+
+
+def _admission_lease(job_path: str, caller_dir: str, log, lend: bool = True):
+    """Ask the server to admit the child whose job file is `job_path`.
+
+    Returns `(connection, environment)`: the connection to keep open while the
+    child runs -- closing it is the release -- and the variables to start the
+    child with. `(None, None)` when there is no server to ask, or it answers
+    that this call is not its to admit; the child then runs as it always did.
+    Blocks while the child waits for room, which the parent spends idle.
+    """
+    path = os.environ.get(ADMISSION_SOCKET_ENV)
+    key = os.environ.get(ADMISSION_KEY_ENV)
+    if not path or not key:
+        return None, None
+    import socket
+    try:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.connect(path)
+        connection.sendall((json.dumps(
+            {"key": key, "job": os.path.abspath(job_path),
+             "caller": os.path.abspath(caller_dir),
+             "holding": _holding_now() if lend else {}}) + "\n").encode("utf-8"))
+        reader = connection.makefile("r", encoding="utf-8")
+        for line in reader:
+            message = json.loads(line)
+            if message.get("queued"):
+                log("waiting for room on this machine")
+                continue
+            if isinstance(message.get("granted"), dict):
+                return (connection, reader), dict(message["granted"].get("environment") or {})
+            break
+    except (OSError, ValueError):
+        pass
+    try:
+        connection.close()
+    except (OSError, UnboundLocalError):
+        pass
+    return None, None
+
+
+# What a process's CUDA context holds on the card, which torch's own counters
+# leave out: measured at 524 MiB for one process on the deployment card.
+_CUDA_CONTEXT_BYTES = 768 * 1024 * 1024
+
+
+def _holding_now() -> dict:
+    """What this level occupies right now, while it waits for a nested call.
+
+    The server LENDS the rest of this level's reservation to the call: an
+    orchestrator reserved for its own heaviest phase, and blocked in `sup.run`
+    it uses almost none of it. Resident memory of this level's own processes
+    (admitted calls' subtrees excluded), one core, and what torch holds on the
+    card if it was ever loaded here -- plus the CUDA context, which
+    `memory_reserved()` does not count and which is about half a GiB on a
+    current driver.
+
+    It assumes the level is IDLE while it waits, which is what `sup.run`
+    blocking means. A level with another call already in flight sends nothing,
+    and lends nothing (see `_Supervisor.run`).
+    """
+    try:
+        ram = _sampler._rss(_sampler._group())
+    except Exception:  # noqa: BLE001 - instrumentation never fails a run
+        ram = None
+    if not ram:
+        return {}
+    vram = 0
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                vram = int(torch.cuda.memory_reserved()) + _CUDA_CONTEXT_BYTES
+        except Exception:  # noqa: BLE001
+            vram = 0
+    return {"cpus": 1, "ram_bytes": int(ram), "vram_bytes": vram}
+
+
+def _close_lease(lease) -> None:
+    if not lease:
+        return
+    for handle in reversed(lease):
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def _kill_tree(process) -> None:
+    """SIGKILL a child and every process descended from it, then reap it.
+
+    Not the group: nested levels share the root's, and killing it would take
+    this level down too. The tree is read from /proc's parent links.
+    """
+    import signal
+    children = {}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/stat" % entry, "rb") as handle:
+                    fields = handle.read().rsplit(b")", 1)[-1].split()
+                children.setdefault(int(fields[1]), []).append(int(entry))
+            except (OSError, IndexError, ValueError):
+                continue
+    except OSError:
+        pass
+    for pid in _subtree(process.pid, children):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        process.wait()
+    except OSError:
+        pass
+
+
+def _subtree(root: int, children: dict) -> set:
+    """`root` and every process descended from it, from a ppid -> pids map."""
+    found, pending = set(), [root]
+    while pending:
+        pid = pending.pop()
+        if pid in found:
+            continue
+        found.add(pid)
+        pending.extend(children.get(pid, ()))
+    return found
 
 
 # The worst VRAM a supervised child was measured to hold, folded up as each
@@ -757,6 +923,16 @@ _child_vram_bytes = 0
 # 32.43 GiB per channel in the table this guard exists to fix.
 _child_vram_source = VRAM_FROM_NONE
 
+# Whether any nested call of this process was admitted by the server as a run
+# of its own. From then on this process reports itself ALONE -- no child folded
+# in -- and says so, so the server records it that way.
+_nested_admitted = False
+
+
+def _mark_nested_admitted() -> None:
+    global _nested_admitted
+    _nested_admitted = True
+
 
 def _fold_child_measurement(payload: dict) -> None:
     """Keep the worst VRAM any child of this process reported, and its source."""
@@ -768,6 +944,49 @@ def _fold_child_measurement(payload: dict) -> None:
     if reported > _child_vram_bytes:
         _child_vram_bytes = reported
         _child_vram_source = str(payload.get(VRAM_SOURCE_KEY) or VRAM_FROM_NONE)
+
+
+# Where this process's own records sit in the progress file the whole chain
+# shares. A tool's own progress module writes records with no depth on them, so
+# a level tells its own from everybody else's by WHERE they are: after this
+# process started, and outside the stretches written while one of its nested
+# calls ran -- during which this level is blocked in `sup.run`, so what was
+# written belongs to the callee.
+_PROGRESS_FROM = 0
+_FOREIGN_RANGES = []
+
+
+def _progress_size() -> int:
+    path = os.environ.get(PROGRESS_FILE_ENV)
+    try:
+        return os.path.getsize(path) if path else 0
+    except OSError:
+        return 0
+
+
+def _mark_progress_start() -> None:
+    global _PROGRESS_FROM
+    _PROGRESS_FROM = _progress_size()
+
+
+def _written_here(record: dict, at: int, depth: int) -> bool:
+    """Is this progress record this process's own?
+
+    One carrying a depth says whose it is. One without -- what a tool's own
+    progress module writes -- is this level's when it was written while this
+    level, and not one of its nested calls, was the one running. Reading such
+    records as depth 0 handed the root its children's widths: a chain whose
+    callee ran two channels wide was recorded as a two-channel orchestrator,
+    and the callee, finding no record at its own depth, as a one-channel tool.
+    """
+    if "depth" in record:
+        try:
+            return int(record.get("depth") or 0) == depth
+        except (TypeError, ValueError):
+            return False
+    if at < _PROGRESS_FROM:
+        return False
+    return not any(start <= at < end for start, end in _FOREIGN_RANGES)
 
 
 def _width_reached() -> int:
@@ -820,7 +1039,9 @@ def _width_reached() -> int:
         depth = 0
     try:
         with open(path, "rb") as handle:
+            offset = 0
             for line in handle:
+                at, offset = offset, offset + len(line)
                 try:
                     record = json.loads(line)
                 except ValueError:
@@ -829,7 +1050,7 @@ def _width_reached() -> int:
                     continue
                 if "width" not in record:
                     continue  # said nothing, rather than said one
-                if int(record.get("depth") or 0) != depth:
+                if not _written_here(record, at, depth):
                     continue
                 try:
                     width = int(record["width"])
@@ -896,7 +1117,11 @@ def _measurements() -> dict:
     # the server reserves card memory for something that never touches the
     # card. It also made the test that pins this FLAKY: passing on an idle
     # machine, failing whenever anything else was running.
-    chain_vram = own if own else (_sampler.peak_vram if _touched_torch() else 0)
+    # Not once a nested call was admitted on its own: the card's growth then
+    # holds that call's allocation too, which is recorded under its own name.
+    # What is left is this process's torch figure, or nothing.
+    card_fallback = _touched_torch() and not _nested_admitted
+    chain_vram = own if own else (_sampler.peak_vram if card_fallback else 0)
     if chain_vram:
         measured["peak_vram_bytes"] = chain_vram
     # WHICH of the two produced it, said out loud. A source, not a confidence
@@ -929,6 +1154,8 @@ def _measurements() -> dict:
     rss = max(rss or 0, _sampler.peak_rss) or None
     if rss is not None:
         measured["peak_rss_bytes"] = rss
+    if _nested_admitted:
+        measured[NESTED_ADMITTED_KEY] = True
     return measured
 
 
@@ -1709,14 +1936,15 @@ class _Supervisor:
     gets its own venv, its own dependency set and its own supervisor. Nesting
     (`AREG -> ASO -> ALI`) is that same recursion and needs no special case.
 
-    **It does not go back through the server.** A nested call is a subprocess of
-    the parent, so it never queues for a slot the parent is already holding --
-    which is exactly the deadlock the in-process version had, where four
-    concurrent ASO runs each waited on a fifth slot. The cost is that nested
-    work is invisible to MAX_GPU_JOBS: a supervised chain can put two tools on
-    the card at once. Chains are serial today (ASO waits for ALI before it
-    registers), so the peak is one tool at a time per chain, but a deployment
-    running several supervised jobs concurrently has to size for that.
+    **It is admitted by the server, never through a slot.** A nested call is a
+    subprocess of the parent, so it never queues for one of the slots that cap
+    how many runs a server takes -- which is exactly the deadlock the
+    in-process version had, where four concurrent ASO runs each waited on a
+    fifth slot. It does queue for ROOM: before starting a child, `run` asks the
+    run's admission desk (the server's `execution/nested.py`) to admit it like
+    a run of its own, in a band ahead of runs not yet started, and judged
+    against everything outside its own chain so it can never wait for its own
+    parents. Without a desk the child runs inside its parent's room.
     """
 
     @staticmethod
@@ -1792,11 +2020,12 @@ class _Supervisor:
         # The job at the top of this tree. Carried so every record in a
         # supervised run can be attributed to the request that started it --
         # traceability, and what a VRAM budget would later be applied to. It is
-        # NOT what makes nesting deadlock-free: a nested call is a subprocess of
-        # its parent and never re-enters the server's admission queue at all,
-        # so there is no queue it could wait in.
+        # NOT what makes nesting deadlock-free: that is the admission desk,
+        # which judges a child against everything outside its own chain.
         self._root = root or job_id
         self._calls = 0
+        self._in_flight = 0
+        self._flight_lock = threading.Lock()
         self.out = Path(job_dir) / "output"
         # Removed with the job directory, by whoever owns it. The tool is held
         # to writing only under `output/`, so its scratch sits beside it rather
@@ -1891,9 +2120,9 @@ class _Supervisor:
         environment = dict(os.environ)
         environment[SUPERVISOR_DEPTH_ENV] = str(self._depth + 1)
         environment[SUPERVISOR_CHAIN_ENV] = ",".join(self._chain + (tool,))
-        # What the child may SPEND -- not how wide it may run. A nested call
-        # never re-enters the server's admission queue (it is a subprocess of
-        # this one), so nothing between the two levels would divide anything,
+        # What the child may SPEND when no server admits it (below) -- not how
+        # wide it may run. Such a call is a subprocess of this one and nothing
+        # between the two levels would divide anything,
         # and a parent running six channels whose child opens eight is
         # forty-eight on a machine that admitted one job. What is handed down
         # is therefore this level's room divided by this level's channels, and
@@ -1931,12 +2160,51 @@ class _Supervisor:
             environment[STOPS_ENV] = json.dumps(sorted(inside))
         else:
             environment.pop(STOPS_ENV, None)
-        # Raises when the budget is already spent, before starting anything.
-        remaining = self._remaining_seconds()
         # SADT_TOOL_DIR points at the PARENT's folder; the callee derives its
         # own from its interpreter, and inheriting ours would send it to the
         # wrong sources.
         environment.pop(TOOL_DIR_ENV, None)
+
+        # Admitted like a run of its own, when there is a server to ask: the
+        # same queue, the same price and the same width a run of this tool
+        # arriving over HTTP would get, held for exactly as long as the child
+        # runs. What is granted REPLACES the share worked out above. Without
+        # a server -- or for a tool it does not serve -- the child runs inside
+        # this level's room, as it always did.
+        # A previous attempt's result in this slot -- a memory retry, a resume
+        # whose memo diverged -- must not be what is read back, by this level
+        # or by the server learning the call's cost.
+        try:
+            os.remove(os.path.join(nested_dir, RESULT_FILE))
+        except OSError:
+            pass
+        # Lends only when no other call of this level is in flight: the loan
+        # assumes the level sits idle in `sup.run`, and a level already
+        # running a call from another thread is not.
+        with self._flight_lock:
+            alone = self._in_flight == 0
+            self._in_flight += 1
+        try:
+            lease, granted = _admission_lease(job_path, self._job_dir, self.log, lend=alone)
+        except BaseException:
+            with self._flight_lock:
+                self._in_flight -= 1
+            raise
+        admitted = granted is not None
+        if admitted:
+            environment.update({str(k): str(v) for k, v in granted.items()})
+            environment[ADMITTED_ENV] = "1"
+        else:
+            environment.pop(ADMITTED_ENV, None)
+        # Raises when the budget is already spent, before starting anything.
+        # After the admission, whose wait is part of the job's time.
+        try:
+            remaining = self._remaining_seconds()
+        except BaseException:
+            _close_lease(lease)
+            with self._flight_lock:
+                self._in_flight -= 1
+            raise
 
         # The nested call declares itself, at the CHILD's depth.
         #
@@ -1960,11 +2228,23 @@ class _Supervisor:
         # time is already spent -- and an open with no close is a span with no
         # end.
         _append_progress(None, "", self._depth + 1, tool=tool)
+        foreign_from = _progress_size()
         try:
             produced = self._nested_subprocess(
-                tool, interpreter, job_path, nested_dir, environment, remaining
+                tool, interpreter, job_path, nested_dir, environment, remaining,
+                admitted
             )
         finally:
+            # Everything an ADMITTED callee wrote is the callee's: see
+            # `_written_here`. One that ran inside this level is folded into
+            # it, and its width has to stay this level's too.
+            if admitted:
+                _FOREIGN_RANGES.append((foreign_from, _progress_size()))
+            # Hung up once the child has exited and written its result: that
+            # is what releases its reservation, and what the server reads.
+            _close_lease(lease)
+            with self._flight_lock:
+                self._in_flight -= 1
             _append_progress(None, "", self._depth + 1, tool=tool)
 
         self._remember(nested_dir, tool, produced)
@@ -2076,7 +2356,7 @@ class _Supervisor:
             )
 
     def _nested_subprocess(self, tool, interpreter, job_path, nested_dir,
-                           environment, remaining):
+                           environment, remaining, admitted=False):
         """Run one nested level and return its result, or raise its error.
 
         Split out of `_run_nested` so the nested markers around it are one
@@ -2092,17 +2372,25 @@ class _Supervisor:
         # The timeout below is therefore the polite path, not the only one: it
         # lets a level fail with a message naming the chain instead of being
         # killed silently, and the group kill remains the backstop.
+        # Popen rather than run(): an admitted child's pid is what this
+        # level's sampler leaves out of its own figures.
+        process = subprocess.Popen(
+            [interpreter, os.path.abspath(__file__), "--job", job_path],
+            # Not captured: a nested tool's log is the only sign of life
+            # during an hour-long run, and it is already on stderr where the
+            # server collects it. Its result never travels on stdout anyway.
+            cwd=nested_dir,
+            env=environment,
+        )
+        if admitted:
+            # Marked once the child exists, not when it was admitted: a call
+            # that never started must not make this level report itself alone.
+            _mark_nested_admitted()
+            _sampler.exclude(process.pid)
         try:
-            completed = subprocess.run(
-                [interpreter, os.path.abspath(__file__), "--job", job_path],
-                # Not captured: a nested tool's log is the only sign of life
-                # during an hour-long run, and it is already on stderr where the
-                # server collects it. Its result never travels on stdout anyway.
-                cwd=nested_dir,
-                env=environment,
-                timeout=remaining,
-            )
+            completed = subprocess.CompletedProcess(process.args, process.wait(timeout=remaining))
         except subprocess.TimeoutExpired:
+            _kill_tree(process)
             raise RunnerError(
                 "Supervised tool '{}' ran out of the job's remaining time after "
                 "{:.0f}s. The chain is {} -> {}; raise the ROOT tool's "
@@ -2110,6 +2398,12 @@ class _Supervisor:
                     tool, remaining or 0, " -> ".join(self._chain), tool
                 )
             )
+        except BaseException:
+            # What subprocess.run did on ANY exception -- and the whole
+            # subtree, not the one pid: a grandchild left running would go on
+            # holding memory after the lease covering it was closed.
+            _kill_tree(process)
+            raise
         if completed.returncode != 0:
             # Its own result file is where the useful half is. The child's
             # traceback goes to stderr, which whatever runs the PARENT may be
@@ -2134,7 +2428,7 @@ class _Supervisor:
                 f"{kind}: {message}" if message else
                 f"Supervised tool '{tool}' failed (exit {completed.returncode}). {kind}."
             )
-        return self._result(tool, nested_dir)
+        return self._result(tool, nested_dir, admitted)
 
     def _failure_parts(self, tool: str, nested_dir: str):
         """`(exception class name, message)` the callee recorded, read back."""
@@ -2353,7 +2647,7 @@ class _Supervisor:
                 ordered.append(root)
         return ordered
 
-    def _result(self, tool: str, nested_dir: str):
+    def _result(self, tool: str, nested_dir: str, admitted: bool = False):
         path = os.path.join(nested_dir, RESULT_FILE)
         try:
             with open(path, encoding="utf-8") as handle:
@@ -2364,7 +2658,10 @@ class _Supervisor:
         # memory is the most useful measurement in the whole chain, and
         # discarding it because the chain then failed is how a budget goes on
         # admitting the thing that broke it.
-        _fold_child_measurement(payload)
+        # Not for a child the server admitted: it was measured, and recorded,
+        # as a run of its own.
+        if not admitted:
+            _fold_child_measurement(payload)
         if "error" in payload:
             error = payload["error"]
             raise RunnerError(
@@ -2453,6 +2750,10 @@ def main(argv=None) -> int:
     arguments = parser.parse_args(argv)
 
     _configure_logging()
+    # An admitted nested call is in the root's process group, beside its
+    # parents: it measures what descends from it, not the whole group.
+    _sampler.subtree_only = os.environ.get(ADMITTED_ENV) == "1"
+    _mark_progress_start()
     # Started before the tool is even imported: a heavy import is real resident
     # memory and belongs in the figure, and starting it later would miss a tool
     # whose peak is in its own loading.

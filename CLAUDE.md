@@ -572,6 +572,105 @@ concurrently in worker threads, capped by `MAX_CONCURRENT_TOOLS`).
 
 ## Changelog
 
+### 2026-10-05 - A nested call is admitted like a run of its own
+
+A tool calling another through `sup.run` used to run the callee inside its own
+reservation. Two costs followed. The root reserved its whole chain's worst case
+for the whole run -- AREG held its segmentation step's card through an hour of
+CPU registration -- and a callee could never be wider than the share it
+inherited, however empty the machine was.
+
+**`execution/nested.py`: one admission desk per root run.** A Unix socket in
+the job directory, with a key only the run's processes hold. Before starting a
+child, the supervisor names the child's `job.json` and blocks; the desk prices
+the child with the same `_shapes`/`_demand_for` an HTTP run of that tool gets,
+queues it in the same `Budget`, and answers with the environment the child is
+started with (width, threads, room). **The connection is the reservation**:
+closed when the child returns, or by the kernel when a process dies, so nothing
+can leak past the process that held it. Children stay in the root's process
+group, so one `killpg` still stops a whole chain. Without a desk -- a tool run
+outside a server, or one the server does not serve -- a child runs inside its
+parent's room exactly as before.
+
+**Admission rules for nested calls**, each one pinned by a reproduction:
+
+- A nested call is never counted against `MAX_CONCURRENT_TOOLS`; it never
+  passes through a slot.
+- It is judged against everything OUTSIDE its own chain: the idle escape,
+  "an unmeasured job is running" and `solo` ignore its ancestors. An unmeasured
+  child holds the whole machine minus its parents.
+- It queues ahead of everything, the deepest first, then HIGH, then normal.
+  HIGH now means "the next run to START": a HIGH run that does not fit,
+  queued ahead of a running chain's child, froze that chain for good.
+- Any nested call that fits goes, not only the head: a shallower call can be
+  waiting for the very chain a deeper one would finish.
+- **The breaker.** When every run holding room outside a chain is itself a
+  parent waiting for a queued child, nothing can ever free room, and the head
+  nested call is admitted anyway. Two 4 GiB chains on 10 GiB each calling a
+  3 GiB child deadlocked without it; parents blocked in `sup.run` are idle, so
+  the overcommit is in the budget, not on the machine.
+
+**Each tool is measured for itself.** The parent's sampler leaves the admitted
+child's process subtree out, an admitted child samples only its own subtree,
+`RUSAGE_CHILDREN` and the card fallback are dropped once a child was admitted,
+and nothing is folded. The desk records the child under its OWN name; the
+parent reports `nested_admitted` and `costs.record(own_only=True)` clears its
+window once, the old figures holding its worst child too. Tool progress records
+carry no depth and the whole chain writes one file, so a level now tells its
+own records from its callees' by byte offset: read by depth alone the root
+took its callee's width (AREG was recorded at AMASSS's two channels) and the
+callee found none.
+
+**Measured on a real AREG -> ASO -> ALI_CBCT chain, occlusal orientation,
+alone, three runs each, old and new code alternated:** 354.6 +/- 1.0 s ->
+337.1 +/- 3.2 s (-5 %). Nearly all of it is AMASSS, 77.2 -> 57.8 s at two
+channels; ALI_CBCT at six channels is 2.5 s SLOWER than at one (27.5 -> 30.0
+s), and AREG's own registration does not move. A single earlier run at 547 s
+had been taken as the baseline and overstated the gain sevenfold. The gain
+that matters is under load: a chain no longer reserves its worst step for its
+whole life, and three AREG launched 20 s apart went from the third waiting
+~115 s to 34 s once loans landed (one demo each, not a controlled measure).
+Two chains at once: 390 s and 422 s, nested calls queueing behind each other
+and none stuck. Learned per tool: AREG alone 14.5 GiB of host and no card (its
+card was its children's), ASO 2.2 GiB, ALI_CBCT 0.83 GiB of card per channel
+over 6.
+
+**A waiting parent LENDS what it does not use.** AREG reserves 17.5 GiB and
+10 cores for its own registration and, blocked in `sup.run`, occupies a few
+hundred MB and one core. The supervisor sends what its level occupies with each
+request (`holding`); the parent's reservation minus that, minus what it has
+already lent, covers the call first, and only the rest is asked of the machine.
+Nothing is taken back: the parent keeps its whole reservation, the loan returns
+when the call ends, so there is no re-admission to wait for. A parent that says
+nothing lends nothing; an unmeasured call borrows nothing.
+
+**A second adversarial review**, of the loans, found five more, all fixed:
+
+- a loan skipped the card's REAL free memory: `_card_has_room` was asked about
+  the net demand, so a call whose VRAM the loan covered was admitted onto a
+  card another process had filled. It is asked about the gross demand now;
+- a stream of small calls from other chains kept a big one at the head for as
+  long as they ran, and everything behind it. A call may pass the head only
+  with what the head does not need: nothing at all on a resource the head is
+  short of;
+- a level killed by the out-of-memory killer closed its socket and released
+  its child's reservation while the child, in the root's group, ran on.
+  Nothing in a run's group outlives the run now, and a nested call that times
+  out or raises is killed with its whole subtree;
+- a call NOT admitted had its width records excluded from its parent's, while
+  its peak was still folded in: the parent was recorded too wide;
+- a parent's reported holding left out the CUDA context (about 0.5 GiB), and a
+  level with another call already in flight still lent as if idle. It lends
+  nothing then.
+
+**Not done:** an out-of-memory in a child is not retried on its own. Width
+records are attributed by where they sit in the shared progress file, which
+assumes one writer at a time per chain; per-level ids in a tool's own progress
+records would remove that, and are a change to the tools.
+
+**Tests:** 1182 server (+31), including the four deadlocks an adversarial
+review reproduced; the two between chains hang without the breaker.
+
 ### 2026-09-21 - Three tools faster, a model with an intercept, and three regressions of my own
 
 **The cost model has an intercept.** It priced a run as `per_channel x width`,
