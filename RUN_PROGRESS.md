@@ -90,7 +90,8 @@ has already reaped.
 ```
 
 For tests, for debugging, and for a client that cannot hold a streaming
-connection. The Slicer client does not use it.
+connection. The Slicer client does not use it. `?logs=user` adds the tool's
+log lines for the requester (§4e).
 
 ### `GET /runs/{run_id}/events` - Server-Sent Events
 
@@ -99,6 +100,10 @@ connection. The Slicer client does not use it.
 **including the events written before this watcher connected** - a watcher that
 attaches late is never behind. The stream ends when a terminal event has been
 delivered, or when the run directory disappears.
+
+`?logs=user` interleaves the tool's log lines written for the requester, as
+events with `"kind": "log"` (§4e). **Without it there are none**: a client
+released before log lines existed would draw one as progress.
 
 The last header is not decoration: nginx buffers a proxied response by default,
 which for a stream means the client sees nothing until the run ends - the exact
@@ -144,6 +149,16 @@ One JSON object per SSE frame, and one per line of the run's `events.jsonl`:
 - `depth` - supervised nesting depth, `0` being the tool the client asked for.
   It is what lets a panel show `AREG -> ASO  30%` without the client knowing
   what a chain is.
+
+Optional, and ignored by a client that does not know them:
+
+- `call` - which supervised call wrote the record (`"1"`, `"1.2"`), absent for
+  the root's own records.
+- `tool`, `edge`, `span` - on the supervisor's markers bracketing a nested
+  call: the callee's name, `open` or `close`, and the span of the caller's bar
+  it was given, if any.
+- `own_fraction` - when a weighted chain rescaled `fraction` (§4d), what the
+  record itself said, on its own tool's 0..1.
 
 `seq` is **the line number, assigned when the record is read**, and nothing
 writes it. It could not be written: a value monotonic per run would have to be
@@ -238,6 +253,102 @@ parent with `depth` one higher. That is the whole implementation of chain
 progress: no plumbing, and no level had to be told about any other.
 
 ---
+
+### 4d. Weighting a nested call: one bar for the whole chain
+
+Without it, each level's records carry that level's own 0..1, so a chain's bar
+runs ASO's 0..0.2, then ALI's 0..1, then ASO's 0.6..1. A caller fixes that by
+saying how much of ITS bar a call fills:
+
+```python
+sup.run("ALI_CBCT", ..., _progress=(0.2, 0.6))
+```
+
+`_progress` is the supervisor's, taken out before the callee sees it, and it
+rides the call's two markers as `span`. The server folds every record into a
+tree of calls as it reads the file: a level's position is the furthest of what
+it said itself and `start + (end - start) * position` of each weighted call,
+a finished call counting as its whole span. ALI at half way is ASO at 0.4, and
+under an AREG that gave ASO 0..0.5, AREG at 0.2.
+
+`fraction` on the wire is then the position of the OUTERMOST call the weighting
+reaches -- the root, when every level was weighted -- and `own_fraction` keeps
+what the record said. A client that knows nothing of this draws a bar that only
+moves forward.
+
+- **Nothing weighted, nothing changed.** A record with no weighted call above or
+  below it keeps the fraction it was written with, so a chain nobody weighted
+  reads exactly as it did.
+- **One span per call.** Two calls in a loop sharing one span read as the
+  furthest of the two; give each its own slice.
+- **Whose record it is** comes from its `call`. A record with none -- a tool's
+  own `progress.py` written before it learned to stamp one -- is attributed to
+  the one call open when it was read, since the caller is blocked in
+  `sup.run`; with two calls open at once that is a guess, and no guess is made:
+  the record keeps its own fraction.
+
+### 4e. Log lines
+
+```python
+sup.log("3 of 7 landmarks found; orienting on those", level="warning")
+sup.log("Scan 4 has no mandible and was skipped", level="warning", user=True)
+```
+
+```json
+{"kind": "log", "at": 1757400123.4, "level": "warning", "audience": "user",
+ "message": "Scan 4 has no mandible and was skipped", "depth": 1, "call": "1"}
+```
+
+Same file, same append rules as a progress record (§4b). `level` is `debug`,
+`info`, `warning` or `error`; `audience` is `user` or `admin`, and a line with
+none is the operator's.
+
+| audience | reaches | as |
+|---|---|---|
+| `admin` (default) | the operator page's run console; warnings and errors are kept in the run's history | **redacted** (`server/redact.py`) |
+| `user` | the client's stream and snapshot, when it asked with `?logs=user`; the operator console too | as written for the requester |
+
+**Never a file name or a patient's.** A `user` line is held to the progress
+message's rule (§4b) because it is read in the same panel. An `admin` line is
+redacted anyway -- any path, file name with a data suffix, address, or token
+mixing letters with two or more digits is replaced by what it was -- but the
+redaction is a net, not a licence.
+
+A log line is never progress: it carries no fraction, is counted apart from
+`MAX_RUN_EVENTS` (500 per reader), and is read as a running tool's whatever
+phase or state it claims.
+
+`sup.log(message)`, one argument, is what the method always accepted and stays
+an `info` line for the operator. The supervisor's own narration (`running
+'ALI_CBCT'`, a channel grant) goes to stderr only and never into the file.
+
+### 4f. Why a run failed
+
+The runner records, beside the exception's class name, where it came from:
+
+```json
+{"error": {"type": "KeyError", "message": "...",
+           "origin": {"tool": "ALI_CBCT", "chain": ["AREG", "ASO", "ALI_CBCT"],
+                      "error_type": "KeyError", "message": "...",
+                      "where": "sadt_ali_cbct/engine.py:742 in _predict",
+                      "stage": "scan 3 of 8", "fraction": 0.375}}}
+```
+
+Written by the level that raised and relayed unchanged by every level above,
+so the root's record names the tool that actually broke. `where` is the
+innermost frame in the tool's own `src/`, a place in code. `stage` is the last
+progress message that level wrote.
+
+The server turns it into a diagnosis -- redacted, every field checked against
+the shape it may have -- and keeps it in the run's ledger record, shown at the
+top of the operator page's run dialog and as the console's last line. When
+nothing below recorded an origin (a crash, a timeout, a 422 from validation),
+what the server knows stands in: the tool asked for, the calls still open, and
+the first line of the exception. The failure's server log line is the same
+diagnosis, redacted the same way.
+
+None of it is on the client's stream: the requester gets the status code and
+the message it always got.
 
 ## 5. Storage, and why it is not the job directory
 
@@ -347,6 +458,8 @@ container exists.
   error dialog.
 - Treats a `404` from the events endpoint as an older server: stop watching, say
   nothing, keep the elapsed timer.
+- May ask for `?logs=user` and show those lines in a log pane, never in place of
+  the progress message. A server that predates log lines ignores the parameter.
 
 ---
 
@@ -357,7 +470,8 @@ container exists.
 | `server/wire/runs.py` | the registry: register, append, read, cancel, reap |
 | `server/main.py` | the header, the phases, the three endpoints, `499` |
 | `server/execution/dispatch.py` | the cancel checks, the `pgid`, `queued_gpu`, the kill |
-| `server/execution/runner.py` | `sup.progress()` also appending to the file |
+| `server/execution/runner.py` | `sup.progress()` and `sup.log()` appending to the file, call ids, spans, a failure's origin |
+| `server/redact.py` | what a tool's words lose before an operator reads them |
 | `server/tests/test_runs.py` | all of it, with no GPU, no weights and no network |
 
 `runs.py` is `transfer.py`'s discipline applied to a second kind of ephemeral

@@ -40,6 +40,7 @@ from execution import admission, costs, dispatch, reports, runner
 from registry import facade
 from registry.facade import FacadeTool
 import file_utils
+import redact
 import resources
 import benchmark_jobs
 import benchmark_presets
@@ -203,6 +204,16 @@ _ACCEPT_ALL_EXTENSIONS = "*"
 #   without its `segmentation` extra), which no request can fix;
 #   anything else is opaque and answers 500 with a fixed message, because a
 #   crash inside a tool can name server-side paths.
+def _tool_error_status(kinds) -> int:
+    """The status for a tool's exception, from its class name or, failing
+    that, the nearest base class this table names -- a tool's own subclass of
+    `ToolInputError` is the caller's fault the way its base is. 500 otherwise."""
+    for kind in kinds or ():
+        if kind in TOOL_ERROR_STATUS:
+            return TOOL_ERROR_STATUS[kind]
+    return status.HTTP_500_INTERNAL_SERVER_ERROR
+
+
 TOOL_ERROR_STATUS = {
     "ToolInputError": status.HTTP_422_UNPROCESSABLE_CONTENT,
     "ValueError": status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -1266,10 +1277,16 @@ def server_debug_run(run_id: str) -> dict:
     wrote turns into "42% · scan 14 of 40"-shaped text built from the fraction
     alone, so a chatty tool produces a busier console than a silent one without
     a character of its text being republished.
+
+    **The one exception is a tool's LOG**, `sup.log(...)`: lines written to be
+    read by whoever runs the server, shown here at their level -- and passed
+    through `redact.scrub` first, so the sentence reaches the operator and any
+    path, file name or identifier in it does not. A failed run ends with its
+    diagnosis: which tool in the chain broke, at which line, and why.
     """
     record = telemetry.ledger_record(run_id)
     try:
-        events = runs.read_events(run_id)
+        events = runs.read_events(run_id, logs=runs.LOG_AUDIENCES)
     except runs.RunError as exc:
         # Reaped, which is the normal state of a run that finished more than a
         # few minutes ago. Its timeline survives in the ledger, so the page can
@@ -1277,13 +1294,16 @@ def server_debug_run(run_id: str) -> dict:
         if record is None:
             raise _run_error(exc)
         return {
-            "run_id": run_id, "lines": [], "reaped": True, "record": record,
+            "run_id": run_id, "lines": _kept_lines(record), "reaped": True, "record": record,
             "timeline": {"spans": record.get("spans") or [],
                          "nested": record.get("nested") or [],
                          "chain": [], "measured": record.get("measured")},
         }
     lines = []
     for event in events:
+        if event.get("kind") == runs.LOG_KIND:
+            lines.append(_log_line(event))
+            continue
         phase = event.get("phase") or runs.PHASE_RUNNING
         fraction = event.get("fraction")
         text = _ACTIVITY_TEXT.get(phase, phase)
@@ -1299,8 +1319,46 @@ def server_debug_run(run_id: str) -> dict:
             "level": _ACTIVITY_LEVEL.get(phase, "info"),
             "text": text,
         })
+    if record and record.get("failure"):
+        lines.append(_failure_line(record["failure"], record.get("ended_at")))
     return {"run_id": run_id, "lines": lines, "reaped": False, "record": record,
             "timeline": runs.timeline(events)}
+
+
+_LOG_CONSOLE_LEVEL = {"debug": "info", "info": "info", "warning": "warn", "error": "error"}
+
+
+def _log_line(event: dict) -> dict:
+    """A tool's log line as a console line: its level, its source, redacted."""
+    source = event.get("source")
+    text = redact.scrub(event.get("message"))
+    if event.get("audience") == runs.LOG_AUDIENCE_USER:
+        text = "(shown to the user) " + text
+    return {
+        "seq": event.get("seq"), "at": event.get("at"),
+        "depth": event.get("depth", 0), "phase": runs.PHASE_RUNNING,
+        "state": runs.STATE_RUNNING, "fraction": None, "kind": runs.LOG_KIND,
+        "level": _LOG_CONSOLE_LEVEL.get(event.get("level"), "info"),
+        "text": f"[{source}] {text}" if source else text,
+    }
+
+
+def _failure_line(failure: dict, at) -> dict:
+    return {"seq": None, "at": at, "depth": 0, "phase": runs.PHASE_FAILED,
+            "state": runs.STATE_FAILED, "fraction": None, "kind": "failure",
+            "level": "error", "text": "failed in " + _described(failure)}
+
+
+def _kept_lines(record: Optional[dict]) -> list:
+    """What a reaped run's console can still show: the warnings and errors its
+    ledger kept, already redacted, and how it failed."""
+    if not record:
+        return []
+    lines = [_log_line(dict(line, kind=runs.LOG_KIND, message=line.get("message")))
+             for line in record.get("logs") or ()]
+    if record.get("failure"):
+        lines.append(_failure_line(record["failure"], record.get("ended_at")))
+    return lines
 
 
 def _benchmark_schemas() -> dict:
@@ -1750,7 +1808,8 @@ def tool_pairs(tool_name: str, wanted: _PairsRequest) -> dict:
                                 detail=f"{tool.name} could not pair these inputs.")
         if "error" in body:
             error = body["error"] or {}
-            code = TOOL_ERROR_STATUS.get(error.get("type"), status.HTTP_500_INTERNAL_SERVER_ERROR)
+            bases = error.get("bases") if isinstance(error.get("bases"), list) else []
+            code = _tool_error_status([error.get("type")] + bases)
             detail = error.get("message") if code < 500 else f"{tool.name} could not pair these inputs."
             raise HTTPException(status_code=code, detail=detail)
         answer = body.get("result") or {}
@@ -2089,22 +2148,36 @@ def _run_error(exc: runs.RunError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=str(exc))
 
 
+def _client_logs(logs: str) -> tuple:
+    """The log audiences a CLIENT may ask for: `user`, or none.
+
+    `admin` is not among them whatever is asked: an operator's line is read on
+    the operator page, redacted, and the API token is held by every
+    workstation. Absent is none, which is what keeps a client released before
+    log lines existed from rendering one as progress.
+    """
+    wanted = {part.strip() for part in (logs or "").split(",")}
+    return (runs.LOG_AUDIENCE_USER,) if runs.LOG_AUDIENCE_USER in wanted else ()
+
+
 @app.get("/runs/{run_id}", dependencies=[Depends(verify_token)])
-async def run_snapshot(run_id: str) -> dict:
+async def run_snapshot(run_id: str, logs: str = "") -> dict:
     """Where a run stands, and every event it has written.
 
     For tests, for debugging, and for a client that cannot hold a streaming
     connection open. The Slicer client watches the event stream instead, so
-    nothing here is on any hot path.
+    nothing here is on any hot path. `?logs=user` adds the log lines a tool
+    wrote for the person who started the run.
     """
     try:
-        return await anyio.to_thread.run_sync(runs.snapshot, run_id)
+        return await anyio.to_thread.run_sync(
+            functools.partial(runs.snapshot, run_id, logs=_client_logs(logs)))
     except runs.RunError as exc:
         raise _run_error(exc)
 
 
 @app.get("/runs/{run_id}/events", dependencies=[Depends(verify_token)])
-async def run_events(run_id: str) -> StreamingResponse:
+async def run_events(run_id: str, logs: str = "") -> StreamingResponse:
     """Server-Sent Events, oldest first, INCLUDING what was written before this
     watcher connected.
 
@@ -2117,14 +2190,19 @@ async def run_events(run_id: str) -> StreamingResponse:
     The file is read in a worker thread, never on the event loop: this handler
     lives for the whole run -- hours, for a cohort -- and a blocking read here
     would stall every other request for as long as it took.
+
+    `?logs=user` interleaves the log lines a tool wrote for the requester, as
+    events with `"kind": "log"`. Without it there are none, which is what a
+    client released before they existed needs: it would draw one as progress.
     """
     try:
         directory = await anyio.to_thread.run_sync(runs.run_directory, run_id)
     except runs.RunError as exc:
         raise _run_error(exc)
+    audiences = _client_logs(logs)
 
     async def frames():
-        reader = runs.EventReader(directory)
+        reader = runs.EventReader(directory, logs=audiences)
         while True:
             for event in await anyio.to_thread.run_sync(reader.read):
                 yield f"data: {json.dumps(event)}\n\n".encode("utf-8")
@@ -2462,12 +2540,107 @@ def _failure_message(exc: BaseException) -> str:
     if isinstance(exc, HTTPException):
         return str(exc.detail)
     if isinstance(exc, dispatch.ToolFailure):
-        if exc.error_type in TOOL_ERROR_STATUS:
+        if _tool_error_status(exc.kinds) != 500:
             return exc.message
         return "Tool execution failed."
     if isinstance(exc, (ToolArgumentError, ToolUnavailableError)):
         return str(exc)
     return "Tool execution failed."
+
+
+# What a diagnosis may carry, field by field. A location in a tool's source is
+# code, not data, so it travels as written -- but only in this shape.
+_ERROR_TYPE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{0,63}")
+_SOURCE_LOCATION = re.compile(r"[A-Za-z0-9_./-]{1,200}:[0-9]{1,6} in [A-Za-z0-9_<>]{1,80}")
+
+
+def _diagnosis(exc: BaseException, tool_name: Optional[str],
+               run_id: Optional[str] = None) -> dict:
+    """Why a run failed and where, for the OPERATOR: `{tool, chain, error_type,
+    reason, where, stage, fraction, status}`, every free-text field redacted.
+
+    The runner records where a tool raised (`runner._origin_of`) and every
+    level above relays it, so a failure three calls down names the leaf, its
+    line, and the last thing it said it was doing. When nothing below said
+    anything -- a crash, a timeout, a 422 from validation -- what this server
+    knows stands in: the tool asked for, the calls still open, the exception.
+    """
+    found, status_code = None, None
+    seen, current = 0, exc
+    while current is not None and seen < 6:
+        if isinstance(current, HTTPException) and status_code is None:
+            status_code = current.status_code
+        if isinstance(current, dispatch.ToolFailure):
+            found = current
+            break
+        if found is None and not isinstance(current, HTTPException):
+            found = current
+        current = current.__cause__ or current.__context__
+        seen += 1
+    found = found or exc
+
+    origin = getattr(found, "origin", None) or {}
+    chain = [name for name in (runs._clean_tool_name(entry)
+                               for entry in origin.get("chain") or ()) if name]
+    if not chain and run_id:
+        try:
+            chain = [tool_name] + runs.timeline(runs.read_events(run_id))["chain"]
+        except runs.RunError:
+            chain = []
+    chain = [name for name in chain if name] or ([tool_name] if tool_name else [])
+    error_type = origin.get("error_type") or (
+        found.error_type if isinstance(found, dispatch.ToolFailure) else type(found).__name__)
+    if isinstance(found, dispatch.ToolFailure):
+        reason = origin.get("message") or found.message
+    elif isinstance(found, HTTPException):
+        reason = found.detail
+    else:
+        # The first line only: a ToolExecutionError carries the stderr tail
+        # after it, and that belongs in the server's log, not on a page.
+        reason = str(found).split("\n", 1)[0]
+    diagnosis = {
+        "tool": runs._clean_tool_name(origin.get("tool")) or (chain[-1] if chain else None),
+        "chain": chain,
+        "error_type": error_type if _ERROR_TYPE.fullmatch(str(error_type)) else "Error",
+        "reason": redact.scrub(reason),
+    }
+    if status_code is not None:
+        diagnosis["status"] = status_code
+    where = origin.get("where")
+    if isinstance(where, str) and _SOURCE_LOCATION.fullmatch(where):
+        diagnosis["where"] = where
+    if origin.get("stage"):
+        diagnosis["stage"] = redact.scrub(origin["stage"])
+    fraction = origin.get("fraction")
+    if isinstance(fraction, (int, float)) and 0.0 <= fraction <= 1.0:
+        diagnosis["fraction"] = fraction
+    return diagnosis
+
+
+def _described(diagnosis: dict) -> str:
+    """A diagnosis as one log line: `AREG > ASO > ALI_CBCT: KeyError at ... -- why`."""
+    text = "{}: {}".format(" > ".join(diagnosis.get("chain") or ["?"]),
+                           diagnosis.get("error_type"))
+    if diagnosis.get("where"):
+        text += " at " + diagnosis["where"]
+    if diagnosis.get("stage"):
+        text += " during '{}'".format(diagnosis["stage"])
+    if diagnosis.get("reason"):
+        text += " -- " + diagnosis["reason"]
+    return text
+
+
+def _run_diagnosis(exc: BaseException, run_id: str, tool_name: Optional[str] = None):
+    """`_diagnosis` for a registered run, or None for one that was cancelled.
+    Never raises: it runs on a failure path, where a second error would hide
+    the first."""
+    if isinstance(exc, dispatch.RunCancelled):
+        return None
+    try:
+        return _diagnosis(exc, tool_name or runs.meta(run_id).get("tool"), run_id)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not diagnose a failed run")
+        return None
 
 
 def _collectable(response) -> dict:
@@ -2516,8 +2689,13 @@ async def _detached_run(tool_name: str, request: Request, run_id: str) -> None:
     except dispatch.RunCancelled:
         runs.finish(run_id, runs.PHASE_CANCELLED)
     except BaseException as exc:  # noqa: BLE001 - nobody is left to raise to
-        logger.warning("endpoint=/run/%s detached failure: %s", tool_name, exc)
-        runs.finish(run_id, runs.PHASE_FAILED, message=_failure_message(exc))
+        diagnosis = _run_diagnosis(exc, run_id, tool_name)
+        # Redacted, like every line about a failure: the exception's own text
+        # is a tool's words and may name the file it died on.
+        logger.warning("endpoint=/run/%s detached failure: %s", tool_name,
+                       _described(diagnosis))
+        runs.finish(run_id, runs.PHASE_FAILED, message=_failure_message(exc),
+                    failure=diagnosis)
     finally:
         runs.CURRENT_RUN.reset(token)
         try:
@@ -2761,11 +2939,12 @@ async def _tracked_run(run_id: str, label: str, background_tasks: BackgroundTask
         raise HTTPException(
             status_code=CLIENT_CLOSED_REQUEST, detail="Run cancelled by the client."
         )
-    except BaseException:
+    except BaseException as exc:
         # Every failure path, the 404 for an unknown tool included -- the tool
         # is resolved after the run is registered, so that one now has a
         # directory to clean up like any other.
-        runs.finish(run_id, runs.PHASE_FAILED)
+        runs.finish(run_id, runs.PHASE_FAILED,
+                    failure=_run_diagnosis(exc, run_id))
         runs.discard(run_id)
         raise
     finally:
@@ -3260,7 +3439,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # exception type to isinstance-check -- there is no shared package --
         # so the NAME decides, and only the names that mean "the caller can fix
         # this" let their message through.
-        code = TOOL_ERROR_STATUS.get(exc.error_type, 500)
+        code = _tool_error_status(exc.kinds)
         logger.warning("endpoint=/run/%s status=%d error=%s", tool_name, code, exc.error_type)
         if code == 500:
             # The ONLY place this exists. A 4xx carries its message to the
@@ -3268,8 +3447,11 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             # directory holding stderr.log is discarded on the next line, so
             # without this the tool's traceback is gone -- which is exactly
             # what makes a failing tool undiagnosable from the outside.
-            # Server-side only, as _stderr_tail intends.
-            logger.error("endpoint=/run/%s failure:\n%s", tool_name, exc.message)
+            # Server-side only, and redacted: the message is the tool's own
+            # words and may name the file it died on (see redact.py). Where it
+            # broke and why survive that; the name does not.
+            logger.error("endpoint=/run/%s failure: %s", tool_name,
+                         _described(_diagnosis(exc, tool_name)))
         _discard(work_dir, scratch_dirs)
         raise HTTPException(
             status_code=code,

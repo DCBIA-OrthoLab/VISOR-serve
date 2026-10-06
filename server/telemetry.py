@@ -337,6 +337,7 @@ def _ledger_record(run_id: str) -> Optional[dict]:
             "files": None, "input_bytes": None, "arguments": None,
             "inputs": None, "settings": None,
             "spans": None, "nested": None, "measured": None, "batch": None,
+            "failure": None, "logs": None,
         }
         _ledger[run_id] = record
         while len(_ledger) > LEDGER_SIZE:
@@ -517,13 +518,19 @@ def record_run_grant(run_id: str, channels=None, cpus=None, ram_bytes=None,
 
 
 def record_run_end(run_id: str, outcome: str, phase: str = "",
-                   timeline: Optional[dict] = None) -> None:
+                   timeline: Optional[dict] = None, failure: Optional[dict] = None,
+                   logs: Optional[list] = None) -> None:
     """How it ended, and therefore how long it occupied this server.
 
     `timeline` is `runs.timeline()` of the run's events, taken just before its
     directory is discarded: the phases and the nested calls are what the
     operator page draws a finished run from, and after this call nothing else
     holds them.
+
+    `failure` and `logs` are why a failed run failed, and the warnings and
+    errors its tools logged -- both REDACTED by `wire/runs` and `main` before
+    they arrive (see `redact.py`). They are the only text in a ledger record
+    a tool had any hand in, and none of it is as the tool wrote it.
 
     Guarded for the same reason `record_run_start` is: `runs.finish` is the one
     funnel every ending passes through, and a run that completed must not be
@@ -543,6 +550,10 @@ def record_run_end(run_id: str, outcome: str, phase: str = "",
                 record["spans"] = timeline.get("spans") or []
                 record["nested"] = timeline.get("nested") or []
                 record["measured"] = timeline.get("measured")
+            if failure:
+                record["failure"] = dict(failure)
+            if logs:
+                record["logs"] = list(logs)
             finished = dict(record)
         _persist(finished)
     except Exception:  # noqa: BLE001 - telemetry must never fail a run

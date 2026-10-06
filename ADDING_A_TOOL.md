@@ -52,7 +52,22 @@ def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
 
 Six members, nothing more: `sup.run(tool, **params)` (blocking, returns what
 that tool's `run()` returned), `sup.out`, `sup.tmp`, `sup.channels(wanted)`,
-`sup.progress(fraction, message)`, `sup.log(message)`.
+`sup.progress(fraction, message)`, `sup.log(message, level="info", user=False)`.
+
+- **Give a call its share of your bar.** `sup.run("ALI_CBCT", ...,
+  _progress=(0.2, 0.6))` says the call fills 0.2..0.6 of THIS tool's bar; the
+  server folds the callee's own 0..1 into that span, at every depth, so the
+  clinician sees one bar that only moves forward. `_progress` is the
+  supervisor's and never reaches the callee. One span per call: two calls in a
+  loop each get their own slice, the way `progress.report(start=, end=)`
+  slices a loop. See `RUN_PROGRESS.md` §4d.
+- **`sup.log` is the tool's voice to the people around the run.** `level` is
+  `debug`, `info`, `warning` or `error`. `user=False` (default) reaches the
+  operator page, redacted, and a warning or error is kept with the run's
+  history; `user=True` reaches the clinician's panel. Neither may name a file
+  or a patient -- the operator copy is redacted anyway, the clinician's is not.
+  One positional argument still means what it always meant. See
+  `RUN_PROGRESS.md` §4e.
 
 - **`sup.channels(wanted)` is how a tool that parallelises asks how widely it
   may.** `wanted` is the tool's OWN count of the things it is about to loop

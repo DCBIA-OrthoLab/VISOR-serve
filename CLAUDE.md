@@ -572,6 +572,52 @@ concurrently in worker threads, capped by `MAX_CONCURRENT_TOOLS`).
 
 ## Changelog
 
+### 2026-10-06 - A tool can log, a chain has one bar, and a failure says where
+
+Three gaps, all on the path between a tool and the people watching it.
+
+**A tool had no way to address anyone.** `sup.log(message)` went to stderr at
+INFO, which nobody reads, and no tool called it. It is now
+`sup.log(message, level="info", user=False)`: one record in the run's events
+file, `{"kind": "log", "level", "audience"}`. `admin` lines (the default) reach
+the operator console redacted; `user` lines reach the client's stream ONLY when
+it asks with `?logs=user`, because the Slicer client released before this
+treats every event as progress and would blank its bar on one and show an
+operator's line to the clinician. Log lines are counted apart from
+`MAX_RUN_EVENTS` and can claim no phase. The supervisor's own narration moved
+to `_say`, stderr only, so the tool's voice is not buried under its mechanics.
+One-argument `sup.log` keeps working, which is what a dozen fakes in
+SADT-VISOR's tests rely on.
+
+**A chain's bar restarted at every level.** ASO's bar ran 0..0.2, then
+ALI_CBCT's own 0..1, then 0.6..1. `sup.run(tool, ..., _progress=(start, end))`
+gives a call its span of the caller's bar; the runner takes it out of the
+params like `output_dir` and puts it on the call's markers, which also carry a
+per-call id (`SADT_PROGRESS_CALL`, `"1"`, `"1.2"`) that every record of that
+process is stamped with. `wire/runs._ProgressTree` folds the records as it
+reads them, so `fraction` on the wire is the outermost weighted level's
+position and only moves forward; `own_fraction` keeps the record's own. A chain
+nobody weighted reads byte for byte as it did, which is what kept every
+existing test green. A tool's untagged `progress.py` line is attributed to the
+one open call, and left alone when two are open.
+
+**An operator could not tell why a run failed.** The page showed `failed` and
+nothing else; the 500 path logged the tool's raw message, file names included.
+The runner now records an `origin` with the error -- tool, chain, error type,
+the line in the tool's own `src/`, the last stage it reported -- relayed
+unchanged by every level above, so a failure three calls down names the leaf.
+`main._diagnosis` turns it into a redacted record kept in the run ledger,
+shown at the top of the run dialog and as the console's last line, and logged
+as one redacted line in place of the raw message. `redact.scrub` replaces
+paths, data file names, addresses and letter-digit identifiers by their kind;
+it over-redacts on purpose.
+
+The other two repositories follow on branches of the same name: SADT-VISOR's
+`progress.py` stamps `call` and gains `progress.log`, every orchestrator gives
+its nested calls a `_progress` span, and every tool's failures name the item,
+the step and the cause; the Slicer client asks for `?logs=user` and shows the
+lines in a Messages pane.
+
 ### 2026-10-06 - A channel may bring its own cores
 
 `cores_per_channel` in `deployment.toml`: each channel of the tool reserves a

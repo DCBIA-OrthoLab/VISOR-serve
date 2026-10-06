@@ -1450,22 +1450,42 @@ DEBUG_PAGE = r"""<!doctype html>
       kpi("started", started ? clock(started) : "—") + "</div>";
 
     var lines = data.lines || [];
+    var conLines = function () {
+      return '<div class="con">' + lines.map(function (line) {
+        var padding = new Array(Math.min(line.depth || 0, 4) + 1).join("  ");
+        return '<div class="ln ' + esc(line.level) + '"><span class="ts">' + clock(line.at || 0) +
+          '</span><span class="tx">' + esc(padding + line.text) + "</span></div>";
+      }).join("") + "</div>";
+    };
     var con = dlg.error ? '<div class="con"><div class="ln error"><span class="tx">' + esc(dlg.error) + "</span></div></div>"
-      : data.reaped ? '<div class="empty" style="text-align:left">The console is kept only while a run is on the server; its timeline above is from the history.</div>'
-      : lines.length ? '<div class="con">' + lines.map(function (line) {
-          var padding = new Array(Math.min(line.depth || 0, 4) + 1).join("  ");
-          return '<div class="ln ' + esc(line.level) + '"><span class="ts">' + clock(line.at || 0) +
-            '</span><span class="tx">' + esc(padding + line.text) + "</span></div>";
-        }).join("") + "</div>"
+      : data.reaped ? (lines.length ? conLines() : "") +
+          '<div class="empty" style="text-align:left">The full console is kept only while a run is on the server; ' +
+          (lines.length ? "the warnings and errors above, and its timeline, are from the history." : "its timeline above is from the history.") + "</div>"
+      : lines.length ? conLines()
       : '<div class="empty" style="text-align:left">Nothing reported yet.</div>';
+    var failure = led.failure ? section("Why it failed", failureHtml(led.failure)) : "";
 
-    return head + '<div class="dbody">' + section("Timeline", timeline) + kpis +
+    return head + '<div class="dbody">' + failure + section("Timeline", timeline) + kpis +
       '<div class="two">' + section("Inputs", inputsHtml(led)) + section("Settings", settingsHtml(led)) + "</div>" +
       section("Console", con) +
       '<div class="caveat">Argument values are deliberately not held anywhere on this page: an uploaded input is ' +
       "never named, only its shape (files, bytes, extensions). A hosted bundle is named, because this deployment " +
       "staged it. Console lines are composed by the server from the phase the run reported, never quoted from " +
-      "what the tool printed.</div></div>";
+      "what the tool printed; a tool's own log lines and failure reason are shown redacted \u2014 paths, file " +
+      "names and identifiers replaced by what they were.</div></div>";
+  }
+
+  function failureHtml(f) {
+    var row = function (label, value) {
+      return value == null || value === "" ? "" :
+        '<div class="ln"><span class="ts">' + esc(label) + '</span><span class="tx">' + esc(String(value)) + "</span></div>";
+    };
+    return '<div class="con">' +
+      row("in", (f.chain || []).join(" \u203a ") || f.tool) +
+      row("error", f.error_type + (f.status ? " (HTTP " + f.status + ")" : "")) +
+      row("at", f.where) +
+      row("during", f.stage == null ? null : f.stage + (f.fraction == null ? "" : " \u00b7 " + (f.fraction * 100).toFixed(0) + "%")) +
+      row("reason", f.reason) + "</div>";
   }
 
   // ---- maintenance & updates ------------------------------------------
@@ -1871,7 +1891,30 @@ DEBUG_PAGE = r"""<!doctype html>
       timeChart(mSeries, mt0, mt1, { height: 130, marks: marks }))
       : '<div class="empty" style="text-align:left">The machine trace covers the last six hours of this process only.</div>';
 
-    return head + '<div class="dbody">' + kpis + dataSection(name, data.data) + section("Where the time goes, on average", stack) +
+    // What the tool said, and why it failed, run by run: the failure and the
+    // lines its history kept, already redacted by the server. A row opens the
+    // run itself.
+    var talked = runsOf.filter(function (r) { return r.failure || (r.logs || []).length; }).slice(0, 12);
+    var messages = talked.length ? '<div class="con">' + talked.map(function (r) {
+        var rows = '<div class="ln ' + (r.outcome === "failed" ? "error" : "info") + ' click" data-run="' + esc(r.run_id) +
+          '"><span class="ts">' + clock(r.started_at || 0) + '</span><span class="tx"><b>' + esc(r.outcome || "running") +
+          "</b> \u00b7 " + esc(r.client || "") + " \u00b7 " + esc(r.run_id.slice(0, 8)) + "</span></div>";
+        (r.logs || []).forEach(function (l) {
+          rows += '<div class="ln ' + (l.level === "error" ? "error" : l.level === "warning" ? "warn" : "info") +
+            '"><span class="ts">' + clock(l.at || 0) + '</span><span class="tx">' +
+            esc("  " + (l.source ? "[" + l.source + "] " : "") + l.message) + "</span></div>";
+        });
+        if (r.failure) {
+          rows += '<div class="ln error"><span class="ts">' + clock(r.ended_at || 0) + '</span><span class="tx">' +
+            esc("  failed in " + (r.failure.chain || []).join(" \u203a ") + ": " + r.failure.error_type +
+                (r.failure.where ? " at " + r.failure.where : "") + (r.failure.reason ? " \u2014 " + r.failure.reason : "")) +
+            "</span></div>";
+        }
+        return rows;
+      }).join("") + "</div>"
+      : '<div class="empty" style="text-align:left">No message or failure recorded for this tool yet.</div>';
+
+    return head + '<div class="dbody">' + kpis + section("Recent messages", messages) + dataSection(name, data.data) + section("Where the time goes, on average", stack) +
       section("Recent runs, each from its own start", runsGantt) +
       '<div class="two">' +
       section("Duration of each run", '<div class="legend"><span><i style="background:var(--accent)"></i>took</span>' +
