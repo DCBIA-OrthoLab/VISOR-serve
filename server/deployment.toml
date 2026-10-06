@@ -45,6 +45,21 @@ data_dir = "AREG"
 # cannot be a baseline, and offering them put a folder of `.vtk` one click away
 # from a CBCT picker.
 server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:CBCT_T1", t2 = "testfile:CBCT_T2" }
+# Its channels are REGISTRATIONS -- one region of one subject each, run side by
+# side and each on one elastix thread -- and it asks for its width at run time
+# (`sup.channels`), once it has paired the subjects. The subjects cannot be
+# counted from outside: `t1` and `t2` are two paired folders. The regions can,
+# so they bound the reservation: a two-region run reserves at most two
+# registrations' worth for its whole life, where an unbounded ladder would hold
+# every registration the machine could afford through hours of nested calls.
+# A cohort therefore runs no wider than its region count; that is the cost of
+# reserving before the tool can say how many subjects it paired.
+width_from = "regions"
+# And each registration brings its own share of cores: elastix scales with the
+# threads it is given (97 s on ten, 43 s on fifty-six), so two registrations
+# side by side on ten threads each finish in about the time of one (102 and
+# 115 s against 97), where dividing ten threads between them gained nothing.
+cores_per_channel = true
 
 [tools.AREG_IOS]
 data_dir = "AREG"
