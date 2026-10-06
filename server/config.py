@@ -196,6 +196,14 @@ class Settings(BaseSettings):
     # same call that writes the document, so the page and the report cannot
     # disagree with each other.
     SADT_BENCHMARK_DIR: str = "/benchmarks"
+    # Where a battery launched from /benchmark writes its summary. Empty means
+    # "decide": SADT_BENCHMARK_DIR when this process may write there (the dev
+    # compose mounts it read-write), otherwise `batteries/` under
+    # SCHEMA_CACHE_DIR -- the one directory the image already gives the server
+    # to write, on a volume that survives a recreated container. The released
+    # compose mounts nothing at /benchmarks, so a battery that insisted on it
+    # failed to start at all. GET /benchmarks reads both.
+    SADT_BATTERY_DIR: str = ""
 
     # --- splitting a cohort -------------------------------------------
     #

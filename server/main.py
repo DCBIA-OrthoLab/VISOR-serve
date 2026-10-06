@@ -545,8 +545,48 @@ def _output_roots(outputs: list, work_dir: str) -> set:
 
 
 
+def _writable(directory: str) -> bool:
+    """Whether this process could write a file in `directory`, creating it if need be."""
+    if os.path.isdir(directory):
+        return os.access(directory, os.W_OK | os.X_OK)
+    parent = os.path.dirname(os.path.abspath(directory))
+    return os.path.isdir(parent) and os.access(parent, os.W_OK | os.X_OK)
+
+
+def _battery_dir() -> str:
+    """Where a battery launched from the page writes its summary (see config)."""
+    if settings.SADT_BATTERY_DIR:
+        return settings.SADT_BATTERY_DIR
+    if _writable(settings.SADT_BENCHMARK_DIR):
+        return settings.SADT_BENCHMARK_DIR
+    return os.path.join(settings.SCHEMA_CACHE_DIR, "batteries")
+
+
+def _campaign_files() -> dict:
+    """{summary name: path}, over the campaigns and the batteries alike.
+
+    Two directories, because a deployment may write the one and only read the
+    other; the first to hold a name keeps it.
+    """
+    files = {}
+    seen = set()
+    for directory in (settings.SADT_BENCHMARK_DIR, _battery_dir()):
+        real = os.path.realpath(directory)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError:
+            continue
+        for name in names:
+            if _CAMPAIGN_NAME.fullmatch(name) and name not in files:
+                files[name] = os.path.join(directory, name)
+    return files
+
+
 def _campaign_index() -> list:
-    """One entry per campaign summary in SADT_BENCHMARK_DIR, newest first.
+    """One entry per campaign or battery summary, newest first.
 
     A missing directory is not an error and neither is an empty one: a
     production deployment runs no campaign, and "nothing measured here" is the
@@ -554,16 +594,8 @@ def _campaign_index() -> list:
     alone -- a campaign still being written must not take the endpoint down for
     the ones already finished.
     """
-    directory = settings.SADT_BENCHMARK_DIR
-    try:
-        names = sorted(os.listdir(directory))
-    except OSError:
-        return []
     index = []
-    for name in names:
-        if not _CAMPAIGN_NAME.fullmatch(name):
-            continue
-        path = os.path.join(directory, name)
+    for name, path in _campaign_files().items():
         try:
             size = os.path.getsize(path)
             with open(path, encoding="utf-8") as handle:
@@ -629,8 +661,13 @@ def benchmark_report(campaign: Optional[str] = None) -> dict:
             raise HTTPException(status_code=404, detail="No such campaign.")
     if chosen is None:
         return {"campaign": None, "campaigns": []}
-    with open(os.path.join(settings.SADT_BENCHMARK_DIR, chosen), encoding="utf-8") as handle:
-        report = json.load(handle)
+    path = _campaign_files().get(chosen)
+    try:
+        with open(path or "", encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError):
+        # Gone or half-written between the listing and the read.
+        raise HTTPException(status_code=404, detail="No such campaign.")
     # The file does not carry its own name; the picker keys every option on it.
     report["source"] = chosen
     return {"campaign": report, "campaigns": index}
@@ -1455,7 +1492,7 @@ def benchmark_start(request: Request, body: BatteryRequest) -> dict:
     base = f"{request.url.scheme}://{request.url.netloc}"
     try:
         return benchmark_jobs.start(
-            plan, settings.SADT_BENCHMARK_DIR, base, settings.API_TOKEN,
+            plan, _battery_dir(), base, settings.API_TOKEN,
             os.path.join(settings.TEMP_DIR, "benchmarks"))
     except benchmark_jobs.BatteryError as exc:
         raise HTTPException(status_code=409, detail=str(exc))
