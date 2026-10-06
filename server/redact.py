@@ -2,7 +2,7 @@
 
 A tool's failure message or log line is free text, and free text written by
 code that handles patient data names patient data sooner or later: `No scan
-found in /tmp/job/P05_T1_Or.nii.gz`, a GreedyReg error listing every pair it
+found in /tmp/job/S17_T1_Or.nii.gz`, a GreedyReg error listing every pair it
 skipped by patient key. The operator needs the SENTENCE -- "no scan found",
 "3 of 7 landmarks" -- and never the name it was said about.
 
@@ -12,7 +12,7 @@ So everything that can carry a name is replaced by what it was:
 - a file name with an imaging/data suffix -> `<file>`
 - an e-mail address                       -> `<email>`
 - an IPv4 address                         -> `<address>`
-- a token mixing letters and two or more digits (`P05`, `C_0001`, `case12`)
+- a token mixing letters and two or more digits (`S17`, `AB_0042`, `case12`)
                                           -> `<id>`
 
 It over-redacts on purpose -- `float32` becomes `<id>` -- because the cost of

@@ -225,7 +225,7 @@ def test_a_log_line_names_the_tool_whose_call_wrote_it(run_id):
 
 def test_the_admin_console_shows_the_tools_lines_redacted(run_id):
     _write(run_id, _open("1", "AMASSS"),
-           _log("no mandible in /tmp/in/P05_T1.nii.gz", "warning", call="1", depth=1))
+           _log("no mandible in /tmp/in/S17_T1.nii.gz", "warning", call="1", depth=1))
 
     lines = client.get(f"/admin-panel/runs/{run_id}.json", headers=_panel()).json()["lines"]
     logged = [line for line in lines if line.get("kind") == "log"]
@@ -234,7 +234,7 @@ def test_the_admin_console_shows_the_tools_lines_redacted(run_id):
 
 
 def test_warnings_and_errors_outlive_the_run_redacted(run_id):
-    _write(run_id, _log("chatter"), _log("skipped C_0001", "warning"),
+    _write(run_id, _log("chatter"), _log("skipped AB_0042", "warning"),
            _log("cannot read /data/x.nrrd", "error"))
     runs.finish(run_id, runs.PHASE_FAILED, failure={
         "tool": "Caller", "chain": ["Caller"], "error_type": "KeyError", "reason": "<id>"})
@@ -257,12 +257,12 @@ class _Boom(Tool):
 
     def run(self):
         raise dispatch.ToolFailure(
-            "RuntimeError", "cannot open /tmp/job/P05_T1_Or.nii.gz",
+            "RuntimeError", "cannot open /tmp/job/S17_T1_Or.nii.gz",
             origin={"tool": "ALI_CBCT", "chain": ["AREG", "ASO", "ALI_CBCT"],
                     "error_type": "RuntimeError",
-                    "message": "cannot open /tmp/job/P05_T1_Or.nii.gz",
+                    "message": "cannot open /tmp/job/S17_T1_Or.nii.gz",
                     "where": "sadt_ali_cbct/engine.py:742 in _predict",
-                    "stage": "scan 3 of 8 (P05)", "fraction": 0.375})
+                    "stage": "scan 3 of 8 (S17)", "fraction": 0.375})
 
 
 def test_a_failed_run_says_where_and_why_and_never_whose(monkeypatch):
@@ -284,7 +284,7 @@ def test_a_failed_run_says_where_and_why_and_never_whose(monkeypatch):
 
 def test_a_diagnosis_without_an_origin_falls_back_on_what_the_server_knows():
     failure = _diagnosis(dispatch.ToolExecutionError(
-        "Tool 'AMASSS' exited with code -9:\nTraceback ... /tmp/P05.nii.gz"), "AMASSS")
+        "Tool 'AMASSS' exited with code -9:\nTraceback ... /tmp/S17.nii.gz"), "AMASSS")
 
     assert failure["chain"] == ["AMASSS"]
     assert failure["error_type"] == "ToolExecutionError"
@@ -294,7 +294,7 @@ def test_a_diagnosis_without_an_origin_falls_back_on_what_the_server_knows():
 
 def test_a_location_that_is_not_one_is_dropped():
     failure = _diagnosis(dispatch.ToolFailure("KeyError", "x", origin={
-        "where": "/home/someone/P05.nii.gz", "chain": ["A", "../etc"]}), "A")
+        "where": "/home/someone/S17.nii.gz", "chain": ["A", "../etc"]}), "A")
 
     assert "where" not in failure
     assert failure["chain"] == ["A"]
@@ -305,15 +305,15 @@ def test_a_location_that_is_not_one_is_dropped():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("text, expected", [
-    ("No scan found in /tmp/job/P05_T1_Or.nii.gz.", "No scan found in <path>"),
-    ("skipped pairs: C_0001 (no T2), P_002", "skipped pairs: <id> (no T2), <id>"),
+    ("No scan found in /tmp/job/S17_T1_Or.nii.gz.", "No scan found in <path>"),
+    ("skipped pairs: AB_0042 (no T2), Q_031", "skipped pairs: <id> (no T2), <id>"),
     ("read case.nrrd", "read <file>"),
     ("from 10.0.0.12 by a@b.org", "from <address> by <email>"),
     ("scan 14 of 40, mesh 3/40", "scan 14 of 40, mesh 3/40"),
     ("CUDA out of memory. Tried to allocate 2.00 GiB", "CUDA out of memory. Tried to allocate 2.00 GiB"),
     ("two\nlines", "two lines"),
     ("scan 1/1: preprocessed in 4.21s, ~35s left, 512MB", "scan 1/1: preprocessed in 4.21s, ~35s left, 512MB"),
-    ("case P05 took 12s", "case <id> took 12s"),
+    ("case S17 took 12s", "case <id> took 12s"),
 ])
 def test_redaction_keeps_the_sentence_and_drops_the_names(text, expected):
     assert scrub(text) == expected
