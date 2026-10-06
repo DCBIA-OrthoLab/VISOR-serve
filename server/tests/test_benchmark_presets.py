@@ -131,25 +131,50 @@ def test_an_input_a_mode_requires_is_sent_although_the_facade_calls_it_optional(
 def test_an_optional_input_is_left_alone_when_the_tool_already_has_one():
     """The guard against helping too much, and it is not hypothetical.
 
-    ASO declares an optional `landmarks` folder behind a `visible_when` as
-    well -- but supplying it is what makes ASO register on the caller's points
-    INSTEAD of asking the landmark tool for them. Filling it would turn a
-    benchmark of the ASO-to-ALI chain into a benchmark of ASO alone, and the
-    number would read as an improvement.
+    ASO declares an optional `landmarks` folder, shown in every mode -- and
+    supplying it is what makes ASO register on the caller's points INSTEAD of
+    asking the landmark tool for them. Filling it would turn a benchmark of the
+    ASO-to-ALI chain into a benchmark of ASO alone, and the number would read
+    as an improvement. Optional everywhere means the tool has its own answer.
     """
     resolved = presets.resolve_arguments(
         schema(
             input=argument(selectable="testfile"),
-            automation=argument(kind="choice",
-                                choices={"Fully-Automated": True, "Semi": False}),
-            landmarks=dict(argument(required=False, selectable="testfile"),
-                           visible_when={"automation": ["Fully-Automated"]}),
+            landmarks=argument(required=False, selectable="testfile"),
         ),
         {"testfiles": ["CBCT_FullyAuto"]})
 
-    assert resolved["params"] == {"input": "CBCT_FullyAuto",
-                                  "automation": "Fully-Automated"}
-    assert "landmarks" not in resolved["params"]
+    assert resolved["params"] == {"input": "CBCT_FullyAuto"}
+    assert resolved["missing"] == []
+
+
+def test_an_input_a_mode_derives_from_is_left_alone():
+    """The other way of helping too much: a value that picks its path from
+    what it is given.
+
+    AREG's engines default `automation` to "From the data", which shows every
+    input the setting governs because any of them may decide the path. Filling
+    `cbct_landmarks` there would CHOOSE the registration-only path and skip the
+    landmark prediction the benchmark is meant to time.
+    """
+    resolved = presets.resolve_arguments(
+        schema(
+            cbct=argument(selectable="testfile"),
+            automation=argument(
+                required=False, kind="choice",
+                choices={"From the data": True, "Registration": False,
+                         "Fully-Automated": False}),
+            cbct_landmarks=dict(
+                argument(required=False, selectable="testfile"),
+                visible_when={"automation": ["From the data", "Registration"]}),
+            reference=dict(
+                argument(required=False, selectable="model"),
+                visible_when={"automation": ["From the data", "Fully-Automated"]}),
+        ),
+        {"testfiles": ["IOSCBCT"], "models": ["Frankfurt"]})
+
+    assert resolved["params"] == {"cbct": "IOSCBCT"}
+    assert resolved["missing"] == []
 
 
 def test_an_input_belonging_to_another_mode_is_not_sent():
