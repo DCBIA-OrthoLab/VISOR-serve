@@ -506,3 +506,238 @@ def catalogue(resolved: dict) -> list:
             entry["blocked"] = str(exc)
         listing.append(entry)
     return listing
+
+
+# --- a battery somebody composed -------------------------------------------
+#
+# The presets answer "press and see". A custom battery answers the question an
+# operator actually has after a change: THIS tool, with THESE arguments, on
+# THIS case, N times -- and, more often than not, against a second
+# configuration of the same tool, alternated so the two sides share whatever
+# the machine was doing. A single run read as a baseline once overstated a gain
+# sevenfold; alternating is what made the measurement honest, and here it is
+# one button rather than a script.
+#
+# What it may send is checked HERE, before anything is spawned, against the
+# same projection of the schemas the presets read: an argument the tool does
+# not declare, a hosted name this deployment does not host, or a required
+# argument left out is a refusal naming it -- not a battery that dies on its
+# third run with a 422 it reports as the tool failing.
+
+# Higher than a preset's, because a custom battery is aimed: somebody chose
+# every number in it. Still a ceiling, for the reason MAX_RUNS gives.
+CUSTOM_MAX_RUNS = 60
+CUSTOM_MAX_CONCURRENCY = 16
+CUSTOM_MAX_CONFIGS = 4
+CUSTOM_MAX_LADDER = 6
+CUSTOM_MAX_STAGGER = 600
+
+# The argument types a value is typed into. Anything else is a file input, and
+# a file input is filled from what this server hosts -- a test file, a model,
+# or a bench entry -- never from text.
+_VALUE_TYPES = {"str", "int", "float", "bool", "choice", "multichoice", "list[str]"}
+_LABELS = "ABCD"
+
+
+def _wire(declaration: dict, value):
+    """One value as the form field `/run` reads, or a PresetError."""
+    kind = declaration.get("type")
+    choices = declaration.get("choices") if isinstance(declaration.get("choices"), dict) else None
+    if kind == "multichoice":
+        picked = value if isinstance(value, list) else [value]
+        picked = [str(item) for item in picked]
+        unknown = [item for item in picked if choices is not None and item not in choices]
+        if unknown:
+            raise PresetError(f"'{unknown[0]}' is not one of its options.")
+        # An empty selection is sent as nothing: the tool's own default then
+        # applies, which is what an empty multichoice means on the wire.
+        return ",".join(picked) if picked else None
+    if isinstance(value, (list, dict)):
+        raise PresetError("takes a single value.")
+    if kind == "choice":
+        if choices is not None and str(value) not in choices:
+            raise PresetError(f"'{value}' is not one of its options.")
+        return str(value)
+    if kind == "bool":
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if str(value).lower() in ("true", "false", "1", "0", "yes", "no"):
+            return str(value).lower()
+        raise PresetError("takes true or false.")
+    if kind == "int":
+        try:
+            return str(int(str(value).strip()))
+        except ValueError:
+            raise PresetError("takes a whole number.")
+    if kind == "float":
+        try:
+            return repr(float(str(value).strip()))
+        except ValueError:
+            raise PresetError("takes a number.")
+    text = str(value)
+    if len(text) > 2000:
+        raise PresetError("is too long.")
+    return text
+
+
+def _config(index: int, raw: dict, schemas: dict, hosted_for, bench_for) -> dict:
+    """One configuration, checked, as {label, tool, params, bench}."""
+    if not isinstance(raw, dict):
+        raise PresetError(f"Configuration {index + 1} is not an object.")
+    tool = raw.get("tool")
+    if tool not in schemas:
+        raise PresetError(f"{_LABELS[index]}: no tool called '{tool}' on this server.")
+    label = _LABELS[index]
+    where = f"{label} ({tool})"
+    arguments = schemas[tool].get("arguments") or {}
+    hosted = hosted_for(tool) or {}
+    bench_names = {entry["name"] for entry in (bench_for(tool) or [])}
+
+    params, bench = {}, {}
+    for name, value in (raw.get("params") or {}).items():
+        declaration = arguments.get(name)
+        if not isinstance(declaration, dict):
+            raise PresetError(f"{where}: '{tool}' has no argument '{name}'.")
+        if value is None or value == "":
+            continue
+        if declaration.get("server_selectable"):
+            pool = _pool_for(declaration, hosted)
+            if str(value) not in pool:
+                raise PresetError(f"{where}: '{value}' is not hosted for '{name}'.")
+            params[name] = str(value)
+            continue
+        if declaration.get("type") not in _VALUE_TYPES:
+            raise PresetError(f"{where}: '{name}' is a file; pick it from what this server hosts.")
+        try:
+            wired = _wire(declaration, value)
+        except PresetError as exc:
+            raise PresetError(f"{where}: '{name}' {exc}")
+        if wired is not None:
+            params[name] = wired
+
+    for name, entry in (raw.get("bench") or {}).items():
+        declaration = arguments.get(name)
+        if not isinstance(declaration, dict):
+            raise PresetError(f"{where}: '{tool}' has no argument '{name}'.")
+        if declaration.get("type") in _VALUE_TYPES:
+            raise PresetError(f"{where}: '{name}' is not a file input.")
+        if entry not in bench_names:
+            raise PresetError(f"{where}: no bench input '{entry}' staged for this tool.")
+        if name in params:
+            raise PresetError(f"{where}: '{name}' is given twice.")
+        bench[name] = entry
+
+    # A required argument nothing fills is a 422 on every run. Said now.
+    for name, declaration in sorted(arguments.items()):
+        if not isinstance(declaration, dict) or not declaration.get("required"):
+            continue
+        if name in params or name in bench or declaration.get("initial") is not None:
+            continue
+        raise PresetError(f"{where}: '{name}' is required.")
+    return {"label": label, "tool": tool, "params": params, "bench": bench}
+
+
+def _int(spec: dict, key: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(spec.get(key, default) if spec.get(key) is not None else default)
+    except (TypeError, ValueError):
+        raise PresetError(f"'{key}' takes a whole number.")
+    if not low <= value <= high:
+        raise PresetError(f"'{key}' is {value}; it goes from {low} to {high}.")
+    return value
+
+
+def build_custom_plan(spec: dict, schemas: dict, hosted_for, bench_for) -> dict:
+    """A composed battery as the arms to execute, or a PresetError saying why not.
+
+    `spec` is what the launcher sends:
+
+        {"label": str, "shape": "sequential" | "parallel",
+         "repeats": int, "concurrency": int, "ladder": [int], "stagger": seconds,
+         "configs": [{"tool": str, "params": {name: value}, "bench": {name: entry}}]}
+
+    `sequential` runs one at a time, the configurations ALTERNATED -- A, B, A,
+    B -- `repeats` times each; with two configurations that is the A/B
+    comparison. `parallel` keeps `concurrency` runs in flight for `repeats`
+    rounds, the configurations cycled across them, and a `ladder` repeats that
+    at each width in turn. `stagger` spaces the starts.
+
+    Bench entries leave here as names only; the caller turns them into paths
+    for the battery process, so this module never touches the filesystem.
+    """
+    if not isinstance(spec, dict):
+        raise PresetError("A custom battery is an object.")
+    raw_configs = spec.get("configs") or []
+    if not isinstance(raw_configs, list) or not raw_configs:
+        raise PresetError("Add at least one configuration.")
+    if len(raw_configs) > CUSTOM_MAX_CONFIGS:
+        raise PresetError(f"At most {CUSTOM_MAX_CONFIGS} configurations in one battery.")
+    configs = [_config(i, raw, schemas, hosted_for, bench_for)
+               for i, raw in enumerate(raw_configs)]
+
+    shape = spec.get("shape") or SEQUENTIAL
+    if shape not in (SEQUENTIAL, PARALLEL):
+        raise PresetError(f"Unknown shape '{shape}'.")
+    repeats = _int(spec, "repeats", 1, 1, CUSTOM_MAX_RUNS)
+    stagger = spec.get("stagger") or 0
+    try:
+        stagger = float(stagger)
+    except (TypeError, ValueError):
+        raise PresetError("'stagger' takes a number of seconds.")
+    if not 0 <= stagger <= CUSTOM_MAX_STAGGER:
+        raise PresetError(f"'stagger' goes from 0 to {CUSTOM_MAX_STAGGER} seconds.")
+
+    label = " ".join(str(spec.get("label") or "").split())[:80]
+    if not label:
+        label = " vs ".join(dict.fromkeys(c["tool"] for c in configs))
+
+    def runs(count: int) -> list:
+        return [{"index": i, "config": configs[i % len(configs)]["label"],
+                 "tool": configs[i % len(configs)]["tool"],
+                 "params": dict(configs[i % len(configs)]["params"]),
+                 "bench": dict(configs[i % len(configs)]["bench"])}
+                for i in range(count)]
+
+    def arm(name: str, count: int, width: int, arm_shape: str) -> dict:
+        said = (f"{width} at once" if arm_shape == PARALLEL else
+                "one at a time" + (", alternated" if len(configs) > 1 else ""))
+        return {"arm": name, "label": f"{label} \u00b7 {said}", "shape": arm_shape,
+                "concurrency": width, "stagger": stagger,
+                "tools": sorted({c["tool"] for c in configs}), "runs": runs(count)}
+
+    arms = []
+    if shape == SEQUENTIAL:
+        arms.append(arm("custom", repeats * len(configs), 1, SEQUENTIAL))
+    else:
+        ladder = spec.get("ladder") or []
+        if not isinstance(ladder, list):
+            raise PresetError("'ladder' is a list of widths.")
+        if len(ladder) > CUSTOM_MAX_LADDER:
+            raise PresetError(f"At most {CUSTOM_MAX_LADDER} steps on a ladder.")
+        widths = []
+        for step in ladder or [spec.get("concurrency") or 1]:
+            try:
+                step = int(step)
+            except (TypeError, ValueError):
+                raise PresetError("A width is a whole number.")
+            if not 1 <= step <= CUSTOM_MAX_CONCURRENCY:
+                raise PresetError(f"A width goes from 1 to {CUSTOM_MAX_CONCURRENCY}.")
+            widths.append(step)
+        for width in widths:
+            name = f"custom-x{width}" if len(widths) > 1 else "custom"
+            arms.append(arm(name, width * repeats, width, PARALLEL))
+
+    total = sum(len(a["runs"]) for a in arms)
+    if total > CUSTOM_MAX_RUNS:
+        raise PresetError(f"That would start {total} runs; a custom battery stops at "
+                          f"{CUSTOM_MAX_RUNS}.")
+    return {
+        "preset": "custom",
+        "label": label,
+        "about": "A battery composed in the launcher.",
+        "configs": [{"label": c["label"], "tool": c["tool"],
+                     "params": dict(c["params"]), "bench": sorted(c["bench"])}
+                    for c in configs],
+        "arms": arms,
+        "total_runs": total,
+    }

@@ -601,9 +601,13 @@ _CAMPAIGN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}\.json")
 
 
 
-@app.get("/benchmarks", dependencies=[Depends(verify_token)])
+@app.get("/benchmarks", dependencies=[Depends(verify_admin)])
 def benchmark_report(campaign: Optional[str] = None) -> dict:
     """The campaign a reader asked for, and the list of the others.
+
+    Behind the ADMIN token, like every benchmark route: a campaign is the
+    operator's and the developer's reading of how far this machine can be
+    pushed, and a workstation's API token has no business with it.
 
     Named `benchmark_report`, not `benchmarks`: see the note below on what a
     handler shadowing a module-level name costs.
@@ -641,7 +645,7 @@ def benchmark_report(campaign: Optional[str] = None) -> dict:
 @app.get("/benchmarks/view", include_in_schema=False)
 def benchmark_view() -> HTMLResponse:
     """The campaign, drawn. Unauthenticated: the page holds no measurement, it
-    asks for one with the token the reader types into it."""
+    asks for one with the admin token the reader types into it."""
     return HTMLResponse(benchmark_page.BENCHMARK_PAGE)
 
 # Per-tool documentation. Unauthenticated like the other two pages: it
@@ -1262,8 +1266,8 @@ def server_debug_run(run_id: str) -> dict:
             "timeline": runs.timeline(events)}
 
 
-def _benchmark_resolution() -> dict:
-    """Which tools this deployment could actually run a preset with.
+def _benchmark_schemas() -> dict:
+    """Every served tool's arguments, projected to what a battery plan reads.
 
     Read live rather than cached: a bundle staged into `DATA/` since startup
     should make its tool runnable without a restart, and the whole point of
@@ -1297,28 +1301,42 @@ def _benchmark_resolution() -> dict:
         }}
         for name, tool in TOOLS.items()
     }
+    return schemas
 
-    def hosted(name: str) -> dict:
-        slug = deployment_config.data_slug(name)
-        # One list per scope the tool's arguments actually name, beside the
-        # unscoped catalogue an unscoped argument still draws from.
-        scopes = {
-            spec.selectable_scope
-            for spec in TOOLS[name].arguments.values()
-            if getattr(spec, "selectable_scope", None)
-        }
-        return {"models": data_store.list_models(slug),
-                "testfiles": data_store.list_testfiles(slug),
-                "testfiles_by_scope": {
-                    scope: data_store.list_testfiles(slug, scope)
-                    for scope in sorted(scopes)
-                },
-                "models_by_scope": {
-                    scope: data_store.list_models(slug, scope)
-                    for scope in sorted(scopes)
-                }}
 
-    return benchmark_presets.runnable_tools(schemas, hosted)
+def _benchmark_hosted(name: str) -> dict:
+    """What this server hosts for one tool, per argument scope."""
+    slug = deployment_config.data_slug(name)
+    # One list per scope the tool's arguments actually name, beside the
+    # unscoped catalogue an unscoped argument still draws from.
+    scopes = {
+        spec.selectable_scope
+        for spec in TOOLS[name].arguments.values()
+        if getattr(spec, "selectable_scope", None)
+    }
+    return {"models": data_store.list_models(slug),
+            "testfiles": data_store.list_testfiles(slug),
+            "testfiles_by_scope": {
+                scope: data_store.list_testfiles(slug, scope)
+                for scope in sorted(scopes)
+            },
+            "models_by_scope": {
+                scope: data_store.list_models(slug, scope)
+                for scope in sorted(scopes)
+            }}
+
+
+def _benchmark_bench(name: str) -> list:
+    """`DATA/<tool>/bench/`, described: what a custom battery may take as input."""
+    try:
+        return data_store.describe_bench(deployment_config.data_slug(name))
+    except OSError:
+        return []
+
+
+def _benchmark_resolution() -> dict:
+    """Which tools this deployment could actually run a preset with."""
+    return benchmark_presets.runnable_tools(_benchmark_schemas(), _benchmark_hosted)
 
 
 @app.get("/benchmark", include_in_schema=False)
@@ -1326,12 +1344,13 @@ def benchmark_home() -> HTMLResponse:
     """Both halves in one place: what was measured, and what to measure next.
 
     Unauthenticated like the other pages -- it holds no reading and starts
-    nothing by itself; every call it makes carries the token the reader typed.
+    nothing by itself; every call it makes carries the admin token the reader
+    typed, the one the admin panel keeps.
     """
     return HTMLResponse(benchmark_launch_page.LAUNCH_PAGE)
 
 
-@app.get("/benchmark/presets", dependencies=[Depends(verify_token)])
+@app.get("/benchmark/presets", dependencies=[Depends(verify_admin)])
 def benchmark_catalogue() -> dict:
     """Every preset, and what it would do on THIS deployment."""
     resolved = _benchmark_resolution()
@@ -1343,17 +1362,69 @@ def benchmark_catalogue() -> dict:
                   for name, entry in sorted(resolved.items())},
         "limits": {"max_runs": benchmark_presets.MAX_RUNS,
                    "max_concurrency": benchmark_presets.MAX_CONCURRENCY},
+        "custom_limits": {"max_runs": benchmark_presets.CUSTOM_MAX_RUNS,
+                          "max_concurrency": benchmark_presets.CUSTOM_MAX_CONCURRENCY,
+                          "max_configs": benchmark_presets.CUSTOM_MAX_CONFIGS,
+                          "max_ladder": benchmark_presets.CUSTOM_MAX_LADDER,
+                          "max_stagger": benchmark_presets.CUSTOM_MAX_STAGGER},
         "running": benchmark_jobs.current(),
     }
 
 
+@app.get("/benchmark/form/{tool_name}", dependencies=[Depends(verify_admin)])
+def benchmark_form(tool_name: str) -> dict:
+    """What the custom launcher needs to fill one tool's form, beside `/tools`.
+
+    `/tools` already publishes the schema the form is drawn from; this adds
+    what only an operator may see: the names this deployment hosts for each
+    argument, the bench inputs staged for the tool, and what a preset would
+    have sent, so the form opens on a run that works and only what matters has
+    to be changed.
+    """
+    if tool_name not in TOOLS:
+        raise HTTPException(status_code=404, detail=f"No tool called '{tool_name}'.")
+    schemas = _benchmark_schemas()
+    hosted = _benchmark_hosted(tool_name)
+    resolved = benchmark_presets.resolve_arguments(schemas[tool_name], hosted, tool_name)
+    return {"tool": tool_name, "defaults": resolved["params"],
+            "missing": resolved["missing"], "hosted": hosted,
+            "bench": _benchmark_bench(tool_name),
+            "bench_folder": f"DATA/{deployment_config.data_slug(tool_name)}/bench"}
+
+
 class BatteryRequest(BaseModel):
-    preset: str
+    preset: Optional[str] = None
     tools: Optional[list] = None
     concurrency: Optional[int] = None
+    # A battery composed in the launcher instead of a preset; see
+    # `benchmark_presets.build_custom_plan` for its shape.
+    custom: Optional[dict] = None
 
 
-@app.post("/benchmark/run", dependencies=[Depends(verify_token), Depends(maintenance.require_accepting)])
+def _custom_plan(spec: dict) -> dict:
+    """A custom battery's plan, with every bench name turned into a path.
+
+    The names stop here. The plan the battery process reads carries the path
+    it uploads from, and the summary it writes carries the input's SHAPE --
+    files, bytes -- never its name: a bench case is a clinical one, and its
+    name can be a patient's.
+    """
+    plan = benchmark_presets.build_custom_plan(
+        spec, _benchmark_schemas(), _benchmark_hosted, _benchmark_bench)
+    for arm in plan["arms"]:
+        for run in arm["runs"]:
+            slug = deployment_config.data_slug(run["tool"])
+            uploads = {}
+            for argument, entry in run.pop("bench").items():
+                try:
+                    uploads[argument] = data_store.resolve_bench(slug, entry).path
+                except DataNotFoundError as exc:
+                    raise benchmark_presets.PresetError(str(exc))
+            run["uploads"] = uploads
+    return plan
+
+
+@app.post("/benchmark/run", dependencies=[Depends(verify_admin), Depends(maintenance.require_accepting)])
 def benchmark_start(request: Request, body: BatteryRequest) -> dict:
     """Start a battery. One at a time, and never on the event loop.
 
@@ -1362,9 +1433,14 @@ def benchmark_start(request: Request, body: BatteryRequest) -> dict:
     inside this one would hold the very slots it is measuring.
     """
     try:
-        plan = benchmark_presets.build_plan(
-            body.preset, _benchmark_resolution(),
-            tools=body.tools, concurrency=body.concurrency)
+        if body.custom is not None:
+            plan = _custom_plan(body.custom)
+        elif body.preset:
+            plan = benchmark_presets.build_plan(
+                body.preset, _benchmark_resolution(),
+                tools=body.tools, concurrency=body.concurrency)
+        else:
+            raise benchmark_presets.PresetError("Name a preset, or compose a custom battery.")
     except benchmark_presets.PresetError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
@@ -1387,12 +1463,12 @@ def benchmark_start(request: Request, body: BatteryRequest) -> dict:
         raise HTTPException(status_code=500, detail=f"Could not start it: {exc}")
 
 
-@app.get("/benchmark/status", dependencies=[Depends(verify_token)])
+@app.get("/benchmark/status", dependencies=[Depends(verify_admin)])
 def benchmark_status() -> dict:
     return {"running": benchmark_jobs.current()}
 
 
-@app.delete("/benchmark/run", dependencies=[Depends(verify_token)])
+@app.delete("/benchmark/run", dependencies=[Depends(verify_admin)])
 def benchmark_stop() -> dict:
     """Stop the battery, and everything it started."""
     return {"stopped": benchmark_jobs.stop()}
