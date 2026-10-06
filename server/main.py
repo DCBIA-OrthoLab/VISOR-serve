@@ -37,7 +37,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 # server -- but the other direction is safe and is what lets the rewind
 # edit the same record the runner wrote. It is standard library only.
 from execution import admission, costs, dispatch, reports, runner
-from registry import facade
+from registry import conventions, facade
 from registry.facade import FacadeTool
 import file_utils
 import redact
@@ -1391,6 +1391,12 @@ def _benchmark_schemas() -> dict:
                   # first hosted name is `IOSCBCT`, a sibling, and every AREG
                   # arm answered 404 before a process started.
                   "selectable_scope": spec.selectable_scope,
+                  # Whether the NAME puts it in the hosted-bundle convention,
+                  # which a deployment may have opted it out of because the
+                  # tool resolves the bundle itself. The resolver cannot fill
+                  # such an argument, but it can see a tool hosting no bundle
+                  # for it to resolve.
+                  "model_named": conventions.is_model(arg),
                   "type": _type_name(spec.types[0])}
             for arg, spec in tool.arguments.items()
         }}

@@ -251,7 +251,8 @@ def resolve_arguments(schema: dict, hosted: dict, tool: str = "") -> dict:
     tool already defaults is left out, so the run exercises the tool's own
     default rather than a value invented here.
 
-    `missing` names every required argument nothing could satisfy. A tool with
+    `missing` names every required argument nothing could satisfy, and every
+    input the values being sent put in force (see the second pass). A tool with
     anything in it is not run -- reporting it as unrunnable up front is the
     whole reason this function exists, since the alternative is a battery that
     dies on its third arm with a 422 and no plan.
@@ -315,65 +316,104 @@ def resolve_arguments(schema: dict, hosted: dict, tool: str = "") -> dict:
             continue
         missing.append(name)
 
-    # Second pass: the inputs a FACADE needs and cannot declare as required.
+    # Second pass: the inputs a MODE needs and the schema cannot declare as
+    # required.
     #
     # A facade over several tools publishes ONE required argument -- its mode --
     # and every input as `required: false`, because `t1` only means something
-    # for AREG's CBCT modes and `ios` only for its CBCT-to-IOS one. A facade
-    # cannot say "required, depending on another argument", so the refusal
-    # arrives later, from the tool the facade dispatched to. Measured on
-    # 2026-09-28: a six-client AREG arm, six `POST /run/AREG` answered
-    # `422 Missing required argument 't1' for tool 'AREG_CBCT'` in 20
-    # milliseconds, and the battery reported it as AREG failing.
+    # for AREG's CBCT modes and `ios` only for its CBCT-to-IOS one. A single
+    # tool with modes has the same problem: FlexReg's `reference` is required
+    # by its two registering modes, its default among them, and meaningless in
+    # the third, so it is published optional. Neither can say "required,
+    # depending on another argument", so the refusal arrives from the tool,
+    # after dispatch. Measured: six concurrent `POST /run/AREG` answered
+    # `422 Missing required argument 't1' for tool 'AREG_CBCT'` in twenty
+    # milliseconds (2026-09-28), and the "each-tool-solo" preset collected
+    # FlexReg's "'Patch and register' registers onto a reference surface" and
+    # VFACE's "'segmentation_model' names the bundle" before either did any
+    # work. All three were reported as the tool failing.
     #
-    # What the facade DOES publish is `visible_when`, which says which mode an
-    # input belongs to. So an input that applies to the mode being run and that
-    # this deployment hosts is filled, whether or not it is marked required.
+    # What the schema DOES publish is `visible_when`, which says which mode an
+    # input belongs to. An input in force for the values being sent is treated
+    # as required by that mode: filled from what this server hosts, and named
+    # in `missing` when nothing hosted can fill it, so the tool is reported as
+    # not runnable instead of being sent a request it will refuse.
     #
-    # **Not added to `missing` when nothing can fill it**, and that asymmetry is
-    # deliberate: the facade does not publish which of its mode-specific inputs
-    # the concrete tool REQUIRES, so `t1` (required by AREG_CBCT) and
-    # `t1_masks` (optional to it) are indistinguishable here. Marking either
-    # missing would report a runnable tool as unrunnable, which is the worse
-    # error -- a battery that refuses to run something that works.
+    # Two exceptions, each one a way this would help too much.
     #
-    # Two guards, and each one is a mistake this made before it was narrowed.
+    # **An argument with no `visible_when` stays unsent.** Being optional
+    # everywhere is a statement by the tool that it has an answer of its own;
+    # a benchmark exercises the tool's own defaults. ASO's optional `landmarks`
+    # is the case in point: supplying it makes ASO register on the caller's
+    # points INSTEAD of asking the landmark tool for them, which would turn a
+    # benchmark of the ASO-to-ALI chain into a benchmark of ASO alone.
     #
-    # **Only an input whose `visible_when` explains why it is optional.** An
-    # argument that is simply optional stays unsent, which is the rule the pass
-    # above exists to keep: a benchmark exercises the tool's own defaults. What
-    # `visible_when` adds is a REASON -- `t1` is not optional, it is required
-    # for two of three modes -- and that is the only case where sending it is
-    # restoring an intent rather than inventing one.
-    #
-    # **And only for a tool that got no input at all above.** ASO declares an
-    # optional `landmarks` folder behind a `visible_when` too, and the first
-    # hosted name satisfies it -- but supplying it is what makes ASO use the
-    # caller's points INSTEAD of asking the landmark tool for them. Filling it
-    # would quietly turn a benchmark of the ASO-to-ALI chain into a benchmark
-    # of ASO alone, and the number would look like an improvement. A tool that
-    # already has its inputs needs nothing more from here; one that has none
-    # cannot run at all.
-    if not any(
-        isinstance(arguments.get(name), dict)
-        and arguments[name].get("server_selectable") == "testfile"
-        for name in params
-    ):
-        effective = _effective(arguments, params)
-        for name, declaration in sorted(arguments.items()):
-            if name in params or not isinstance(declaration, dict):
-                continue
-            if declaration.get("server_selectable") != "testfile":
-                continue
-            if not declaration.get("visible_when"):
-                continue
-            if not _applies(declaration, effective):
-                continue
+    # **An input shown by a value that DERIVES the mode stays unsent.** AREG's
+    # engines default `automation` to "From the data", which shows every input
+    # the setting governs because it picks the path from what is supplied.
+    # Filling `cbct_landmarks` there would not satisfy a requirement, it would
+    # CHOOSE the registration-only path and skip the landmark prediction the
+    # benchmark is meant to time. See `_derives_mode` for how that is told
+    # apart without naming a tool.
+    effective = _effective(arguments, params)
+    for name, declaration in sorted(arguments.items()):
+        if name in params or not isinstance(declaration, dict):
+            continue
+        if declaration.get("required") or not declaration.get("visible_when"):
+            continue
+        if not _applies(declaration, effective):
+            continue
+        if any(_derives_mode(arguments, other, effective.get(other))
+               for other in declaration["visible_when"]):
+            continue
+        kind = declaration.get("server_selectable")
+        if kind in ("model", "testfile"):
             pool = _pool_for(declaration, hosted)
-            if pool:
-                params[name] = pool[0]
+            chosen = _preferred(tool, name, pool) or (pool[0] if pool else None)
+            if chosen:
+                params[name] = chosen
+            else:
+                missing.append(name)
+            continue
+        # Not selectable, but named like a hosted bundle (`*_model`,
+        # `*_reference`): a deployment opted it out because the TOOL resolves
+        # it from its own data folder, so the server cannot fill it and should
+        # not try. What it can still see is a tool hosting no model at all,
+        # where that resolution has nothing to find -- VFACE's
+        # `segmentation_model` on a deployment with no VFACE bundles staged.
+        if declaration.get("model_named") and not (hosted.get("models") or ()):
+            missing.append(name)
 
     return {"params": params, "missing": missing}
+
+
+def _derives_mode(arguments: dict, controller: str, value) -> bool:
+    """Whether `value` of `controller` picks the path from what is supplied.
+
+    Read off the schema alone: the value shows EVERY one of the several inputs
+    the controller governs. A value that picks its path from what it is given
+    has to show them all, since any of them may be the one that decides, and
+    an input it shows is then optional: supplying it changes which path runs.
+    AREG's "From the data" shows all seven inputs its `automation` governs.
+
+    "Several" is what keeps a plain requirement out. FlexReg's `mode` governs
+    one input, `reference`, and a value showing the only input there is says
+    nothing about choosing between inputs: it is a mode that needs it.
+    """
+    if value is None or isinstance(value, (list, tuple)):
+        return False
+    gated = [
+        declaration["visible_when"][controller]
+        for declaration in arguments.values()
+        if isinstance(declaration, dict)
+        and controller in (declaration.get("visible_when") or {})
+    ]
+    if len(gated) < 2:
+        return False
+    return all(
+        value in (wanted if isinstance(wanted, (list, tuple)) else [wanted])
+        for wanted in gated
+    )
 
 
 def runnable_tools(schemas: dict, hosted_for) -> dict:
