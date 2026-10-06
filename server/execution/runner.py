@@ -38,6 +38,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import shutil
@@ -250,6 +251,33 @@ MAX_PROGRESS_RECORD_BYTES = 4096
 # chain append to the same file -- so it bounds the BYTES it can add rather than
 # the count. The server applies the real MAX_RUN_EVENTS cap when it reads.
 MAX_PROGRESS_FILE_BYTES = 8 * 1024 * 1024
+
+# Which supervised call this process IS, as a dotted path of slot numbers:
+# unset (the root), "1" for the root's first `sup.run`, "1.2" for that child's
+# second. Set by the supervisor for each child, so every record a level writes
+# can say whose it is -- which is what lets the server fold a child's own 0..1
+# into the span its parent gave it, and tell two siblings running at once
+# apart, where `depth` alone cannot.
+PROGRESS_CALL_ENV = "SADT_PROGRESS_CALL"
+_CALL_ID = re.compile(r"[0-9]{1,4}(\.[0-9]{1,4}){0,9}")
+
+# The keyword a caller passes to `sup.run` to say how much of ITS OWN bar the
+# call occupies: `sup.run("ALI_CBCT", ..., _progress=(0.2, 0.6))`. Taken out
+# before the callee sees it, the way `output_dir` is, so no tool has to declare
+# it. Underscored because it is the supervisor's, and a tool argument can never
+# start with one.
+SPAN_ARGUMENT = "_progress"
+
+# What `sup.log` accepts, and what the rest are read as. The names are the
+# standard library's, so a level means here what it means in every log the
+# tool already writes.
+LOG_LEVELS = ("debug", "info", "warning", "error")
+_LOG_LEVEL_ALIASES = {"warn": "warning", "critical": "error", "fatal": "error"}
+
+# How much of a failure the runner hands the server. The message is a tool's
+# own words and the server redacts it before an operator sees it; the bound is
+# here so a 40-patient list joined into one sentence cannot outgrow result.json.
+MAX_FAILURE_MESSAGE = 500
 
 # The tools already on the stack, innermost last, as one comma-separated value.
 # It travels in the environment rather than in job.json because it belongs to
@@ -1257,6 +1285,119 @@ def _write_result(job_dir: str, result) -> None:
     os.replace(temp_path, final_path)
 
 
+# Where a failure came from, attached to the exception a nested failure is
+# re-raised as, so the level above writes the CALLEE's origin rather than its
+# own. An attribute rather than a class: the re-raised type has to keep the
+# callee's name, which is what the server maps to a status code.
+ORIGIN_ATTRIBUTE = "_sadt_origin"
+
+
+def _origin_of(exc: BaseException) -> dict:
+    """Where this failure happened, for the operator: `{tool, chain, error_type,
+    message, where, stage, fraction}`.
+
+    Written once, by the level that raised, and passed up unchanged by every
+    level above (see `_nested_subprocess`), so the root's result names the
+    tool that actually broke. Facts, not prose:
+
+    - `chain` -- the tools on the stack, root first, ending at this one.
+    - `where` -- `package/module.py:line in function`, the innermost frame
+      inside the TOOL's own source. A location in code, never in data.
+    - `stage` / `fraction` -- the last thing this level said it was doing,
+      read back from the progress file. A message is the tool's own words, so
+      the server redacts it before an operator sees it.
+    """
+    inherited = getattr(exc, ORIGIN_ATTRIBUTE, None)
+    if isinstance(inherited, dict):
+        return inherited
+    chain = [name for name in os.environ.get(SUPERVISOR_CHAIN_ENV, "").split(",") if name]
+    tool = chain[-1] if chain else _JOB_TOOL
+    if not chain and tool:
+        chain = [tool]
+    origin = {
+        "tool": tool,
+        "chain": chain,
+        "error_type": type(exc).__name__,
+        "message": str(exc).replace("\r", " ").replace("\n", " ")[:MAX_FAILURE_MESSAGE],
+    }
+    where = _source_location(exc)
+    if where:
+        origin["where"] = where
+    stage = _last_stage()
+    if stage:
+        origin.update(stage)
+    return origin
+
+
+# The tool this process was started for, set by `main` once job.json is read.
+_JOB_TOOL = None
+
+
+def _source_location(exc: BaseException):
+    """`sadt_x/module.py:123 in function` for the innermost frame in the tool's
+    src/, or None when the failure never reached the tool's code."""
+    try:
+        src = os.path.realpath(os.path.join(_tool_dir(), SRC_DIR_NAME)) + os.sep
+    except Exception:  # noqa: BLE001
+        return None
+    found = None
+    for frame in traceback.extract_tb(exc.__traceback__):
+        path = os.path.realpath(frame.filename)
+        if path.startswith(src):
+            found = "{}:{} in {}".format(path[len(src):], frame.lineno, frame.name)
+    return found
+
+
+def _last_stage():
+    """`{stage, fraction}`: the last progress THIS level reported, or None.
+
+    Read back from the shared file rather than remembered, because most tools
+    report through their own `progress.py`, which this process never sees.
+    Only the last megabyte is read: the stage that matters is the latest one.
+    """
+    path = os.environ.get(PROGRESS_FILE_ENV)
+    if not path:
+        return None
+    try:
+        depth = int(os.environ.get(SUPERVISOR_DEPTH_ENV, "0") or 0)
+    except ValueError:
+        depth = 0
+    own = _own_call()
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            start = max(0, size - (1 << 20))
+            handle.seek(start)
+            chunk = handle.read()
+    except OSError:
+        return None
+    found = None
+    offset = start
+    for line in chunk.split(b"\n"):
+        at = offset
+        offset += len(line) + 1
+        try:
+            record = json.loads(line.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("kind") or record.get("tool"):
+            continue
+        if "call" in record:
+            mine = record.get("call") == own
+        else:
+            mine = (own == "" or "depth" not in record) and _written_here(record, at, depth)
+        if mine and (record.get("message") or record.get("fraction") is not None):
+            found = record
+    if found is None:
+        return None
+    stage = {}
+    if found.get("message"):
+        stage["stage"] = _single_line(found["message"])
+    if isinstance(found.get("fraction"), (int, float)):
+        stage["fraction"] = found["fraction"]
+    return stage or None
+
+
 def _write_error(job_dir: str, exc: Exception) -> None:
     """Record WHICH failure happened, next to where a result would have gone.
 
@@ -1268,6 +1409,12 @@ def _write_error(job_dir: str, exc: Exception) -> None:
     failure.
     """
     payload = {"error": {"type": type(exc).__name__, "message": str(exc)}}
+    try:
+        origin = _origin_of(exc)
+    except Exception:  # noqa: BLE001 - a diagnosis must never cost the error itself
+        origin = None
+    if origin:
+        payload["error"]["origin"] = origin
     # The measurements travel with the failure too. A run that died of an
     # out-of-memory is the most informative thing a budget can learn from, and
     # it used to be the one run that recorded nothing at all.
@@ -1297,11 +1444,100 @@ def _configure_logging() -> None:
 # Progress
 # ---------------------------------------------------------------------------
 
-def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
+def _own_call() -> str:
+    """This process's call id (see PROGRESS_CALL_ENV), or "" for the root."""
+    raw = os.environ.get(PROGRESS_CALL_ENV) or ""
+    return raw if _CALL_ID.fullmatch(raw) else ""
+
+
+def _clean_span(value):
+    """`(start, end)` within 0..1 with start <= end, or None.
+
+    A malformed span is dropped rather than refused: it only shapes a progress
+    bar, and a bar is never a reason to fail a run.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        start, end = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= start <= end <= 1.0):
+        return None
+    return (round(start, 4), round(end, 4))
+
+
+def _clean_level(level) -> str:
+    text = str(level or "info").strip().lower()
+    text = _LOG_LEVEL_ALIASES.get(text, text)
+    return text if text in LOG_LEVELS else "info"
+
+
+def _write_record(record: dict) -> None:
+    """One record, one write, O_APPEND, no O_CREAT -- or nothing at all.
+
+    Shared by progress, nested markers and log lines, which all ride the same
+    file under the same three rules (see `_append_progress`).
+    """
+    path = os.environ.get(PROGRESS_FILE_ENV)
+    if not path:
+        return
+    try:
+        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(payload) > MAX_PROGRESS_RECORD_BYTES:
+            return
+        handle = os.open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            if os.fstat(handle).st_size + len(payload) > MAX_PROGRESS_FILE_BYTES:
+                return
+            os.write(handle, payload)
+        finally:
+            os.close(handle)
+    except Exception:  # noqa: BLE001 - progress must never break a run
+        pass
+
+
+def _single_line(message) -> str:
+    text = "" if message is None else str(message)
+    # A newline inside a record would be read as the end of it, and a message
+    # is free text written by a tool.
+    return text.replace("\r", " ").replace("\n", " ")[:MAX_PROGRESS_MESSAGE]
+
+
+def _append_log(message, level: str, user: bool, depth: int) -> None:
+    """Append one log line to the run's file, for the operator or the clinician.
+
+    `user=False` -- the default -- is for whoever runs the server: the server
+    never sends it to the client, and redacts it before the operator page shows
+    it. `user=True` is written for the person who started the run, and reaches
+    the panel of a client that asked for it. Neither is a progress record, so
+    neither can move a bar or end a stream.
+    """
+    record = {
+        "kind": "log",
+        "at": time.time(),
+        "level": _clean_level(level),
+        "audience": "user" if user else "admin",
+        "message": _single_line(message),
+        "depth": depth,
+    }
+    call = _own_call()
+    if call:
+        record["call"] = call
+    _write_record(record)
+
+
+def _append_progress(fraction, message, depth: int, tool: str = "",
+                     call=None, span=None, edge: str = "") -> None:
     """Append one progress record to SADT_PROGRESS_FILE, if there is one.
 
     `tool` is set only by the supervisor, to mark a nested call opening and
-    closing at the CHILD's depth -- see `Supervisor._run_nested`.
+    closing at the CHILD's depth -- see `Supervisor._run_nested`. With it come
+    the child's `call` id, which edge of the call this is, and the `span` of
+    the parent's bar the call was given, if it was given one.
+
+    Every other record carries THIS process's call id, when it is not the
+    root's, so the server can tell whose fraction it is reading.
 
     Best effort in the strictest sense: nothing here may reach the tool. A run
     that cannot report its progress is a run, and turning a failed `write` into
@@ -1322,8 +1558,7 @@ def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
     processes -- so the count is capped by the server when it reads, and the
     bytes are capped here, which is what actually protects the disk.
     """
-    path = os.environ.get(PROGRESS_FILE_ENV)
-    if not path:
+    if not os.environ.get(PROGRESS_FILE_ENV):
         return
     try:
         try:
@@ -1334,7 +1569,6 @@ def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
                 value = min(1.0, max(0.0, value))
         except (TypeError, ValueError):
             value = None
-        text = "" if message is None else str(message)
         # `at` and `depth`, and nothing else the server would only override:
         # a tool's line says how far along it is, never what phase the RUN is
         # in. These two are facts only this side knows -- the depth of a
@@ -1343,11 +1577,12 @@ def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
         record = {
             "at": time.time(),
             "fraction": value,
-            # A newline inside a record would be read as the end of it, and a
-            # message is free text written by a tool.
-            "message": text.replace("\r", " ").replace("\n", " ")[:MAX_PROGRESS_MESSAGE],
+            "message": _single_line(message),
             "depth": depth,
         }
+        call = _own_call() if call is None else call
+        if call:
+            record["call"] = call
         # Only on a supervisor's nested marker. It is a TOOL NAME, so it is
         # emitted as its own field rather than inside `message`: a message is
         # free text a tool wrote and may name a patient's file, which is why
@@ -1356,18 +1591,13 @@ def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
         # one fact the drawing needs and cannot carry anything else.
         if tool:
             record["tool"] = str(tool)[:MAX_PROGRESS_MESSAGE]
-        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
-        if len(payload) > MAX_PROGRESS_RECORD_BYTES:
-            return
-        handle = os.open(path, os.O_WRONLY | os.O_APPEND)
-        try:
-            if os.fstat(handle).st_size + len(payload) > MAX_PROGRESS_FILE_BYTES:
-                return
-            os.write(handle, payload)
-        finally:
-            os.close(handle)
+            if edge:
+                record["edge"] = edge
+            if span is not None:
+                record["span"] = list(span)
     except Exception:  # noqa: BLE001 - progress must never break a run
-        pass
+        return
+    _write_record(record)
 
 
 # ---------------------------------------------------------------------------
@@ -2076,8 +2306,23 @@ class _Supervisor:
         # the caller's scratch directory has its results deleted with it, before
         # anything could collect them.
         params.pop(OUTPUT_DIR_ARGUMENT, None)
-        self._calls += 1
-        slot = f"{self._calls:02d}_{tool}"
+        # How much of THIS level's bar the call fills. The supervisor's, never
+        # the callee's: taken out here so no tool has to declare it. A bad one
+        # costs the weighting and nothing else.
+        raw_span = params.pop(SPAN_ARGUMENT, None)
+        span = _clean_span(raw_span)
+        if raw_span is not None and span is None:
+            self._say(f"ignoring {SPAN_ARGUMENT}={raw_span!r} for '{tool}': "
+                      "expected (start, end) with 0 <= start <= end <= 1")
+        # Under the lock: a level running its items in threads may call
+        # `sup.run` from several at once, and two calls sharing a number would
+        # share a slot directory and a call id.
+        with self._flight_lock:
+            self._calls += 1
+            number = self._calls
+        slot = f"{number:02d}_{tool}"
+        own = _own_call()
+        call = f"{own}.{number}" if own else str(number)
         nested_dir = os.path.join(self._job_dir, "sup", slot)
 
         # A resumed run re-enters the tool from the top: nothing preserves a
@@ -2089,15 +2334,17 @@ class _Supervisor:
         remembered = self._memo(slot, tool)
         if remembered is not None:
             self._substitute(slot, nested_dir)
-            _append_progress(None, "", self._depth + 1, tool=tool)
-            _append_progress(None, "", self._depth + 1, tool=tool)
+            _append_progress(None, "", self._depth + 1, tool=tool, call=call,
+                             span=span, edge="open")
+            _append_progress(None, "", self._depth + 1, tool=tool, call=call,
+                             span=span, edge="close")
             if tool in self._stops:
                 raise QualityControlStop(tool)
             return remembered["result"]
 
         os.makedirs(os.path.join(nested_dir, "output"), exist_ok=True)
 
-        child_id = f"{os.path.basename(self._job_dir)}.{self._calls}"
+        child_id = f"{os.path.basename(self._job_dir)}.{number}"
         job_path = os.path.join(nested_dir, JOB_FILE)
         with open(job_path, "w", encoding="utf-8") as handle:
             json.dump(
@@ -2116,10 +2363,11 @@ class _Supervisor:
                 default=_jsonable,
             )
 
-        self.log(f"running '{tool}'")
+        self._say(f"running '{tool}'")
         environment = dict(os.environ)
         environment[SUPERVISOR_DEPTH_ENV] = str(self._depth + 1)
         environment[SUPERVISOR_CHAIN_ENV] = ",".join(self._chain + (tool,))
+        environment[PROGRESS_CALL_ENV] = call
         # What the child may SPEND when no server admits it (below) -- not how
         # wide it may run. Such a call is a subprocess of this one and nothing
         # between the two levels would divide anything,
@@ -2185,7 +2433,7 @@ class _Supervisor:
             alone = self._in_flight == 0
             self._in_flight += 1
         try:
-            lease, granted = _admission_lease(job_path, self._job_dir, self.log, lend=alone)
+            lease, granted = _admission_lease(job_path, self._job_dir, self._say, lend=alone)
         except BaseException:
             with self._flight_lock:
                 self._in_flight -= 1
@@ -2227,7 +2475,8 @@ class _Supervisor:
         # between them can raise -- `_remaining_seconds` does, when the job's
         # time is already spent -- and an open with no close is a span with no
         # end.
-        _append_progress(None, "", self._depth + 1, tool=tool)
+        _append_progress(None, "", self._depth + 1, tool=tool, call=call,
+                         span=span, edge="open")
         foreign_from = _progress_size()
         try:
             produced = self._nested_subprocess(
@@ -2245,7 +2494,8 @@ class _Supervisor:
             _close_lease(lease)
             with self._flight_lock:
                 self._in_flight -= 1
-            _append_progress(None, "", self._depth + 1, tool=tool)
+            _append_progress(None, "", self._depth + 1, tool=tool, call=call,
+                             span=span, edge="close")
 
         self._remember(nested_dir, tool, produced)
 
@@ -2409,7 +2659,7 @@ class _Supervisor:
             # traceback goes to stderr, which whatever runs the PARENT may be
             # capturing and trimming -- so "see above" is a promise this cannot
             # keep, and the message has to carry the reason itself.
-            kind, message = self._failure_parts(tool, nested_dir)
+            kind, message, origin = self._failure_parts(tool, nested_dir)
 
             # A child's answer to the CALLER is re-raised under the child's own
             # exception name, so the server maps it the way it would have if the
@@ -2421,24 +2671,33 @@ class _Supervisor:
             # prepended because in a chain the caller cannot otherwise tell which
             # step is talking.
             if kind in CALLER_FACING_ERRORS:
-                raise type(kind, (Exception,), {})(f"{tool}: {message}")
-
-            raise RunnerError(
-                f"Supervised tool '{tool}' failed (exit {completed.returncode}). "
-                f"{kind}: {message}" if message else
-                f"Supervised tool '{tool}' failed (exit {completed.returncode}). {kind}."
-            )
+                failure = type(kind, (Exception,), {})(f"{tool}: {message}")
+            else:
+                failure = RunnerError(
+                    f"Supervised tool '{tool}' failed (exit {completed.returncode}). "
+                    f"{kind}: {message}" if message else
+                    f"Supervised tool '{tool}' failed (exit {completed.returncode}). {kind}."
+                )
+            # Where it REALLY broke travels up untouched: every level above
+            # re-raises the failure under its own frame, and an operator asking
+            # "where" wants the innermost tool, not the root that relayed it.
+            if origin:
+                setattr(failure, ORIGIN_ATTRIBUTE, origin)
+            raise failure
         return self._result(tool, nested_dir, admitted)
 
     def _failure_parts(self, tool: str, nested_dir: str):
-        """`(exception class name, message)` the callee recorded, read back."""
+        """`(exception class name, message, origin)` the callee recorded."""
         path = os.path.join(nested_dir, RESULT_FILE)
         try:
             with open(path, encoding="utf-8") as handle:
                 error = json.load(handle).get("error") or {}
         except (OSError, ValueError):
-            return ("Error", f"It wrote no readable result; see its output and {path}.")
-        return (error.get("type", "Error"), error.get("message", "").strip())
+            return ("Error", f"It wrote no readable result; see its output and {path}.",
+                    None)
+        origin = error.get("origin")
+        return (error.get("type", "Error"), error.get("message", "").strip(),
+                origin if isinstance(origin, dict) else None)
 
     def channels(self, wanted: int = 0) -> int:
         """How many of `wanted` items this run may process at once. Never below 1.
@@ -2517,7 +2776,7 @@ class _Supervisor:
             except (TypeError, ValueError):
                 pass
         answer = _capped_here(answer)
-        self.log("{} channel(s) of {} asked for".format(answer, asked or "any"))
+        self._say("{} channel(s) of {} asked for".format(answer, asked or "any"))
         return _record_width(answer)
 
     def declareQualityControl(self, name: str, kind: str = "view") -> bool:
@@ -2558,14 +2817,43 @@ class _Supervisor:
 
     def progress(self, fraction: float, message: str) -> None:
         try:
-            self.log(f"{float(fraction):.0%} {message}")
+            self._say(f"{float(fraction):.0%} {message}")
         except (TypeError, ValueError):
-            self.log(str(message))
+            self._say(str(message))
         _append_progress(fraction, message, self._depth)
 
-    def log(self, message: str) -> None:
+    def log(self, message: str, level: str = "info", user: bool = False) -> None:
+        """Say something about this run, to its operator or to its requester.
+
+            sup.log("ALI found 3 of 7 landmarks; orienting on those", level="warning")
+            sup.log("Scan 4 has no mandible; skipped", level="warning", user=True)
+
+        `level` is one of debug, info, warning, error. `user=False` (the
+        default) is for whoever runs the server: it reaches the operator page,
+        redacted, and is kept with the run's history when it is a warning or
+        an error. `user=True` is written to be read by the clinician, in the
+        panel of a client that asked for it -- the same rule as a progress
+        message, so never a file name or a patient's.
+
+        One positional argument is exactly what this method always accepted,
+        and still means an info line for the operator.
+        """
+        level = _clean_level(level)
         # Through logging, not print: the runner owns handlers and the server
         # reads stderr. The depth prefix is what makes a nested chain readable.
+        logging.getLogger("sadt.supervisor").log(
+            getattr(logging, level.upper(), logging.INFO),
+            "%s%s", "  " * self._depth, message)
+        _append_log(message, level, bool(user), self._depth)
+
+    def _say(self, message: str) -> None:
+        """The supervisor's OWN narration -- stderr only, never the run's log.
+
+        What it says about its own mechanics ("running 'ALI_CBCT'", a channel
+        grant) is a developer's trace, and the run's log channel is the TOOL's
+        voice; mixing them would bury the one line that matters under a dozen
+        that never do.
+        """
         logging.getLogger("sadt.supervisor").info("%s%s", "  " * self._depth, message)
 
     # -- internals ----------------------------------------------------------
@@ -2759,9 +3047,11 @@ def main(argv=None) -> int:
     # whose peak is in its own loading.
     _sampler.start()
 
+    global _JOB_TOOL
     job = None
     try:
         job = _load_job(arguments.job)
+        _JOB_TOOL = job.get("tool")
         module = _import_tool(job["tool"], os.path.join(_tool_dir(), SRC_DIR_NAME))
         if job.get("entry") == PAIRS_ENTRY:
             # Not a run: the tool is asked which of the listed file NAMES go

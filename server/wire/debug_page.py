@@ -1450,22 +1450,42 @@ DEBUG_PAGE = r"""<!doctype html>
       kpi("started", started ? clock(started) : "—") + "</div>";
 
     var lines = data.lines || [];
+    var conLines = function () {
+      return '<div class="con">' + lines.map(function (line) {
+        var padding = new Array(Math.min(line.depth || 0, 4) + 1).join("  ");
+        return '<div class="ln ' + esc(line.level) + '"><span class="ts">' + clock(line.at || 0) +
+          '</span><span class="tx">' + esc(padding + line.text) + "</span></div>";
+      }).join("") + "</div>";
+    };
     var con = dlg.error ? '<div class="con"><div class="ln error"><span class="tx">' + esc(dlg.error) + "</span></div></div>"
-      : data.reaped ? '<div class="empty" style="text-align:left">The console is kept only while a run is on the server; its timeline above is from the history.</div>'
-      : lines.length ? '<div class="con">' + lines.map(function (line) {
-          var padding = new Array(Math.min(line.depth || 0, 4) + 1).join("  ");
-          return '<div class="ln ' + esc(line.level) + '"><span class="ts">' + clock(line.at || 0) +
-            '</span><span class="tx">' + esc(padding + line.text) + "</span></div>";
-        }).join("") + "</div>"
+      : data.reaped ? (lines.length ? conLines() : "") +
+          '<div class="empty" style="text-align:left">The full console is kept only while a run is on the server; ' +
+          (lines.length ? "the warnings and errors above, and its timeline, are from the history." : "its timeline above is from the history.") + "</div>"
+      : lines.length ? conLines()
       : '<div class="empty" style="text-align:left">Nothing reported yet.</div>';
+    var failure = led.failure ? section("Why it failed", failureHtml(led.failure)) : "";
 
-    return head + '<div class="dbody">' + section("Timeline", timeline) + kpis +
+    return head + '<div class="dbody">' + failure + section("Timeline", timeline) + kpis +
       '<div class="two">' + section("Inputs", inputsHtml(led)) + section("Settings", settingsHtml(led)) + "</div>" +
       section("Console", con) +
       '<div class="caveat">Argument values are deliberately not held anywhere on this page: an uploaded input is ' +
       "never named, only its shape (files, bytes, extensions). A hosted bundle is named, because this deployment " +
       "staged it. Console lines are composed by the server from the phase the run reported, never quoted from " +
-      "what the tool printed.</div></div>";
+      "what the tool printed; a tool's own log lines and failure reason are shown redacted \u2014 paths, file " +
+      "names and identifiers replaced by what they were.</div></div>";
+  }
+
+  function failureHtml(f) {
+    var row = function (label, value) {
+      return value == null || value === "" ? "" :
+        '<div class="ln"><span class="ts">' + esc(label) + '</span><span class="tx">' + esc(String(value)) + "</span></div>";
+    };
+    return '<div class="con">' +
+      row("in", (f.chain || []).join(" \u203a ") || f.tool) +
+      row("error", f.error_type + (f.status ? " (HTTP " + f.status + ")" : "")) +
+      row("at", f.where) +
+      row("during", f.stage == null ? null : f.stage + (f.fraction == null ? "" : " \u00b7 " + (f.fraction * 100).toFixed(0) + "%")) +
+      row("reason", f.reason) + "</div>";
   }
 
   // ---- maintenance & updates ------------------------------------------

@@ -649,9 +649,10 @@ rather than a feature, and the callee gets its own venv and its own dependency
 set. `ASO` needs landmarks **mid-run**, after it has recentred its scans;
 `AREG` drives four tools.
 
-Five members, duck-typed, nothing shared: `sup.run(tool, **params)` (blocking,
-returns what that tool's `run()` returned), `sup.out`, `sup.tmp`,
-`sup.progress(fraction, message)`, `sup.log(message)`. A tool never imports the
+Duck-typed, nothing shared: `sup.run(tool, **params)` (blocking, returns what
+that tool's `run()` returned, and takes the reserved `_progress=(start, end)`),
+`sup.out`, `sup.tmp`, `sup.channels(wanted)`, `sup.progress(fraction, message)`,
+`sup.log(message, level="info", user=False)`. A tool never imports the
 class - it cannot, its venv holds none of the server - and the same shape is
 produced by `SADT-VISOR`'s `scripts/run_tool.py` and faked in its tests.
 

@@ -77,8 +77,11 @@ Unannotated is the marker rather than an accident: every other parameter must be
 annotated, so nothing else has that shape, and `describe.py` uses the same rule
 to keep it out of the published schema.
 
-Five members, frozen: `run(tool, **params)`, `out`, `tmp`, `progress(frac, msg)`,
-`log(msg)`.
+The frozen members: `run(tool, **params)`, `out`, `tmp`, `channels(wanted)`,
+`progress(frac, msg)`, `log(msg, level="info", user=False)`, plus
+`declareQualityControl(name)` and `datapath`. `run` also takes the reserved
+`_progress=(start, end)`, the callee's span of the caller's bar
+(RUN_PROGRESS.md §4d).
 
 `sup.run()` re-enters `runner.py` with the sibling's interpreter, so nesting is
 one recursion rather than a feature. It does **not** go back through the server:

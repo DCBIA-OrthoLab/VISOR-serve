@@ -611,9 +611,13 @@ def test_progress_from_a_chain_lands_in_one_file_with_its_depth(tools_dir, tmp_p
     assert [record.get("tool") for record in records] == [
         None, "Leaf", None, "Leaf", None
     ]
+    # Whose each record is: the root's carry no call id, the child's own line
+    # and both markers carry the child's.
+    assert [record.get("call") for record in records] == [None, "1", "1", "1", None]
+    assert [record.get("edge") for record in records] == [None, "open", None, "close", None]
     # Nothing else: a tool's line says how far along it is, and the server
     # stamps the phase, the state and the sequence when it reads them back.
-    assert all(set(record) - {"tool"} == {"at", "fraction", "message", "depth"}
+    assert all(set(record) - {"tool", "call", "edge"} == {"at", "fraction", "message", "depth"}
                for record in records)
 
 
@@ -1042,3 +1046,143 @@ def test_a_width_at_depth_never_divides_its_way_below_one(tools_dir, tmp_path):
     assert _ask(tools_dir, tmp_path, "Caller", {"mine": 8, "theirs": 8},
                 {"Caller": {"vram_bytes": 1}, "Leaf": {"vram_bytes": 1 << 30}},
                 budget="7,0", channels=8) == [7, 1]
+
+
+def _records(events_file: Path) -> list:
+    return [json.loads(line) for line in
+            events_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_a_span_given_to_a_call_rides_its_markers_and_never_reaches_the_callee(
+        tools_dir, tmp_path):
+    """`_progress=(start, end)` is the CALLER saying how much of its bar the
+    call fills. The supervisor's, like `output_dir`: the callee declares no
+    such argument and must not receive one."""
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Caller", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Give the leaf the middle of the bar.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Leaf", scans=scans, output_dir=sup.tmp / "leaf", _progress=(0.2, 0.6))
+        return output_dir
+    """)
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text("", encoding="utf-8")
+
+    completed, _ = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env={"SADT_PROGRESS_FILE": str(events_file)},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    markers = [record for record in _records(events_file) if record.get("tool")]
+    assert [(m["edge"], m["span"]) for m in markers] == [("open", [0.2, 0.6]),
+                                                        ("close", [0.2, 0.6])]
+    nested = json.loads((tmp_path / "job" / "sup" / "01_Leaf" / "job.json").read_text())
+    assert "_progress" not in nested["params"]
+
+
+def test_a_malformed_span_costs_the_weighting_and_nothing_else(tools_dir, tmp_path):
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Caller", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"A span that ends before it starts.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.run("Leaf", scans=scans, output_dir=sup.tmp / "leaf", _progress=(0.8, 0.2))
+        return output_dir
+    """)
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text("", encoding="utf-8")
+
+    completed, _ = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env={"SADT_PROGRESS_FILE": str(events_file)},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert all("span" not in record for record in _records(events_file))
+    assert "ignoring _progress" in completed.stderr
+
+
+def test_sup_log_writes_a_leveled_line_for_its_audience(tools_dir, tmp_path):
+    """The one-argument form is what every existing tool and fake calls, and
+    it stays an info line for the operator."""
+    make_tool(tools_dir, "Leaf", """
+    def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
+        \"\"\"Log three ways.\"\"\"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        sup.log("plain")
+        sup.log("3 of 7 landmarks found", level="warning")
+        sup.log("scan 4 skipped: no mandible", level="WARN", user=True)
+        sup.log("odd level", level="high")
+        return output_dir
+    """)
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text("", encoding="utf-8")
+
+    completed, _ = run_job(
+        tools_dir, "Leaf", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env={"SADT_PROGRESS_FILE": str(events_file)},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    logs = [(r["kind"], r["level"], r["audience"], r["message"]) for r in _records(events_file)]
+    assert logs == [
+        ("log", "info", "admin", "plain"),
+        ("log", "warning", "admin", "3 of 7 landmarks found"),
+        ("log", "warning", "user", "scan 4 skipped: no mandible"),
+        ("log", "info", "admin", "odd level"),
+    ]
+    assert "WARNING sadt.supervisor: 3 of 7 landmarks found" in completed.stderr
+
+
+def test_the_supervisors_own_narration_is_not_the_runs_log(tools_dir, tmp_path):
+    """"running 'Leaf'" is the supervisor talking about itself: stderr only."""
+    make_tool(tools_dir, "Leaf", LEAF)
+    make_tool(tools_dir, "Caller", CALLER)
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text("", encoding="utf-8")
+
+    completed, _ = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env={"SADT_PROGRESS_FILE": str(events_file)},
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "running 'Leaf'" in completed.stderr
+    assert not [record for record in _records(events_file) if record.get("kind") == "log"]
+
+
+def test_a_failure_two_levels_down_is_attributed_to_the_tool_that_raised(tools_dir, tmp_path):
+    """The root relays the failure; the diagnosis names the leaf, its line,
+    and the last thing the leaf said it was doing."""
+    make_tool(tools_dir, "Leaf", """
+    def run(scans: Path, output_dir: Path, tag: str = "leaf", *, sup=None) -> Path:
+        \"\"\"Get halfway, then break.\"\"\"
+        sup.progress(0.5, "scan 2 of 4")
+        raise KeyError("missing landmark")
+    """)
+    make_tool(tools_dir, "Caller", CALLER)
+    events_file = tmp_path / "events.jsonl"
+    events_file.write_text("", encoding="utf-8")
+
+    completed, result = run_job(
+        tools_dir, "Caller", tmp_path / "job",
+        {"scans": str(tmp_path / "in"), "output_dir": str(tmp_path / "job" / "output")},
+        env={"SADT_PROGRESS_FILE": str(events_file)},
+    )
+
+    assert completed.returncode != 0
+    origin = result["error"]["origin"]
+    assert origin["tool"] == "Leaf"
+    assert origin["chain"] == ["Caller", "Leaf"]
+    assert origin["error_type"] == "KeyError"
+    assert origin["where"].startswith("sadt_leaf/__init__.py:")
+    assert origin["stage"] == "scan 2 of 4" and origin["fraction"] == 0.5

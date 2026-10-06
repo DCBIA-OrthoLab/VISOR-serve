@@ -48,6 +48,7 @@ import shutil
 import time
 from typing import List, Optional
 
+import redact
 import telemetry
 from config import settings
 from wire import _scratch
@@ -140,6 +141,32 @@ MAX_RECORD_BYTES = 4096
 # The deepest a supervised chain can nest (runner.MAX_SUPERVISOR_DEPTH). A
 # `depth` outside this is not a depth, and the record is read as the root's.
 _MAX_DEPTH = 10
+
+# Which supervised call a record belongs to (runner.PROGRESS_CALL_ENV): absent
+# for the root, "1" for its first `sup.run`, "1.2" for that child's second.
+_CALL_ID = re.compile(r"[0-9]{1,4}(\.[0-9]{1,4}){0,9}")
+
+# A log line, as opposed to a progress record: `{"kind": "log", "level",
+# "audience", "message"}`, written by `sup.log` (or a tool's own helper).
+#
+# **Never delivered to a reader that did not ask for it.** The Slicer client
+# released before this existed treats every event as progress -- it would put
+# a log line in place of the progress message, blank the bar on its null
+# fraction, and show an operator's line to the clinician. So a reader is given
+# the audiences it asked for and nothing else, and the client's own stream asks
+# for `user` at most; `admin` lines reach only the operator page, redacted.
+LOG_KIND = "log"
+LOG_AUDIENCE_USER = "user"
+LOG_AUDIENCE_ADMIN = "admin"
+LOG_AUDIENCES = (LOG_AUDIENCE_USER, LOG_AUDIENCE_ADMIN)
+LOG_LEVELS = ("debug", "info", "warning", "error")
+# Per reader, apart from MAX_RUN_EVENTS: a chatty log must not be able to use
+# up the progress budget and leave a client's bar frozen.
+MAX_RUN_LOGS = 500
+# What a run's ledger record keeps of its log once the run is gone: the lines
+# worth reading afterwards, redacted, and only the latest few.
+_KEPT_LOG_LEVELS = ("warning", "error")
+_MAX_KEPT_LOGS = 20
 
 # The run this request belongs to, for the code between the endpoint and the
 # subprocess. A ContextVar rather than a parameter threaded through
@@ -420,6 +447,16 @@ def _clean_fraction(fraction) -> Optional[float]:
     return min(1.0, max(0.0, value))
 
 
+def _clean_span(span) -> Optional[list]:
+    """`[start, end]` within 0..1, start <= end, or None."""
+    if not isinstance(span, (list, tuple)) or len(span) != 2:
+        return None
+    start, end = _clean_fraction(span[0]), _clean_fraction(span[1])
+    if start is None or end is None or start > end:
+        return None
+    return [start, end]
+
+
 def _append_record(directory: str, record: dict) -> None:
     """One record, one `write()`, `O_APPEND`. See the module docstring for why
     that is the whole locking strategy."""
@@ -495,9 +532,15 @@ def emit(phase: str, fraction=None, message: str = "", depth: int = 0,
     append(run_id, phase, fraction, message, depth, measured=measured)
 
 
-def finish(run_id: str, phase: str, message: str = "", result=None) -> None:
+def finish(run_id: str, phase: str, message: str = "", result=None,
+           failure: Optional[dict] = None) -> None:
     """The terminal event. Written before the directory is discarded, so a
-    watcher that polls once more sees how the run ended."""
+    watcher that polls once more sees how the run ended.
+
+    `failure` is the operator's diagnosis of a failed run -- which tool, where
+    in the chain, why -- already redacted by the caller. It goes to the ledger
+    only, never on the event stream.
+    """
     append(run_id, phase, None, message, result=result)
     # The ledger is closed HERE rather than at each of the five call sites that
     # end a run, because this is the one funnel all of them pass through: a
@@ -508,11 +551,34 @@ def finish(run_id: str, phase: str, message: str = "", result=None) -> None:
     # The timeline is taken now because this is the last moment the events
     # exist: the directory is discarded right after, and the ledger is what
     # the operator page draws a finished run from.
+    #
+    # The warnings and errors a tool logged are kept too, REDACTED, so "why did
+    # this run fail" still has an answer after the directory is gone. Never
+    # the whole log, and never a line as the tool wrote it.
+    shape, kept = None, None
     try:
-        shape = timeline(read_events(run_id))
+        events = EventReader(run_directory(run_id), logs=LOG_AUDIENCES).read()
+        shape = timeline(events)
+        kept = notable_logs(events)
     except Exception:  # noqa: BLE001 - the ledger must not fail a run's ending
-        shape = None
-    telemetry.record_run_end(run_id, phase, phase, timeline=shape)
+        pass
+    telemetry.record_run_end(run_id, phase, phase, timeline=shape,
+                             failure=failure, logs=kept)
+
+
+def notable_logs(events: List[dict]) -> List[dict]:
+    """The warning and error lines among `events`, redacted, latest last."""
+    kept = []
+    for event in events:
+        if event.get("kind") != LOG_KIND or event.get("level") not in _KEPT_LOG_LEVELS:
+            continue
+        line = {"at": event.get("at"), "level": event["level"],
+                "audience": event.get("audience"), "depth": event.get("depth", 0),
+                "message": redact.scrub(event.get("message"))}
+        if event.get("source"):
+            line["source"] = event["source"]
+        kept.append(line)
+    return kept[-_MAX_KEPT_LOGS:]
 
 
 # ----------------------------------------------------------------------
@@ -558,6 +624,33 @@ def _normalised(raw: dict, seq: int, seen_at: float) -> dict:
     if depth < 0 or depth > _MAX_DEPTH:
         depth = 0
 
+    call = raw.get("call")
+    call = call if isinstance(call, str) and _CALL_ID.fullmatch(call) else None
+
+    if raw.get("kind") == LOG_KIND and raw.get(_SOURCE_KEY) != _SERVER_SOURCE:
+        # A log line. `state` and `phase` ride along as a running tool's, so
+        # that anything reading `event["state"]` -- the terminal check above
+        # all -- reads a log line as harmless; it carries no fraction, because
+        # it says nothing about how far along the run is.
+        level = str(raw.get("level") or "").lower()
+        audience = raw.get("audience")
+        event = {
+            "seq": seq,
+            "at": at,
+            "kind": LOG_KIND,
+            "state": STATE_RUNNING,
+            "phase": PHASE_RUNNING,
+            "level": level if level in LOG_LEVELS else "info",
+            # Unmarked is the operator's: a line nobody said the clinician
+            # should read is not shown to the clinician.
+            "audience": audience if audience in LOG_AUDIENCES else LOG_AUDIENCE_ADMIN,
+            "message": _clean_message(raw.get("message")),
+            "depth": depth,
+        }
+        if call:
+            event["call"] = call
+        return event
+
     event = {
         "seq": seq,
         "at": at,
@@ -574,6 +667,13 @@ def _normalised(raw: dict, seq: int, seen_at: float) -> dict:
     nested = _clean_tool_name(raw.get("tool"))
     if nested:
         event["tool"] = nested
+        if raw.get("edge") in ("open", "close"):
+            event["edge"] = raw["edge"]
+        span = _clean_span(raw.get("span"))
+        if span:
+            event["span"] = span
+    if call:
+        event["call"] = call
     # Only ever from the server, and for the same reason a phase is: a TOOL
     # appends to this same file, and a tool able to write its own `result`
     # could hand the client a pointer to somebody else's bytes.
@@ -588,6 +688,144 @@ def _normalised(raw: dict, seq: int, seen_at: float) -> dict:
     return event
 
 
+def _parent_call(call: str) -> str:
+    return call.rsplit(".", 1)[0] if "." in call else ""
+
+
+class _Call:
+    __slots__ = ("parent", "tool", "span", "depth", "local", "opened", "done", "children")
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.tool = None
+        self.span = None
+        self.depth = 0
+        self.local = None
+        self.opened = False
+        self.done = False
+        self.children = []
+
+
+class _ProgressTree:
+    """One run's supervised calls, and the bar they add up to.
+
+    A caller that hands a call a span -- `sup.run(..., _progress=(0.2, 0.6))`
+    -- is saying that call fills 0.2..0.6 of ITS bar, so a child at half way
+    puts the caller at 0.4. Applied at every level, a leaf three calls down
+    moves the root's bar by exactly its share, and the clinician sees one bar
+    that only ever moves forward instead of each tool's own 0..1 in turn.
+
+    A level's position is the furthest of what it said itself and where its
+    weighted calls have got it; a finished call counts as its whole span. A
+    call given no span weighs nothing on its caller, and its records keep the
+    fraction they were written with -- so a chain nobody weighted reads
+    exactly as it did before this existed.
+
+    Records say whose they are with `call`. One that does not -- a tool's own
+    `progress.py`, written before it learned to -- is attributed by where it
+    falls: to the one call open when it was written, since its caller is
+    blocked in `sup.run` meanwhile. Two calls open at once make that a guess,
+    and a guess is not made: the record keeps its own fraction.
+    """
+
+    def __init__(self):
+        self.calls = {"": _Call(None)}
+        self.calls[""].opened = True
+
+    def _node(self, call: str) -> _Call:
+        node = self.calls.get(call)
+        if node is None:
+            parent = _parent_call(call)
+            parent_node = self._node(parent)
+            node = _Call(parent)
+            node.depth = min(_MAX_DEPTH, call.count(".") + 1)
+            parent_node.children.append(call)
+            self.calls[call] = node
+        return node
+
+    def _open(self) -> List[str]:
+        return [call for call, node in self.calls.items()
+                if call and node.opened and not node.done]
+
+    def _attributed(self, raw: dict) -> Optional[str]:
+        """The call an untagged record belongs to, or None when it is a guess."""
+        open_calls = self._open()
+        if "depth" in raw:
+            depth = raw.get("depth")
+            if depth == 0:
+                return ""
+            here = [call for call in open_calls if self.calls[call].depth == depth]
+            return here[0] if len(here) == 1 else None
+        if not open_calls:
+            return ""
+        depths = [self.calls[call].depth for call in open_calls]
+        if len(set(depths)) != len(depths):
+            return None  # siblings running at once: whose it is is unknowable
+        return max(open_calls, key=lambda call: self.calls[call].depth)
+
+    def _position(self, call: str) -> Optional[float]:
+        """How far along `call` is on its own 0..1, its weighted calls included."""
+        node = self.calls[call]
+        if node.done:
+            return 1.0
+        found = [] if node.local is None else [node.local]
+        for child_id in node.children:
+            child = self.calls[child_id]
+            if child.span is None or not child.opened:
+                continue
+            start, end = child.span
+            found.append(start + (end - start) * (self._position(child_id) or 0.0))
+        return max(found) if found else None
+
+    def _weighted(self, call: str) -> bool:
+        return any(self.calls[child].span is not None for child in self.calls[call].children)
+
+    def feed(self, event: dict, raw: dict) -> dict:
+        """Fold one tool record into the tree; return it with the run's fraction."""
+        if raw.get(_SOURCE_KEY) == _SERVER_SOURCE:
+            return event
+        call = event.get("call")
+        if event.get("tool"):
+            if call is None:
+                return event  # a marker from before calls had ids
+            node = self._node(call)
+            edge = event.get("edge")
+            if edge == "open" or (edge is None and not node.opened):
+                node.opened, node.tool = True, event["tool"]
+                node.span = tuple(event["span"]) if event.get("span") else None
+                node.depth = event.get("depth", node.depth)
+            else:
+                node.done = True
+        else:
+            if call is None:
+                call = self._attributed(raw)
+                if call is None:
+                    return event
+                if call and "depth" not in raw:
+                    event["depth"] = self.calls[call].depth
+            node = self._node(call)
+            if event.get("fraction") is not None:
+                node.local = event["fraction"]
+        # Up the weighted links: the outermost call this record's position
+        # reaches is the scale its fraction is reported on.
+        top = call
+        while top and self.calls[top].span is not None:
+            top = self.calls[top].parent
+        if top == call and not self._weighted(call):
+            return event  # nothing weighted anywhere above or below: as written
+        value = self._position(top)
+        if value is None:
+            return event
+        if event.get("fraction") is not None and event["fraction"] != value:
+            event["own_fraction"] = event["fraction"]
+        event["fraction"] = round(value, 4)
+        return event
+
+    def tool_of(self, call: Optional[str]) -> Optional[str]:
+        node = self.calls.get(call or "")
+        return node.tool if node is not None else None
+
+
 class EventReader:
     """Reads `events.jsonl` forward, once for a snapshot or repeatedly for a
     stream.
@@ -600,7 +838,7 @@ class EventReader:
     completed on the next poll instead of being parsed in half.
     """
 
-    def __init__(self, directory: str, keep_alive: bool = True):
+    def __init__(self, directory: str, keep_alive: bool = True, logs=()):
         # `keep_alive=False` reads WITHOUT stamping the directory, and exists
         # for the operator listing. The TTL is an idle timeout so that a run
         # still reporting progress is never reaped under itself -- that is
@@ -616,6 +854,11 @@ class EventReader:
         self._seq = 0
         self._delivered = 0
         self._truncated = False
+        # Which log audiences this reader hands out: none unless asked. See
+        # LOG_KIND for why that default is the only safe one.
+        self._logs = tuple(audience for audience in logs if audience in LOG_AUDIENCES)
+        self._logs_delivered = 0
+        self._tree = _ProgressTree()
 
     @property
     def path(self) -> str:
@@ -658,6 +901,15 @@ class EventReader:
                 continue
             event = _normalised(raw, self._seq, seen_at)
             self._seq += 1
+            if event.get("kind") == LOG_KIND:
+                if event["audience"] in self._logs and self._logs_delivered < MAX_RUN_LOGS:
+                    self._logs_delivered += 1
+                    source = self._tree.tool_of(event.get("call"))
+                    if source:
+                        event["source"] = source
+                    events.append(event)
+                continue
+            event = self._tree.feed(event, raw)
             capped = self._capped(event)
             if capped is not None:
                 events.append(capped)
@@ -693,9 +945,12 @@ class EventReader:
         )
 
 
-def read_events(run_id: str) -> List[dict]:
-    """Every event so far, oldest first. `404` for an unknown id."""
-    return EventReader(run_directory(run_id)).read()
+def read_events(run_id: str, logs=()) -> List[dict]:
+    """Every event so far, oldest first. `404` for an unknown id.
+
+    `logs` names the log audiences to include; none by default.
+    """
+    return EventReader(run_directory(run_id), logs=logs).read()
 
 
 # What a timeline keeps at most. A run that reports progress every second for
@@ -728,6 +983,8 @@ def timeline(events: List[dict]) -> dict:
     """
     spans, nested, open_calls, measured = [], [], {}, None
     for event in events:
+        if event.get("kind") == LOG_KIND:
+            continue
         at = event.get("at")
         if event.get("measured"):
             measured = event["measured"]
@@ -763,7 +1020,7 @@ def timeline(events: List[dict]) -> dict:
     }
 
 
-def snapshot(run_id: str) -> dict:
+def snapshot(run_id: str, logs=()) -> dict:
     """The whole run in one object: how it stands now, and how it got there.
 
     Exists for tests, for debugging, and for a client that cannot hold a
@@ -771,12 +1028,14 @@ def snapshot(run_id: str) -> dict:
     instead, so nothing here is on the hot path.
     """
     directory = run_directory(run_id)
-    events = EventReader(directory).read()
+    events = EventReader(directory, logs=logs).read()
     try:
         started_at = os.path.getctime(directory)
     except OSError:
         started_at = time.time()
-    latest = events[-1] if events else None
+    # Where the run STANDS is its latest progress, never a log line.
+    progress = [event for event in events if event.get("kind") != LOG_KIND]
+    latest = progress[-1] if progress else None
     return {
         "run_id": run_id,
         "state": latest["state"] if latest else STATE_PENDING,
@@ -784,7 +1043,7 @@ def snapshot(run_id: str) -> dict:
         "fraction": latest["fraction"] if latest else None,
         "message": latest["message"] if latest else "",
         "depth": latest["depth"] if latest else 0,
-        "started_at": events[0]["at"] if events else started_at,
+        "started_at": progress[0]["at"] if progress else started_at,
         "updated_at": latest["at"] if latest else started_at,
         "events": events,
     }
