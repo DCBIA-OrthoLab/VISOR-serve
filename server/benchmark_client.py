@@ -64,6 +64,44 @@ UPLOAD_CHUNK = 32 * 1024 * 1024
 UPLOAD_WORKERS = 4
 UPLOADS_FIELD = "__uploads__"
 
+# The ledger of the runs this battery has started, one line each, which is how
+# the server finds them when the battery is stopped. The runs are the
+# SERVER's: killing this process ends none of them, so a stop that did not
+# know their ids would leave them holding the card to the end. Set by `--runs`.
+LEDGER_START = "start"
+LEDGER_END = "end"
+_ledger: Optional[str] = None
+
+
+def _record(kind: str, run_id: str) -> None:
+    """Append one line to the ledger: `start` before the run's POST leaves,
+    `end` once the server has answered it.
+
+    One `write` on an O_APPEND descriptor, so concurrent runs never interleave
+    a line and a line is on the kernel's side of the file the moment this
+    returns: a battery SIGKILLed right after has still recorded it. Not fsynced
+    -- what this guards against is the process dying, not the machine.
+    """
+    if not _ledger:
+        return
+    if kind == LEDGER_END:
+        # Best effort: a missing end line costs a stop one needless look at
+        # a run that is already over, never a run left going.
+        try:
+            _write_line(kind, run_id)
+        except OSError:
+            pass
+        return
+    _write_line(kind, run_id)
+
+
+def _write_line(kind: str, run_id: str) -> None:
+    descriptor = os.open(_ledger, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        os.write(descriptor, f"{kind} {run_id}\n".encode("ascii"))
+    finally:
+        os.close(descriptor)
+
 
 def _request(url: str, token: str, data=None, method=None, timeout=POLL_TIMEOUT,
              headers=None):
@@ -252,6 +290,17 @@ def _one_run(base: str, token: str, item: dict, client: int, origin: float,
                 results.append(record)
             return
         form[UPLOADS_FIELD] = json.dumps(references)
+    # Recorded before the POST, never after: a battery stopped between the two
+    # would otherwise leave a run on the server that no stop could name. And a
+    # run that could not be recorded is not sent, for the same reason.
+    try:
+        _record(LEDGER_START, run_id)
+    except OSError as exc:
+        record.update(status="error", error=f"ledger: {type(exc).__name__}", seconds=0.0)
+        record["spans"] = [transfer] if transfer else []
+        with lock:
+            results.append(record)
+        return
     posted = time.time()
 
     sink, stop = {}, threading.Event()
@@ -263,12 +312,17 @@ def _one_run(base: str, token: str, item: dict, client: int, origin: float,
             f"{base}/run/{urllib.parse.quote(item['tool'])}",
             token, data=form, method="POST",
             timeout=REQUEST_TIMEOUT, headers={RUN_ID_HEADER: run_id})
+        _record(LEDGER_END, run_id)
         record["seconds"] = round(time.time() - posted, 2)
         record["invocation"]["produced"] = {"bytes": len(body)}
         if status >= 400:
             record["status"] = "error"
             record["error"] = f"HTTP {status}"
     except urllib.error.HTTPError as exc:
+        # The server answered, so the run is over. Any OTHER exception -- a
+        # timeout, a reset -- says nothing about the run, which may still be
+        # going, and leaves it on the ledger for a stop to cancel.
+        _record(LEDGER_END, run_id)
         record["seconds"] = round(time.time() - posted, 2)
         record["status"] = "error"
         # The status and the tool's own exception TYPE, never the body: a 422
@@ -409,7 +463,12 @@ def main() -> int:
     parser.add_argument("--plan", required=True)
     parser.add_argument("--out", required=True)
     parser.add_argument("--base", default="http://127.0.0.1:8000")
+    parser.add_argument("--runs", default=None,
+                        help="file to append the id of every run started to")
     args = parser.parse_args()
+
+    global _ledger
+    _ledger = args.runs
 
     token = os.environ.get("API_TOKEN") or ""
     if not token:

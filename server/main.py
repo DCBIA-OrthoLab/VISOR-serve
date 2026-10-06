@@ -1585,8 +1585,12 @@ def benchmark_status() -> dict:
 
 @app.delete("/benchmark/run", dependencies=[Depends(verify_admin)])
 def benchmark_stop() -> dict:
-    """Stop the battery, and everything it started."""
-    return {"stopped": benchmark_jobs.stop()}
+    """Stop the battery, and every run it started that is still in flight.
+
+    `cancelled_runs` counts the runs that were cancelled here, queued or
+    running; a run that had already finished is left alone and not counted.
+    """
+    return benchmark_jobs.stop()
 
 
 @app.get("/admin-panel", include_in_schema=False)
@@ -2241,11 +2245,9 @@ async def cancel_run(run_id: str) -> Response:
     rather than through this process's memory.
     """
     try:
-        pgid = await anyio.to_thread.run_sync(runs.request_cancel, run_id)
+        pgid = await anyio.to_thread.run_sync(dispatch.cancel_run, run_id)
     except runs.RunError as exc:
         raise _run_error(exc)
-    if pgid is not None:
-        await anyio.to_thread.run_sync(dispatch.kill_process_group, pgid)
     logger.info("endpoint=/runs status=204 action=cancel signalled=%s", pgid is not None)
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
