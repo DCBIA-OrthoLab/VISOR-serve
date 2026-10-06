@@ -211,8 +211,11 @@ def _shapes(tool, params: dict) -> list:
     # ladder down to one first would put (1 channel, floor cores) ahead of
     # (1 channel, every core free) -- a run admitted on two cores while ten
     # were going spare, because the list stopped narrowing monotonically.
+    # A tool whose channels each bring their own cores (`cores_per_channel`)
+    # asks for a share per channel; every other tool's channels split one.
+    per_channel = bool(getattr(deployment_config.resolved(tool.name), "cores_per_channel", False))
     for channels in range(widest, 1, -1):
-        shapes.append((channels, share))
+        shapes.append((channels, share * channels if per_channel else share))
     # Then one channel, giving cores back one at a time. A tool that declares
     # no channel argument has `widest == 1` and this tail is the whole list --
     # which is right: it is the only axis it has.

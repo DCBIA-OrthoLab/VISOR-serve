@@ -1610,3 +1610,20 @@ def test_an_interval_too_short_to_divide_is_ignored(monkeypatch):
     sampler.sample()
     sampler.sample()
     assert sampler.peak_cores == 0.0
+
+
+def test_a_tool_whose_channels_bring_their_own_cores_asks_for_a_share_each(monkeypatch):
+    """`cores_per_channel`: a channel that is a whole CPU-bound computation
+    reserves its own share and opens its own threads, where every other
+    tool's channels divide one."""
+    from execution import dispatch
+    from registry.deployment import ToolDeployment
+
+    monkeypatch.setattr(settings, "SADT_MAX_CHANNELS", 8)
+    monkeypatch.setattr(dispatch.deployment_config, "resolved",
+                        lambda name: ToolDeployment(cores_per_channel=True))
+    shapes = _shapes(_Tool(), per_job=10, monkeypatch=monkeypatch, affordable=3)
+    assert shapes[:3] == [(3, 30), (2, 20), (1, 10)]
+    # And the threads a channel opens are that channel's share.
+    limits = dispatch._thread_limits(30, 3)
+    assert set(limits.values()) == {"10"}

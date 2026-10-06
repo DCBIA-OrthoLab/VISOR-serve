@@ -67,7 +67,7 @@ CONFIG_AHEAD_MARKER = "DEPLOYMENT-CONFIG-AHEAD-OF-SERVER"
 
 
 _TOOL_KEYS = ("server_selectable", "max_upload_mb", "data_dir", "hidden",
-              "timeout_seconds", "dispatch", "batch", "width_from")
+              "timeout_seconds", "dispatch", "batch", "width_from", "cores_per_channel")
 
 # What a [tools.X] `batch` table may say. `axis` names the argument a cohort is
 # split on when the convention cannot derive it; the two caps override this
@@ -200,6 +200,16 @@ class ToolDeployment:
     # and how many slices there are is not known until the volume has been
     # read, which is after admission has decided.
     width_from: Optional[object] = None
+
+    # Each channel brings its OWN share of cores, and opens that many threads.
+    # Off by default, and the default is right for most of the catalogue: a
+    # channel of ALI_CBCT or AMASSS costs memory on the card, and its CPU work
+    # is a slice of the threads the run already holds. A tool whose channel is
+    # a whole CPU-bound computation -- AREG_CBCT's channel is one elastix
+    # registration, measured 97 s alone on ten threads and 102-115 s with a
+    # second beside it on ten more -- gains nothing from a width whose threads
+    # are divided, and everything from one whose threads are added.
+    cores_per_channel: bool = False
 
     # The RESOLVED plan a client is handed -- `{axis, max_mb, max_files}`, or
     # None for a cohort that travels whole. Filled by conventions.derive, never
@@ -442,6 +452,12 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
             f"this tool's width cannot be counted from the request."
         )
 
+    per_channel = table.get("cores_per_channel", False)
+    if not isinstance(per_channel, bool):
+        raise DeploymentConfigError(
+            f"{where}: 'cores_per_channel' must be true or false."
+        )
+
     batch_enabled, batch_axis, batch_max_mb, batch_max_files = _batch_declaration(where, table)
 
     return ToolDeployment(
@@ -453,6 +469,7 @@ def _tool_deployment(tool_name: str, table) -> ToolDeployment:
         hidden=tuple(hidden),
         timeout_seconds=float(timeout) if timeout is not None else None,
         width_from=bound,
+        cores_per_channel=per_channel,
         batch_enabled=batch_enabled,
         batch_axis=batch_axis,
         batch_max_mb=batch_max_mb,

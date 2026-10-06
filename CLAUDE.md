@@ -572,6 +572,23 @@ concurrently in worker threads, capped by `MAX_CONCURRENT_TOOLS`).
 
 ## Changelog
 
+### 2026-10-06 - A channel may bring its own cores
+
+`cores_per_channel` in `deployment.toml`: each channel of the tool reserves a
+whole per-job share of cores and opens that many threads, where every other
+tool's channels split one share. Off by default, because a channel of ALI_CBCT
+or AMASSS costs card memory and its CPU work is a slice of the run's threads.
+
+AREG_CBCT is the first to declare it, with `width_from = "regions"`. Its
+channel is one elastix registration, and elastix scales with the threads it is
+given -- one region of the test pair: 97 s on ten threads, 43 s on fifty-six,
+while elastix's own `NumberOfThreads` changes nothing (1, 8 and 10 give the
+same time and the same transform on eight validated cases). Dividing ten
+threads between two registrations gained nothing (182-203 s each); giving each
+its own ten does: two regions 210 s -> 130 s. The regions bound the
+reservation, since the subjects of two paired folders cannot be counted before
+the tool pairs them.
+
 ### 2026-10-05 - A nested call is admitted like a run of its own
 
 A tool calling another through `sup.run` used to run the callee inside its own
