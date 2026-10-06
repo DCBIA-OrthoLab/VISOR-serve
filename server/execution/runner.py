@@ -1318,7 +1318,7 @@ def _origin_of(exc: BaseException) -> dict:
         "tool": tool,
         "chain": chain,
         "error_type": type(exc).__name__,
-        "message": str(exc).replace("\r", " ").replace("\n", " ")[:MAX_FAILURE_MESSAGE],
+        "message": _condensed(str(exc), MAX_FAILURE_MESSAGE),
     }
     where = _source_location(exc)
     if where:
@@ -1501,11 +1501,28 @@ def _write_record(record: dict) -> None:
         pass
 
 
+def _condensed(text, limit: int) -> str:
+    """`text` on one line and within `limit`, keeping its END as well as its start.
+
+    A newline inside a record would be read as the end of it, so lines are
+    joined. And a long message is cut in the MIDDLE rather than at the end:
+    the one that does not fit is a third-party error -- a DataLoader worker's
+    "Original Traceback", greedy's stderr, an ITK exception -- whose first
+    line says where and whose LAST line says what actually went wrong.
+    """
+    raw = "" if text is None else str(text)
+    lines = [line.strip() for line in raw.replace("\r", "\n").split("\n") if line.strip()]
+    flat = " ".join(lines)
+    if len(flat) <= limit:
+        return flat
+    tail = lines[-1] if len(lines) > 1 else flat
+    keep_tail = min(len(tail), limit * 3 // 5)
+    head = flat[: max(0, limit - keep_tail - 3)]
+    return "{} … {}".format(head.rstrip(), tail[-keep_tail:].lstrip())[:limit]
+
+
 def _single_line(message) -> str:
-    text = "" if message is None else str(message)
-    # A newline inside a record would be read as the end of it, and a message
-    # is free text written by a tool.
-    return text.replace("\r", " ").replace("\n", " ")[:MAX_PROGRESS_MESSAGE]
+    return _condensed(message, MAX_PROGRESS_MESSAGE)
 
 
 def _append_log(message, level: str, user: bool, depth: int) -> None:

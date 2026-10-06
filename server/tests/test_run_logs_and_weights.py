@@ -326,3 +326,19 @@ def test_a_chatty_tool_cannot_push_its_error_out_of_the_history(run_id):
     kept = telemetry.ledger_record(run_id)["logs"]
     assert kept[0]["message"] == "the one error"
     assert len(kept) == 21 and kept[-1]["message"] == "step 59"
+
+
+def test_a_long_third_party_error_keeps_its_cause():
+    """A DataLoader or greedy error says where first and WHAT last; cutting
+    the end kept the boilerplate and dropped the cause."""
+    from execution import runner
+
+    trace = ("Caught RuntimeError in DataLoader worker process 0.\nOriginal Traceback:\n"
+             + '  File "x.py", line 3, in f\n' * 12
+             + "RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB")
+
+    condensed = runner._condensed(trace, 200)
+    assert len(condensed) <= 200 and "\n" not in condensed
+    assert condensed.startswith("Caught RuntimeError in DataLoader")
+    assert condensed.endswith("RuntimeError: CUDA out of memory. Tried to allocate 2.00 GiB")
+    assert scrub("x " * 400 + "the real cause").endswith("the real cause")

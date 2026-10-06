@@ -74,4 +74,9 @@ def scrub(text) -> str:
     value = _IPV4.sub("<address>", value)
     value = _IDENTIFIER.sub(_identifier, value)
     value = re.sub(r"\s+", " ", value).strip()
-    return value[:MAX_REDACTED_CHARS]
+    if len(value) <= MAX_REDACTED_CHARS:
+        return value
+    # Cut in the middle, not at the end: a long reason is a third-party
+    # error whose last words are the cause.
+    keep_tail = MAX_REDACTED_CHARS * 3 // 5
+    return value[: MAX_REDACTED_CHARS - keep_tail - 3].rstrip() + " … " + value[-keep_tail:].lstrip()
