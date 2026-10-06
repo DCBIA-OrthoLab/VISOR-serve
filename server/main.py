@@ -1462,18 +1462,18 @@ def _custom_plan(spec: dict) -> dict:
 
 
 def _local_base(request: Request) -> str:
-    """`http://<host>:<port>` of the socket this request was accepted on.
+    """`http://127.0.0.1:<port>`: this server, on its own loopback.
 
-    Plain HTTP: TLS is the reverse proxy's, in front of uvicorn, and a server
-    serving TLS itself would be reached the same way it is reached here -- on
-    its own socket. Falls back to loopback on the configured port when the
-    server address is unknown.
+    The battery runs in the same container as uvicorn, so it never needs to
+    leave it: loopback traffic does not reach the Docker network, the host or
+    anything beyond, which is the property that makes plain HTTP acceptable
+    here -- the same plain HTTP the reverse proxy already speaks to uvicorn
+    after terminating TLS, only shorter. The port is the one uvicorn accepted
+    this request on.
     """
-    server = request.scope.get("server") or ("127.0.0.1", 8000)
-    host, port = server[0] or "127.0.0.1", server[1]
-    if ":" in str(host):
-        host = f"[{host}]"  # an IPv6 address in a URL
-    return f"http://{host}:{port}" if port else f"http://{host}"
+    server = request.scope.get("server") or (None, 8000)
+    port = server[1] or 8000
+    return f"http://127.0.0.1:{port}"
 
 
 @app.post("/benchmark/run", dependencies=[Depends(verify_admin), Depends(maintenance.require_accepting)])
@@ -1504,11 +1504,11 @@ def benchmark_start(request: Request, body: BatteryRequest) -> dict:
     )
     # The battery talks to this server over HTTP like any other client, so it
     # needs an address to reach it at -- and it runs HERE, beside uvicorn, so
-    # that is the socket uvicorn itself accepted this request on, never the
-    # address the operator typed. Behind the reverse proxy those differ: the
-    # request arrives as https://<public address>, which the container cannot
-    # reach (its connect hung in SYN_SENT and the battery sent nothing), while
-    # uvicorn listens on plain HTTP on its own address and port.
+    # that is this server's own loopback, never the address the operator
+    # typed. Behind the reverse proxy those differ: the request arrives as
+    # https://<public address>, which the container cannot reach (its connect
+    # hung in SYN_SENT and the battery sent nothing). Loopback never leaves the
+    # container, so nothing a battery sends crosses any network.
     base = _local_base(request)
     try:
         return benchmark_jobs.start(
