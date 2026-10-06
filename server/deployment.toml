@@ -29,9 +29,8 @@ data_dir = "AREG"
 # below about its own: the convention fills an unnamed model argument with
 # DATA/<tool>/models/ -- the FOLDER -- and AREG passed that straight to AMASSS,
 # which answered "No nnUNet model found in 'models'". The folder is not a
-# bundle. Left empty, the tool resolves the AMASSS bundle itself
-# (dispatch._own_segmentation), which is the one answer there was ever going
-# to be.
+# bundle. Left empty, AREG sends no model and AMASSS resolves its own bundle,
+# which is the one answer there was ever going to be.
 # One folder per ARGUMENT, not per modality. Scoped to the modality, the
 # picker still offered whole cohorts -- `<name>/{T1,T2}/` -- so the baseline
 # field listed entries holding the follow-up too, and the intraoral field
@@ -195,6 +194,13 @@ width_from = false
 # structures and was answered one, and the card stayed at 2.4 GiB while the
 # run took as long as it always had.
 width_from = "structures"
+# AMASSS has one model and resolves it itself when `model` is empty, from
+# DATA/AMASSS/models/AMASSS_Models. The convention would fill the argument with
+# the models FOLDER, which is not a bundle, and would put a picker with a
+# single answer in front of a clinician. So it is neither filled nor asked;
+# a caller that names a bundle is still obeyed.
+server_selectable = { model = "none" }
+hidden = ["model"]
 
 # AREG became three tools when it was split, one per modality, because the
 # engines cannot share a virtualenv. This publishes the name callers already
