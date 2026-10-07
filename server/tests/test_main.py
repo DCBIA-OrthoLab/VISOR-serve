@@ -1664,6 +1664,44 @@ def test_the_data_listing_says_what_each_entry_is_and_costs(monkeypatch, tmp_pat
     assert body["entries"]["models"] == []
 
 
+def test_the_gzip_check_runs_off_the_event_loop(monkeypatch, tmp_path):
+    """It gunzips the whole input -- 5 s for a clinical CBCT -- and on the
+    event loop that froze every other request for as long: eight runs arriving
+    together staged one after another and stalled each other's uploads."""
+    import asyncio
+    import main
+
+    seen = []
+    real = main._reject_a_truncated_gzip
+
+    def checked(*args):
+        try:
+            asyncio.get_running_loop()
+            seen.append("event loop")
+        except RuntimeError:
+            seen.append("worker thread")
+        return real(*args)
+
+    class _Probe(Tool):
+        name = "Gzip_Thread_Probe"
+        arguments = {"scan": ArgSpec(type="path")}
+        output_kind = "text"
+
+        def run(self, scan):
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Gzip_Thread_Probe", _Probe())
+    monkeypatch.setattr(main, "_reject_a_truncated_gzip", checked)
+    response = client.post(
+        "/run/Gzip_Thread_Probe",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"scan": ("scan.nii.gz", io.BytesIO(gzip.compress(b"volume" * 100)),
+                        "application/gzip")},
+    )
+    assert response.status_code == 200, response.text
+    assert seen == ["worker thread"]
+
+
 def test_a_truncated_gzip_is_refused_rather_than_segmented(monkeypatch, tmp_path):
     """ITK's NIfTI reader does not report a truncated gzip: it believes the
     header's dimensions and zero-fills the rest. Measured on a scan cut to

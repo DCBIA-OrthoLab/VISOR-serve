@@ -3289,7 +3289,11 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
                     detail=f"File exceeds the {upload_limit_mb} MB limit.",
                 )
-            _reject_a_truncated_gzip(input_path, field_name, upload.filename or "")
+            # In a worker thread: it gunzips the whole file (5 s for a clinical
+            # CBCT), and on the event loop that froze every other request --
+            # uploads, /status, the next run's staging -- for as long.
+            await anyio.to_thread.run_sync(functools.partial(
+                _reject_a_truncated_gzip, input_path, field_name, upload.filename or ""))
             input_paths.append(input_path)
             # An argument can accept several types (e.g. ("csv_file",
             # "folder")): decide here which one this upload is and tag the path
@@ -3332,7 +3336,9 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             # actually happens. Each PART is checksummed, but the parts only
             # tile what the client SENT -- a client that stopped early sends a
             # complete set of parts for an incomplete file.
-            _reject_a_truncated_gzip(input_path, field_name, session.filename)
+            # Off the event loop, for the reason given on the multipart path.
+            await anyio.to_thread.run_sync(functools.partial(
+                _reject_a_truncated_gzip, input_path, field_name, session.filename))
             size += session.size
             input_paths.append(input_path)
             args[field_name] = await _as_resolved_path(
