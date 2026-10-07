@@ -630,6 +630,26 @@ def test_a_torch_figure_is_learned_whether_the_run_was_alone_or_not(solo):
     assert costs.cost_of("Batch_Dental_Seg").vram_bytes == 16 * 1024 ** 3
 
 
+def test_a_run_whose_width_nobody_saw_teaches_nothing():
+    """A run with no progress file cannot say how many channels its peak was
+    spread over. Learned as one, a four-structure AMASSS priced ONE channel at
+    38.65 GiB, and every AMASSS after it ran alone."""
+    from execution import dispatch
+
+    unknown = dict(_measured("torch"), channels=None)
+    dispatch._keep_measurements("AMASSS", unknown, solo=True)
+    assert costs.cost_of("AMASSS") is None
+
+
+def test_a_payload_from_before_widths_were_reported_still_means_one():
+    from execution import dispatch
+
+    old = _measured("torch")
+    del old["channels"]
+    dispatch._keep_measurements("Batch_Dental_Seg", old, solo=True)
+    assert costs.cost_of("Batch_Dental_Seg").vram_bytes == 16 * 1024 ** 3
+
+
 def test_a_card_figure_is_learned_from_a_run_that_had_the_machine_to_itself():
     """On an idle machine the card's growth IS this run's allocation, and on
     this deployment it is the only reading the driver ever gives."""
