@@ -396,18 +396,8 @@ def banner(allocation: Allocation) -> str:
             allocation.expected_clients, allocation.max_parallel_jobs
         ),
     ]
-    # MAX_CONCURRENT_TOOLS caps the worker threads that may be inside a tool run
-    # at once, and it sits ABOVE admission. Left below what the budget allows it
-    # becomes the real limit, silently, and every budget past it looks identical
-    # -- which is a very expensive afternoon to spend not knowing.
     lines.append(
         "  admission    what each run was measured to need, at the width it was "
         "granted; a tool with no measured cost runs alone"
     )
-    threads = int(getattr(settings, "MAX_CONCURRENT_TOOLS", 0) or 0)
-    if threads and threads < allocation.max_parallel_jobs:
-        lines.append(
-            "  NOTE  MAX_CONCURRENT_TOOLS={} is below that, so it is the real "
-            "limit, not the budget".format(threads)
-        )
     return "\n".join(lines)

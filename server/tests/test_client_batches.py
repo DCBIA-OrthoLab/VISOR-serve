@@ -132,7 +132,7 @@ def test_a_batch_that_gives_up_frees_its_turn():
     assert clients.may_start("10.0.0.5", _batch(2), "r2")
 
 
-def test_the_slot_holds_a_serial_batch_until_its_sibling_ends(monkeypatch):
+def test_the_gate_holds_a_serial_batch_until_its_sibling_ends(monkeypatch):
     allocation = resources.Allocation(cpus=8.0, ram_bytes=16 << 30, vram_bytes=8 << 30, cpus_per_job=2,
                                       ram_per_job=4 << 30, vram_per_job=2 << 30, expected_clients=4)
     monkeypatch.setattr(admission, "_budget", admission.Budget(allocation, free_vram=lambda: 1 << 60))
@@ -140,12 +140,11 @@ def test_the_slot_holds_a_serial_batch_until_its_sibling_ends(monkeypatch):
         runs.register(run_id, tool="AMASSS", client="10.0.0.5", batch=_batch(index, total=2))
 
     async def scenario():
-        monkeypatch.setattr(main, "_tool_limiter", anyio.CapacityLimiter(4))
         monkeypatch.setattr(main, "_PRIORITY_POLL_SECONDS", 0.01)
         order, release_first = [], anyio.Event()
 
         async def run(run_id, hold=None):
-            async with main._tool_slot(run_id):
+            async with main._batch_turn(run_id):
                 order.append(run_id[-1])
                 if hold is not None:
                     await hold.wait()
@@ -189,7 +188,8 @@ def test_a_workstation_reads_its_own_rule():
     clients.set_policy(answer["client"], clients.PARALLEL)
     answer = client.get("/clients/me", headers=AUTH).json()
     assert answer["batches"] == clients.PARALLEL
-    assert answer["max_parallel"] == settings.MAX_CONCURRENT_TOOLS
+    budget = admission.budget()
+    assert answer["max_parallel"] == max(1, int(budget.cpus // budget.cpus_per_job))
 
 
 def test_only_the_admin_token_changes_a_rule(monkeypatch):

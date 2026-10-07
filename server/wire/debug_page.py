@@ -1057,12 +1057,11 @@ DEBUG_PAGE = r"""<!doctype html>
   }
   function drawQueue(d) {
     var byId = ledgerById(d), q = d.queue || {};
-    // Two gates, in the order a run meets them: a slot among the
-    // MAX_CONCURRENT_TOOLS the server serves at once (the run is "received"
-    // until it gets one -- or still uploading, which this page cannot tell
-    // apart), then room on the machine ("queued_gpu").
+    // One gate: room on the machine ("queued_gpu"). A run is "received"
+    // while its inputs are still uploading or being staged, which this page
+    // cannot tell apart.
     // The order admission will actually admit in, which an operator may have
-    // changed; runs still waiting for a slot follow, oldest first.
+    // changed; runs not in its queue yet follow, oldest first.
     var adm = d.admission || {}, prios = adm.priorities || {}, position = {}, serialClients = {};
     (d.clients || []).forEach(function (c) { if (c.batches === "serial") { serialClients[c.client] = true; } });
     (adm.queue || []).forEach(function (entry) { if (entry.run_id) { position[entry.run_id] = entry.position; } });
@@ -1088,11 +1087,11 @@ DEBUG_PAGE = r"""<!doctype html>
     });
     el("q-count").textContent = waiting.length;
     el("q-list").innerHTML = waiting.length ? waiting.map(function (r, i) {
-      var slot = r.phase === "received", high = prios[r.run_id] === "high";
-      // A serial cohort's later batches wait at the batch gate, before any
-      // slot: say which batch they are waiting for rather than "a slot".
+      var arriving = r.phase === "received", high = prios[r.run_id] === "high";
+      // A serial cohort's later batches wait at the batch gate, before
+      // admission: say which batch they are waiting for.
       var sibling = null;
-      if (slot && r.batch && serialClients[r.client]) {
+      if (arriving && r.batch && serialClients[r.client]) {
         (d.runs || []).forEach(function (o) {
           if (o.run_id !== r.run_id && o.batch && o.batch.id === r.batch.id && o.client === r.client &&
               inFlight(o) && o.batch.index < r.batch.index && (!sibling || o.batch.index < sibling)) {
@@ -1101,18 +1100,18 @@ DEBUG_PAGE = r"""<!doctype html>
         });
       }
       var ctl = r.nested ? "" : admin.ok ? '<span class="ctl">' +
-        (slot ? "" : '<button data-move="top" data-id="' + esc(r.run_id) + '" title="to the top">\u2912</button>' +
+        (arriving ? "" : '<button data-move="top" data-id="' + esc(r.run_id) + '" title="to the top">\u2912</button>' +
           '<button data-move="up" data-id="' + esc(r.run_id) + '" title="up one">\u2191</button>' +
           '<button data-move="down" data-id="' + esc(r.run_id) + '" title="down one">\u2193</button>') +
         '<button class="star' + (high ? " on" : "") + '" data-prio="' + (high ? "normal" : "high") + '" data-id="' +
         esc(r.run_id) + '" title="' + (high ? "back to normal" : "give priority") + '">\u2605</button></span>' : "";
       // A nested call is not a run of its own: no run dialog to open.
-      return '<div class="qitem' + (slot ? " slot" : "") + (high ? " high" : "") + '"' +
+      return '<div class="qitem' + (arriving ? " slot" : "") + (high ? " high" : "") + '"' +
         (r.nested ? "" : ' data-run="' + esc(r.run_id) + '"') + '><span class="pos">' + (i + 1) + "</span>" +
         '<div style="min-width:0;flex:1"><div class="n">' + esc(r.tool || "?") + (high ? ' <span class="prio">PRIORITY</span>' : "") +
           (r.batch ? ' <span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") + "</div>" +
         '<div class="m mono">' + (r.nested ? "called by " + esc(r.calledBy || "?") + " \u00b7 " : "") +
-        (sibling ? "waiting for batch " + sibling + " " : slot ? "waiting for a slot " : "waiting for room ") + ago(r.started_at) +
+        (sibling ? "waiting for batch " + sibling + " " : arriving ? "receiving its inputs " : "waiting for room ") + ago(r.started_at) +
         (r.client ? " \u00b7 " + esc(r.client) : "") + "</div></div>" + ctl + "</div>";
     }).join("") : '<div class="empty">' + (anyFilter() ? "Nothing waiting matches this filter." : "Nothing waiting.") + "</div>";
 

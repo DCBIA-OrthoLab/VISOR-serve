@@ -464,7 +464,7 @@ dependency on when the next request arrives.
   - **core** - `API_TOKEN`, `DEVICE`, `TEMP_DIR`, `DATA_DIR`, `DATA_BACKEND`.
   - **running a tool** - `SADT_DISPATCH_MODE`, `TOOLS_DIR`, `RUNNER_PATH`,
     `DESCRIBE_PATH`, `SCHEMA_CACHE_DIR`, `DEPLOYMENT_CONFIG`, `SADT_API`,
-    `MAX_CONCURRENT_TOOLS`, `MAX_CONCURRENT_GPU_JOBS`, `TOOL_TIMEOUT_SECONDS`.
+    `MAX_CONCURRENT_GPU_JOBS`, `TOOL_TIMEOUT_SECONDS`.
   - **uploads and results** - `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
     `UPLOAD_CHUNK_MB`, `TRANSFER_TTL_SECONDS`, `TRANSFER_SWEEP_SECONDS`,
     `RESULT_REFERENCE_MIN_MB`, `ZIP_COMPRESSLEVEL`, `ALLOWED_EXTENSIONS`.
@@ -568,9 +568,29 @@ Provide a small, generic client mirroring the server:
 
 Already implemented, despite earlier versions of this list: real GPU inference,
 out-of-process execution, and in-process parallelism (tool runs execute
-concurrently in worker threads, capped by `MAX_CONCURRENT_TOOLS`).
+concurrently in worker threads, gated by admission alone).
 
 ## Changelog
+
+### 2026-10-07 - MAX_CONCURRENT_TOOLS is gone; admission alone decides
+
+Eight workstations each sending one AREG CBCT run at the same second left a
+production server with 103 GB of RAM free and a load of 5 on 56 cores, while
+the seventh and eighth runs sat in `staging` for minutes. They were not
+staging: they were waiting for one of the six `MAX_CONCURRENT_TOOLS` slots,
+a wait that emitted no phase of its own. A count of jobs cannot describe a
+machine, which is why admission budgets bytes and cores; the slot was a
+second, coarser queue in front of it.
+
+The setting is removed. Tool runs still go to worker threads of their own,
+`_get_tool_threads()`, now an unbounded `CapacityLimiter`: a run waits for
+admission INSIDE its thread, so on anyio's default pool a deep queue would
+starve staging, uploads and `/status`. A waiting run costs one idle thread.
+`_tool_slot` became `_batch_turn`, which keeps the serial-cohort gate and its
+priority bypass; the priority race against the slot went with the slot.
+`GET /clients/me` answers `max_parallel` from the CPU budget
+(`cpus // cpus_per_job`). A `MAX_CONCURRENT_TOOLS` left in an `.env` is
+ignored (`extra="ignore"`).
 
 ### 2026-10-06 - A tool can log, a chain has one bar, and a failure says where
 
@@ -657,8 +677,6 @@ parent's room exactly as before.
 
 **Admission rules for nested calls**, each one pinned by a reproduction:
 
-- A nested call is never counted against `MAX_CONCURRENT_TOOLS`; it never
-  passes through a slot.
 - It is judged against everything OUTSIDE its own chain: the idle escape,
   "an unmeasured job is running" and `solo` ignore its ancestors. An unmeasured
   child holds the whole machine minus its parents.
@@ -1829,7 +1847,7 @@ table, a RAM watchdog, killing nnUNet processes a crashed scan left behind, a
 "free memory" button, a cool-down between scans, restoring the queue from disk.
 All of it exists because the widget runs inside Slicer on a clinician's laptop
 and has to survive being out of memory. Here the queue is a folder argument,
-concurrency is `MAX_CONCURRENT_TOOLS` plus a GPU semaphore, and a failure is an
+concurrency is admission plus a GPU semaphore, and a failure is an
 exception. None of it is ported.
 
 **Four models, and they do not label the same things.** DentalSegmentator and
@@ -2251,9 +2269,8 @@ argument is `required=False`, with cross-argument rules raised as
 `ToolArgumentError` **before** any file is read.
 
 The call into the landmark tool is **in-process, not HTTP to our own /run/ALI**:
-a tool run holds one of `MAX_CONCURRENT_TOOLS` slots for its whole duration, so
-four concurrent ASO runs each waiting on a fifth slot would deadlock the
-server, `/health` included. `Tool.invoke` is the same entry point `main.py`
+a tool run holds its admission for its whole duration, so concurrent ASO runs
+each waiting on room for an inner run would deadlock the server. `Tool.invoke` is the same entry point `main.py`
 uses, validation included.
 
 **Fully-Automated IOS takes already-segmented meshes only** (crown segmentation

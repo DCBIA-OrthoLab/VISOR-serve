@@ -14,8 +14,7 @@ segfault inside a CUDA kernel takes the API down with the job.
 
 **Still synchronous.** The HTTP request blocks for exactly as long as it does
 today; `subprocess.run` is called from the same worker thread `tool.invoke`
-already ran in, so MAX_CONCURRENT_TOOLS keeps arbitrating how many run at
-once. No queue, no polling, no change to the contract with the client.
+already ran in, so admission keeps arbitrating how many run at once. No queue, no polling, no change to the contract with the client.
 
 The job directory is handed out by file_utils, which means the request handler
 already removes it once the response has been streamed -- outputs included,
