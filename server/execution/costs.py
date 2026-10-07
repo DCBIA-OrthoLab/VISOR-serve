@@ -52,6 +52,7 @@ import json
 import logging
 import math
 import os
+import statistics
 import tempfile
 import threading
 import time
@@ -95,6 +96,14 @@ OWN_ONLY_KEY = "own_only"
 # chosen for the same shapes -- and calling that input-dependent would make the
 # signal fire on everything and mean nothing.
 SPREAD_THRESHOLD = 1.5
+
+# A run whose peak is more than this many times the median of the window's
+# runs at the same width is held aside rather than learned, until a second run
+# confirms it (see `_held_as_outlier`). Only once the width has this many runs
+# to compare against: below that there is no "usual" to depart from.
+OUTLIER_FACTOR = 2.0
+OUTLIER_PEERS = 3
+QUARANTINE_KEY = "quarantine"
 
 _lock = threading.Lock()
 
@@ -678,10 +687,18 @@ def record(tool_name: str, vram_bytes: Optional[int], ram_bytes: Optional[int],
         # figure in gigabytes, but "the fitted line covers every recorded run"
         # is easier to hold as an invariant than as an approximation.
         opened = max(1, int(channels))
-        window.append([None if not vram_known else -(-int(vram_bytes or 0) // opened),
-                       -(-int(ram_bytes or 0) // opened),
-                       opened,
-                       round(float(cpu_cores or 0.0) / opened, 3)])
+        point = [None if not vram_known else -(-int(vram_bytes or 0) // opened),
+                 -(-int(ram_bytes or 0) // opened),
+                 opened,
+                 round(float(cpu_cores or 0.0) / opened, 3)]
+        held = _held_as_outlier(tool_name, entry, window, point)
+        if held is True:
+            entry[UPDATED_KEY] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            table[tool_name] = entry
+            _store(table)
+            return
+        window.extend(held or [])
+        window.append(point)
         window = _trim(window, keep)
         entry[RECENT_KEY] = window
         # Kept beside the window, and the same numbers admission reads through
@@ -698,6 +715,59 @@ def record(tool_name: str, vram_bytes: Optional[int], ram_bytes: Optional[int],
         entry[UPDATED_KEY] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         table[tool_name] = entry
         _store(table)
+
+
+def _held_as_outlier(tool_name: str, entry: dict, window: list, point: list):
+    """True to hold `point` aside, or the earlier held runs it confirms.
+
+    The table keeps the WORST of its window, so one run far above the others
+    sets every reservation of its tool for the next COST_WINDOW runs. Twice in
+    one day on this deployment: an AMASSS run recorded at 38.65 GiB for one
+    channel where one channel takes 13.6, then one at 87.38 GiB for two where
+    five others at two, on the same scan, took 20 to 21. Each time every
+    AMASSS after it was reserved for most of the host and ran alone, on one
+    channel. Measured: eight AREG runs 25 min against 16 once the figure went.
+
+    But a heavier run is not always an error: a larger scan IS heavier, and a
+    table that refused it would under-reserve every large scan after it. So a
+    run more than OUTLIER_FACTOR times the median of the window's runs at its
+    width is QUARANTINED, not dropped: kept in the entry, not learned. A second
+    such run at that width, within a factor of two of the first, confirms it,
+    and both are learned -- a cohort of large scans teaches the table on its
+    second scan. A one-off never is, and the next outlier replaces it.
+
+    Returns True to hold `point`, a list of held runs to learn with it, or
+    None when it is an ordinary run.
+    """
+    peers = [row for row in window if row[2] == point[2]]
+    if len(peers) < OUTLIER_PEERS:
+        return None
+    above = []
+    for index in (0, 1):  # VRAM, then RAM, per channel
+        values = [row[index] for row in peers if row[index] is not None]
+        if point[index] is not None and len(values) >= OUTLIER_PEERS:
+            usual = statistics.median(values)
+            if usual and point[index] > OUTLIER_FACTOR * usual:
+                above.append(index)
+    if not above:
+        return None
+    previous = entry.get(QUARANTINE_KEY)
+    if (isinstance(previous, list) and len(previous) == 4 and previous[2] == point[2]
+            and all(previous[i] is not None and point[i] is not None
+                    and max(previous[i], point[i]) <= 2 * min(previous[i], point[i])
+                    for i in above)):
+        entry.pop(QUARANTINE_KEY, None)
+        logger.info("tool=%s outlier confirmed by a second run at %d channel(s): "
+                    "both are learned", tool_name, point[2])
+        return [previous]
+    entry[QUARANTINE_KEY] = point
+    logger.warning(
+        "tool=%s held, not learned: %.2f GiB of RAM and %s of card per channel at "
+        "%d channel(s), over %.0fx the median of this width's recorded runs; a "
+        "second such run confirms it", tool_name, point[1] / 1024 ** 3,
+        "unknown" if point[0] is None else "%.2f GiB" % (point[0] / 1024 ** 3),
+        point[2], OUTLIER_FACTOR)
+    return True
 
 
 def known() -> dict:
