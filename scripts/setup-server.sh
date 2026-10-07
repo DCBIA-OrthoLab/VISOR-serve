@@ -370,7 +370,10 @@ if [ "$BUILD_TOOLS" -eq 1 ] && [ -n "$TOOLS_ROOT" ]; then
             _tool_dir="$(dirname "$_pyproject")"
             _tool_name="$(basename "$_tool_dir")"
             printf '  %-20s ' "$_tool_name"
-            if ( cd "$_tool_dir" && uv sync --frozen --quiet ) >/dev/null 2>&1; then
+            # --all-extras, as the image builds them: Crown_Seg's segmentation
+            # engine is an extra, and without it every mesh that is not already
+            # labelled is refused (AREG IOS included).
+            if ( cd "$_tool_dir" && uv sync --frozen --all-extras --quiet ) >/dev/null 2>&1; then
                 echo "built"
             else
                 echo "FAILED"
@@ -381,7 +384,7 @@ if [ "$BUILD_TOOLS" -eq 1 ] && [ -n "$TOOLS_ROOT" ]; then
             echo
             echo "These tools did not build and will not be served:$_failed"
             echo "  Re-run the one that matters from its own folder to see why:"
-            echo "      cd $TOOLS_ROOT/tools/<name> && uv sync --frozen"
+            echo "      cd $TOOLS_ROOT/tools/<name> && uv sync --frozen --all-extras"
         fi
     fi
 fi

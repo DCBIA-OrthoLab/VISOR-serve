@@ -266,3 +266,10 @@ def test_a_change_to_a_shared_package_rebuilds_every_environment_that_copies_it(
     assert "tools/User" in changes["environments"]
     assert changes["reinstall"] == {"tools/User": ["shared-common"]}
     assert {t["tool"]: t["environment"] for t in changes["tools"]}["User"] is True
+
+
+def test_a_rebuilt_environment_keeps_its_extras(agent_module):
+    """A sync without them removes what an extra installed: Crown_Seg's
+    segmentation engine went that way, and AREG IOS refused raw scans."""
+    assert "--all-extras" in agent_module.SYNC_COMMAND
+    assert "--frozen" in agent_module.SYNC_COMMAND

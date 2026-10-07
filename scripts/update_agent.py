@@ -18,7 +18,7 @@ two things:
       close the door to new runs      (POST /maintenance, renewed as it goes)
       wait for the runs in flight     (withdrawing the request here aborts)
       pull                            (fast-forward only)
-      rebuild changed environments    (uv sync --frozen, per changed tool)
+      rebuild changed environments    (uv sync --frozen --all-extras, per changed tool)
       restart the server              (compose restart, or recreate if needed)
       reopen the door, report
 
@@ -55,6 +55,13 @@ import server_ctl  # noqa: E402 - beside this file, and stdlib only too
 REPO_ROOT = server_ctl.REPO_ROOT
 STATUS_FILE = "status.json"
 REQUEST_FILE = "request.json"
+
+# How a changed tool's environment is rebuilt. `--all-extras`, as the image
+# builds them: without it a sync REMOVES what an extra installed. Crown_Seg's
+# segmentation engine is one, and a deployment synced without it refused every
+# mesh that was not already labelled -- AREG IOS on a raw intraoral scan
+# included.
+SYNC_COMMAND = ["uv", "sync", "--frozen", "--all-extras", "--quiet"]
 
 # How often the request file is looked for. Cheap -- one stat -- and it is the
 # delay between an operator's click and the door closing.
@@ -452,7 +459,7 @@ class Agent:
                         reinstall = []
                         for package in info["changes"].get("reinstall", {}).get(folder, []):
                             reinstall += ["--reinstall-package", package]
-                        done = subprocess.run(["uv", "sync", "--frozen", "--quiet"] + reinstall,
+                        done = subprocess.run(SYNC_COMMAND + reinstall,
                                               cwd=os.path.join(info["path"], folder),
                                               capture_output=True, text=True, timeout=3600)
                         if done.returncode != 0:
