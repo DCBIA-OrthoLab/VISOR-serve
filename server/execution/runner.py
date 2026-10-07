@@ -220,7 +220,7 @@ class QualityControlStop(BaseException):
 # Measured: an orchestrating tool holds ~12 MB (AREG_IOSCBCT imports no torch),
 # a leaf ~500 MB, and a chain is SEQUENTIAL -- each sup.run() waits for its
 # child -- so one heavy process lives at a time per chain whatever the depth.
-# What multiplies memory is MAX_CONCURRENT_TOOLS, not this.
+# What multiplies memory is how many runs admission lets in at once, not this.
 SUPERVISOR_DEPTH_ENV = "SADT_SUPERVISOR_DEPTH"
 MAX_SUPERVISOR_DEPTH = 10
 

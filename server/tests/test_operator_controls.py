@@ -11,6 +11,7 @@ only way that order changes. What they must guarantee:
   the controls do not exist.
 """
 
+import math
 import threading
 
 import anyio
@@ -203,45 +204,39 @@ def test_a_high_run_is_admitted_on_the_widest_shape_that_fits():
 
 
 # ---------------------------------------------------------------------------
-# The tool slot, the first queue a run meets
+# The tool threads, which never cap how many runs execute
 # ---------------------------------------------------------------------------
 
-def test_a_high_run_goes_past_a_full_tool_slot(monkeypatch):
-    monkeypatch.setattr(admission, "_budget", _budget())
-
+def test_tool_runs_have_unbounded_threads_of_their_own():
     async def scenario():
-        monkeypatch.setattr(main, "_tool_limiter", anyio.CapacityLimiter(1))
-        monkeypatch.setattr(main, "_PRIORITY_POLL_SECONDS", 0.01)
-        occupant = object()
-        await main._tool_limiter.acquire_on_behalf_of(occupant)
-        entered = []
-
-        async def run():
-            async with main._tool_slot("vip"):
-                entered.append("vip")
-
-        async with anyio.create_task_group() as group:
-            group.start_soon(run)
-            await anyio.sleep(0.1)
-            assert entered == [], "a normal run got past a full slot"
-            admission.budget().set_priority("vip", admission.PRIORITY_HIGH)
-            with anyio.fail_after(2):
-                while not entered:
-                    await anyio.sleep(0.01)
-        main._tool_limiter.release_on_behalf_of(occupant)
-        assert main._tool_limiter.borrowed_tokens == 0
+        threads = main._get_tool_threads()
+        assert threads.total_tokens == math.inf
+        assert threads is not anyio.to_thread.current_default_thread_limiter()
 
     anyio.run(scenario)
 
 
-def test_a_normal_run_takes_and_gives_back_its_slot(monkeypatch):
-    monkeypatch.setattr(admission, "_budget", _budget())
+def test_more_runs_than_the_default_pool_wait_side_by_side(monkeypatch):
+    """Runs park in their thread while admission makes them wait; that must
+    never block the default pool everything else is served from."""
+    monkeypatch.setattr(main, "_tool_threads", None)
 
     async def scenario():
-        monkeypatch.setattr(main, "_tool_limiter", anyio.CapacityLimiter(1))
-        async with main._tool_slot("ordinary"):
-            assert main._tool_limiter.borrowed_tokens == 1
-        assert main._tool_limiter.borrowed_tokens == 0
+        default = anyio.to_thread.current_default_thread_limiter()
+        release, started = threading.Event(), []
+
+        def parked():
+            started.append(1)
+            release.wait(5)
+
+        async with anyio.create_task_group() as group:
+            for _ in range(int(default.total_tokens) + 5):
+                group.start_soon(main._run_tool_call, parked)
+            with anyio.fail_after(5):
+                while len(started) < default.total_tokens + 5:
+                    await anyio.sleep(0.01)
+                assert await anyio.to_thread.run_sync(lambda: "served") == "served"
+            release.set()
 
     anyio.run(scenario)
 

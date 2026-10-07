@@ -23,9 +23,9 @@ written that way; see [`ADDING_A_TOOL.md`](../ADDING_A_TOOL.md).
 Requests are served **in parallel**: each tool execution runs in a worker
 thread (never on the event loop), so a long inference never blocks other
 requests - `/health`, `/tools` and other `/run` calls all stay responsive
-while a tool is working. `MAX_CONCURRENT_TOOLS` (default 4) caps how many
-worker threads may be inside a run at once, and **admission decides the rest in
-bytes and cores** rather than in jobs - see "Who gets the card" below.
+while a tool is working. Runs get worker threads of their own, without a cap:
+**admission alone decides how many run at once, in bytes and cores** rather
+than in jobs - see "Who gets the card" below.
 
 The HTTP call is blocking request/response **by default**: the client sends a
 request and gets the result in the same response. A client that sends

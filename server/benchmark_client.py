@@ -3,10 +3,10 @@
     python benchmark_client.py --plan <plan.json> --out <summary.json>
 
 A subprocess, and that is the whole reason this file exists rather than a
-function. `tool.invoke` runs in a worker thread capped by MAX_CONCURRENT_TOOLS,
-and admission caps it again: a battery executed inside the server would occupy
-the slots it is trying to measure, and six concurrent runs launched from the
-event loop would deadlock against their own limit. So the server spawns this,
+function. `tool.invoke` runs in a worker thread that admission gates: a battery
+executed inside the server would occupy the room it is trying to measure, and
+concurrent runs launched from the event loop would deadlock against their own
+admission. So the server spawns this,
 it opens ordinary HTTP connections like any other client, and what it measures
 is what a client would see.
 

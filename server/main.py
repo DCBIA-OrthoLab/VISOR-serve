@@ -9,6 +9,7 @@ import functools
 import gzip
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -262,53 +263,47 @@ _BATCH_TOTAL_HEADER = "X-Batch-Total"
 # dialog.
 CLIENT_CLOSED_REQUEST = 499
 
-# Caps how many tool executions run at once (settings.MAX_CONCURRENT_TOOLS).
-# Dedicated to tool runs, so waiting inference jobs never starve the threadpool
-# used for everything else. Created lazily: anyio needs a running event loop to
-# instantiate a CapacityLimiter.
-_tool_limiter: Optional[anyio.CapacityLimiter] = None
+# Tool runs get worker threads of their own, apart from anyio's default pool
+# that serves everything else (staging, uploads, /status). A run waits for room
+# INSIDE its thread, in admission, so on the shared pool a deep enough queue
+# would starve the rest of the server. How many runs execute at once is
+# admission's decision alone, from what each was measured to need: this pool
+# is unbounded so it can never be the binding limit. A waiting run is one idle
+# thread. Created lazily: anyio needs a running event loop to instantiate a
+# CapacityLimiter.
+_tool_threads: Optional[anyio.CapacityLimiter] = None
 
 
-def _get_tool_limiter() -> anyio.CapacityLimiter:
-    global _tool_limiter
-    if _tool_limiter is None:
-        _tool_limiter = anyio.CapacityLimiter(settings.MAX_CONCURRENT_TOOLS)
-    return _tool_limiter
+def _get_tool_threads() -> anyio.CapacityLimiter:
+    global _tool_threads
+    if _tool_threads is None:
+        _tool_threads = anyio.CapacityLimiter(math.inf)
+    return _tool_threads
 
 
+async def _run_tool_call(call):
+    """`call` in a tool worker thread, once its batch's turn has come (see
+    `_batch_turn`)."""
+    async with _batch_turn(runs.CURRENT_RUN.get()):
+        return await anyio.to_thread.run_sync(call, limiter=_get_tool_threads())
 
 
-async def _run_in_slot(call):
-    """`call` in a worker thread, inside a tool slot (see `_tool_slot`)."""
-    async with _tool_slot(runs.CURRENT_RUN.get()):
-        return await anyio.to_thread.run_sync(call)
-
-
-# How often a run waiting for a slot checks whether an operator has given it
-# priority. Half a second is invisible next to a wait for a slot, which is a
-# wait for a whole other run to finish.
+# How often a batch waiting for its sibling checks whether an operator has
+# given it priority. Half a second is invisible next to a wait for a whole
+# other run to finish.
 _PRIORITY_POLL_SECONDS = 0.5
 
 
 @contextlib.asynccontextmanager
-async def _tool_slot(run_id: Optional[str]):
-    """One of the MAX_CONCURRENT_TOOLS slots, or none for a run given priority.
+async def _batch_turn(run_id: Optional[str]):
+    """Hold a cohort batch until its turn, when its workstation's rule is
+    serial (wire/clients.py); a run that is no batch goes straight through.
 
-    The slot is the FIRST queue a run meets, before admission's, and it is
-    anyio's own FIFO: a run an operator marks HIGH while it waits here would
-    otherwise sit behind every run that arrived first, which is the opposite
-    of what the mark means. So the wait is raced against the mark, and a
-    marked run goes through without a slot. Admission still decides what it
-    may hold -- the slot bounds worker threads, the budget bounds the machine.
+    Priority goes past this gate: a batch an operator marks HIGH while it
+    waits here does not sit behind its siblings. Admission, next, decides
+    what each run may hold on the machine.
     """
-    limiter = _get_tool_limiter()
-    borrower = object()
-    acquired = False
     budget = admission.budget()
-    # A batch of a cohort first waits its turn among its siblings, when its
-    # workstation's rule is serial (wire/clients.py). Before the slot, so a
-    # batch waiting on a sibling holds no slot another workstation could use.
-    # Priority goes past this gate too.
     info = runs.meta(run_id) if run_id else {}
     batch, address = info.get("batch"), info.get("client")
     if batch:
@@ -321,27 +316,9 @@ async def _tool_slot(run_id: Optional[str]):
                 clients.leave(address, batch, run_id)
                 raise HTTPException(status_code=CLIENT_CLOSED_REQUEST, detail="The client cancelled this run.")
             await anyio.sleep(_PRIORITY_POLL_SECONDS)
-    if run_id is None or budget.priority_of(run_id) != admission.PRIORITY_HIGH:
-        async with anyio.create_task_group() as group:
-            async def take() -> None:
-                nonlocal acquired
-                await limiter.acquire_on_behalf_of(borrower)
-                acquired = True
-                group.cancel_scope.cancel()
-
-            async def watch() -> None:
-                while budget.priority_of(run_id) != admission.PRIORITY_HIGH:
-                    await anyio.sleep(_PRIORITY_POLL_SECONDS)
-                group.cancel_scope.cancel()
-
-            group.start_soon(take)
-            if run_id is not None:
-                group.start_soon(watch)
     try:
         yield
     finally:
-        if acquired:
-            limiter.release_on_behalf_of(borrower)
         if batch:
             clients.leave(address, batch, run_id)
 
@@ -861,10 +838,15 @@ def client_me(request: Request) -> dict:
     -- the server enforcing it either way."""
     address = _client_address(request)
     batches = clients.policy_for(address)
+    # How many batches are worth uploading ahead: as many as the CPU budget
+    # alone would run side by side. Admission still decides what each may
+    # hold, so this only bounds what is sent before it can start.
+    budget = admission.budget()
+    parallel = max(1, int(budget.cpus // max(1, budget.cpus_per_job)))
     return {
         "client": address,
         "batches": batches,
-        "max_parallel": settings.MAX_CONCURRENT_TOOLS if batches == clients.PARALLEL else 1,
+        "max_parallel": parallel if batches == clients.PARALLEL else 1,
     }
 
 
@@ -2507,7 +2489,7 @@ def _registered_run(request: Request, tool_name: str) -> Optional[str]:
         return None
     # Which batch of a divided cohort this is, when the client says so. Read
     # here, with the id, so the dashboard can group the runs from the moment
-    # they exist and the gate in `_tool_slot` can order them.
+    # they exist and the gate in `_batch_turn` can order them.
     batch = runs.parse_batch(request.headers.get(_BATCH_ID_HEADER),
                              request.headers.get(_BATCH_INDEX_HEADER),
                              request.headers.get(_BATCH_TOTAL_HEADER))
@@ -3204,7 +3186,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             # wants a number.
             size=0,
             work_dir=None, scratch_dirs=file_utils.track_scratch_dirs(),
-            result=await _run_in_slot(
+            result=await _run_tool_call(
                 functools.partial(dispatch.dispatch, tool, {}, resume_from=resume_from)),
         )
 
@@ -3435,10 +3417,10 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # Run the tool in a worker thread, NOT on the event loop: tool.invoke
         # is synchronous CPU-bound work and would otherwise freeze the whole
         # server -- even /health -- for its entire duration. Concurrency is
-        # bounded by MAX_CONCURRENT_TOOLS and safe: tools are stateless
+        # bounded by admission and safe: tools are stateless
         # (everything arrives via args), each request gets its own work_dir,
         # and DATA_DIR is read-only.
-        result = await _run_in_slot(functools.partial(tool.invoke, args))
+        result = await _run_tool_call(functools.partial(tool.invoke, args))
     except ToolArgumentError as exc:
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
