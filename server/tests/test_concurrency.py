@@ -997,12 +997,26 @@ def test_a_half_written_line_costs_that_record_and_nothing_else(tmp_path, monkey
     assert _runner._width_reached() == 3
 
 
-def test_no_progress_file_is_one(monkeypatch):
-    """`scripts/run_tool.py` runs a tool with no server around it."""
+def test_no_progress_file_and_one_channel_is_exactly_one(monkeypatch):
+    """`scripts/run_tool.py` runs a tool with no server around it: nothing
+    handed it more than one channel, so it cannot have run wider."""
     from execution import runner
 
     monkeypatch.delenv(runner.PROGRESS_FILE_ENV, raising=False)
+    monkeypatch.setattr(runner, "_WIDTH_GRANTED", 1)
+    monkeypatch.setattr(runner, "_WIDTH_ASKED", None)
     assert runner._width_reached() == 1
+
+
+def test_no_progress_file_and_a_wider_grant_is_unknown(monkeypatch):
+    """A run sent without a run id has no progress file: granted four, the
+    tool's width went nowhere, and one would be a guess."""
+    from execution import runner
+
+    monkeypatch.delenv(runner.PROGRESS_FILE_ENV, raising=False)
+    monkeypatch.setattr(runner, "_WIDTH_GRANTED", 4)
+    monkeypatch.setattr(runner, "_WIDTH_ASKED", None)
+    assert runner._width_reached() is None
 
 
 @pytest.mark.parametrize("junk", ["lots", -1, 0, None, [3]])
@@ -1295,6 +1309,13 @@ def test_a_single_file_is_one(monkeypatch, tmp_path):
     scan = tmp_path / "only.nii.gz"
     scan.write_bytes(b"x")
     assert _bounded(monkeypatch, {"scans": str(scan)}, axis="scans") == 1
+
+
+def test_a_multichoice_sent_as_comma_shorthand_is_counted(monkeypatch):
+    """The schema accepts "CBMASK,CB,MAND,MAX" beside the array. Read as
+    nothing, a direct AMASSS call was bounded by affordability alone."""
+    params = {"structures": "CBMASK,CB,MAND,MAX"}
+    assert _bounded(monkeypatch, params, axis="structures", cap=8) == 4
 
 
 def test_an_uncountable_value_leaves_the_ceiling_alone(monkeypatch):

@@ -1056,10 +1056,21 @@ def _width_reached() -> int:
     Falls back to ONE when nothing was reported at all -- never to what the
     server granted. Reading a grant as a measurement is the defect this exists
     to close.
+
+    **Unknown, None, when there is nowhere to read a width from and the run
+    could have been wider than one.** A run started without a run id has no
+    progress file, so the tool's `width` records went nowhere. One would be a
+    guess in the dangerous direction: an AMASSS run sent that way was granted
+    four structures, peaked at 38.65 GiB, and went into the table as one
+    channel's cost -- three times the 13.6 GiB one channel takes. Every AMASSS
+    after it reserved about 50 GiB and they ran one at a time. A process that
+    was never handed or answered more than one channel cannot have run wider,
+    so one is then exact rather than a guess. The dispatcher learns nothing
+    from a run whose width is None.
     """
     path = os.environ.get(PROGRESS_FILE_ENV)
     if not path:
-        return 1
+        return 1 if _width_running_at() == 1 else None
     mine = None
     try:
         depth = int(os.environ.get(SUPERVISOR_DEPTH_ENV, "0") or 0)

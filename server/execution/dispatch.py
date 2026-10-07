@@ -943,6 +943,18 @@ def _keep_measurements(tool_name: str, payload: dict, solo: bool = False) -> Non
     rss = rss if isinstance(rss, int) else None
     if vram is None and rss is None:
         return
+    # Present and None: the runner had no progress file to read the width from
+    # (a run started without a run id), so nobody knows how many channels this
+    # peak was spread over. Its figures are logged and not learned -- see
+    # `runner._width_reached`. Absent altogether is a runner from before widths
+    # were reported, and keeps meaning one.
+    if "channels" in payload and payload["channels"] is None:
+        logger.info(
+            "tool=%s peak_vram=%.2f GiB peak_rss=%.2f GiB not learned: the run "
+            "had no progress file, so its width is unknown",
+            tool_name, (vram or 0) / 1024 ** 3, (rss or 0) / 1024 ** 3,
+        )
+        return
     channels = payload.get("channels")
     channels = channels if isinstance(channels, int) and channels > 0 else 1
     cores = payload.get("peak_cpu_cores")
