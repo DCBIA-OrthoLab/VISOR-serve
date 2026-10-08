@@ -12,10 +12,19 @@
 # than one that has to be remembered. Set it in this deployment's .env, beside
 # the API token:
 #
-#     off      the default. The unit starts, says so, and exits.
-#     notify   poll and report what would happen. What to run while deciding
+#     off      the default. The agent runs, answers the admin panel, and
+#              never updates on its own.
+#     notify   also logs what it would update. What to run while deciding
 #              whether to trust the mechanism.
-#     apply    drain, pull, restart.
+#     apply    when the server or the tools move on their branch: close the
+#              door to new runs FIRST, let the runs in flight finish, pull both
+#              repositories, rebuild the environments that changed, restart,
+#              reopen. Closing before waiting is what lets it happen on a busy
+#              server; one that failed waits for the branch to move again.
+#
+# What runs is scripts/update_agent.py, the same agent the admin panel's update
+# button talks to, so both go through one procedure. Stop an agent started by
+# `server_ctl.py agent` before enabling this unit: only one runs per clone.
 #
 # It runs on the HOST and not in the container, and it has to: the container is
 # given only `server/`, so the deployment's .git is not in it. Running outside
@@ -36,7 +45,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/code/VISOR-serve
-ExecStart=/usr/bin/env python3 scripts/server_ctl.py watch --branch deploy --poll 30
+ExecStart=/usr/bin/env python3 scripts/update_agent.py
+# uv, which rebuilds a tool's environment, is installed in ~/.local/bin, which a
+# systemd user session does not put on PATH.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 # The updater restarts the server it watches, so it must not be brought down
 # with it, and it must come back if it falls over.
