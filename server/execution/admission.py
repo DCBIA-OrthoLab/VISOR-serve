@@ -319,6 +319,11 @@ class Budget:
         # that -- but the FLOOR of what a job is allowed to spend, so a busy
         # machine grants exactly what it always granted.
         self.cpus_per_job = int(allocation.cpus_per_job or 1)
+        # The per-job share of each memory (`SADT_RAM_PER_JOB`, or the budget
+        # divided by SADT_EXPECTED_CLIENTS). A fairness target, as the setting
+        # is documented, not a refusal: see `_within_share`.
+        self.ram_per_job = int(getattr(allocation, "ram_per_job", 0) or 0)
+        self.vram_per_job = int(getattr(allocation, "vram_per_job", 0) or 0)
         self._free_vram = free_vram or (lambda: resources.detect_vram_bytes()[1])
         self._condition = threading.Condition()
         self._queue: list = []          # _Waiter, head first
@@ -521,6 +526,39 @@ class Budget:
         # what is lent is reserved, not free on the card, and the card's real
         # free memory is what has to hold the allocation.
         return self._card_has_room(card if card is not None else demand)
+
+    def _within_share(self, net, gross, ancestors=()):
+        """The shapes this run may take while the machine is shared.
+
+        With another run in flight outside this run's own chain, no shape
+        wider than the narrowest may hold more than one job's share of host or
+        card memory. Alone, every shape stays on offer.
+
+        The fair pass of `_widest_that_fits` only sees the runs already
+        QUEUED. Eight AREG runs sent together each reach AMASSS minutes after
+        admission, one after another, so the first found an empty queue and
+        took four channels -- 51 GiB of a 100 GiB budget, with five AREG
+        parents holding most of the rest -- and the seven after it ran one at
+        a time behind it, up to eight minutes each in the queue. Bounding a
+        shape by the share is what the per-job setting was documented to do,
+        and nothing read it.
+
+        The narrowest is never removed: a job whose narrowest shape exceeds its
+        share still runs, as the setting promises. Returns the kept shapes,
+        net and gross, in the same order.
+        """
+        if not (self.ram_per_job or self.vram_per_job) or len(net) < 2:
+            return net, gross
+        mine = set(ancestors)
+        shared = any(grant not in mine and not (set(grant.ancestors) & mine)
+                     for grant in self._live)
+        if not shared:
+            return net, gross
+        kept = [index for index, (_count, want) in enumerate(net[:-1])
+                if (not self.ram_per_job or want.ram_bytes <= self.ram_per_job)
+                and (not self.vram_per_job or want.vram_bytes <= self.vram_per_job)]
+        kept.append(len(net) - 1)
+        return [net[i] for i in kept], ([gross[i] for i in kept] if gross else gross)
 
     def _widest_that_fits(self, candidates, waiting: int, ancestors=(), gross=None):
         """The shape to admit, given what is running AND what is queued.
@@ -802,7 +840,8 @@ class Budget:
                     behind = 0 if rank == 1 else sum(
                         1 for other in self._queue[position + 1:]
                         if self._rank(other) <= max(rank, 0))
-                    fitted = self._widest_that_fits(net, behind, ancestors, gross=candidates)
+                    shares, gross = self._within_share(net, candidates, ancestors)
+                    fitted = self._widest_that_fits(shares, behind, ancestors, gross=gross)
                     if fitted is not None and (position == 0 or
                                                self._leaves_room_for_head(fitted[1])):
                         channels, demand = fitted
