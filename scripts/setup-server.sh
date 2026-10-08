@@ -52,6 +52,16 @@
 #                   makes them actually RUN. ~25 GB and well over an hour, it
 #                   downloads two CUDA torch runtimes. Implied by --full.
 #                   Installs `uv` from astral.sh if it is not on PATH.
+#   --tailscale     also put the server on a Tailscale network, reachable as
+#                   https://<name>.<tailnet>.ts.net from the tailnet's machines
+#                   and from nowhere else (scripts/setup-tailscale.sh; needs
+#                   sudo). Forces --bind 127.0.0.1: Tailscale is then the only
+#                   way in, and it brings the TLS. Off unless asked for.
+#   --tailscale-key-file PATH
+#                   the Tailscale auth key, read from this file (a file holding
+#                   only the key). Without it the key is asked for at the
+#                   prompt, hidden, or taken from TS_AUTHKEY. Never accepted
+#                   on the command line, where `ps` and the history keep it.
 #   --yes           never ask anything; take the defaults and the options given
 #
 # Environment:
@@ -59,6 +69,7 @@
 #   REPO_URL        the clone URL outright, when REPO's github.com/<owner>/<name>
 #                   shape does not fit (a mirror, an ssh remote, a local path)
 #   INSTALL_DIR     same as --dir
+#   TS_AUTHKEY      the Tailscale auth key, for an unattended --tailscale
 #
 # Re-running is safe: an existing clone is updated rather than re-cloned, and
 # the API token already in .env is kept, so clients configured against this
@@ -83,6 +94,8 @@ TOOLS_REPO=""
 TOOLS_DIR_OPT=""
 TOOLS_REF="${TOOLS_REF:-}"
 BUILD_TOOLS=0
+TAILSCALE=0
+TS_KEY_FILE=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -100,8 +113,10 @@ while [ $# -gt 0 ]; do
         --tools-dir) TOOLS_DIR_OPT="$2"; shift 2 ;;
         --tools-ref) TOOLS_REF="$2"; shift 2 ;;
         --build-tools) BUILD_TOOLS=1; shift ;;
+        --tailscale) TAILSCALE=1; shift ;;
+        --tailscale-key-file) TAILSCALE=1; TS_KEY_FILE="$2"; shift 2 ;;
         --yes|-y|--non-interactive) ASK=0; shift ;;
-        -h|--help) sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "setup-server: unknown option '$1'" >&2; exit 2 ;;
     esac
 done
@@ -131,7 +146,19 @@ if [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
 fi
 
 ask PORT "Host port to publish the server on" "8000"
-ask BIND "Host address to publish it on (127.0.0.1 keeps it off the network)" "127.0.0.1"
+
+# Tailscale decides the address, so it is settled first. Only --tailscale turns
+# it on: an operator who wants it says so, and nothing is asked otherwise.
+if [ "$TAILSCALE" -eq 1 ]; then
+    # Anything else would leave the same port open in plain HTTP beside the
+    # tailnet, which is the one thing Tailscale was brought in to prevent.
+    if [ "$BIND" != "127.0.0.1" ]; then
+        echo "setup-server: --tailscale publishes through Tailscale only; binding 127.0.0.1, not $BIND." >&2
+    fi
+    BIND="127.0.0.1"
+else
+    ask BIND "Host address to publish it on (127.0.0.1 keeps it off the network)" "127.0.0.1"
+fi
 ask REF  "Branch this deployment follows" "$REF"
 ask AUTO_UPDATE "Follow that branch automatically? off | notify | apply" "off"
 
@@ -438,7 +465,39 @@ if [ "$AUTO_UPDATE" != "off" ] && [ -n "$AUTO_UPDATE" ]; then
     echo "It polls '${REF}' and never interrupts a run in flight; 'notify' reports"
     echo "what it would do, 'apply' fast-forwards and restarts between runs."
 fi
-echo
-echo "This deployment listens on ${BIND} over plain HTTP. That is fine for"
-echo "localhost; putting it on a network address requires a TLS terminator in"
-echo "front -- see SECURITY.md."
+
+if [ "$TAILSCALE" -eq 1 ]; then
+    echo
+    echo "--- Tailscale ---"
+    _ts_args="--port ${PORT:-8000} --dir $INSTALL_DIR"
+    [ "$ASK" -eq 0 ] && _ts_args="$_ts_args --yes"
+    [ -n "$TS_KEY_FILE" ] && _ts_args="$_ts_args --auth-key-file $TS_KEY_FILE"
+    # The server is installed and running by now. A Tailscale step that stops
+    # -- no key on an unattended run, certificates not enabled on the tailnet,
+    # a device waiting for approval -- must not turn that into a failed
+    # install: it says what is missing, and re-running the script finishes it.
+    _ts_ok=1
+    if [ "$(id -u)" -eq 0 ]; then
+        # shellcheck disable=SC2086 -- a deliberately word-split option list
+        sh "$INSTALL_DIR/scripts/setup-tailscale.sh" $_ts_args || _ts_ok=0
+    else
+        echo "Installing Tailscale needs root; sudo may ask for your password."
+        # TS_AUTHKEY is kept by NAME, so an unattended install works under
+        # sudo, which would otherwise drop it -- and the key itself never
+        # becomes an argument `ps` could show.
+        # shellcheck disable=SC2086
+        sudo --preserve-env=TS_AUTHKEY sh "$INSTALL_DIR/scripts/setup-tailscale.sh" $_ts_args || _ts_ok=0
+    fi
+    if [ "$_ts_ok" -eq 0 ]; then
+        echo
+        echo "The server is installed and listens on 127.0.0.1:${PORT:-8000}, but Tailscale"
+        echo "is not finished (see above). Once that is fixed, finish it with:"
+        echo
+        echo "    sudo sh $INSTALL_DIR/scripts/setup-tailscale.sh --port ${PORT:-8000} --dir $INSTALL_DIR"
+    fi
+else
+    echo
+    echo "This deployment listens on ${BIND} over plain HTTP. That is fine for"
+    echo "localhost; putting it on a network address requires a TLS terminator in"
+    echo "front -- see SECURITY.md, or re-run with --tailscale."
+fi
