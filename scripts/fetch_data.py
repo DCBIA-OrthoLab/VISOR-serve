@@ -18,6 +18,7 @@ actually uses (see _parse_manifest), not YAML at large.
 """
 
 import argparse
+import contextlib
 import hashlib
 import os
 import shutil
@@ -398,6 +399,78 @@ def _fetch_entry(entry: dict, data_dir: str, force: bool, progress) -> str:
 
 
 # ---------------------------------------------------------------------------
+# One copy of each file, however many tools list it
+# ---------------------------------------------------------------------------
+
+# Below this a duplicate is not worth hashing: the bytes it would save are
+# fewer than the ones the walk reads to find it.
+_DEDUPE_MIN_BYTES = 1 << 20
+
+
+def _sha256_of(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dedupe(data_dir: str) -> tuple:
+    """Hardlink every file under `data_dir` to the first identical one.
+
+    Several tools publish the same scans and models in their own releases --
+    the same CBCT pair as five tools' test files, AMASSS's nine structure
+    models under AREG as well -- and each lands in its own `<tool>/<kind>/`
+    tree, because that is where `data_store` looks. Measured on one
+    deployment: 6.5 GB of a 32 GB DATA/ was second copies. A hardlink keeps
+    every tool's path exactly where it was and stores the bytes once.
+
+    Identical means the same size AND the same sha256, never the same name.
+    Safe to share because nothing writes into DATA/ in place: a re-download
+    removes the old file and renames a new one over it (`_fetch_entry`),
+    which leaves the other names on the old bytes. Files on another
+    filesystem are left as they are. Returns `(files relinked, bytes freed)`.
+    """
+    by_size = {}
+    for root, dirs, names in os.walk(data_dir):
+        # Staging folders are another run's work in progress.
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".fetch_") and not d.endswith(".partial"))
+        for name in sorted(names):
+            path = os.path.join(root, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            size = os.path.getsize(path)
+            if size >= _DEDUPE_MIN_BYTES:
+                by_size.setdefault(size, []).append(path)
+
+    relinked = freed = 0
+    for size, paths in sorted(by_size.items()):
+        if len(paths) < 2:
+            continue
+        keepers = {}  # sha256 -> the path every identical file is linked to
+        for path in paths:
+            keeper = keepers.setdefault(_sha256_of(path), path)
+            if keeper == path:
+                continue
+            kept, this = os.stat(keeper), os.stat(path)
+            if (kept.st_dev, kept.st_ino) == (this.st_dev, this.st_ino) or kept.st_dev != this.st_dev:
+                continue  # already one file, or another filesystem
+            # Linked beside it and renamed over it: never a moment without
+            # the file, and an interrupted run leaves the original in place.
+            temporary = f"{path}.dedupe"
+            try:
+                os.link(keeper, temporary)
+                os.replace(temporary, path)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.remove(temporary)
+                continue
+            relinked += 1
+            freed += size
+    return relinked, freed
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -495,7 +568,17 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--list", action="store_true", help="Show the manifest and exit.")
     parser.add_argument("--force", action="store_true", help="Re-download even if present.")
+    parser.add_argument(
+        "--dedupe", action="store_true",
+        help="Only hardlink identical files already under the data dir, and exit. "
+             "Every fetch does this at its end anyway.",
+    )
     args = parser.parse_args(argv)
+
+    if args.dedupe:
+        relinked, freed = dedupe(os.path.abspath(args.data_dir))
+        print(f"{relinked} duplicate file(s) now share one copy; {_human(freed)} freed.")
+        return 0
 
     try:
         manifest = _parse_manifest(args.manifest)
@@ -558,6 +641,10 @@ def main(argv=None) -> int:
             print(f"  ! FAILED {entry['tool']}/{entry['kind']}/{entry['name']}: {exc}")
             failures.append(entry)
 
+    if counts["fetched"]:
+        relinked, freed = dedupe(data_dir)
+        if relinked:
+            print(f"\n{relinked} duplicate file(s) now share one copy; {_human(freed)} freed.")
     print(f"\n{counts['fetched']} fetched, {counts['skipped']} already present, {len(failures)} failed.")
     if failures:
         print("\nFailed items (re-run to retry just those):")

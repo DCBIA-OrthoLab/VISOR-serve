@@ -243,3 +243,62 @@ def test_a_split_that_could_escape_or_cannot_apply_is_refused(fetch_data, split,
     ]}}
     with pytest.raises(fetch_data.ManifestError):
         fetch_data._entries(manifest, "testfiles", ["AREG"])
+
+
+# ---------------------------------------------------------------------------
+# One copy of each file, however many tools list it
+# ---------------------------------------------------------------------------
+
+def _write(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+def test_identical_files_of_two_tools_share_one_copy(fetch_data, tmp_path, monkeypatch):
+    """The same scan published as five tools' test files was five copies."""
+    monkeypatch.setattr(fetch_data, "_DEDUPE_MIN_BYTES", 1)
+    first = _write(tmp_path / "AMASSS" / "testfiles" / "scan.nii.gz", b"same bytes")
+    second = _write(tmp_path / "CLIC" / "testfiles" / "scan.nii.gz", b"same bytes")
+
+    relinked, freed = fetch_data.dedupe(str(tmp_path))
+
+    assert (relinked, freed) == (1, len(b"same bytes"))
+    assert os.path.samefile(first, second)
+    assert second.read_bytes() == b"same bytes", "every tool keeps its own path"
+
+
+def test_the_same_size_is_not_the_same_file(fetch_data, tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch_data, "_DEDUPE_MIN_BYTES", 1)
+    first = _write(tmp_path / "A" / "models" / "m.pth", b"aaaa")
+    second = _write(tmp_path / "B" / "models" / "m.pth", b"bbbb")
+    assert fetch_data.dedupe(str(tmp_path)) == (0, 0)
+    assert not os.path.samefile(first, second)
+
+
+def test_a_second_pass_finds_nothing_left_to_do(fetch_data, tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch_data, "_DEDUPE_MIN_BYTES", 1)
+    for tool in ("A", "B", "C"):
+        _write(tmp_path / tool / "testfiles" / "scan.nii.gz", b"x" * 64)
+    assert fetch_data.dedupe(str(tmp_path))[0] == 2
+    assert fetch_data.dedupe(str(tmp_path)) == (0, 0)
+
+
+def test_a_redownload_leaves_the_other_tools_copy_untouched(fetch_data, tmp_path, monkeypatch):
+    """Safe to share only because nothing writes into DATA/ in place."""
+    monkeypatch.setattr(fetch_data, "_DEDUPE_MIN_BYTES", 1)
+    first = _write(tmp_path / "A" / "testfiles" / "scan.nii.gz", b"old")
+    second = _write(tmp_path / "B" / "testfiles" / "scan.nii.gz", b"old")
+    fetch_data.dedupe(str(tmp_path))
+    # What `_fetch_entry` does with --force: remove, then rename a new file in.
+    os.remove(first)
+    _write(tmp_path / "new", b"new").rename(first)
+    assert second.read_bytes() == b"old"
+
+
+def test_dedupe_alone_downloads_nothing(fetch_data, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(fetch_data, "_DEDUPE_MIN_BYTES", 1)
+    for tool in ("A", "B"):
+        _write(tmp_path / tool / "testfiles" / "scan.nii.gz", b"same")
+    assert fetch_data.main(["--dedupe", "--data-dir", str(tmp_path)]) == 0
+    assert "1 duplicate file(s) now share one copy" in capsys.readouterr().out
