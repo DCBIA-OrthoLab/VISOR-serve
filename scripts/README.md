@@ -160,6 +160,39 @@ policy that gives the researchers' machines HTTPS and nothing else:
 ]
 ```
 
+#### Adding a workstation
+
+A shared lab workstation joins with an auth key, so it belongs to no person and
+its login never expires. Generate one in **Settings -> Keys**: **reusable** to
+set up several machines in one sitting, **tagged** (`tag:user`, so the policy
+above applies), with a **short expiry** (a day), and revoke it once the machines
+are in; those already joined stay joined. Then, on each workstation:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+printf 'Auth key: '; stty -echo; read -r TSKEY; stty echo; echo
+printf '%s' "$TSKEY" | sudo tee /root/.tskey >/dev/null && sudo chmod 600 /root/.tskey
+sudo tailscale up --auth-key=file:/root/.tskey; sudo rm -f /root/.tskey; unset TSKEY
+curl -s https://<name>.<tailnet>.ts.net/health; echo
+```
+
+The key is asked for without echo (pasting works) and reaches `tailscale up`
+through a root-only file removed right after, so it lands in neither the shell
+history nor `ps`. The last line answers `{"status":"ok"}` once the machine can
+reach the server.
+
+In the Slicer client, set the server URL to `https://<name>.<tailnet>.ts.net`
+and keep TLS verification **on**: the certificate is publicly trusted, so no
+certificate file is needed. The API token does not change.
+
+A personal laptop is simpler: install the app from tailscale.com/download and
+sign in. For someone who is already on another tailnet, share the server's
+machine with their account (**Machines -> the server -> Share**) instead: it
+then appears in their own tailnet, with no switching, and nothing else of this
+one is reachable. A machine can be on one tailnet at a time; `tailscale login`
+adds an account without dropping the current one, and `tailscale switch`
+moves between them without signing in again.
+
 ### `DATA/` has to exist before docker starts
 
 `./DATA:/data:ro` is a bind mount, so a missing host path is created by the
