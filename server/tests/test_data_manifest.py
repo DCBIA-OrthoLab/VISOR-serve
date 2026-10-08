@@ -302,3 +302,24 @@ def test_dedupe_alone_downloads_nothing(fetch_data, tmp_path, monkeypatch, capsy
         _write(tmp_path / tool / "testfiles" / "scan.nii.gz", b"same")
     assert fetch_data.main(["--dedupe", "--data-dir", str(tmp_path)]) == 0
     assert "1 duplicate file(s) now share one copy" in capsys.readouterr().out
+
+
+def test_a_run_stopped_between_its_link_and_its_rename_is_recovered(fetch_data, tmp_path, monkeypatch):
+    """It left a second name for the kept file beside the original. Counted
+    as data, it was hashed after being removed, and the next run crashed."""
+    monkeypatch.setattr(fetch_data, "_DEDUPE_MIN_BYTES", 1)
+    kept = _write(tmp_path / "A" / "testfiles" / "scan.nii.gz", b"same")
+    other = _write(tmp_path / "B" / "testfiles" / "scan.nii.gz", b"same")
+    left = fetch_data._dedupe_staging(str(other))
+    os.link(kept, left)
+
+    assert fetch_data.dedupe(str(tmp_path)) == (1, len(b"same"))
+    assert os.path.samefile(kept, other)
+    assert not os.path.exists(left)
+
+
+def test_a_file_named_like_data_is_never_taken_for_the_staging_link(fetch_data, tmp_path, monkeypatch):
+    monkeypatch.setattr(fetch_data, "_DEDUPE_MIN_BYTES", 1)
+    data = _write(tmp_path / "A" / "models" / "weights.dedupe", b"weights")
+    fetch_data.dedupe(str(tmp_path))
+    assert data.read_bytes() == b"weights"

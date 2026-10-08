@@ -405,6 +405,14 @@ def _fetch_entry(entry: dict, data_dir: str, force: bool, progress) -> str:
 # Below this a duplicate is not worth hashing: the bytes it would save are
 # fewer than the ones the walk reads to find it.
 _DEDUPE_MIN_BYTES = 1 << 20
+# The link `dedupe` makes beside a file before renaming it over that file:
+# hidden, and named so that nothing else in DATA/ could be mistaken for one.
+_DEDUPE_STAGING = ".dedupe-partial"
+
+
+def _dedupe_staging(path: str) -> str:
+    folder, name = os.path.split(path)
+    return os.path.join(folder, f".{name}{_DEDUPE_STAGING}")
 
 
 def _sha256_of(path: str) -> str:
@@ -437,9 +445,19 @@ def dedupe(data_dir: str) -> tuple:
         dirs[:] = sorted(d for d in dirs if not d.startswith(".fetch_") and not d.endswith(".partial"))
         for name in sorted(names):
             path = os.path.join(root, name)
+            if name.startswith(".") and name.endswith(_DEDUPE_STAGING):
+                # Left by a run stopped between its link and its rename: a
+                # second name for a kept file, never data. Counted as data it
+                # was hashed after the run below had removed it, and crashed.
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+                continue
             if os.path.islink(path) or not os.path.isfile(path):
                 continue
-            size = os.path.getsize(path)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue  # gone since the listing
             if size >= _DEDUPE_MIN_BYTES:
                 by_size.setdefault(size, []).append(path)
 
@@ -449,15 +467,18 @@ def dedupe(data_dir: str) -> tuple:
             continue
         keepers = {}  # sha256 -> the path every identical file is linked to
         for path in paths:
-            keeper = keepers.setdefault(_sha256_of(path), path)
-            if keeper == path:
-                continue
-            kept, this = os.stat(keeper), os.stat(path)
+            try:
+                keeper = keepers.setdefault(_sha256_of(path), path)
+                if keeper == path:
+                    continue
+                kept, this = os.stat(keeper), os.stat(path)
+            except OSError:
+                continue  # removed or replaced while the walk was running
             if (kept.st_dev, kept.st_ino) == (this.st_dev, this.st_ino) or kept.st_dev != this.st_dev:
                 continue  # already one file, or another filesystem
             # Linked beside it and renamed over it: never a moment without
             # the file, and an interrupted run leaves the original in place.
-            temporary = f"{path}.dedupe"
+            temporary = _dedupe_staging(path)
             try:
                 os.link(keeper, temporary)
                 os.replace(temporary, path)
