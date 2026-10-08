@@ -27,8 +27,16 @@ It also downloads a tool's models and test files when an operator asks
 `DATA/`, which the container can only read. And each survey reports, per
 manifest entry, whether it is on disk -- what the panel's tool view lists.
 
-It never acts on its own: no request, no update. A change that needs an image
-rebuilt is reported and refused, because a pull cannot deliver it.
+It acts on its own only when SADT_AUTO_UPDATE is `apply` (in the environment or
+the .env, re-read at every survey): a survey that finds the server or the tools
+behind their branch then files the same request an operator would, so the door
+closes FIRST, the runs in flight finish, and only then is anything pulled.
+Closing before waiting is what lets an update happen on a busy server at all;
+waiting for an idle moment first never ends while clients keep sending. A
+request filed this way can be withdrawn like any other (delete request.json),
+and one that fails is not retried until the branch moves again. `notify` logs
+what would be applied; `off`, the default, does nothing. A change that needs an
+image rebuilt is reported and refused, because a pull cannot deliver it.
 
 Standard library only, like the other host scripts: it runs before anything is
 installed and must not need anything that an update could break.
@@ -520,9 +528,37 @@ class Agent:
             handle.write(str(os.getpid()))
         return True
 
+    def auto_request(self):
+        """The request SADT_AUTO_UPDATE=apply files for what the survey found
+        waiting, or None. See the module docstring for the order it keeps."""
+        waiting = [info for info in (self.server, self.tools) if info and info.get("behind")]
+        if not waiting:
+            self._auto_failed = None
+            return None
+        targets = sorted(f"{info['kind']}:{info.get('target') or '?'}" for info in waiting)
+        mode = server_ctl.auto_update_mode()
+        if mode == server_ctl.AUTO_UPDATE_NOTIFY:
+            if targets != getattr(self, "_auto_noted", None):
+                log("SADT_AUTO_UPDATE is 'notify': would update " + ", ".join(targets) + ".")
+                self._auto_noted = targets
+            return None
+        if mode != server_ctl.AUTO_UPDATE_APPLY:
+            return None
+        refused = [f"{info['kind']}: {reason}" for info in waiting for reason in blockers(info)]
+        if refused:
+            if targets != getattr(self, "_auto_noted", None):
+                log("Not updating automatically: " + "; ".join(refused))
+                self._auto_noted = targets
+            return None
+        if targets == getattr(self, "_auto_failed", None):
+            return None  # failed once on these commits; wait for the branch to move
+        return {"id": "auto-" + "-".join(t.split(":", 1)[1][:9] for t in targets),
+                "target": "all", "auto": True, "targets": targets}
+
     def run(self):
         if not self.args.once and not self.claim():
             return
+        log(f"SADT_AUTO_UPDATE is '{server_ctl.auto_update_mode()}'.")
         self.survey()
         if self.args.once:
             return
@@ -535,6 +571,8 @@ class Agent:
                 else:
                     self.apply(request)
                     last = self.state["last"] or {}
+                    if request.get("auto") and not last.get("ok"):
+                        self._auto_failed = request.get("targets")
                     if last.get("ok") and last.get("target") in ("all", "server") \
                             and "server" in (last.get("message") or ""):
                         # This file may have been updated with the rest: run the
@@ -544,6 +582,14 @@ class Agent:
                 next_survey = time.monotonic() + self.args.poll
             elif time.monotonic() >= next_survey:
                 self.survey()
+                automatic = self.auto_request()
+                if automatic:
+                    log("SADT_AUTO_UPDATE is 'apply': updating " + ", ".join(automatic["targets"]) + ".")
+                    staging = self._path(REQUEST_FILE) + ".tmp"
+                    with open(staging, "w", encoding="utf-8") as handle:
+                        json.dump(automatic, handle)
+                    os.replace(staging, self._path(REQUEST_FILE))
+                    continue  # picked up at once, as an operator's would be
                 next_survey = time.monotonic() + self.args.poll
             else:
                 # The heartbeat, so the panel can tell a quiet agent from a

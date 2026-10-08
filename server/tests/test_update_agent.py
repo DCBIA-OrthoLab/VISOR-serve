@@ -273,3 +273,71 @@ def test_a_rebuilt_environment_keeps_its_extras(agent_module):
     segmentation engine went that way, and AREG IOS refused raw scans."""
     assert "--all-extras" in agent_module.SYNC_COMMAND
     assert "--frozen" in agent_module.SYNC_COMMAND
+
+
+# ---------------------------------------------------------------------------
+# SADT_AUTO_UPDATE=apply: the agent files the request itself
+# ---------------------------------------------------------------------------
+
+def _behind(agent_module, repos, tmp_path, monkeypatch, mode):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    monkeypatch.setenv("SADT_AUTO_UPDATE", mode)
+    agent = _agent(agent_module, checkout, tmp_path)
+    agent.survey()
+    return agent, writer, checkout
+
+
+def test_apply_files_an_update_for_what_the_survey_found(agent_module, repos, tmp_path, monkeypatch):
+    agent, _writer, _checkout = _behind(agent_module, repos, tmp_path, monkeypatch, "apply")
+    request = agent.auto_request()
+    assert request["target"] == "all" and request["auto"] is True
+    assert request["targets"] == [f"server:{agent.server['target']}"]
+
+
+@pytest.mark.parametrize("mode", ["off", "notify", "", "sometimes"])
+def test_nothing_is_filed_unless_the_mode_is_apply(agent_module, repos, tmp_path, monkeypatch, mode):
+    agent, _writer, _checkout = _behind(agent_module, repos, tmp_path, monkeypatch, mode)
+    assert agent.auto_request() is None
+
+
+def test_an_up_to_date_deployment_files_nothing(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    monkeypatch.setenv("SADT_AUTO_UPDATE", "apply")
+    agent = _agent(agent_module, checkout, tmp_path)
+    agent.survey()
+    assert agent.auto_request() is None
+
+
+def test_a_checkout_a_pull_would_refuse_is_left_alone(agent_module, repos, tmp_path, monkeypatch):
+    agent, _writer, checkout = _behind(agent_module, repos, tmp_path, monkeypatch, "apply")
+    (checkout / "server" / "main.py").write_text("edited by hand")
+    agent.survey(fetch=False)
+    assert agent.auto_request() is None
+
+
+def test_a_failed_update_waits_for_the_branch_to_move(agent_module, repos, tmp_path, monkeypatch):
+    agent, writer, _checkout = _behind(agent_module, repos, tmp_path, monkeypatch, "apply")
+    agent._auto_failed = agent.auto_request()["targets"]
+    assert agent.auto_request() is None
+    _commit(writer, {"server/main.py": "v3"}, "FIX: y")
+    agent.survey()
+    assert agent.auto_request() is not None
+
+
+def test_an_automatic_update_closes_the_door_before_it_waits(agent_module, repos, tmp_path, monkeypatch):
+    """Waiting for an idle moment first never ends on a server clients keep
+    busy: the door closes, the runs in flight finish, then the pull."""
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent, _writer, checkout = _behind(agent_module, repos, tmp_path, monkeypatch, "apply")
+    server = _FakeServer(busy_polls=2)
+    server.install(agent)
+    request = agent.auto_request()
+    os.makedirs(agent.update_dir, exist_ok=True)
+    with open(os.path.join(agent.update_dir, "request.json"), "w") as handle:
+        json.dump(request, handle)
+    agent.apply(request)
+    assert server.door_calls[0] is False and server.door_calls[-1] is True
+    assert (checkout / "server" / "main.py").read_text() == "v2"
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True and any("Waiting for 1 run(s)" in line for line in last["log"])
