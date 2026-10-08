@@ -762,7 +762,9 @@ BENCHMARK_PAGE = """<!doctype html>
   (function () {
     var key = window.location.host || "local", hash = 0, i;
     for (i = 0; i < key.length; i++) { hash = (hash * 31 + key.charCodeAt(i)) % 360; }
-    el("flag").style.background = "hsl(" + hash + " 60% 52%)";
+    // Greens to violets only (140-300): reds, oranges and yellows read as an
+    // alarm, and a server whose address happened to hash to red looked down.
+    el("flag").style.background = "hsl(" + (140 + hash % 160) + " 60% 52%)";
   })();
 
   // ------------------------------------------------------------------
