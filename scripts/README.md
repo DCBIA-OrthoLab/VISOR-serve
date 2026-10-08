@@ -9,6 +9,7 @@ model bundles around.
 | File | Role |
 | --- | --- |
 | [`setup-server.sh`](setup-server.sh) | Clone, check docker, start. One command from nothing. Runnable straight from GitHub. |
+| [`setup-tailscale.sh`](setup-tailscale.sh) | Put the server on a Tailscale network, in HTTPS, and nowhere else. Linux, needs root. |
 | [`install-docker.sh`](install-docker.sh) | Docker Engine + compose plugin (+ the NVIDIA toolkit on request). Linux, needs root. |
 | [`server_ctl.py`](server_ctl.py) | The deployment engine: `status` / `up` / `update` / `down` / `logs` / `catalog` / `models`. |
 | [`setup-models.sh`](setup-models.sh) | Fetch AI models. Runnable straight from GitHub. |
@@ -109,6 +110,55 @@ looks perfectly healthy.
 
 A container that genuinely has nothing installed still fails, on purpose and
 in one line (`DEPENDENCY-INSTALL-FATAL`): it needs the network once.
+
+### Reaching it from other machines: Tailscale
+
+The simplest way to let other machines in without exposing plain HTTP is a
+Tailscale network. Add `--tailscale` to the install, or run it on its own
+against a deployment that is already up:
+
+```bash
+curl -fsSL .../setup-server.sh | sh -s -- --tailscale
+sudo sh scripts/setup-tailscale.sh          # an existing deployment
+```
+
+It installs Tailscale, joins the tailnet with an auth key asked for at a
+prompt that does not echo it, and publishes the server with `tailscale serve`
+as `https://<name>.<tailnet>.ts.net`. The server keeps listening on
+`127.0.0.1` in plain HTTP; `tailscale serve` is the TLS terminator in front of
+it, and fetches and renews the certificate itself. Nothing has to run at boot:
+`tailscaled` keeps the configuration.
+
+Before running it, in the tailnet's admin console:
+
+- **DNS**: MagicDNS on, and **HTTPS Certificates** enabled. Without them the
+  script stops and says so, rather than hanging on `tailscale serve`.
+- **Settings -> Keys**: an auth key for the server, **not reusable**, tagged
+  (`tag:server`), so the machine belongs to no person and its login never
+  expires. The tag has to be declared in the access policy's `tagOwners`
+  first.
+
+The key is never accepted as an argument, where the shell history and `ps`
+would keep it: the prompt (hidden; pasting works), `--auth-key-file`
+(`--tailscale-key-file` through `setup-server.sh`), or `TS_AUTHKEY` for an
+unattended install. If the Tailscale step stops -- no key on an unattended run,
+certificates not enabled, a device awaiting approval -- the server is still
+installed on `127.0.0.1`, and the script prints the one command that finishes
+the job once that is fixed.
+
+The machine's name ends up in its URL, and is **public**: every certificate is
+written to the Certificate Transparency logs. It defaults to `visor`; keep any
+`--hostname` neutral.
+
+Who may reach the server is the tailnet's access policy, not this script. A
+policy that gives the researchers' machines HTTPS and nothing else:
+
+```json
+"grants": [
+  {"src": ["tag:user"],         "dst": ["tag:server"], "ip": ["tcp:443"]},
+  {"src": ["<admin account>"],  "dst": ["tag:server"], "ip": ["tcp:22"]}
+]
+```
 
 ### `DATA/` has to exist before docker starts
 
