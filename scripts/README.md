@@ -181,6 +181,19 @@ through a root-only file removed right after, so it lands in neither the shell
 history nor `ps`. The last line answers `{"status":"ok"}` once the machine can
 reach the server.
 
+On a machine that already runs Tailscale, `tailscale up` refuses with
+"changing settings via 'tailscale up' requires mentioning all non-default
+flags". To keep the tailnet it is on and add this one beside it, replace the
+`tailscale up` line with `tailscale login`, restating the flags the error
+lists (often `--operator=<user>`):
+
+```bash
+sudo tailscale login --auth-key=file:/root/.tskey --operator="$USER"; sudo rm -f /root/.tskey; unset TSKEY
+```
+
+To put it on this tailnet only, use `tailscale up --reset --auth-key=file:/root/.tskey`
+instead, which drops its previous settings.
+
 In the Slicer client, set the server URL to `https://<name>.<tailnet>.ts.net`
 and keep TLS verification **on**: the certificate is publicly trusted, so no
 certificate file is needed. The API token does not change.
