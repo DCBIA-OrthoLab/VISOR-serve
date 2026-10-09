@@ -20,6 +20,7 @@ actually uses (see _parse_manifest), not YAML at large.
 import argparse
 import contextlib
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -342,10 +343,58 @@ def _split(entry: dict, data_dir: str, force: bool) -> None:
         print(f"    -> {os.path.relpath(view, data_dir)}")
 
 
+# What each path under DATA/ was installed from: the sha256 of the downloaded
+# file (of the archive, for an extracted entry). Without it "present" was the
+# only test, so a file replaced upstream under the same name never reached a
+# deployment that already had the old one. Kept at the root of DATA/, which
+# data_store never lists: it only reads DATA/<tool>/<kind>/.
+_STAMPS = ".fetched.json"
+
+
+def _load_stamps(data_dir: str) -> dict:
+    try:
+        with open(os.path.join(data_dir, _STAMPS), encoding="utf-8") as handle:
+            stamps = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return stamps if isinstance(stamps, dict) else {}
+
+
+def _save_stamp(data_dir: str, label: str, sha256: str) -> None:
+    """Record one entry, written beside and renamed over the old file."""
+    stamps = _load_stamps(data_dir)
+    stamps[label] = sha256
+    os.makedirs(data_dir, exist_ok=True)
+    temporary = os.path.join(data_dir, _STAMPS + ".partial")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(stamps, handle, indent=1, sort_keys=True)
+    os.replace(temporary, os.path.join(data_dir, _STAMPS))
+
+
+def _is_current(entry: dict, target: str, data_dir: str, label: str) -> bool:
+    """Whether what is at `target` is the version the manifest pins.
+
+    An entry with no sha256 pins nothing, so being present is enough. A target
+    installed before the stamps existed has none: a plain file is hashed once
+    and stamped; an extracted folder cannot be hashed back into its archive,
+    so it is taken to be the pinned version and stamped as such -- otherwise
+    every existing deployment would download its whole DATA/ again.
+    """
+    expected = entry.get("sha256")
+    if not expected:
+        return True
+    installed = _load_stamps(data_dir).get(label)
+    if installed is None:
+        installed = expected if entry.get("extract") or os.path.isdir(target) else _sha256_of(target)
+        _save_stamp(data_dir, label, installed)
+    return installed == expected
+
+
 def _fetch(entry: dict, data_dir: str, force: bool, progress) -> str:
     """Fetch one entry, then its views. Returns "skipped", "fetched", or raises."""
     status = _fetch_entry(entry, data_dir, force, progress)
-    _split(entry, data_dir, force)
+    # A replaced entry's views still hold the old content: rebuild them.
+    _split(entry, data_dir, force or status == "fetched")
     return status
 
 
@@ -355,11 +404,14 @@ def _fetch_entry(entry: dict, data_dir: str, force: bool, progress) -> str:
     label = os.path.relpath(target, data_dir)
 
     if os.path.exists(target) and not force:
-        print(f"  = {label} (already present)")
-        return "skipped"
+        if _is_current(entry, target, data_dir, label):
+            print(f"  = {label} (already present)")
+            return "skipped"
+        print(f"  ~ {label} (changed in the manifest)")
+    else:
+        print(f"  + {label}")
 
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    print(f"  + {label}")
 
     # Downloaded into a scratch folder beside the target and only moved into
     # place once complete and verified. An interrupted run therefore leaves
@@ -393,6 +445,7 @@ def _fetch_entry(entry: dict, data_dir: str, force: bool, progress) -> str:
         if os.path.exists(target):
             shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
         os.rename(ready, target)
+        _save_stamp(data_dir, label, actual)
         return "fetched"
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -566,7 +619,8 @@ def _list_manifest(manifest: dict, wanted=None) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Download the server's models / test files into DATA/.",
-        epilog="Files already present are skipped, so re-running is cheap and resumable.",
+        epilog="Files already present are skipped unless the manifest pins another sha256, "
+               "so re-running is cheap, resumable, and picks up a replaced file.",
     )
     parser.add_argument(
         "--kind", choices=KINDS, action="append",
@@ -666,7 +720,8 @@ def main(argv=None) -> int:
         relinked, freed = dedupe(data_dir)
         if relinked:
             print(f"\n{relinked} duplicate file(s) now share one copy; {_human(freed)} freed.")
-    print(f"\n{counts['fetched']} fetched, {counts['skipped']} already present, {len(failures)} failed.")
+    print(f"\n{counts['fetched']} fetched, {counts['skipped']} already present and current, "
+          f"{len(failures)} failed.")
     if failures:
         print("\nFailed items (re-run to retry just those):")
         for entry in failures:

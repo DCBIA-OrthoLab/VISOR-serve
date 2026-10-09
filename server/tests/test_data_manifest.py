@@ -10,9 +10,12 @@ manifest. `--list` ignored `--tool` entirely, so asking about one tool answered
 with every other one's bundles and nothing said the filter had been dropped.
 """
 
+import hashlib
 import importlib.util
+import io
 import os
 import sys
+import zipfile
 
 import pytest
 
@@ -323,3 +326,98 @@ def test_a_file_named_like_data_is_never_taken_for_the_staging_link(fetch_data, 
     data = _write(tmp_path / "A" / "models" / "weights.dedupe", b"weights")
     fetch_data.dedupe(str(tmp_path))
     assert data.read_bytes() == b"weights"
+
+
+# ---------------------------------------------------------------------------
+# A file replaced upstream reaches the deployments that already have it
+# ---------------------------------------------------------------------------
+
+def _sha(content):
+    return hashlib.sha256(content).hexdigest()
+
+
+@pytest.fixture
+def served(fetch_data, monkeypatch):
+    """What the release currently serves, and how many downloads were made."""
+    state = {"content": b"v1", "downloads": 0}
+
+    def download(url, destination, progress):
+        state["downloads"] += 1
+        with open(destination, "wb") as handle:
+            handle.write(state["content"])
+        return _sha(state["content"])
+
+    monkeypatch.setattr(fetch_data, "_download", download)
+    return state
+
+
+def _model(content):
+    return {"tool": "AMASSS", "kind": "models", "name": "weights.pth",
+            "url": "https://example.invalid/weights.pth", "sha256": _sha(content)}
+
+
+def test_a_new_sha256_in_the_manifest_replaces_the_file_on_disk(fetch_data, tmp_path, served):
+    assert fetch_data._fetch(_model(b"v1"), str(tmp_path), False, None) == "fetched"
+    served["content"] = b"v2"
+
+    assert fetch_data._fetch(_model(b"v2"), str(tmp_path), False, None) == "fetched"
+    assert (tmp_path / "AMASSS" / "models" / "weights.pth").read_bytes() == b"v2"
+    assert served["downloads"] == 2
+
+
+def test_an_unchanged_pin_downloads_nothing(fetch_data, tmp_path, served):
+    fetch_data._fetch(_model(b"v1"), str(tmp_path), False, None)
+    assert fetch_data._fetch(_model(b"v1"), str(tmp_path), False, None) == "skipped"
+    assert served["downloads"] == 1
+
+
+def test_a_file_from_before_the_stamps_is_hashed_once_not_downloaded(fetch_data, tmp_path, served):
+    """Every deployment has a DATA/ fetched with no stamps at all."""
+    _write(tmp_path / "AMASSS" / "models" / "weights.pth", b"v1")
+    assert fetch_data._fetch(_model(b"v1"), str(tmp_path), False, None) == "skipped"
+    assert served["downloads"] == 0
+    assert fetch_data._load_stamps(str(tmp_path)) == {
+        os.path.join("AMASSS", "models", "weights.pth"): _sha(b"v1")}
+
+
+def test_a_file_from_before_the_stamps_that_differs_is_replaced(fetch_data, tmp_path, served):
+    _write(tmp_path / "AMASSS" / "models" / "weights.pth", b"old")
+    assert fetch_data._fetch(_model(b"v1"), str(tmp_path), False, None) == "fetched"
+    assert (tmp_path / "AMASSS" / "models" / "weights.pth").read_bytes() == b"v1"
+
+
+def test_an_extracted_folder_from_before_the_stamps_is_kept(fetch_data, tmp_path, served):
+    """It cannot be hashed back into its archive; re-downloading every bundle
+    of every deployment to find out would cost tens of GB."""
+    _write(tmp_path / "AMASSS" / "models" / "bundle" / "net.pth", b"weights")
+    entry = {**_model(b"v1"), "name": "bundle.zip", "extract": True}
+    assert fetch_data._fetch(entry, str(tmp_path), False, None) == "skipped"
+    assert served["downloads"] == 0
+
+
+def test_an_entry_without_a_pin_is_never_downloaded_again(fetch_data, tmp_path, served):
+    entry = {key: value for key, value in _model(b"v1").items() if key != "sha256"}
+    fetch_data._fetch(entry, str(tmp_path), False, None)
+    served["content"] = b"v2"
+    assert fetch_data._fetch(entry, str(tmp_path), False, None) == "skipped"
+    assert served["downloads"] == 1
+
+
+def test_a_replaced_cohort_rebuilds_its_views(fetch_data, tmp_path, served):
+    """A view kept from the old cohort would serve the old scans."""
+    entry = {"tool": "AREG", "kind": "testfiles", "name": "cohort.zip",
+             "url": "https://example.invalid/cohort.zip", "sha256": _sha(b"v2"),
+             "dest": "CBCT/cohort", "split": "CBCT", "extract": True}
+    _cohort(str(tmp_path), "AREG", entry["dest"])
+    fetch_data._split(entry, str(tmp_path), False)
+    fetch_data._save_stamp(str(tmp_path), os.path.join("AREG", "testfiles", "CBCT", "cohort"), _sha(b"v1"))
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("cohort/T1/new_T1.nii.gz", "new")
+    served["content"] = buffer.getvalue()
+    entry["sha256"] = _sha(served["content"])
+
+    assert fetch_data._fetch(entry, str(tmp_path), False, None) == "fetched"
+    view = tmp_path / "AREG" / "testfiles" / "CBCT_T1" / "cohort"
+    assert (view / "new_T1.nii.gz").read_text() == "new"
+    assert not (view / "scan_T1.nii.gz").exists()

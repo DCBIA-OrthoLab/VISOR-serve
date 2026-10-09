@@ -16,6 +16,8 @@
 #   sha256    optional  verified after download; the file is discarded on a
 #                       mismatch. Absent means "not pinned yet" -- fetch_data.py
 #                       prints the hash it got, which is what you paste here.
+#                       Also what makes an update reach a deployment: a file
+#                       on disk installed under another sha256 is replaced.
 #   size      optional  bytes, for the size report before a run. Informational.
 #   extract   optional  true -> unpack the zip and keep the FOLDER, dropping
 #                       the archive. A single top-level folder inside the
@@ -47,7 +49,11 @@
 #     python3 scripts/fetch_data.py --list        # sizes per tool, downloads nothing
 #
 # Anything already on disk is skipped, so re-running only fetches what is
-# missing and an interrupted run resumes by simply being restarted.
+# missing and an interrupted run resumes by simply being restarted. An entry
+# with a sha256 is the exception: when the pin changes, the file on disk is
+# replaced. Changing a file is therefore publishing the new one and updating
+# its `url` and `sha256` here; every deployment then downloads that file and
+# nothing else.
 #
 # ---------------------------------------------------------------------------
 # Status of each tool
@@ -823,6 +829,7 @@ tools:
       # user which is the scan and which is the box.
       - name: ROI.mrk.zip
         dest: ROI_box
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/raw/main/AutoCrop3D/Crop_Volumes_UI/Testing/Test_data/ROI.mrk.zip
+        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/raw/main/AutoCrop3D/Crop_Volumes_UI/Resources/testfiles/AutoCrop3D/ROI.mrk.zip
         size: 1121
+        sha256: eb5e90e2146f3be46e24d8879583781b5c8be89b506e0560b18bbb0fc4ab51a5
         extract: true
