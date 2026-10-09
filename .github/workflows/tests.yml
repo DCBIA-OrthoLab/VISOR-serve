@@ -20,17 +20,19 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The image is prebuilt and pulled, never built here. Building the
-      # deployment image is a separate job below: it is ~15 GB, it installs one
-      # virtualenv per tool, and it needs the tools repository as a named build
-      # context -- none of which the server suite exercises.
+      # The server image is BUILT here, from this commit's
+      # docker/server.Dockerfile, under the name docker-compose.yml runs. It
+      # is small (Python, the API's four dependencies, a few system
+      # libraries), so building it costs about a minute -- and the suite then
+      # runs against the image this change would publish, not against
+      # whatever the registry held before it. Publishing is
+      # server-image.yml's job, on main only.
       #
-      # No registry login: ghcr.io/jules-gp/lab-ai is a PUBLIC package. Checked
-      # rather than assumed -- `docker manifest inspect` succeeds logged out,
-      # and ghcr.io issues an anonymous pull token for it. If it is ever made
-      # private this job fails on the pull, which is the right failure: a
-      # login-action carried "just in case" is dead weight that also hides the
-      # change of state.
+      # The deployment image -- the server plus one library's virtualenvs --
+      # is the separate job below: ~15 GB, and it needs the tools repository
+      # as a named build context, none of which the server suite exercises.
+      - name: Build the server image
+        run: docker build -f docker/server.Dockerfile -t ghcr.io/dcbia-orthologab/visor-serve:main .
 
       # `DATA/` is a read-only bind mount in the compose file. Docker would
       # create it as root if it were missing, which is what broke every fresh
