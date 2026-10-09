@@ -13,7 +13,11 @@ name: visor-serve
 # leaves the reservation in place). `inference` stays the default;
 # `inference-cpu` is what scripts/server_ctl.py starts on a machine with no card.
 x-inference-base: &inference-base
-  image: ghcr.io/jules-gp/lab-ai:2026.08
+  # The server image (docker/server.Dockerfile): Python, the API's four
+  # dependencies and the system libraries tool virtualenvs load -- no tool.
+  # Built and published by .github/workflows/server-image.yml. VISOR_SERVER_IMAGE
+  # pins another build, e.g. a local `docker build` or a dated tag.
+  image: ${VISOR_SERVER_IMAGE:-ghcr.io/dcbia-orthologab/visor-serve:main}
   shm_size: 8gb
   working_dir: /workspace/server
   volumes:
@@ -54,12 +58,13 @@ x-inference-base: &inference-base
     #
     # HOST_PORT moves the HOST side only; the container always serves 8000.
     - "${BIND_ADDR:+${BIND_ADDR:-}:}${HOST_PORT:-8000}:8000"
-  # The install must NOT gate uvicorn. `pip install -r requirements.txt` cannot
-  # succeed offline even when everything is already installed: nnunetv2 ->
-  # batchgenerators -> unittest2 -> argparse, and pip never treats `argparse` as
-  # satisfied because the stdlib module shadows the distribution -- so it
-  # re-downloads that 23 kB wheel on every start. With `&&`, a machine off the
-  # network had a server that started once and never again.
+  # The image already carries requirements-api.txt, so this install is a
+  # no-op that needs no network -- it only acts when a pull changed the API's
+  # requirements ahead of the image. It must still NOT gate uvicorn: the
+  # previous image installed the whole tool stack here, and that could not
+  # succeed offline (nnunetv2 -> batchgenerators -> unittest2 -> argparse, a
+  # wheel pip never treats as satisfied), so a machine off the network had a
+  # server that started once and never again.
   #
   # A genuinely missing dependency still fails loudly: the `import fastapi,
   # uvicorn` probe separates "pip could not run but everything is here" (warn,
@@ -71,7 +76,7 @@ x-inference-base: &inference-base
   # keeps the newlines of its continuation lines, so a line STARTING with `||`
   # reaches sh as its own command and is a syntax error.
   command: >
-    sh -c "pip install --no-cache-dir --user --retries 1 --timeout 20 -r requirements.txt ||
+    sh -c "pip install --no-cache-dir --user --retries 1 --timeout 20 -r requirements-api.txt ||
            echo 'DEPENDENCY-INSTALL-SKIPPED: pip failed (offline?); continuing with what is already installed' >&2;
            python -c 'import fastapi, uvicorn' ||
            { echo 'DEPENDENCY-INSTALL-FATAL: fastapi is not importable and pip could not install it. This container needs network access once.' >&2; exit 1; };
@@ -83,7 +88,7 @@ x-inference-base: &inference-base
 # command cannot drift between the suite the hook runs and the one a maintainer
 # runs.
 x-test-base: &test-base
-  image: ghcr.io/jules-gp/lab-ai:2026.08
+  image: ${VISOR_SERVER_IMAGE:-ghcr.io/dcbia-orthologab/visor-serve:main}
   profiles: ["test"]
   working_dir: /workspace/server
   volumes:
@@ -102,7 +107,7 @@ x-test-base: &test-base
     # written to catch a silent staleness was itself silently not running.
     - ./docker-compose.dev.yml:/workspace/docker-compose.dev.yml:ro
   command: >
-    sh -c "pip install --no-cache-dir --user -r requirements.txt -r requirements-dev.txt &&
+    sh -c "pip install --no-cache-dir --user -r requirements-dev.txt &&
            python -m pytest"
 
 services:

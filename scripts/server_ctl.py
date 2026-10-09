@@ -698,7 +698,7 @@ def warn_if_deps_skipped(service: str) -> bool:
     """Say so when the container started without re-running its dependency install.
 
     Harmless in the offline case it exists for - everything was already
-    installed - but it is the one state where a change to requirements.txt has
+    installed - but it is the one state where a change to requirements-api.txt has
     NOT taken effect while the server looks perfectly healthy. That has to be
     visible rather than buried in `docker compose logs`.
     """
@@ -709,7 +709,7 @@ def warn_if_deps_skipped(service: str) -> bool:
         return False
     log(
         "NOTE: the dependency install did not run this start (no network?). The server is up "
-        "on the packages already in its container. If you just changed requirements.txt, it "
+        "on the packages already in its container. If you just changed requirements-api.txt, it "
         "has NOT taken effect - re-run 'update' with the network available."
     )
     return True
@@ -1121,7 +1121,7 @@ def cmd_up(args) -> dict:
 
     command = compose_base(service) + ["up", "-d"]
     if args.force_recreate:
-        # Not cosmetic: the container installs requirements.txt as part of its
+        # Not cosmetic: the container installs requirements-api.txt as part of its
         # *command*, into a writable layer that survives `restart`. Only a
         # fresh container re-resolves them. See CLAUDE.md, 2026-07-31.
         command.append("--force-recreate")
@@ -1145,8 +1145,8 @@ def cmd_update(args) -> dict:
     """Fetch, fast-forward if there is something to fast-forward to, relaunch.
 
     "Relaunch" is `up -d --force-recreate` rather than `restart` for the reason
-    in CLAUDE.md: the container pip-installs requirements.txt in its command,
-    into a layer `restart` keeps. A new requirements.txt that is never
+    in CLAUDE.md: the container pip-installs requirements-api.txt in its command,
+    into a layer `restart` keeps. A new requirements-api.txt that is never
     re-resolved is a silent no-op update, which is worse than a failed one.
     """
     service = pick_service(args.device)
