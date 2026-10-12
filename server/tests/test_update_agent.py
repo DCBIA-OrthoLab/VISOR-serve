@@ -494,3 +494,15 @@ def test_apply_mode_files_an_update_for_a_new_tools_image(agent_module, repos, t
     agent.survey()
     request = agent.auto_request()
     assert request["auto"] is True and request["targets"] == ["tools:tools-2026.10.13-1"]
+
+
+def test_a_run_without_a_run_id_still_holds_the_update(agent_module, repos, tmp_path):
+    """A client sending no X-Run-Id is absent from /status's runs; admission
+    still holds it, and recreating the container would kill it mid-run."""
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path)
+    answers = iter([{"runs": [], "admission": {"running": 2, "waiting": 0}},
+                    {"runs": [], "admission": {"running": 0, "waiting": 0}}])
+    agent._api = lambda path, payload=None, method=None, timeout=10: next(answers)
+    assert len(agent.in_flight()) == 2
+    assert agent.in_flight() == []
