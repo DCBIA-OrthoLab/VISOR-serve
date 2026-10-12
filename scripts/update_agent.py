@@ -417,9 +417,17 @@ class Agent:
         if status is None:
             return None
         now = time.time()
-        return [run for run in status.get("runs") or []
-                if run.get("state") in ("running", "pending")
-                and now - (run.get("updated_at") or now) < server_ctl.GHOST_AFTER_SECONDS]
+        tracked = [run for run in status.get("runs") or []
+                   if run.get("state") in ("running", "pending")
+                   and now - (run.get("updated_at") or now) < server_ctl.GHOST_AFTER_SECONDS]
+        if tracked:
+            return tracked
+        # A client that sends no X-Run-Id is not in `runs` at all, yet its run
+        # holds the machine like any other -- and a restart would kill it in
+        # the middle. What admission still holds or queues is the ground truth.
+        admission = status.get("admission") or {}
+        held = int(admission.get("running") or 0) + int(admission.get("waiting") or 0)
+        return [{"tool": "a run without a run id", "state": "running"}] * held
 
     def healthy(self) -> bool:
         try:
