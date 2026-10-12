@@ -1613,6 +1613,10 @@ def cmd_uninstall(args) -> dict:
     if os.path.isfile(server_env):
         shutil.copy2(server_env, os.path.join(kept, "server.env"))
         os.chmod(os.path.join(kept, "server.env"), 0o600)
+    # The deployment's own post-update checks (update_agent.py's smoke.json).
+    smoke = os.path.join(repo_root, "server", ".update", "smoke.json")
+    if os.path.isfile(smoke):
+        shutil.copy2(smoke, os.path.join(kept, "smoke.json"))
     if plan["data"] and plan["data"]["action"] == "keep":
         try:
             os.rename(plan["data"]["path"], os.path.join(kept, "DATA"))  # same filesystem: instant

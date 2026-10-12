@@ -64,6 +64,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import urllib.error
 import urllib.request
 
@@ -76,6 +77,12 @@ import server_ctl  # noqa: E402 - beside this file, and stdlib only too
 REPO_ROOT = server_ctl.REPO_ROOT
 STATUS_FILE = "status.json"
 REQUEST_FILE = "request.json"
+# The runs that prove an update left the tools working, beside status.json
+# unless --smoke-file names another. Deployment-specific on purpose: which
+# tools and which hosted test files are worth a check is this deployment's
+# knowledge, and the server holds none about any tool.
+SMOKE_FILE = "smoke.json"
+SMOKE_TIMEOUT_SECONDS = 1800
 
 # How a changed tool's environment is rebuilt. `--all-extras`, as the image
 # builds them: without it a sync REMOVES what an extra installed. Crown_Seg's
@@ -623,11 +630,84 @@ class Agent:
                     os.remove(self._path(REQUEST_FILE))
             except OSError:
                 pass
+            smoke = None
+            if ok:
+                # After the door reopens: /run refuses everyone while it is
+                # shut, this check included, and clients need not wait for it.
+                smoke = self.run_smoke()
+                if smoke:
+                    failed = [entry for entry in smoke if not entry["ok"]]
+                    message += (f" Smoke test: {len(smoke)} of {len(smoke)} passed." if not failed else
+                                f" Smoke test FAILED for {len(failed)} of {len(smoke)}: " +
+                                "; ".join(f"{entry['label']} ({entry['detail']})" for entry in failed))
             self.state["last"] = {"id": request.get("id"), "target": target, "ok": ok,
-                                  "message": message, "at": time.time(), "log": self.log_lines}
+                                  "message": message, "at": time.time(), "log": self.log_lines,
+                                  "smoke": smoke}
             self.state["applying"] = None
             log(message)
             self.survey(fetch=False)
+
+    # -- the smoke test ------------------------------------------------
+    def smoke_plan(self) -> list:
+        """`[{"tool", "form", "label"?, "timeout"?}]` from the smoke file, or []
+        when there is none. A malformed file is reported, never fatal."""
+        path = getattr(self.args, "smoke_file", "") or self._path(SMOKE_FILE)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                plan = json.load(handle)
+        except FileNotFoundError:
+            return []
+        except (OSError, ValueError) as exc:
+            log(f"The smoke file {path} could not be read ({exc}); no smoke test.")
+            return []
+        if not isinstance(plan, list) or not all(isinstance(item, dict) and item.get("tool")
+                                                 for item in plan):
+            log(f"The smoke file {path} must be a list of {{\"tool\", \"form\"}}; no smoke test.")
+            return []
+        return plan
+
+    def run_smoke(self) -> list:
+        """Run every smoke check, one at a time, and say how each went."""
+        results = []
+        for item in self.smoke_plan():
+            label = item.get("label") or item["tool"]
+            self.phase(f"Smoke test: {label}.")
+            started = time.monotonic()
+            code, detail = self._post_run(item["tool"], item.get("form") or {},
+                                          float(item.get("timeout") or SMOKE_TIMEOUT_SECONDS))
+            results.append({"label": label, "tool": item["tool"], "ok": code == 200, "http": code,
+                            "seconds": round(time.monotonic() - started, 1),
+                            "detail": "ok" if code == 200 else detail})
+        return results
+
+    def _post_run(self, tool: str, form: dict, timeout: float):
+        """POST /run/<tool> with `form` as multipart fields; (status, detail).
+
+        Sent with a run id, so the run is listed in /status like any client's
+        and the next update waits for it. The result is read and discarded:
+        what is checked is that the tool ran to the end.
+        """
+        boundary = uuid.uuid4().hex
+        body = b"".join(
+            (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{key}\"\r\n\r\n{value}\r\n").encode("utf-8")
+            for key, value in form.items()) + f"--{boundary}--\r\n".encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.url.rstrip('/')}/run/{tool}", data=body, method="POST",
+            headers={"Authorization": f"Bearer {self.token}", "X-Run-Id": str(uuid.uuid4()),
+                     "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                while response.read(1 << 20):
+                    pass
+                return response.status, ""
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = json.loads(exc.read().decode("utf-8") or "{}").get("detail")
+            except (OSError, ValueError):
+                detail = None
+            return exc.code, str(detail or exc.reason)[:160]
+        except Exception as exc:  # noqa: BLE001 - a smoke check reports, it never raises
+            return 0, f"{type(exc).__name__}: {exc}"[:160]
 
     def hold_door(self) -> threading.Event:
         """Keep the door shut until the returned event is set.
@@ -790,11 +870,17 @@ def main(argv=None) -> int:
     parser.add_argument("--health-timeout", type=int, default=600)
     parser.add_argument("--no-sync", action="store_true", help="Never run uv sync (for testing).")
     parser.add_argument("--once", action="store_true", help="One survey, then exit.")
+    parser.add_argument("--smoke-file", default=None,
+                        help="Runs to check after every successful update, as a JSON list of "
+                             '{"tool", "form", "label"?, "timeout"?}. Default: SADT_SMOKE_FILE, '
+                             "else smoke.json in the update dir; none, no check.")
     args = parser.parse_args(argv)
     if args.tools_image is None:
         args.tools_image = os.environ.get("SADT_TOOLS_IMAGE") or env.get("SADT_TOOLS_IMAGE") or ""
     if args.tools_repo is None:
         args.tools_repo = "" if args.tools_image else _default_tools_repo()
+    if args.smoke_file is None:
+        args.smoke_file = os.environ.get("SADT_SMOKE_FILE") or env.get("SADT_SMOKE_FILE") or ""
     if args.server_image is None:
         args.server_image = (os.environ.get("VISOR_SERVER_IMAGE") or env.get("VISOR_SERVER_IMAGE")
                              or server_ctl.DEFAULT_SERVER_IMAGE)

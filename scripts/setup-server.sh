@@ -358,6 +358,10 @@ if [ -d "$KEPT" ]; then
     if [ -f "$KEPT/server.env" ] && [ ! -f "$INSTALL_DIR/server/.env" ]; then
         cp -p "$KEPT/server.env" "$INSTALL_DIR/server/.env" && echo "  server/.env restored"
     fi
+    if [ -f "$KEPT/smoke.json" ] && [ ! -f "$INSTALL_DIR/server/.update/smoke.json" ]; then
+        mkdir -p "$INSTALL_DIR/server/.update"
+        cp -p "$KEPT/smoke.json" "$INSTALL_DIR/server/.update/smoke.json" && echo "  smoke tests restored"
+    fi
     # Kept until everything in it is back in place; then it goes.
     [ -d "$KEPT/DATA" ] || rm -rf "$KEPT"
 fi
