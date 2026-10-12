@@ -9,6 +9,12 @@
 #
 #   curl -fsSL .../setup-server.sh | sh -s -- --tool AMASSS --tool ALI
 #
+# A complete server -- every tool prebuilt, every model and test file, reached
+# over Tailscale -- in one command:
+#
+#   curl -fsSL .../setup-server.sh | sh -s -- --full --tailscale \
+#       --tools-image ghcr.io/dcbia-ortholab/sadt-visor-tools:latest
+#
 # Options:
 #   --dir DIR       where to clone (default: ./VISOR-serve, or $INSTALL_DIR)
 #   --tool NAME     also download this tool's models and test files (repeatable).
@@ -48,6 +54,17 @@
 #                   two sides are promoted together, and a server following
 #                   `deploy` while the tools follow their tip is how a schema
 #                   and the server that reads it come apart.
+#   --tools-image IMAGE
+#                   serve a tool library from its PREBUILT image instead of a
+#                   clone: every tool's virtualenv and its Python, already
+#                   installed, pulled as one image and mounted read-only
+#                   (docker/compose.tools-image.yml). Minutes instead of an
+#                   hour of builds, and the same bytes on every server. E.g.
+#                   ghcr.io/dcbia-ortholab/sadt-visor-tools:latest, or a
+#                   release tag such as :tools-2026.10.12-1. Replaces --tools
+#                   and --build-tools; data is still downloaded per --tool or
+#                   --full. The automatic updater does not follow images yet,
+#                   so --auto-update is set to off with it.
 #   --build-tools   build each tool's virtualenv after cloning, which is what
 #                   makes them actually RUN. ~25 GB and well over an hour, it
 #                   downloads two CUDA torch runtimes. Implied by --full.
@@ -94,6 +111,7 @@ TOOLS_REPO=""
 TOOLS_DIR_OPT=""
 TOOLS_REF="${TOOLS_REF:-}"
 BUILD_TOOLS=0
+TOOLS_IMAGE=""
 TAILSCALE=0
 TS_KEY_FILE=""
 
@@ -113,10 +131,11 @@ while [ $# -gt 0 ]; do
         --tools-dir) TOOLS_DIR_OPT="$2"; shift 2 ;;
         --tools-ref) TOOLS_REF="$2"; shift 2 ;;
         --build-tools) BUILD_TOOLS=1; shift ;;
+        --tools-image) TOOLS_IMAGE="$2"; shift 2 ;;
         --tailscale) TAILSCALE=1; shift ;;
         --tailscale-key-file) TAILSCALE=1; TS_KEY_FILE="$2"; shift 2 ;;
         --yes|-y|--non-interactive) ASK=0; shift ;;
-        -h|--help) sed -n '2,76p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,94p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "setup-server: unknown option '$1'" >&2; exit 2 ;;
     esac
 done
@@ -138,6 +157,17 @@ ask() {
     [ -n "$_answer" ] || _answer="$3"
     eval "$1=\$_answer"
 }
+
+if [ -n "$TOOLS_IMAGE" ]; then
+    if [ -n "$TOOLS_REPO" ] || [ "$BUILD_TOOLS" -eq 1 ]; then
+        echo "setup-server: --tools-image serves prebuilt tools; ignoring --tools / --build-tools." >&2
+    fi
+    TOOLS_REPO=""
+    if [ -n "$AUTO_UPDATE" ] && [ "$AUTO_UPDATE" != "off" ]; then
+        echo "setup-server: the updater does not follow a tools image yet; --auto-update set to off." >&2
+    fi
+    AUTO_UPDATE="off"
+fi
 
 if [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
     echo
@@ -165,7 +195,7 @@ ask AUTO_UPDATE "Follow that branch automatically? off | notify | apply" "off"
 # Without a tools repository the server starts with its two demo tools and
 # nothing else, which reads as a small deployment rather than an unfinished
 # one. Asked as a URL rather than offered as a default: see --tools.
-if [ -z "$TOOLS_REPO" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+if [ -z "$TOOLS_REPO" ] && [ -z "$TOOLS_IMAGE" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
     printf 'Git URL of the tools repository to serve (empty: the demos only): ' > /dev/tty
     read -r TOOLS_REPO < /dev/tty || TOOLS_REPO=""
 fi
@@ -193,7 +223,7 @@ fi
 
 # A server whose tools have no virtualenv reports every one of them as
 # unloadable, which reads as a broken deployment rather than an unbuilt one.
-[ "$FULL" -eq 1 ] && BUILD_TOOLS=1
+[ "$FULL" -eq 1 ] && [ -z "$TOOLS_IMAGE" ] && BUILD_TOOLS=1
 if [ "$BUILD_TOOLS" -eq 0 ] && [ -n "$TOOLS_REPO" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
     printf 'Build each tool virtualenv now? Needed to run them. ~25 GB, over an hour [y/N]: ' > /dev/tty
     read -r _bt < /dev/tty || _bt=""
@@ -417,7 +447,30 @@ if [ "$BUILD_TOOLS" -eq 1 ] && [ -n "$TOOLS_ROOT" ]; then
 fi
 
 # --- point the deployment at the tools -----------------------------------
-if [ -n "$TOOLS_ROOT" ]; then
+if [ -n "$TOOLS_IMAGE" ]; then
+    # Pulled here, with docker's own progress, rather than left to `up`: the
+    # library image is tens of GB, and a start that sits silent for twenty
+    # minutes looks like a hang.
+    echo
+    echo "Pulling the tools image $TOOLS_IMAGE ..."
+    if ! docker pull "$TOOLS_IMAGE"; then
+        # A tools image built on this machine was never in a registry.
+        docker image inspect "$TOOLS_IMAGE" >/dev/null 2>&1 || {
+            echo "setup-server: $TOOLS_IMAGE could not be pulled and is not on this machine." >&2
+            exit 1
+        }
+        echo "Using the copy of $TOOLS_IMAGE already on this machine."
+    fi
+    set_env COMPOSE_FILE "docker-compose.yml:docker/compose.tools-image.yml"
+    set_env SADT_TOOLS_IMAGE "$TOOLS_IMAGE"
+    # A previous install from a clone left these; with an image they would
+    # mount a checkout nothing reads any more.
+    for _key in SADT_TOOLS UV_PYTHON_STORE; do
+        if [ -f "$INSTALL_DIR/.env" ] && grep -q "^$_key=" "$INSTALL_DIR/.env"; then
+            sed "/^$_key=/d" "$INSTALL_DIR/.env" > "$INSTALL_DIR/.env.tmp.$$" && mv "$INSTALL_DIR/.env.tmp.$$" "$INSTALL_DIR/.env"
+        fi
+    done
+elif [ -n "$TOOLS_ROOT" ]; then
     set_env SADT_TOOLS "$TOOLS_ROOT"
     # The interpreters those virtualenvs symlink to. uv installs its own
     # CPython outside the checkout, so without this every `.venv/bin/python`
