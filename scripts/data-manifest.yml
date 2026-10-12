@@ -846,11 +846,11 @@ tools:
         sha256: 2c851b37cc7ea001f56e296ee0f1a1df066363034974361badee65e2cb3c82be
       # The two modes that skip steps need scans already oriented and
       # registered. Derived by the tools themselves from the T1 of the scan
-      # above, already public; data-2026.10.12-1's SOURCES.md says how.
+      # above, already public; data-2026.10.12-2's SOURCES.md says how.
       # 'File already Oriented' takes it as t1, 'File already Registered' too.
       - name: TestFile025_T1_CBCT_Or_Matrix.zip
         dest: CBCT_Oriented
-        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.12-1/TestFile025_T1_CBCT_Or_Matrix.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.12-2/TestFile025_T1_CBCT_Or_Matrix.zip
         release_name: TestFile025_T1_CBCT_Or_Matrix.zip
         sha256: 1048b626ea377d3b8cf847c5a5756a05376fd8e1decb1368644186637de58ca6
         size: 257642493
@@ -858,7 +858,7 @@ tools:
       # ... and its registration transforms, one subfolder per region.
       - name: TestFile026_Matrix_Reg.zip
         dest: Registration_Transforms
-        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.12-1/TestFile026_Matrix_Reg.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.12-2/TestFile026_Matrix_Reg.zip
         release_name: TestFile026_Matrix_Reg.zip
         sha256: 9b4d0bf61a530b00225ec557b8410eb5188288edd1da5ad82e7c183afc270979
         size: 1329
