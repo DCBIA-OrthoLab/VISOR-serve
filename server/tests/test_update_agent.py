@@ -539,3 +539,95 @@ def test_a_run_that_slipped_in_is_waited_for_before_the_restart(agent_module, re
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is True
     assert any("Before restarting: waiting for 1 run(s): AREG_CBCT" in line for line in last["log"])
+
+
+# ---------------------------------------------------------------------------
+# The smoke test after an update
+# ---------------------------------------------------------------------------
+
+def _updated_agent(agent_module, repos, tmp_path, monkeypatch, smoke=None):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    if smoke is not None:
+        os.makedirs(agent.update_dir, exist_ok=True)
+        with open(os.path.join(agent.update_dir, "smoke.json"), "w") as handle:
+            handle.write(smoke if isinstance(smoke, str) else json.dumps(smoke))
+    server = _FakeServer()
+    server.install(agent)
+    return agent, server
+
+
+def _last(agent):
+    return json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+
+
+def test_no_smoke_file_means_no_smoke_test(agent_module, repos, tmp_path, monkeypatch):
+    agent, _server = _updated_agent(agent_module, repos, tmp_path, monkeypatch)
+    agent._post_run = lambda *a: pytest.fail("nothing to check")
+    agent.apply(_request(agent))
+    assert _last(agent)["ok"] is True and "Smoke" not in _last(agent)["message"]
+
+
+def test_each_check_runs_after_the_door_reopens_and_is_reported(agent_module, repos, tmp_path, monkeypatch):
+    smoke = [{"tool": "Fast", "form": {"input": "a"}, "label": "fast tool"},
+             {"tool": "Broken", "form": {}}]
+    agent, server = _updated_agent(agent_module, repos, tmp_path, monkeypatch, smoke)
+    calls = []
+
+    def post(tool, form, timeout):
+        calls.append((tool, form, server.door_calls[-1]))
+        return (200, "") if tool == "Fast" else (500, "Tool execution failed.")
+
+    agent._post_run = post
+    agent.apply(_request(agent))
+    last = _last(agent)
+    assert [c[0] for c in calls] == ["Fast", "Broken"]
+    assert all(door_open for _tool, _form, door_open in calls), "the door is open while it checks"
+    assert last["ok"] is True, "the update itself was applied"
+    assert "Smoke test FAILED for 1 of 2: Broken (Tool execution failed.)" in last["message"]
+    assert [entry["ok"] for entry in last["smoke"]] == [True, False]
+
+
+def test_a_malformed_smoke_file_is_ignored(agent_module, repos, tmp_path, monkeypatch):
+    agent, _server = _updated_agent(agent_module, repos, tmp_path, monkeypatch, smoke="{not json")
+    agent._post_run = lambda *a: pytest.fail("nothing to check")
+    agent.apply(_request(agent))
+    assert _last(agent)["ok"] is True
+
+
+def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path):
+    """Against a real HTTP server: the fields arrive as multipart, the run
+    carries an id (so the next update waits for it), and a refusal's detail
+    is what the report says."""
+    import http.server
+    import threading
+
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            seen.update(path=self.path, run_id=self.headers.get("X-Run-Id"), body=body.decode())
+            status = 200 if self.path.endswith("/Good") else 422
+            payload = b"result bytes" if status == 200 else json.dumps({"detail": "no such input"}).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        _writer, checkout = repos
+        agent = _agent(agent_module, checkout, tmp_path, url=f"http://127.0.0.1:{httpd.server_port}")
+        assert agent._post_run("Good", {"scans": "test.nii.gz"}, 10) == (200, "")
+        assert seen["path"] == "/run/Good" and seen["run_id"]
+        assert 'name="scans"' in seen["body"] and "test.nii.gz" in seen["body"]
+        assert agent._post_run("Bad", {}, 10) == (422, "no such input")
+    finally:
+        httpd.shutdown()

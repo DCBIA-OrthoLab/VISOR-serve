@@ -192,3 +192,10 @@ def test_only_containers_started_from_this_clone_are_removed(tmp_path, monkeypat
     assert ["docker", "rm", "-f", "abc123"] in calls
     assert not any("down" in cmd for cmd in calls)
     assert result["removed_containers"] == ["abc123"]
+
+
+def test_the_deployments_smoke_checks_are_kept(tmp_path):
+    root = _clone(tmp_path)
+    _write(str(root / "server" / ".update" / "smoke.json"), '[{"tool": "X", "form": {}}]')
+    ctl.cmd_uninstall(_args(root))
+    assert (tmp_path / "VISOR-serve.kept" / "smoke.json").read_text() == '[{"tool": "X", "form": {}}]'
