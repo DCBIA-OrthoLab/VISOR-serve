@@ -240,6 +240,8 @@ re-enters the same file with the sibling's interpreter, so chaining and nesting
 │   ├── setup-server.sh      #   curl-pipeable: clone, check docker, start
 │   ├── install-docker.sh    #   Docker Engine + compose plugin (Linux, root)
 │   ├── install-docker-gpu.sh#   ... plus the NVIDIA container toolkit
+│   ├── install-nvidia-driver.sh # the recommended NVIDIA driver (Ubuntu, root)
+│   ├── check-gpu.sh         #   can the tools use this GPU (driver, compute capability)
 │   ├── server_ctl.py        #   the deployment engine: status/up/update/down/catalog/models
 │   ├── setup-models.sh      #   curl-pipeable entry points
 │   ├── setup-testfiles.sh

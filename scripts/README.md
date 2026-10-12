@@ -11,6 +11,8 @@ model bundles around.
 | [`setup-server.sh`](setup-server.sh) | Clone, check docker, start. One command from nothing. Runnable straight from GitHub. |
 | [`setup-tailscale.sh`](setup-tailscale.sh) | Put the server on a Tailscale network, in HTTPS, and nowhere else. Linux, needs root. |
 | [`install-docker.sh`](install-docker.sh) | Docker Engine + compose plugin (+ the NVIDIA toolkit on request). Linux, needs root. |
+| [`install-nvidia-driver.sh`](install-nvidia-driver.sh) | The NVIDIA driver Ubuntu recommends for the card (an RTX 50xx gets 570+). Ubuntu, needs root, then a reboot. |
+| [`check-gpu.sh`](check-gpu.sh) | Can the tools use this GPU? Exit 0 yes, 1 no GPU, 2 card too old, 3 driver missing or too old. |
 | [`server_ctl.py`](server_ctl.py) | The deployment engine: `status` / `up` / `update` / `down` / `logs` / `catalog` / `models`. |
 | [`setup-models.sh`](setup-models.sh) | Fetch AI models. Runnable straight from GitHub. |
 | [`setup-testfiles.sh`](setup-testfiles.sh) | Fetch reference test files. Runnable straight from GitHub. |
