@@ -1,0 +1,33 @@
+# Tools from a prebuilt library image instead of a host checkout.
+#
+# A tool library can publish every tool's virtualenv, and the Python they run
+# on, as one image built at a fixed path (SADT-VISOR's tools releases:
+# ghcr.io/<owner>/sadt-visor-tools:tools-YYYY.MM.DD-N). Mounted read-only at
+# that same path, the absolute paths its virtualenvs recorded all hold, and a
+# server needs neither a tools checkout nor an hour of `uv sync`.
+#
+# Enabled from .env, which docker compose reads on every command:
+#
+#     COMPOSE_FILE=docker-compose.yml:docker/compose.tools-image.yml
+#     SADT_TOOLS_IMAGE=ghcr.io/dcbia-ortholab/sadt-visor-tools:tools-2026.10.12-1
+#
+# SADT_TOOLS and UV_PYTHON_STORE are then left unset: nothing on the host is
+# mounted for the tools. Moving to another tools release is changing the tag
+# and recreating the container (`server_ctl.py update` does both).
+
+x-tools-image: &tools-image
+  volumes:
+    - type: image
+      source: ${SADT_TOOLS_IMAGE:?set SADT_TOOLS_IMAGE to the tools image this deployment runs}
+      target: /opt/visor/libraries/sadt-visor
+      image:
+        subpath: opt/visor/libraries/sadt-visor
+  environment:
+    - TOOLS_DIR=/opt/visor/libraries/sadt-visor/tools
+    - DESCRIBE_PATH=/opt/visor/libraries/sadt-visor/scripts/describe.py
+
+services:
+  inference:
+    <<: *tools-image
+  inference-cpu:
+    <<: *tools-image

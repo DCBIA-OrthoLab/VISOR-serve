@@ -1,32 +1,35 @@
 name: server image
 
-# Publishes docker/server.Dockerfile as ghcr.io/dcbia-orthologab/visor-serve,
-# the image docker-compose.yml runs. It holds the server and what tool
-# virtualenvs load from the system -- no tool -- so it is small enough to build
-# on a hosted runner.
+# Publishes docker/server.Dockerfile as ghcr.io/<owner>/visor-serve, the image
+# docker-compose.yml runs. It holds the server and what tool virtualenvs load
+# from the system -- no tool -- so it is small enough to build on a hosted
+# runner.
 #
-# Tags:
-#   main          the latest build of main; docker-compose.yml's default
-#   sha-<short>   every build, so a deployment can pin exactly what it runs
-#   server-...    a `server-YYYY.MM.DD-N` git tag publishes under that name
+#   push to main     -> :main and :sha-<short>
+#   push to deploy   -> a server release: :server-YYYY.MM.DD-N, :deploy and
+#                       :sha-<short>, plus a GitHub release of that name
+#   tag server-*     -> that tag (a release cut by hand)
 #
-# The package belongs to the organisation and inherits nothing from the
-# repository's visibility: the first publish creates it private, and making it
-# public is one click under the organisation's Packages settings. Until then a
-# deployment pulls it only after `docker login ghcr.io`.
+# A push to deploy that changes nothing the image is built from cuts no
+# release. The tag counter only counts `server-` tags.
+#
+# <owner> is the repository's owner, lowercased, as the registry wants it, so
+# a fork publishes under its own account and needs no edit here. A package an
+# organisation's workflow creates starts private; making it public is one click
+# under the organisation's Packages settings.
 
 on:
   push:
-    branches: [main]
+    branches: [main, deploy]
     tags: ["server-*"]
-    paths:
-      - docker/server.Dockerfile
-      - server/**
-      - .github/workflows/server-image.yml
   workflow_dispatch:
 
+concurrency:
+  group: server-image-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -35,26 +38,77 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-      - name: Log in to ghcr.io
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Build
-        run: docker build -f docker/server.Dockerfile -t visor-serve .
-
-      - name: Push
-        env:
-          IMAGE: ghcr.io/dcbia-orthologab/visor-serve
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
+      - name: Decide what to publish
+        id: plan
         run: |
+          owner=$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/$owner/visor-serve" >> "$GITHUB_OUTPUT"
           tags="sha-${GITHUB_SHA::7}"
-          if [ "$REF_TYPE" = tag ]; then
-            tags="$tags $REF_NAME"
+          release=""
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tags="$tags $GITHUB_REF_NAME"
+          elif [ "$GITHUB_REF_NAME" = deploy ]; then
+            previous=$(git tag --list 'server-*' --sort=-creatordate | head -1)
+            if [ -n "$previous" ] && [ -z "$(git diff --name-only "$previous" HEAD -- server docker/server.Dockerfile)" ]; then
+              echo "Nothing the server image is built from changed since $previous: no release."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            day=$(date -u +%Y.%m.%d)
+            used=$(git tag --list "server-$day-*" | sed "s/^server-$day-//" | sort -n | tail -1)
+            release="server-$day-$(( ${used:-0} + 1 ))"
+            tags="$tags deploy $release"
+            echo "previous=$previous" >> "$GITHUB_OUTPUT"
           else
             tags="$tags main"
           fi
-          for tag in $tags; do
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        if: steps.plan.outputs.publish == 'true'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build
+        if: steps.plan.outputs.publish == 'true'
+        run: docker build -f docker/server.Dockerfile -t visor-serve .
+
+      - name: Push
+        if: steps.plan.outputs.publish == 'true'
+        id: push
+        env:
+          IMAGE: ${{ steps.plan.outputs.image }}
+          TAGS: ${{ steps.plan.outputs.tags }}
+        run: |
+          for tag in $TAGS; do
             docker tag visor-serve "$IMAGE:$tag"
             docker push "$IMAGE:$tag"
           done
+          echo "digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:sha-${GITHUB_SHA::7}" | sed 's/.*@//')" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the server release
+        if: steps.plan.outputs.release != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.plan.outputs.release }}
+          IMAGE: ${{ steps.plan.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          PREVIOUS: ${{ steps.plan.outputs.previous }}
+        run: |
+          {
+            echo "The VISOR server, ready to run: the API and the system libraries tool virtualenvs load. No tool inside -- tools come from a tool library's own release."
+            echo
+            echo '```'
+            echo "$IMAGE:$TAG"
+            echo "$IMAGE@$DIGEST"
+            echo '```'
+            echo
+            echo "On a server: \`VISOR_SERVER_IMAGE=$IMAGE:$TAG\` in .env, then recreate the container."
+          } > notes.md
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" \
+             --notes-file notes.md --generate-notes \
+             ${PREVIOUS:+--notes-start-tag "$PREVIOUS"}
