@@ -1472,13 +1472,18 @@ def kept_dir(repo_root: str = None) -> str:
 
 
 def _tree_size(path: str) -> int:
-    total = 0
+    """Bytes on disk, each hardlinked file once: fetch_data links identical
+    files across tools, and counting every name overstated DATA/ twofold."""
+    total, seen = 0, set()
     for root, _dirs, names in os.walk(path, onerror=lambda _error: None):
         for name in names:
             try:
-                total += os.lstat(os.path.join(root, name)).st_size
+                info = os.lstat(os.path.join(root, name))
             except OSError:
-                pass
+                continue
+            if (info.st_dev, info.st_ino) not in seen:
+                seen.add((info.st_dev, info.st_ino))
+                total += info.st_size
     return total
 
 
