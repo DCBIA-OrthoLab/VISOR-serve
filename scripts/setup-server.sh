@@ -63,8 +63,10 @@
 #                   ghcr.io/dcbia-ortholab/sadt-visor-tools:latest, or a
 #                   release tag such as :tools-2026.10.12-1. Replaces --tools
 #                   and --build-tools; data is still downloaded per --tool or
-#                   --full. The automatic updater does not follow images yet,
-#                   so --auto-update is set to off with it.
+#                   --full. The updater follows the image's tag: a new tools
+#                   release is pulled and the container recreated, between
+#                   runs, like any other update. The server image then follows
+#                   the deployment's branch too (`:deploy` for deploy).
 #   --build-tools   build each tool's virtualenv after cloning, which is what
 #                   makes them actually RUN. ~25 GB and well over an hour, it
 #                   downloads two CUDA torch runtimes. Implied by --full.
@@ -163,10 +165,6 @@ if [ -n "$TOOLS_IMAGE" ]; then
         echo "setup-server: --tools-image serves prebuilt tools; ignoring --tools / --build-tools." >&2
     fi
     TOOLS_REPO=""
-    if [ -n "$AUTO_UPDATE" ] && [ "$AUTO_UPDATE" != "off" ]; then
-        echo "setup-server: the updater does not follow a tools image yet; --auto-update set to off." >&2
-    fi
-    AUTO_UPDATE="off"
 fi
 
 if [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
@@ -493,6 +491,15 @@ if [ -n "$TOOLS_IMAGE" ]; then
     fi
     set_env COMPOSE_FILE "docker-compose.yml:docker/compose.tools-image.yml"
     set_env SADT_TOOLS_IMAGE "$TOOLS_IMAGE"
+    # The server image of the branch this deployment follows: server-image.yml
+    # publishes `:main` from main and `:deploy` with every server release, so
+    # the code a pull lands and the image it runs in move together.
+    case "$REF" in
+        main|deploy)
+            _owner="$(echo "${REPO%%/*}" | tr '[:upper:]' '[:lower:]')"
+            set_env VISOR_SERVER_IMAGE "ghcr.io/${_owner}/visor-serve:${REF}"
+            ;;
+    esac
     # A previous install from a clone left these; with an image they would
     # mount a checkout nothing reads any more.
     for _key in SADT_TOOLS UV_PYTHON_STORE; do
