@@ -279,7 +279,7 @@ def compose_base(service: str):
 ENV_PATH = os.path.join(REPO_ROOT, ".env")
 
 # Keys docker-compose.yml interpolates. Anything else in the file is left alone.
-_ENV_KEYS = ("API_TOKEN", "DEVICE", "BIND_ADDR", "HOST_PORT")
+_ENV_KEYS = ("API_TOKEN", "ADMIN_TOKEN", "DEVICE", "BIND_ADDR", "HOST_PORT")
 _ENV_BANNER = "# Written by scripts/server_ctl.py. This file is gitignored - keep it that way."
 
 
@@ -398,6 +398,12 @@ def ensure_env(service: str, bind_addr=None, token=None, port=None) -> str:
     if bind_addr is None:
         bind_addr = existing.get("BIND_ADDR", "127.0.0.1")
     updates = {"API_TOKEN": api_token, "BIND_ADDR": bind_addr, "HOST_PORT": str(port or effective_port())}
+    # The admin panel's own token, distinct from the one every workstation
+    # holds. Left empty, the panel is DISABLED, and a fresh install used to be
+    # left exactly so, with nothing saying how to turn it on. Generated once
+    # and kept, like the API token; `token --admin` prints it.
+    if not existing.get("ADMIN_TOKEN"):
+        updates["ADMIN_TOKEN"] = secrets.token_urlsafe(32)
     if service == GPU_SERVICE:
         updates["DEVICE"] = existing.get("DEVICE") or "cuda"
     write_env(updates)
@@ -1031,11 +1037,12 @@ def cmd_status(args) -> dict:
     }
 
 
-def cmd_token(_args) -> dict:
-    token = read_env().get("API_TOKEN")
+def cmd_token(args) -> dict:
+    key = "ADMIN_TOKEN" if getattr(args, "admin", False) else "API_TOKEN"
+    token = read_env().get(key)
     if not token:
         raise ServerCtlError(
-            f"No API_TOKEN in {ENV_PATH}. Run 'server_ctl.py up' - it generates one."
+            f"No {key} in {ENV_PATH}. Run 'server_ctl.py up' - it generates one."
         )
     return {"token": token}
 
@@ -1815,7 +1822,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status.set_defaults(func=cmd_status, printer=_print_status)
 
-    token = subparsers.add_parser("token", help="Print this deployment's API token.")
+    token = subparsers.add_parser(
+        "token", help="Print this deployment's API token, the one every workstation is configured with.")
+    token.add_argument("--admin", action="store_true",
+                       help="Print the admin panel's token instead. It controls the whole server "
+                            "(updates, shutdown, benchmarks): keep it out of shared logs.")
     token.set_defaults(func=cmd_token, printer=lambda result: print(result["token"]))
 
     up = subparsers.add_parser("up", help="Generate .env if needed and start the server.")
