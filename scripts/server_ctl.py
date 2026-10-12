@@ -1450,6 +1450,206 @@ def cmd_down(args) -> dict:
     return {"service": service, "stopped": rc == 0}
 
 
+# ---------------------------------------------------------------------------
+# uninstall - take this deployment down to nothing but what it should keep
+# ---------------------------------------------------------------------------
+
+# What `uninstall` keeps lands beside the clone, at <clone>.kept/, and
+# setup-server.sh looks there when it clones into the same place again: the
+# API token comes back (every Slicer pointed at this server keeps working) and
+# so does DATA/ (tens of GB that need not travel twice).
+KEPT_SUFFIX = ".kept"
+# The compose file's own default, for a deployment whose .env never set one.
+DEFAULT_SERVER_IMAGE = "ghcr.io/dcbia-ortholab/visor-serve:main"
+# The entries of a .env that are a deployment's identity rather than its
+# shape: the next install generates the rest, and must not inherit a stale
+# COMPOSE_FILE or a tools path that no longer exists.
+_KEPT_ENV_KEYS = ("API_TOKEN", "ADMIN_TOKEN")
+
+
+def kept_dir(repo_root: str = None) -> str:
+    return os.path.normpath(repo_root or REPO_ROOT) + KEPT_SUFFIX
+
+
+def _tree_size(path: str) -> int:
+    total = 0
+    for root, _dirs, names in os.walk(path, onerror=lambda _error: None):
+        for name in names:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _is_this_clone(repo_root: str) -> bool:
+    """True only for a directory that is unmistakably a server clone.
+
+    The one check between `uninstall` and an `rmtree` of the wrong place: a
+    clone has its history, this script, and the compose file it drives -- and
+    is neither the filesystem root nor a home directory.
+    """
+    root = os.path.realpath(repo_root)
+    if root in ("/", os.path.realpath(os.path.expanduser("~"))):
+        return False
+    return all(os.path.exists(os.path.join(root, part))
+               for part in (".git", os.path.join("scripts", "server_ctl.py"), "docker-compose.yml"))
+
+
+def uninstall_plan(repo_root: str = None, remove_data: bool = False,
+                   remove_tools_clone: bool = False) -> dict:
+    """Everything `uninstall` would do, decided without touching anything.
+
+    Images are only the ones THIS deployment names -- its server image and its
+    tools image -- never a prune: the machine may run other containers whose
+    images are not ours to remove. The tools clone is only listed for removal
+    when asked: SADT_TOOLS may be a developer's own working checkout.
+    """
+    repo_root = os.path.normpath(repo_root or REPO_ROOT)
+    env = read_env(os.path.join(repo_root, ".env"))
+    data = os.path.join(repo_root, "DATA")
+    plan = {
+        "clone": repo_root,
+        "kept": kept_dir(repo_root),
+        "images": [image for image in (env.get("VISOR_SERVER_IMAGE") or DEFAULT_SERVER_IMAGE,
+                                       env.get("SADT_TOOLS_IMAGE")) if image],
+        "keep_env": [key for key in _KEPT_ENV_KEYS if env.get(key)],
+        "data": None,
+        "tools_clone": None,
+        "tools_clone_kept": None,
+    }
+    if os.path.isdir(data) and os.listdir(data):
+        plan["data"] = {"path": data, "bytes": _tree_size(data),
+                        "action": "remove" if remove_data else "keep"}
+    tools = env.get("SADT_TOOLS")
+    if tools and os.path.isdir(os.path.join(tools, ".git")) \
+            and not os.path.realpath(tools).startswith(os.path.realpath(repo_root) + os.sep):
+        if remove_tools_clone:
+            plan["tools_clone"] = tools
+        else:
+            plan["tools_clone_kept"] = tools
+    return plan
+
+
+def _print_uninstall_plan(plan: dict) -> None:
+    log(f"Server clone to remove:     {plan['clone']}")
+    for image in plan["images"]:
+        log(f"Image to remove:            {image}")
+    if plan["data"]:
+        size = plan["data"]["bytes"] / 1e9
+        if plan["data"]["action"] == "remove":
+            log(f"Data to remove:             {plan['data']['path']} ({size:.1f} GB)")
+        else:
+            log(f"Data to keep:               {plan['data']['path']} ({size:.1f} GB) -> {plan['kept']}/DATA")
+    if plan["keep_env"]:
+        log(f"Kept for the next install:  {', '.join(plan['keep_env'])} -> {plan['kept']}/.env")
+    if plan["tools_clone"]:
+        log(f"Tools clone to remove:      {plan['tools_clone']}")
+    if plan["tools_clone_kept"]:
+        log(f"Tools clone left alone:     {plan['tools_clone_kept']} (pass --tools-clone to remove it)")
+
+
+def _remove_tree(path: str, failures: list) -> None:
+    """rmtree that reports what it could not remove instead of stopping.
+
+    A deployment's tree holds files the docker daemon created as root (a
+    DATA/ the bind mount made, a job folder); the user cannot delete those,
+    and a half-removed clone is worse than one that names what is left.
+    """
+    def record(_function, failed_path, _exc_info):
+        failures.append(failed_path)
+
+    shutil.rmtree(path, onerror=record)
+
+
+def cmd_uninstall(args) -> dict:
+    repo_root = os.path.normpath(getattr(args, "repo_root", None) or REPO_ROOT)
+    if not _is_this_clone(repo_root):
+        raise ServerCtlError(f"{repo_root} does not look like a server clone; refusing to remove it.")
+    kept = kept_dir(repo_root)
+    if os.path.exists(os.path.join(kept, "DATA")) and not args.data:
+        # A second uninstall would otherwise stop half-way, with the clone's
+        # DATA/ unable to move onto the one already kept.
+        raise ServerCtlError(
+            f"{kept}/DATA already holds data from an earlier uninstall. Reinstall first (it moves that "
+            f"data back), or move it aside, or pass --data to remove this clone's data instead."
+        )
+    plan = uninstall_plan(repo_root, remove_data=args.data, remove_tools_clone=args.tools_clone)
+    _print_uninstall_plan(plan)
+    if args.dry_run:
+        return {"dry_run": True, **plan}
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise ServerCtlError("Nothing removed: confirm with --yes when not at a terminal.")
+        answer = input("Remove all of the above? Type 'yes' to go on: ").strip().lower()
+        if answer != "yes":
+            raise ServerCtlError("Nothing removed.")
+
+    warnings = []
+    # 1. What must survive goes first, before anything is deleted.
+    os.makedirs(kept, exist_ok=True)
+    os.chmod(kept, 0o700)
+    env = read_env(os.path.join(repo_root, ".env"))
+    if plan["keep_env"]:
+        kept_env = os.path.join(kept, ".env")
+        with open(kept_env, "w", encoding="utf-8") as handle:
+            handle.write("# Kept by `server_ctl.py uninstall`; setup-server.sh restores it.\n")
+            for key in plan["keep_env"]:
+                handle.write(f"{key}={env[key]}\n")
+        os.chmod(kept_env, 0o600)
+    server_env = os.path.join(repo_root, "server", ".env")
+    if os.path.isfile(server_env):
+        shutil.copy2(server_env, os.path.join(kept, "server.env"))
+        os.chmod(os.path.join(kept, "server.env"), 0o600)
+    if plan["data"] and plan["data"]["action"] == "keep":
+        try:
+            os.rename(plan["data"]["path"], os.path.join(kept, "DATA"))  # same filesystem: instant
+        except OSError as exc:
+            # Still nothing removed: stopping here leaves a working deployment.
+            raise ServerCtlError(
+                f"Could not move {plan['data']['path']} aside ({exc.strerror}); nothing was removed. "
+                f"If docker created it as root: sudo chown -R $(id -u):$(id -g) {plan['data']['path']}"
+            ) from None
+
+    # 2. The container, both services, whichever is running.
+    compose = compose_command()
+    if compose:
+        rc, _out, err = _capture(compose + ["--profile", CPU_PROFILE, "down", "--remove-orphans"],
+                                 cwd=repo_root, timeout=300)
+        if rc != 0:
+            warnings.append(f"docker compose down: {err.splitlines()[-1] if err else rc}")
+    # The updater would otherwise wake in a directory that is gone.
+    if _which("systemctl"):
+        _capture(["systemctl", "--user", "stop", "visor-update.service"], timeout=30)
+
+    # 3. The images this deployment named. One still used elsewhere is left.
+    removed_images = []
+    if _which("docker"):
+        for image in plan["images"]:
+            rc, _out, err = _capture(["docker", "image", "rm", image], timeout=300)
+            if rc == 0:
+                removed_images.append(image)
+            elif "No such image" not in err:
+                warnings.append(f"image {image} kept: {err.splitlines()[-1] if err else rc}")
+
+    # 4. The trees.
+    failures = []
+    if plan["tools_clone"]:
+        _remove_tree(plan["tools_clone"], failures)
+    _remove_tree(repo_root, failures)
+    if failures:
+        top = sorted({path for path in failures})[:5]
+        warnings.append(
+            f"{len(failures)} path(s) could not be removed (created by docker as root?), e.g. "
+            f"{', '.join(top)}. Remove the rest with: sudo rm -rf {repo_root}"
+        )
+    for warning in warnings:
+        log(f"warning: {warning}")
+    log(f"Uninstalled. Kept for the next install: {kept}")
+    return {"removed_clone": not os.path.exists(repo_root), "removed_images": removed_images,
+            "kept": kept, "warnings": warnings, **plan}
+
+
 def cmd_logs(args) -> dict:
     service = pick_service(args.device)
     cmd_logs_tail(service, args.lines)
@@ -1673,6 +1873,18 @@ def build_parser() -> argparse.ArgumentParser:
     down = subparsers.add_parser("down", help="Stop the server container.")
     add_common(down, with_url=False)
     down.set_defaults(func=cmd_down, printer=None)
+
+    uninstall = subparsers.add_parser(
+        "uninstall",
+        help="Remove this deployment: its container, its images and this clone. The API token and "
+             "DATA/ are kept beside the clone, at <clone>.kept/, for setup-server.sh to restore.")
+    uninstall.add_argument("--data", action="store_true",
+                           help="Remove DATA/ too instead of keeping it.")
+    uninstall.add_argument("--tools-clone", action="store_true",
+                           help="Remove the tools clone SADT_TOOLS points at too.")
+    uninstall.add_argument("--dry-run", action="store_true", help="Say what would go, remove nothing.")
+    uninstall.add_argument("--yes", action="store_true", help="Do not ask for confirmation.")
+    uninstall.set_defaults(func=cmd_uninstall, printer=None)
 
     logs = subparsers.add_parser("logs", help="Show the last lines of the server log.")
     add_common(logs, with_url=False)
