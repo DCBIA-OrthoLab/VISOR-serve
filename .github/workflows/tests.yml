@@ -32,7 +32,7 @@ jobs:
       # is the separate job below: ~15 GB, and it needs the tools repository
       # as a named build context, none of which the server suite exercises.
       - name: Build the server image
-        run: docker build -f docker/server.Dockerfile -t ghcr.io/dcbia-orthologab/visor-serve:main .
+        run: docker build -f docker/server.Dockerfile -t ghcr.io/dcbia-ortholab/visor-serve:main .
 
       # `DATA/` is a read-only bind mount in the compose file. Docker would
       # create it as root if it were missing, which is what broke every fresh

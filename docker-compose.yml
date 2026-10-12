@@ -17,7 +17,7 @@ x-inference-base: &inference-base
   # dependencies and the system libraries tool virtualenvs load -- no tool.
   # Built and published by .github/workflows/server-image.yml. VISOR_SERVER_IMAGE
   # pins another build, e.g. a local `docker build` or a dated tag.
-  image: ${VISOR_SERVER_IMAGE:-ghcr.io/dcbia-orthologab/visor-serve:main}
+  image: ${VISOR_SERVER_IMAGE:-ghcr.io/dcbia-ortholab/visor-serve:main}
   shm_size: 8gb
   working_dir: /workspace/server
   volumes:
@@ -88,7 +88,7 @@ x-inference-base: &inference-base
 # command cannot drift between the suite the hook runs and the one a maintainer
 # runs.
 x-test-base: &test-base
-  image: ${VISOR_SERVER_IMAGE:-ghcr.io/dcbia-orthologab/visor-serve:main}
+  image: ${VISOR_SERVER_IMAGE:-ghcr.io/dcbia-ortholab/visor-serve:main}
   profiles: ["test"]
   working_dir: /workspace/server
   volumes:
