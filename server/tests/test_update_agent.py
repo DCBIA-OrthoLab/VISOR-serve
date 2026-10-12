@@ -506,3 +506,36 @@ def test_a_run_without_a_run_id_still_holds_the_update(agent_module, repos, tmp_
     agent._api = lambda path, payload=None, method=None, timeout=10: next(answers)
     assert len(agent.in_flight()) == 2
     assert agent.in_flight() == []
+
+
+def test_the_door_stays_shut_while_a_step_runs_silent(agent_module, repos, tmp_path, monkeypatch):
+    """A pull that prints nothing for minutes must not let the lease lapse:
+    the keeper renews it on its own clock."""
+    _writer, checkout = repos
+    monkeypatch.setattr(agent_module, "DOOR_LEASE_SECONDS", 0.3)
+    agent = _agent(agent_module, checkout, tmp_path)
+    renewals = []
+    agent.door = lambda accepting, reason="": renewals.append(accepting)
+    released = agent.hold_door()
+    import time as _time
+    _time.sleep(0.5)
+    released.set()
+    count = len(renewals)
+    _time.sleep(0.3)
+    assert count >= 3 and set(renewals) == {False}
+    assert len(renewals) == count, "the keeper stops once released"
+
+
+def test_a_run_that_slipped_in_is_waited_for_before_the_restart(agent_module, repos, tmp_path, monkeypatch):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    server = _FakeServer()
+    server.install(agent)
+    answers = iter([[], [{"tool": "AREG_CBCT", "state": "running"}], []])
+    agent.in_flight = lambda: next(answers)
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True
+    assert any("Before restarting: waiting for 1 run(s): AREG_CBCT" in line for line in last["log"])

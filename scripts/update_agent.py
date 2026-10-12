@@ -62,6 +62,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -504,6 +505,7 @@ class Agent:
     # -- applying ------------------------------------------------------
     def apply(self, request: dict) -> None:
         target = request.get("target") or "all"
+        keeper = None
         self.log_lines = []
         self.state["applying"] = {"id": request.get("id"), "target": target,
                                   "started_at": time.time(), "phase": "", "log": []}
@@ -522,7 +524,7 @@ class Agent:
 
             self.phase("Closing the server to new runs.")
             self.door(False, "updating")
-            last_lease = time.monotonic()
+            keeper = self.hold_door()
             while True:
                 if not os.path.exists(self._path(REQUEST_FILE)):
                     message = "Withdrawn before anything was changed."
@@ -535,9 +537,6 @@ class Agent:
                 else:
                     self.phase(f"Waiting for {len(busy)} run(s) to finish: " +
                                ", ".join(sorted({r.get('tool') or '?' for r in busy})))
-                if time.monotonic() - last_lease > DOOR_LEASE_SECONDS / 3:
-                    self.door(False, "updating")
-                    last_lease = time.monotonic()
                 time.sleep(REQUEST_POLL_SECONDS * 2)
 
             # The point of no return: the request is consumed, the pull begins.
@@ -592,6 +591,7 @@ class Agent:
                                        f"The code is pulled; the server was not restarted.")
                             return
 
+            self.wait_idle("Before restarting")
             self.phase("Restarting the server." if restart == RESTART else "Recreating the server's container.")
             if self.args.restart_cmd:
                 done = subprocess.run(self.args.restart_cmd, shell=True, capture_output=True, text=True, timeout=600)
@@ -615,6 +615,8 @@ class Agent:
         except Exception as exc:  # noqa: BLE001 - an update must always end with the door open
             message = f"The update stopped on an unexpected error: {exc}"
         finally:
+            if keeper is not None:
+                keeper.set()
             self.door(True)
             try:
                 if not ok and os.path.exists(self._path(REQUEST_FILE)):
@@ -627,22 +629,46 @@ class Agent:
             log(message)
             self.survey(fetch=False)
 
+    def hold_door(self) -> threading.Event:
+        """Keep the door shut until the returned event is set.
+
+        Renewed from a thread of its own, every third of the lease, whatever
+        the update is doing. It used to be renewed between steps and on a
+        pull's output lines -- and `docker pull` of a tools image prints
+        nothing for minutes while a layer downloads, as `uv sync` does while it
+        builds. The lease lapsed, the server reopened, and a run admitted then
+        would have been killed by the recreate that followed.
+        """
+        released = threading.Event()
+
+        def renew():
+            while not released.wait(DOOR_LEASE_SECONDS / 3):
+                self.door(False, "updating")
+
+        threading.Thread(target=renew, name="door-keeper", daemon=True).start()
+        return released
+
     def pull_image(self, image: str) -> bool:
-        """`docker pull`, renewing the door's lease while it runs: a tool
-        library is tens of GB, and a lease left to lapse would reopen the
-        server half-way through the update."""
+        """`docker pull`, its notable lines kept for the panel's log."""
         process = subprocess.Popen(["docker", "pull", image], stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True)
-        last_lease = time.monotonic()
         for line in process.stdout:
             line = line.rstrip()
-            if line and not line.endswith(("Waiting", "Pulling fs layer")):
+            if line and not line.endswith(("Waiting", "Pulling fs layer", "Download complete")):
                 self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
-            if time.monotonic() - last_lease > DOOR_LEASE_SECONDS / 3:
-                self.door(False, "updating")
-                self.write_status()
-                last_lease = time.monotonic()
         return process.wait() == 0
+
+    def wait_idle(self, why: str) -> None:
+        """Block until nothing is in flight. The last check before a restart:
+        whatever slipped in while the door was open must finish first."""
+        while True:
+            busy = self.in_flight()
+            if busy == []:
+                return
+            self.phase(f"{why}: waiting for " + (
+                "the server to answer" if busy is None else
+                f"{len(busy)} run(s): " + ", ".join(sorted({r.get('tool') or '?' for r in busy}))))
+            time.sleep(REQUEST_POLL_SECONDS * 2)
 
     def claim(self) -> bool:
         """One agent per deployment: refuse to start beside a live one."""
