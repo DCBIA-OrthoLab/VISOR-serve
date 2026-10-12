@@ -334,6 +334,36 @@ set_env() {
 # --- the tools -----------------------------------------------------------
 # A separate repository on purpose: this server imports nothing from it and
 # knows no dental tool. It is cloned, mounted at its own path, and served.
+# What `server_ctl.py uninstall` kept beside this clone: the tokens, so every
+# client keeps working, and DATA/, so tens of GB do not travel twice. Put back
+# before anything is downloaded, and only where nothing is already in place.
+KEPT="$(cd "$(dirname "$INSTALL_DIR")" && pwd)/$(basename "$INSTALL_DIR").kept"
+if [ -d "$KEPT" ]; then
+    echo "Restoring what the last uninstall kept, from $KEPT ..."
+    if [ -d "$KEPT/DATA" ]; then
+        if [ ! -e "$INSTALL_DIR/DATA" ] || [ -z "$(ls -A "$INSTALL_DIR/DATA" 2>/dev/null)" ]; then
+            rmdir "$INSTALL_DIR/DATA" 2>/dev/null || true
+            mv "$KEPT/DATA" "$INSTALL_DIR/DATA" && echo "  DATA/ moved back"
+        else
+            echo "  $INSTALL_DIR/DATA already has data; leaving $KEPT/DATA where it is." >&2
+        fi
+    fi
+    if [ -f "$KEPT/.env" ]; then
+        while IFS='=' read -r _key _value; do
+            case "$_key" in API_TOKEN|ADMIN_TOKEN) ;; *) continue ;; esac
+            if [ -f "$INSTALL_DIR/.env" ] && grep -q "^$_key=" "$INSTALL_DIR/.env"; then
+                continue
+            fi
+            set_env "$_key" "$_value" && echo "  $_key restored"
+        done < "$KEPT/.env"
+    fi
+    if [ -f "$KEPT/server.env" ] && [ ! -f "$INSTALL_DIR/server/.env" ]; then
+        cp -p "$KEPT/server.env" "$INSTALL_DIR/server/.env" && echo "  server/.env restored"
+    fi
+    # Kept until everything in it is back in place; then it goes.
+    [ -d "$KEPT/DATA" ] || rm -rf "$KEPT"
+fi
+
 TOOLS_ROOT=""
 if [ -n "$TOOLS_REPO" ]; then
     if [ -n "$TOOLS_DIR_OPT" ]; then

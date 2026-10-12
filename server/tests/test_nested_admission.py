@@ -752,8 +752,19 @@ def test_nothing_in_a_run_s_group_outlives_it(tmp_path):
     assert _until(lambda: marker.exists() and marker.read_text().strip())
     orphan = int(marker.read_text())
     dispatch._kill_leftovers(process)
-    assert _until(lambda: not os.path.exists(f"/proc/{orphan}") or
-                  open(f"/proc/{orphan}/stat").read().split()[2] == "Z")
+
+    def gone():
+        # Read in one step: checking that /proc/<pid> exists and then reading
+        # its stat raced the kernel reaping it in between, and the read raised
+        # ProcessLookupError -- the test failed on exactly the outcome it waits
+        # for. A process that vanishes mid-read is gone.
+        try:
+            with open(f"/proc/{orphan}/stat") as stat:
+                return stat.read().split()[2] == "Z"
+        except OSError:
+            return True
+
+    assert _until(gone)
 
 
 CALLER_FOUR_WIDE = WIDTH_RECORD + """
