@@ -96,6 +96,12 @@
 
 set -eu
 
+# The arguments as given, quoted, for the re-run under the docker group below.
+ORIGINAL_ARGS=""
+for _arg in "$@"; do
+    ORIGINAL_ARGS="$ORIGINAL_ARGS '$(printf '%s' "$_arg" | sed "s/'/'\\\\''/g")'"
+done
+
 REPO="${REPO:-DCBIA-OrthoLab/VISOR-serve}"
 REF="${REF:-deploy}"
 REPO_URL="${REPO_URL:-https://github.com/${REPO}.git}"
@@ -303,17 +309,105 @@ if [ "$REF" != "main" ]; then
 fi
 
 # --- docker --------------------------------------------------------------
+# Docker, with the GPU's container toolkit when this host has a working
+# NVIDIA driver -- installed here rather than left as a second command, so a
+# bare machine becomes a server in one go. Root is asked for through sudo, the
+# way the Tailscale step asks for it.
+GPU_STATE=0
+GPU_REPORT="$(sh "$INSTALL_DIR/scripts/check-gpu.sh")" || GPU_STATE=$?
+
+# A card the tools can use, held back by its driver: missing on a fresh
+# install, or older than the card or CUDA 12.8 needs. Installing the
+# recommended one takes a reboot, so the install stops there and the same
+# command finishes it -- before Docker and before the Tailscale key is asked
+# for, so nothing is half done across the reboot.
+if [ "$GPU_STATE" -eq 3 ]; then
+    echo
+    echo "GPU: $GPU_REPORT"
+    _driver=1
+    if [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+        printf 'Install the recommended NVIDIA driver now (needs sudo, then a reboot)? [Y/n]: ' > /dev/tty
+        read -r _answer < /dev/tty || _answer=""
+        case "$_answer" in n|N|no|NO) _driver=0 ;; esac
+    fi
+    if [ "$_driver" -eq 1 ]; then
+        if [ "$(id -u)" -eq 0 ]; then
+            sh "$INSTALL_DIR/scripts/install-nvidia-driver.sh" || _driver=0
+        else
+            echo "Installing it needs root; sudo may ask for your password."
+            sudo sh "$INSTALL_DIR/scripts/install-nvidia-driver.sh" || _driver=0
+        fi
+    fi
+    if [ "$_driver" -eq 1 ]; then
+        echo
+        echo "Reboot this machine, then run the same install command again:"
+        echo "it picks up where it left off, on the GPU."
+        exit 0
+    fi
+    GPU_STATE=2
+fi
+_needs_toolkit=0
+if [ "$GPU_STATE" -eq 0 ] && ! command -v nvidia-ctk >/dev/null 2>&1; then
+    _needs_toolkit=1
+fi
+if ! command -v docker >/dev/null 2>&1 || [ "$_needs_toolkit" -eq 1 ]; then
+    _what="Docker"
+    [ "$_needs_toolkit" -eq 1 ] && _what="Docker and the NVIDIA Container Toolkit"
+    command -v docker >/dev/null 2>&1 && [ "$_needs_toolkit" -eq 1 ] && _what="the NVIDIA Container Toolkit"
+    echo
+    echo "$_what is not installed on this machine."
+    if [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+        printf 'Install it now (needs sudo)? [Y/n]: ' > /dev/tty
+        read -r _install < /dev/tty || _install=""
+        case "$_install" in n|N|no|NO)
+            echo "Install it yourself with:"
+            echo "    sudo sh $INSTALL_DIR/scripts/install-docker.sh$( [ "$GPU_STATE" -eq 0 ] && echo ' --nvidia')"
+            echo "then re-run this script."
+            exit 1 ;;
+        esac
+    fi
+    _flags=""
+    [ "$GPU_STATE" -eq 0 ] && _flags="--nvidia"
+    if [ "$(id -u)" -eq 0 ]; then
+        sh "$INSTALL_DIR/scripts/install-docker.sh" $_flags
+    else
+        echo "Installing it needs root; sudo may ask for your password."
+        sudo sh "$INSTALL_DIR/scripts/install-docker.sh" $_flags
+    fi
+fi
+
 if ! docker info >/dev/null 2>&1; then
+    # Installed just now, or this user was only just added to the docker group:
+    # a group joined in this session does not apply to it until a new login.
+    # `sg` starts the rest of this install in that group instead, so nobody has
+    # to log out half-way through.
+    if [ -z "${VISOR_SETUP_REEXEC:-}" ] && command -v sg >/dev/null 2>&1 \
+            && getent group docker | grep -qw "$(id -un)" && sg docker -c "docker info" >/dev/null 2>&1; then
+        echo "Continuing in the docker group (no need to log out)..."
+        export VISOR_SETUP_REEXEC=1 REPO REF REPO_URL INSTALL_DIR
+        eval "exec sg docker -c \"sh \\\"$INSTALL_DIR/scripts/setup-server.sh\\\" $ORIGINAL_ARGS\""
+    fi
     echo
-    echo "Docker is not installed, or its daemon is not reachable by this user."
-    echo "Install it with:"
-    echo
-    echo "    sudo sh $INSTALL_DIR/scripts/install-docker.sh"
-    echo
-    echo "then log out and back in (group membership only applies to a new session)"
-    echo "and re-run this script. It will pick up where it left off."
+    echo "Docker is installed but this user cannot reach its daemon yet."
+    echo "Log out and back in (group membership applies to a new session),"
+    echo "then re-run this script. It will pick up where it left off."
     exit 1
 fi
+
+# A GPU the tools cannot use -- a card older than Turing, or a driver that was
+# not updated -- would let the GPU service start and every run fail at its
+# first CUDA call. Saying so now and starting on CPU is the honest outcome;
+# updating the driver and re-running moves it to the GPU.
+case "$GPU_STATE" in
+    0) echo "GPU: $GPU_REPORT" ;;
+    2)
+        echo
+        echo "GPU: $GPU_REPORT"
+        echo "The server starts on CPU: every tool works, slowly."
+        [ "$DEVICE" = "auto" ] && DEVICE="cpu"
+        ;;
+    *) echo "GPU: $GPU_REPORT; the server runs on CPU." ;;
+esac
 
 # --- settings that outlive this run --------------------------------------
 # Merged line by line, never rewritten: an operator's own additions to .env
