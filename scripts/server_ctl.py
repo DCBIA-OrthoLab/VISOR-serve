@@ -1611,13 +1611,21 @@ def cmd_uninstall(args) -> dict:
                 f"If docker created it as root: sudo chown -R $(id -u):$(id -g) {plan['data']['path']}"
             ) from None
 
-    # 2. The container, both services, whichever is running.
-    compose = compose_command()
-    if compose:
-        rc, _out, err = _capture(compose + ["--profile", CPU_PROFILE, "down", "--remove-orphans"],
-                                 cwd=repo_root, timeout=300)
-        if rc != 0:
-            warnings.append(f"docker compose down: {err.splitlines()[-1] if err else rc}")
+    # 2. This deployment's containers -- found by the directory compose
+    # started them from, NOT by project name. Every clone called VISOR-serve
+    # is compose project "visor-serve", so `compose down --remove-orphans`
+    # from here would also take down another checkout's containers on the same
+    # machine; the working-directory label names this clone and nothing else.
+    removed_containers = []
+    if _which("docker"):
+        rc, out, err = _capture(["docker", "ps", "-a", "-q", "--filter",
+                                 f"label=com.docker.compose.project.working_dir={repo_root}"])
+        for container in out.split() if rc == 0 else []:
+            rc, _out, err = _capture(["docker", "rm", "-f", container], timeout=120)
+            if rc == 0:
+                removed_containers.append(container)
+            else:
+                warnings.append(f"container {container} kept: {err.splitlines()[-1] if err else rc}")
     # The updater would otherwise wake in a directory that is gone.
     if _which("systemctl"):
         _capture(["systemctl", "--user", "stop", "visor-update.service"], timeout=30)
@@ -1646,7 +1654,8 @@ def cmd_uninstall(args) -> dict:
     for warning in warnings:
         log(f"warning: {warning}")
     log(f"Uninstalled. Kept for the next install: {kept}")
-    return {"removed_clone": not os.path.exists(repo_root), "removed_images": removed_images,
+    return {"removed_clone": not os.path.exists(repo_root), "removed_containers": removed_containers,
+            "removed_images": removed_images,
             "kept": kept, "warnings": warnings, **plan}
 
 

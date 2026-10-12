@@ -169,3 +169,26 @@ def test_without_a_terminal_it_will_not_proceed_unconfirmed(tmp_path, monkeypatc
     with pytest.raises(ctl.ServerCtlError, match="--yes"):
         ctl.cmd_uninstall(_args(root, yes=False))
     assert root.exists()
+
+
+def test_only_containers_started_from_this_clone_are_removed(tmp_path, monkeypatch):
+    """Every clone named VISOR-serve is compose project "visor-serve": a
+    project-wide `down --remove-orphans` took another checkout's containers."""
+    root = _clone(tmp_path)
+    calls = []
+
+    def capture(cmd, cwd=None, timeout=60):
+        calls.append(cmd)
+        if cmd[:2] == ["docker", "ps"]:
+            return 0, "abc123", ""
+        return 0, "", ""
+
+    monkeypatch.setattr(ctl, "_which", lambda name: "/usr/bin/" + name if name == "docker" else None)
+    monkeypatch.setattr(ctl, "_capture", capture)
+    result = ctl.cmd_uninstall(_args(root))
+
+    listing = next(cmd for cmd in calls if cmd[:2] == ["docker", "ps"])
+    assert f"label=com.docker.compose.project.working_dir={root}" in listing
+    assert ["docker", "rm", "-f", "abc123"] in calls
+    assert not any("down" in cmd for cmd in calls)
+    assert result["removed_containers"] == ["abc123"]
