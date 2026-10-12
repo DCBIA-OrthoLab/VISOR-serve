@@ -341,3 +341,156 @@ def test_an_automatic_update_closes_the_door_before_it_waits(agent_module, repos
     assert (checkout / "server" / "main.py").read_text() == "v2"
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is True and any("Waiting for 1 run(s)" in line for line in last["log"])
+
+
+# ---------------------------------------------------------------------------
+# Images: a deployment that runs a tool library (and its server) as images
+# ---------------------------------------------------------------------------
+
+TOOLS_IMAGE = "ghcr.io/lab/sadt-visor-tools:latest"
+SOURCE = "https://github.com/lab/SADT-VISOR"
+
+
+class _Registry:
+    """The registry and GitHub, as image_release answers them."""
+
+    def __init__(self, agent_module, monkeypatch, local_digest="sha256:aaa", remote="sha256:aaa",
+                 present=True, labels=None):
+        self.local = {"present": present, "digest": local_digest, "labels": labels if labels is not None else {
+            "org.opencontainers.image.version": "tools-2026.10.12-1",
+            "org.opencontainers.image.revision": "1111111aaaa",
+            "org.opencontainers.image.source": SOURCE}}
+        self.remote = remote
+        self.github_calls = 0
+        release = agent_module.image_release
+        monkeypatch.setattr(release, "local_image", lambda image: dict(self.local))
+        monkeypatch.setattr(release, "remote_digest", lambda image: self.remote)
+
+        def latest(source, prefix):
+            self.github_calls += 1
+            assert (source, prefix) == (SOURCE, "tools-")
+            return {"tag": "tools-2026.10.13-1", "revision": "2222222bbbb"}
+
+        def compare(source, base, head):
+            return {"behind": 2, "paths": ["tools/AMASSS/src/a.py", "tools/AREG/AREG_CBCT/uv.lock"],
+                    "commits": [{"sha": "2222222bb", "subject": "FIX: amasss", "author": "t", "at": None},
+                                {"sha": "3333333cc", "subject": "UPDATE: areg deps", "author": "t", "at": None}]}
+
+        monkeypatch.setattr(release, "latest_release", latest)
+        monkeypatch.setattr(release, "compare", compare)
+
+
+def test_a_current_tools_image_has_nothing_waiting(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch)
+    info = agent_module.inspect_image(TOOLS_IMAGE, "tools")
+    assert info["error"] == "" and info["behind"] == 0
+    assert (info["branch"], info["local"]) == ("latest", "tools-2026.10.12-1")
+    assert "1111111aa" in info["current"]["subject"]
+
+
+def test_a_new_digest_lists_the_release_its_commits_and_its_tools(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    info = agent_module.inspect_image(TOOLS_IMAGE, "tools")
+    assert info["behind"] == 2 and info["target"] == "tools-2026.10.13-1"
+    assert [c["subject"] for c in info["commits"]] == ["FIX: amasss", "UPDATE: areg deps"]
+    assert {t["tool"] for t in info["changes"]["tools"]} == {"AMASSS", "AREG"}
+    assert info["changes"]["action"] == agent_module.RECREATE
+    assert agent_module.blockers(info) == []
+
+
+def test_github_is_asked_once_per_published_digest(agent_module, monkeypatch):
+    """The registry is asked every survey; GitHub's anonymous limit is 60 an
+    hour, so it is asked only when the digest moves."""
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    cache = {}
+    for _ in range(5):
+        agent_module.inspect_image(TOOLS_IMAGE, "tools", True, cache)
+    assert registry.github_calls == 1
+    registry.remote = "sha256:ccc"
+    agent_module.inspect_image(TOOLS_IMAGE, "tools", True, cache)
+    assert registry.github_calls == 2
+
+
+def test_an_image_built_here_is_not_followed(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch, local_digest="")
+    info = agent_module.inspect_image(TOOLS_IMAGE, "tools")
+    assert "built on this machine" in info["error"] and info["behind"] == 0
+
+
+def test_an_unreachable_registry_is_a_warning_not_an_update(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch, remote="")
+    info = agent_module.inspect_image(TOOLS_IMAGE, "tools")
+    assert info["behind"] == 0 and info["error"] == "" and "registry" in info["warning"]
+
+
+def test_a_missing_image_is_reported(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch, present=False)
+    assert "not on this machine" in agent_module.inspect_image(TOOLS_IMAGE, "tools")["error"]
+
+
+def test_a_tools_image_update_drains_pulls_recreates_and_reopens(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    server = _FakeServer(busy_polls=1)
+    server.install(agent)
+    pulled = []
+
+    def pull(image):
+        pulled.append(image)
+        registry.local["digest"] = registry.remote
+        return True
+
+    agent.pull_image = pull
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True and "tools to tools-2026.10.13-1" in last["message"]
+    assert pulled == [TOOLS_IMAGE]
+    assert server.door_calls[0] is False and server.door_calls[-1] is True
+
+
+def test_a_failed_image_pull_restarts_nothing_and_reopens(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE, restart_cmd="exit 1")
+    server = _FakeServer()
+    server.install(agent)
+    agent.pull_image = lambda image: False
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "Nothing was restarted" in last["message"]
+    assert server.door_calls[-1] is True
+
+
+def test_a_server_commit_needing_an_image_waits_for_the_published_one(agent_module, repos, tmp_path,
+                                                                     monkeypatch):
+    """Refused while the registry still serves the old server image; applied --
+    code pulled AND image pulled -- once the new one is published."""
+    writer, checkout = repos
+    _commit(writer, {"docker/server.Dockerfile": "FROM y"}, "UPDATE: server image")
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:aaa")
+    agent = _agent(agent_module, checkout, tmp_path, server_image="ghcr.io/lab/visor-serve:deploy")
+    server = _FakeServer()
+    server.install(agent)
+    agent.survey()
+    assert any("waiting for the server image" in r for r in agent_module.blockers(agent.server))
+
+    registry.remote = "sha256:bbb"
+    pulled = []
+    agent.pull_image = lambda image: pulled.append(image) or True
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True
+    assert (checkout / "docker" / "server.Dockerfile").read_text() == "FROM y"
+    assert pulled == ["ghcr.io/lab/visor-serve:deploy"]
+
+
+def test_apply_mode_files_an_update_for_a_new_tools_image(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    monkeypatch.setenv("SADT_AUTO_UPDATE", "apply")
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    agent.survey()
+    request = agent.auto_request()
+    assert request["auto"] is True and request["targets"] == ["tools:tools-2026.10.13-1"]

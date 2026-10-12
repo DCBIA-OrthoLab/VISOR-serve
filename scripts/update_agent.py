@@ -38,6 +38,16 @@ and one that fails is not retried until the branch moves again. `notify` logs
 what would be applied; `off`, the default, does nothing. A change that needs an
 image rebuilt is reported and refused, because a pull cannot deliver it.
 
+A deployment that runs a tool library from its PREBUILT image
+(SADT_TOOLS_IMAGE, docker/compose.tools-image.yml) has no tools checkout. Its
+tools are then followed by TAG: they are behind when the registry serves a
+different digest under that tag than the image on this machine, and what
+changed comes from the image's labels and the GitHub repository they name.
+Updating them is pulling the image and recreating the container, inside the
+same door and the same wait. The server image (VISOR_SERVER_IMAGE) is followed
+the same way, so a server commit that needs a new image is applied once that
+image is published, instead of being refused.
+
 Standard library only, like the other host scripts: it runs before anything is
 installed and must not need anything that an update could break.
 
@@ -49,6 +59,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -58,6 +69,7 @@ import urllib.request
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 
+import image_release  # noqa: E402 - beside this file, stdlib only
 import server_ctl  # noqa: E402 - beside this file, and stdlib only too
 
 REPO_ROOT = server_ctl.REPO_ROOT
@@ -185,6 +197,67 @@ def inspect(repo: str, kind: str, fetch: bool = True) -> dict:
     return info
 
 
+# A pulled image's release series, from its version label: the tools releases
+# are `tools-YYYY.MM.DD-N` and share their repository with `data-` releases.
+_RELEASE_SERIES = re.compile(r"^([a-z]+-)\d")
+
+
+def inspect_image(image: str, kind: str, fetch: bool = True, cache: dict = None) -> dict:
+    """What the panel shows about a component the deployment runs as an image.
+
+    Shaped like `inspect`, so the panel renders a library from an image as it
+    renders one from a checkout: `branch` is the tag followed, `local` the
+    release this machine runs, `behind` the commits the published release adds.
+    The registry is asked at every survey (one request); GitHub only when that
+    digest moves, through `cache`, which keeps an agent polling every minute
+    far under the API's anonymous limit.
+    """
+    cache = cache if cache is not None else {}
+    _registry, repository, tag = image_release.split_reference(image)
+    info = {"kind": kind, "path": image, "image": image, "error": "", "remote": repository,
+            "branch": tag, "behind": 0, "ahead": 0, "dirty": False, "commits": [],
+            "changes": {"action": RECREATE, "tools": [], "environments": [], "heavy": [image]}}
+    local = image_release.local_image(image)
+    if not local["present"]:
+        info["error"] = f"{image} is not on this machine"
+        return info
+    labels = local["labels"]
+    release = labels.get("org.opencontainers.image.version") or "unlabelled"
+    revision = labels.get("org.opencontainers.image.revision") or ""
+    source = labels.get("org.opencontainers.image.source") or ""
+    info.update({"local": release, "target": release, "revision": revision[:9],
+                 "current": {"subject": f"image {release}" + (f", commit {revision[:9]}" if revision else ""),
+                             "at": None}})
+    if not local["digest"]:
+        info["error"] = f"{image} was built on this machine, not pulled: there is no published version to follow"
+        return info
+    remote = image_release.remote_digest(image) if fetch else cache.get(("digest", image), "")
+    cache[("digest", image)] = remote
+    if not remote:
+        info["warning"] = "the registry could not be asked; shown as of the last pull"
+        return info
+    if remote == local["digest"]:
+        return info
+    known = cache.get(("release", remote))
+    if known is None:
+        series = _RELEASE_SERIES.match(release)
+        latest = image_release.latest_release(source, series.group(1)) if series else {}
+        difference = image_release.compare(source, revision, latest.get("revision", ""))
+        known = {"latest": latest, "difference": difference}
+        cache[("release", remote)] = known
+    latest, difference = known["latest"], known["difference"]
+    info.update({
+        "target": latest.get("tag") or remote.split(":", 1)[-1][:12],
+        "behind": max(1, difference.get("behind") or 0),
+        "commits": difference.get("commits") or [],
+        "pending_digest": remote,
+    })
+    if kind == "tools":
+        classified = release_diff.classify_tools(difference.get("paths") or [])
+        info["changes"] = {**classified, "action": RECREATE, "heavy": [image]}
+    return info
+
+
 def blockers(info: dict) -> list:
     """Why this checkout cannot be updated from the panel, or []."""
     reasons = []
@@ -194,9 +267,12 @@ def blockers(info: dict) -> list:
         reasons.append("it has uncommitted changes; a pull would refuse")
     if info.get("ahead"):
         reasons.append(f"it has {info['ahead']} local commit(s) the remote does not; a fast-forward is impossible")
-    if info.get("kind") == "server" and (info.get("changes") or {}).get("action") == IMAGE:
+    if info.get("kind") == "server" and (info.get("changes") or {}).get("action") == IMAGE \
+            and not info.get("image_update"):
         reasons.append("it changes the image (" + ", ".join(info["changes"]["heavy"][:3]) +
-                       "), which a pull cannot deliver: build and publish an image")
+                       "), which a pull cannot deliver: " + (
+                           "waiting for the server image to be published" if info.get("server_image")
+                           else "build and publish an image"))
     return reasons
 
 
@@ -260,6 +336,11 @@ def data_summary(tools_repo: str, data_dir: str) -> dict:
 
 class Agent:
     def __init__(self, args):
+        # Images are followed only when named: arguments built by an older
+        # caller -- or a test -- carry neither, and mean checkouts only.
+        for name in ("server_image", "tools_image"):
+            if not hasattr(args, name):
+                setattr(args, name, "")
         self.args = args
         self.update_dir = args.update_dir
         self.url = args.url
@@ -270,6 +351,8 @@ class Agent:
         self.server = {}
         self.tools = {}
         self.data = {}
+        self.server_image = {}
+        self.image_cache = {}
         self.log_lines = []
 
     # -- files ---------------------------------------------------------
@@ -348,8 +431,19 @@ class Agent:
     # -- status --------------------------------------------------------
     def survey(self, fetch: bool = True):
         self.server = inspect(self.args.server_repo, "server", fetch=fetch)
-        self.tools = inspect(self.args.tools_repo, "tools", fetch=fetch) if self.args.tools_repo else {
-            "kind": "tools", "error": "no tools checkout configured (SADT_TOOLS or --tools-repo)"}
+        if self.args.server_image:
+            # Not a panel entry of its own: it decides whether a server commit
+            # that needs a new image can be applied (the published one has it).
+            self.server_image = inspect_image(self.args.server_image, "server-image", fetch, self.image_cache)
+            self.server["server_image"] = self.args.server_image
+            self.server["image_update"] = bool(self.server_image.get("behind"))
+        if self.args.tools_image:
+            self.tools = inspect_image(self.args.tools_image, "tools", fetch, self.image_cache)
+        elif self.args.tools_repo:
+            self.tools = inspect(self.args.tools_repo, "tools", fetch=fetch)
+        else:
+            self.tools = {"kind": "tools",
+                          "error": "no tools configured (SADT_TOOLS_IMAGE, SADT_TOOLS or --tools-repo)"}
         self.data = data_summary(self.args.tools_repo, self.args.data_dir)
         self.write_status()
 
@@ -446,6 +540,14 @@ class Agent:
             restart = RESTART
             applied = {}
             for info in parts:
+                if info.get("image"):
+                    self.phase(f"Pulling {info['image']} ({info['target']}).")
+                    if not self.pull_image(info["image"]):
+                        message = f"Pulling {info['image']} failed; see the log. Nothing was restarted."
+                        return
+                    applied[info["kind"]] = info["target"]
+                    restart = RECREATE
+                    continue
                 self.phase(f"Pulling the {info['kind']} ({info['behind']} commit(s)).")
                 self.door(False, "updating")
                 rc, _out, err = git(info["path"], ["pull", "--ff-only"], timeout=600)
@@ -454,6 +556,13 @@ class Agent:
                     return
                 applied[info["kind"]] = info["target"]
                 if info["kind"] == "server" and info["changes"]["action"] == RECREATE:
+                    restart = RECREATE
+                if info["kind"] == "server" and info["changes"]["action"] == IMAGE:
+                    self.phase(f"Pulling the published server image {self.args.server_image}.")
+                    if not self.pull_image(self.args.server_image):
+                        message = ("The server code is pulled but its image could not be; "
+                                   "the server was not restarted.")
+                        return
                     restart = RECREATE
                 if info["kind"] == "tools":
                     for folder in info["changes"]["environments"]:
@@ -509,6 +618,23 @@ class Agent:
             self.state["applying"] = None
             log(message)
             self.survey(fetch=False)
+
+    def pull_image(self, image: str) -> bool:
+        """`docker pull`, renewing the door's lease while it runs: a tool
+        library is tens of GB, and a lease left to lapse would reopen the
+        server half-way through the update."""
+        process = subprocess.Popen(["docker", "pull", image], stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, text=True)
+        last_lease = time.monotonic()
+        for line in process.stdout:
+            line = line.rstrip()
+            if line and not line.endswith(("Waiting", "Pulling fs layer")):
+                self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
+            if time.monotonic() - last_lease > DOOR_LEASE_SECONDS / 3:
+                self.door(False, "updating")
+                self.write_status()
+                last_lease = time.monotonic()
+        return process.wait() == 0
 
     def claim(self) -> bool:
         """One agent per deployment: refuse to start beside a live one."""
@@ -613,6 +739,11 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Report and apply updates for the admin panel.")
     parser.add_argument("--server-repo", default=REPO_ROOT)
     parser.add_argument("--tools-repo", default=None, help="Default: the checkout holding SADT_TOOLS.")
+    parser.add_argument("--tools-image", default=None,
+                        help="Follow the tools as this image instead of a checkout. Default: SADT_TOOLS_IMAGE.")
+    parser.add_argument("--server-image", default=None,
+                        help="The server image to follow. Default: VISOR_SERVER_IMAGE, else the compose "
+                             "file's default.")
     parser.add_argument("--update-dir", default=os.path.join(REPO_ROOT, "server", ".update"))
     parser.add_argument("--data-dir", default=os.path.join(REPO_ROOT, "DATA"),
                         help="Where models and test files are downloaded (the server's DATA/).")
@@ -626,8 +757,13 @@ def main(argv=None) -> int:
     parser.add_argument("--no-sync", action="store_true", help="Never run uv sync (for testing).")
     parser.add_argument("--once", action="store_true", help="One survey, then exit.")
     args = parser.parse_args(argv)
+    if args.tools_image is None:
+        args.tools_image = os.environ.get("SADT_TOOLS_IMAGE") or env.get("SADT_TOOLS_IMAGE") or ""
     if args.tools_repo is None:
-        args.tools_repo = _default_tools_repo()
+        args.tools_repo = "" if args.tools_image else _default_tools_repo()
+    if args.server_image is None:
+        args.server_image = (os.environ.get("VISOR_SERVER_IMAGE") or env.get("VISOR_SERVER_IMAGE")
+                             or server_ctl.DEFAULT_SERVER_IMAGE)
     args.url = args.url or server_ctl.url_for()
     args.token = args.token or os.environ.get("API_TOKEN") or env.get("API_TOKEN") or ""
     Agent(args).run()
