@@ -533,8 +533,11 @@ echo
 echo "Or open the 'Slicer Cloud' module in Slicer, which does all of the above"
 echo "(clone, start, update, model selection) from a panel."
 echo
-echo "Dashboard   http://localhost:${PORT:-8000}/server-debug   (the same token)"
+echo "Admin panel http://localhost:${PORT:-8000}/server-debug"
 echo "Benchmarks  http://localhost:${PORT:-8000}/benchmark"
+echo "Both open with the ADMIN token, which is not printed here: it controls the"
+echo "whole server, and this output tends to end up pasted somewhere. Show it with"
+echo "    python3 $CTL token --admin"
 
 if [ "$AUTO_UPDATE" != "off" ] && [ -n "$AUTO_UPDATE" ]; then
     echo
