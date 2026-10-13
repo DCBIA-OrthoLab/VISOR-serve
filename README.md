@@ -35,7 +35,58 @@ supervisor starts the callee in its own interpreter and passes a directory of
 files. The declared call graph is verified at every boot: the server refuses to
 start when a declared callee is not served.
 
-## Running it
+## Installing a server
+
+One command takes a bare Ubuntu machine to a running server: the server image,
+the whole SADT-VISOR tool library as its prebuilt image, every model and test
+file, and Tailscale in front of it. Run it from the directory that should hold
+the deployment (it needs about 60 GB):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-server.sh \
+  | sh -s -- --full --tailscale --auto-update apply \
+      --tools-image ghcr.io/dcbia-ortholab/sadt-visor-tools:latest
+```
+
+What it does on its way, asking before each step that needs sudo:
+
+- **NVIDIA driver.** A card whose driver is missing or too old (below 525, or
+  below 570 for an RTX 50xx) gets the driver Ubuntu recommends; reboot, then
+  run the same command again. A card older than Turing (RTX 20xx) runs on CPU.
+- **Docker** and the **NVIDIA Container Toolkit**, when missing.
+- **Tailscale.** Before running the command, open the Tailscale admin console,
+  Settings > Keys, and generate an auth key. Paste it when asked: the prompt
+  hides it, and it never appears on a command line. The server is then
+  reachable at `https://<name>.<tailnet>.ts.net`, from the tailnet only.
+
+Run again, the same command updates the deployment and keeps its tokens. The
+two tokens a deployment needs are printed by:
+
+```bash
+python3 VISOR-serve/scripts/server_ctl.py token            # for the Slicer client
+python3 VISOR-serve/scripts/server_ctl.py token --admin    # for /server-debug
+```
+
+## Connecting a workstation
+
+A workstation reaches the server through the same tailnet. On Ubuntu:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+```
+
+`tailscale up` prints a link; open it and sign in with the lab's Tailscale
+account. On Windows or macOS, install the app from
+<https://tailscale.com/download> and sign in the same way.
+
+Then, in 3D Slicer, open the Slicer Cloud module and set:
+
+- **URL**: `https://<name>.<tailnet>.ts.net`, as printed at the end of the
+  server install (`tailscale serve status` on the server shows it again);
+- **token**: the API token above, never the admin one.
+
+## Running it by hand
 
 ```bash
 cp .env.example .env          # API_TOKEN, TOOLS_DIR, DATA_DIR, DEVICE
