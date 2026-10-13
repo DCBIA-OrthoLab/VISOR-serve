@@ -30,8 +30,12 @@
 #                   default for a site that does not yet know what it uses.
 #   --token VALUE   set the API token instead of keeping or generating one
 #   --auto-update MODE   off | notify | apply. Written to .env as
-#                   SADT_AUTO_UPDATE, which `server_ctl.py watch` reads. See
-#                   scripts/visor-update.service for the unit that runs it.
+#                   SADT_AUTO_UPDATE, and the update agent that acts on it is
+#                   installed as a systemd user service (visor-update). See
+#                   scripts/visor-update.service.
+#   --hints         print how to reach and run this deployment -- its URL,
+#                   tokens, update agent -- and stop. What an install prints
+#                   at its end, for whoever comes back to it later.
 #   --branch NAME   the branch this deployment follows (default: deploy). Both
 #                   what is cloned and what `watch` fast-forwards to. `deploy`
 #                   is a commit of `main` whose CI went green and which was
@@ -122,6 +126,7 @@ BUILD_TOOLS=0
 TOOLS_IMAGE=""
 TAILSCALE=0
 TS_KEY_FILE=""
+HINTS_ONLY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -143,10 +148,62 @@ while [ $# -gt 0 ]; do
         --tailscale) TAILSCALE=1; shift ;;
         --tailscale-key-file) TAILSCALE=1; TS_KEY_FILE="$2"; shift 2 ;;
         --yes|-y|--non-interactive) ASK=0; shift ;;
+        --hints) HINTS_ONLY=1; shift ;;
         -h|--help) sed -n '2,94p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "setup-server: unknown option '$1'" >&2; exit 2 ;;
     esac
 done
+
+# --- what to do with it --------------------------------------------------
+# Printed last, after Tailscale, so it is what the screen shows when the
+# install ends, and again on demand with --hints.
+print_hints() {
+    _ctl="$INSTALL_DIR/scripts/server_ctl.py"
+    _port="$(sed -n 's/^HOST_PORT=//p' "$INSTALL_DIR/.env" 2>/dev/null | tail -n1)"
+    _port="${_port:-${PORT:-8000}}"
+    _url="http://localhost:${_port}"
+    if command -v tailscale >/dev/null 2>&1; then
+        _ts_url="$(tailscale serve status 2>/dev/null | grep -o 'https://[^ ]*' | head -n1)"
+        [ -n "$_ts_url" ] && _url="$_ts_url"
+    fi
+    _mode="$(sed -n 's/^SADT_AUTO_UPDATE=//p' "$INSTALL_DIR/.env" 2>/dev/null | tail -n1)"
+    _agent="not installed (the command below installs it)"
+    if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/visor-update.service" ]; then
+        _agent="$(systemctl --user is-active visor-update.service 2>/dev/null)" || true
+    fi
+    echo
+    echo "=================================================================="
+    echo " VISOR server"
+    echo "=================================================================="
+    echo
+    echo "Slicer client"
+    echo "    URL    $_url"
+    echo "    token  python3 $_ctl token"
+    echo
+    echo "Admin panel and benchmarks, opened with the ADMIN token (it controls the"
+    echo "whole server, so it is not printed here):"
+    echo "    ${_url}/server-debug"
+    echo "    ${_url}/benchmark"
+    echo "    python3 $_ctl token --admin"
+    echo
+    echo "Updates: mode '${_mode:-off}', agent ${_agent}"
+    echo "    set the mode      sh $INSTALL_DIR/scripts/setup-server.sh --dir $INSTALL_DIR --auto-update apply"
+    echo "    agent log         journalctl --user -u visor-update -f"
+    echo
+    echo "Status    python3 $_ctl status"
+    echo "Logs      python3 $_ctl logs"
+    echo "Remove    python3 $_ctl uninstall   (keeps tokens, settings and DATA)"
+    echo "These again: sh $INSTALL_DIR/scripts/setup-server.sh --dir $INSTALL_DIR --hints"
+}
+
+if [ "$HINTS_ONLY" -eq 1 ]; then
+    # Run from inside a clone, the clone is where this script lives.
+    if [ ! -f "$INSTALL_DIR/scripts/server_ctl.py" ] && [ -f "$(dirname "$0")/server_ctl.py" ]; then
+        INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+    fi
+    print_hints
+    exit 0
+fi
 
 # --- the questions -------------------------------------------------------
 # Only on a terminal, and read from /dev/tty rather than stdin: the documented
@@ -630,31 +687,34 @@ else
     python3 "$CTL" up --device "$DEVICE" --bind "$BIND" --branch "$REF"
 fi
 
-echo
-echo "Point the Slicer client at this server with:"
-echo "    URL    http://localhost:${PORT:-8000}"
-echo "    token  $(python3 "$CTL" token)"
-echo
-echo "Or open the 'Slicer Cloud' module in Slicer, which does all of the above"
-echo "(clone, start, update, model selection) from a panel."
-echo
-echo "Admin panel http://localhost:${PORT:-8000}/server-debug"
-echo "Benchmarks  http://localhost:${PORT:-8000}/benchmark"
-echo "Both open with the ADMIN token, which is not printed here: it controls the"
-echo "whole server, and this output tends to end up pasted somewhere. Show it with"
-echo "    python3 $CTL token --admin"
-
-if [ "$AUTO_UPDATE" != "off" ] && [ -n "$AUTO_UPDATE" ]; then
-    echo
-    echo "SADT_AUTO_UPDATE is '${AUTO_UPDATE}', which only takes effect once the"
-    echo "updater is running. It is a systemd unit, not part of this script:"
-    echo
-    echo "    sudo cp $INSTALL_DIR/scripts/visor-update.service /etc/systemd/system/"
-    echo "    sudo systemctl daemon-reload"
-    echo "    sudo systemctl enable --now visor-update"
-    echo
-    echo "It polls '${REF}' and never interrupts a run in flight; 'notify' reports"
-    echo "what it would do, 'apply' fast-forwards and restarts between runs."
+# --- the update agent ----------------------------------------------------
+# What acts on SADT_AUTO_UPDATE: scripts/update_agent.py, as a systemd user
+# service bound to THIS clone, lingering so it runs with nobody logged in.
+# Installed whatever the mode -- 'off' only keeps it from acting, and the
+# admin panel's update button talks to it either way.
+if [ -n "$AUTO_UPDATE" ] && [ "$(id -u)" -ne 0 ] && command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user show-environment >/dev/null 2>&1; then
+    _unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    _abs_dir="$(cd "$INSTALL_DIR" && pwd)"
+    mkdir -p "$_unit_dir"
+    sed "s|^WorkingDirectory=.*|WorkingDirectory=$_abs_dir|" \
+        "$INSTALL_DIR/scripts/visor-update.service" > "$_unit_dir/visor-update.service"
+    systemctl --user daemon-reload
+    systemctl --user enable visor-update.service >/dev/null 2>&1
+    # restart, not start: a re-run must hand the agent the new code and mode.
+    if systemctl --user restart visor-update.service; then
+        echo "Update agent running (mode '${AUTO_UPDATE}')."
+    else
+        echo "The update agent did not start: journalctl --user -u visor-update" >&2
+    fi
+    if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != "yes" ]; then
+        loginctl enable-linger "$(id -un)" 2>/dev/null \
+            || sudo loginctl enable-linger "$(id -un)" \
+            || echo "Without linger the agent stops at logout: sudo loginctl enable-linger $(id -un)" >&2
+    fi
+elif [ -n "$AUTO_UPDATE" ]; then
+    echo "The update agent is a systemd user service, which this session cannot reach;"
+    echo "see scripts/visor-update.service to install it by hand."
 fi
 
 if [ "$TAILSCALE" -eq 1 ]; then
@@ -668,6 +728,9 @@ if [ "$TAILSCALE" -eq 1 ]; then
     # a device waiting for approval -- must not turn that into a failed
     # install: it says what is missing, and re-running the script finishes it.
     _ts_ok=1
+    # A handler, not an ignore: the child still dies on Ctrl-C (a handler is
+    # reset across exec), and this script carries on to the summary.
+    trap ':' INT
     if [ "$(id -u)" -eq 0 ]; then
         # shellcheck disable=SC2086 -- a deliberately word-split option list
         sh "$INSTALL_DIR/scripts/setup-tailscale.sh" $_ts_args || _ts_ok=0
@@ -679,6 +742,8 @@ if [ "$TAILSCALE" -eq 1 ]; then
         # shellcheck disable=SC2086
         sudo --preserve-env=TS_AUTHKEY sh "$INSTALL_DIR/scripts/setup-tailscale.sh" $_ts_args || _ts_ok=0
     fi
+    trap - INT
+    stty echo < /dev/tty 2>/dev/null || true
     if [ "$_ts_ok" -eq 0 ]; then
         echo
         echo "The server is installed and listens on 127.0.0.1:${PORT:-8000}, but Tailscale"
@@ -692,3 +757,5 @@ else
     echo "localhost; putting it on a network address requires a TLS terminator in"
     echo "front -- see SECURITY.md, or re-run with --tailscale."
 fi
+
+print_hints
