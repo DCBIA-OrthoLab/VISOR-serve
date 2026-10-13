@@ -69,16 +69,40 @@ python3 VISOR-serve/scripts/server_ctl.py token --admin    # for /server-debug
 
 ## Connecting a workstation
 
-A workstation reaches the server through the same tailnet. On Ubuntu:
+A workstation reaches the server through the same tailnet, and membership is
+what decides who can reach the server at all. With an **auth key** — the same
+kind the install above asks for — joining is one command on every platform:
 
-```bash
-curl -fsSL https://tailscale.com/install.sh | sh
-sudo tailscale up
-```
+| | Install | Join |
+|---|---|---|
+| Ubuntu | `curl -fsSL https://tailscale.com/install.sh \| sh` | `sudo tailscale up --auth-key <key>` |
+| Windows | the installer from <https://tailscale.com/download> | `tailscale up --auth-key <key> --unattended` |
+| macOS | the **standalone package** from <https://tailscale.com/download> | `tailscale up --auth-key <key>` |
 
-`tailscale up` prints a link; open it and sign in with the lab's Tailscale
-account. On Windows or macOS, install the app from
-<https://tailscale.com/download> and sign in the same way.
+Generate the key in the Tailscale admin console under *Settings > Keys*; it
+looks like `tskey-auth-…`. A reusable key covers a whole set of workstations, so
+one key rolls out a lab. Treat it as a credential — anything holding a valid key
+can join the tailnet — and revoke it there once the rollout is done.
+
+Without a key, `tailscale up` with no argument prints a link instead: open it
+and sign in with the lab's Tailscale account. That is the shorter path for a
+single machine with someone sitting at it, and the only one on a Mac installed
+from the App Store.
+
+Two platform details, because the Ubuntu line does not carry over:
+
+- **macOS** — the App Store build is sandboxed and puts no `tailscale` on
+  `PATH`, so the command above needs the **standalone package**; the App Store
+  build signs in from the menu bar instead, and its command, if you want it,
+  sits inside the bundle at
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale`.
+- **Windows** — `--unattended` is what keeps a workstation on the tailnet while
+  nobody is logged in, which is what a machine left running overnight needs.
+  The flag is Windows-only and does not exist in the Linux build, so it cannot
+  be copied the other way either.
+
+Either way the machine then appears in the admin console, and removing it there
+is how access is withdrawn — nothing changes on the server or in Slicer.
 
 Then, in 3D Slicer, open the Slicer Cloud module and set:
 
