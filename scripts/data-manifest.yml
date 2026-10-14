@@ -12,12 +12,15 @@
 # Entry format
 # ---------------------------------------------------------------------------
 #   name      REQUIRED  the file name to download (a bare name, no path)
-#   url       REQUIRED  direct download URL
-#   sha256    optional  verified after download; the file is discarded on a
-#                       mismatch. Absent means "not pinned yet" -- fetch_data.py
-#                       prints the hash it got, which is what you paste here.
-#                       Also what makes an update reach a deployment: a file
-#                       on disk installed under another sha256 is replaced.
+#   url       REQUIRED  direct download URL, https:// only
+#   sha256    REQUIRED  verified after download; the file is discarded on a
+#                       mismatch. Also what makes an update reach a deployment:
+#                       a file on disk installed under another sha256 is
+#                       replaced.
+#   unpinned  optional  `true` lets an entry go without a sha256. Never a
+#                       default: fetch_data.py refuses an entry with neither,
+#                       and prints the hash it got, which is what to paste in
+#                       place of this line.
 #   release_name  the file's name in the data releases of this repository
 #                 (scripts/publish_data_release.py). Required for a file to be
 #                 republished; entries sharing a url share it. Two schemes:
@@ -882,6 +885,11 @@ tools:
         dest: TMJ/qwen-ft-q4_k_m.gguf
         url: https://huggingface.co/dcbia/Qwen-2.5-7B-Instruct-TMJ/resolve/main/qwen-ft-q4_k_m.gguf
         size: 4683073408
+        # NOT PINNED: `resolve/main` follows the branch and no sha256 is
+        # declared, so this installs whatever the repository holds that day.
+        # TODO(maintainer): replace `main` by a commit revision and add its
+        # sha256, then drop this line.
+        unpinned: true
     testfiles:
       # One of the synthetic TMJ consult notes the module ships in its own
       # repository -- not patient data, and the only note anywhere public.
@@ -891,6 +899,10 @@ tools:
         dest: TMJ/TMJ_note1.txt
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/raw/main/CNE/Resources/testfiles/input_TMJ/TMJ_note1.txt
         size: 4731
+        # NOT PINNED: `raw/main` follows the branch and no sha256 is declared.
+        # TODO(maintainer): replace `main` by a commit sha and add the file's
+        # sha256, then drop this line.
+        unpinned: true
 
   # =========================================================================
   # MRI2CBCT -- MRI/CBCT registration. NOT PORTED YET.

@@ -241,7 +241,7 @@ def test_force_rebuilds_a_view_rather_than_keeping_what_it_held(fetch_data, tmp_
 @pytest.mark.parametrize("split, extract", [("../out", True), ("a/b", True), ("CBCT", False)])
 def test_a_split_that_could_escape_or_cannot_apply_is_refused(fetch_data, split, extract):
     manifest = {"AREG": {"testfiles": [
-        {"name": "a.zip", "url": "https://example.invalid/a.zip",
+        {"name": "a.zip", "url": "https://example.invalid/a.zip", "sha256": "0" * 64,
          "split": split, "extract": extract},
     ]}}
     with pytest.raises(fetch_data.ManifestError):
@@ -421,3 +421,28 @@ def test_a_replaced_cohort_rebuilds_its_views(fetch_data, tmp_path, served):
     view = tmp_path / "AREG" / "testfiles" / "CBCT_T1" / "cohort"
     assert (view / "new_T1.nii.gz").read_text() == "new"
     assert not (view / "scan_T1.nii.gz").exists()
+
+
+@pytest.mark.parametrize("url", ["http://example.invalid/a.zip", "file:///etc/passwd",
+                                 "ftp://example.invalid/a.zip", "example.invalid/a.zip"])
+def test_a_url_that_is_not_https_is_refused(fetch_data, url):
+    manifest = {"AMASSS": {"models": [{"name": "a.zip", "url": url, "sha256": "0" * 64}]}}
+    with pytest.raises(fetch_data.ManifestError, match="https"):
+        fetch_data._entries(manifest, "models", ["AMASSS"])
+    with pytest.raises(fetch_data.ManifestError, match="https"):
+        fetch_data._download(url, "/nonexistent/never-written", None)
+
+
+def test_an_entry_without_a_sha256_must_say_it_is_unpinned(fetch_data):
+    entry = {"name": "a.bin", "url": "https://example.invalid/a.bin"}
+    with pytest.raises(fetch_data.ManifestError, match="sha256"):
+        fetch_data._entries({"CNE": {"models": [entry]}}, "models", ["CNE"])
+    with pytest.raises(fetch_data.ManifestError, match="sha256"):
+        fetch_data._entries({"CNE": {"models": [{**entry, "unpinned": "maybe"}]}}, "models", ["CNE"])
+    assert fetch_data._entries({"CNE": {"models": [{**entry, "unpinned": True}]}}, "models", ["CNE"])
+
+
+def test_the_shipped_manifest_passes_validation(fetch_data):
+    manifest = fetch_data._parse_manifest(fetch_data._DEFAULT_MANIFEST)
+    for kind in fetch_data.KINDS:
+        fetch_data._entries(manifest, kind, None)
