@@ -33,7 +33,13 @@ LOG="${LOG:-$HERE/local-server.log}"
 
 echo "tools   : $TOOLS_DIR"
 echo "data    : $DATA_DIR"
-echo "token   : $API_TOKEN"
+# Where the token is, never its value: this output lands in terminals, logs
+# and bug reports.
+if [ -s "$TOKEN_FILE" ] && [ "$API_TOKEN" = "$(cat "$TOKEN_FILE")" ]; then
+    echo "token   : in $TOKEN_FILE"
+else
+    echo "token   : from the API_TOKEN environment variable"
+fi
 echo "url     : https://localhost:8001  (self-signed: server/.tls/cert.pem)"
 echo "log     : $LOG"
 echo
