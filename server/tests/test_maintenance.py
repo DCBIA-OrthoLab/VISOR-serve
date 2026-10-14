@@ -189,14 +189,38 @@ def test_an_open_door_changes_nothing():
 # The endpoint the updater uses
 # ---------------------------------------------------------------------------
 
+ADMIN = {"X-Admin-Token": "operator-secret-for-the-maintenance-tests"}
+
+
+@pytest.fixture(autouse=True)
+def _admin_token(monkeypatch):
+    monkeypatch.setattr(settings, "ADMIN_TOKEN", ADMIN["X-Admin-Token"])
+
+
 def test_shutting_the_door_needs_the_token():
     """It is a control over whether this deployment serves anyone."""
     assert client.post("/maintenance", json={"accepting": False}).status_code == 401
 
 
+def test_a_workstation_token_cannot_shut_or_reopen_the_door():
+    """Every workstation holds the API token; the door is the operator's."""
+    assert client.post("/maintenance", headers=AUTH, json={"accepting": False}).status_code == 401
+    maintenance.close_by_operator(600, "operator")
+    assert client.post("/maintenance", headers=AUTH, json={"accepting": True}).status_code == 401
+    assert maintenance.accepting() is False
+    maintenance.reopen()
+
+
+def test_a_closure_that_never_ends_is_refused():
+    response = client.post("/maintenance", headers={**ADMIN, "Content-Type": "application/json"},
+                           content='{"accepting": false, "seconds": "nan"}')
+    assert response.status_code == 422
+    assert maintenance.accepting() is True
+
+
 def test_the_updater_closes_and_reopens_over_http():
     closed = client.post(
-        "/maintenance", headers=AUTH,
+        "/maintenance", headers=ADMIN,
         json={"accepting": False, "seconds": 30, "reason": "applying an update"},
     )
     assert closed.status_code == 200
@@ -204,7 +228,7 @@ def test_the_updater_closes_and_reopens_over_http():
     assert closed.json()["reason"] == "applying an update"
     assert client.post("/run/Test_Tool", headers=AUTH, data=RUN_ARGS).status_code == 503
 
-    reopened = client.post("/maintenance", headers=AUTH, json={"accepting": True})
+    reopened = client.post("/maintenance", headers=ADMIN, json={"accepting": True})
     assert reopened.status_code == 200
     assert reopened.json()["accepting"] is True
     assert client.post("/run/Test_Tool", headers=AUTH, data=RUN_ARGS).status_code == 200
@@ -212,7 +236,7 @@ def test_the_updater_closes_and_reopens_over_http():
 
 def test_the_endpoint_answers_with_what_it_granted_not_what_was_asked():
     response = client.post(
-        "/maintenance", headers=AUTH, json={"accepting": False, "seconds": 86400}
+        "/maintenance", headers=ADMIN, json={"accepting": False, "seconds": 86400}
     )
     assert response.json()["closed_for"] <= maintenance.MAX_CLOSE_SECONDS
 

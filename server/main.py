@@ -546,6 +546,27 @@ def _log_served(tool_name: str, start_time: float, received: int, sent: Optional
     )
 
 
+def _confined_outputs(outputs: list, roots) -> list:
+    """`outputs`, refused unless each lies inside one of this request's `roots`.
+
+    A tool's result names its outputs, and the server used to stream, zip,
+    move into the result store and then DELETE whatever it named: another
+    run's directory under TEMP_DIR, /proc/self/environ, the TLS key. The roots
+    are the directories this request created or was handed -- its work dir,
+    its tracked scratch dirs (the job directory among them), and the job
+    directory a resume picks up -- and nothing a tool writes can add to them.
+    """
+    allowed = [os.path.realpath(root) for root in roots if root]
+    for path in outputs:
+        if os.path.islink(path):
+            raise ValueError(f"An output is a symbolic link: {os.path.basename(path)}")
+        resolved = os.path.realpath(path)
+        if not any(resolved == root or os.path.commonpath([root, resolved]) == root
+                   for root in allowed):
+            raise ValueError("A tool returned an output outside its own directories.")
+    return outputs
+
+
 def _output_roots(outputs: list, work_dir: str) -> set:
     """TEMP_DIR folders holding the tool's outputs, excluding the request's own
     work dir (already scheduled for cleanup by the caller)."""
@@ -845,7 +866,7 @@ class _Maintenance(BaseModel):
     reason: str = ""
 
 
-@app.post("/maintenance", dependencies=[Depends(verify_token)])
+@app.post("/maintenance", dependencies=[Depends(verify_admin)])
 def set_maintenance(wanted: _Maintenance) -> dict:
     """Close or reopen this server to new work.
 
@@ -865,6 +886,13 @@ def set_maintenance(wanted: _Maintenance) -> dict:
     `/status` to confirm nothing slipped in, pulls, and lets the restart clear
     the flag. What is held is the restart, not the drain.
     """
+    # The operator's credential, not the API token every workstation holds:
+    # with that one, any workstation could close the server to everyone, for
+    # ever by renewing, or reopen a closure an operator had made. The updater
+    # runs on the host and reads ADMIN_TOKEN from the same .env.
+    if wanted.seconds is not None and not math.isfinite(wanted.seconds):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                            detail="seconds must be a finite number.")
     if not wanted.accepting:
         granted = maintenance.close(
             wanted.seconds if wanted.seconds is not None else 60.0, wanted.reason
@@ -2580,6 +2608,13 @@ def _registered_run(request: Request, tool_name: str) -> Optional[str]:
     raw = request.headers.get(_RUN_ID_HEADER)
     if not raw:
         return None
+    # Only a tool this server serves is recorded. The name comes from the URL,
+    # and a run registered under an unknown one used to be kept -- and shown
+    # on the status page -- as whatever string the client sent.
+    try:
+        get_tool(tool_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     # Which batch of a divided cohort this is, when the client says so. Read
     # here, with the id, so the dashboard can group the runs from the moment
     # they exist and the gate in `_batch_turn` can order them.
@@ -2974,6 +3009,12 @@ def _stage_corrections(tool, job_dir: str, form) -> list:
         shutil.rmtree(destination, ignore_errors=True)
         os.makedirs(destination, exist_ok=True)
         name = os.path.basename(value.filename or slot)
+        # A client's name, written to disk: "." and ".." are directories, and
+        # anything hidden or empty is not a correction anyone meant to send.
+        if not name or name.startswith(".") or "\x00" in name:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"The correction for '{slot}' needs a file name.")
         landed = os.path.join(destination, name)
         with open(landed, "wb") as handle:
             shutil.copyfileobj(value.file, handle)
@@ -3292,6 +3333,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             work_dir=None, scratch_dirs=file_utils.track_scratch_dirs(),
             result=await _run_tool_call(
                 functools.partial(dispatch.dispatch, tool, {}, resume_from=resume_from)),
+            confine_to=(resume_from,),
         )
 
     # Generic argument collection: whatever scalar fields and/or files the
@@ -3625,7 +3667,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
 
 async def _finish_stopped_run(tool, tool_name: str, start_time: float,
                               background_tasks: BackgroundTasks, work_dir,
-                              scratch_dirs, record: dict, size):
+                              scratch_dirs, record: dict, size, confine_to=()):
     """Deliver a run that stopped at a checkpoint.
 
     What goes back is the record -- which checkpoint, and what was produced
@@ -3633,7 +3675,8 @@ async def _finish_stopped_run(tool, tool_name: str, start_time: float,
     directory stays where it is: it is what a resume reads, and packing is a
     copy out of it rather than a move.
     """
-    outputs = file_utils.output_paths(record)
+    outputs = _confined_outputs(file_utils.output_paths(record),
+                                [work_dir, *scratch_dirs, *confine_to])
     reference = None
     # The archive is built in a directory of its OWN, never in the request's
     # work dir. That work dir is where an uploaded folder was unpacked, and
@@ -3679,7 +3722,7 @@ async def _finish_stopped_run(tool, tool_name: str, start_time: float,
 async def _finish_run(tool, tool_name: str, start_time: float,
                       background_tasks: BackgroundTasks, detached: bool,
                       work_dir, scratch_dirs, result, size=None,
-                      wants_reference: bool = False):
+                      wants_reference: bool = False, confine_to=()):
     """Turn what a tool returned into what the caller receives.
 
     Split out of `_run_tool` so a RESUME reaches it too. Everything here is
@@ -3713,7 +3756,8 @@ async def _finish_run(tool, tool_name: str, start_time: float,
         # look at, and the fact that this run can be told to carry on.
         return await _finish_stopped_run(tool, tool_name, start_time,
                                          background_tasks, work_dir,
-                                         scratch_dirs, result, size)
+                                         scratch_dirs, result, size,
+                                         confine_to=confine_to)
 
     if tool.output_kind in ("file", "segmentation", "files"):
         # `result` is a path to the output file the tool wrote -- or, for
@@ -3727,7 +3771,8 @@ async def _finish_run(tool, tool_name: str, start_time: float,
         # `scratch_dirs` covers file_utils.make_scratch_dir(); _output_roots
         # also catches a tool that wrote under TEMP_DIR by hand.
         try:
-            outputs = file_utils.output_paths(result)
+            outputs = _confined_outputs(file_utils.output_paths(result),
+                                        [work_dir, *scratch_dirs, *confine_to])
             if not outputs:
                 raise ValueError(
                     f"Tool '{tool.name}' declares output_kind={tool.output_kind!r} but "
@@ -3769,10 +3814,9 @@ async def _finish_run(tool, tool_name: str, start_time: float,
                 )
         except Exception:
             logger.exception("endpoint=/run/%s status=500 (packing output)", tool_name)
-            _discard(
-                work_dir,
-                _output_roots(file_utils.output_paths(result), work_dir) | set(scratch_dirs),
-            )
+            # Never the roots of what the tool NAMED: those are exactly what a
+            # rejected output pointed at -- another run's directory, say.
+            _discard(work_dir, list(scratch_dirs) + list(confine_to))
             raise HTTPException(status_code=500, detail="Tool execution failed.")
 
         media_type = _media_type_of(str(result))

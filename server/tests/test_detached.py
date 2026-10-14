@@ -157,16 +157,17 @@ def test_a_failing_detached_run_says_so_without_naming_a_path(detached_client):
     runs.discard(run_id)
 
 
-def test_an_unknown_tool_fails_the_run_rather_than_the_request(detached_client):
+def test_an_unknown_tool_is_refused_before_any_run_is_recorded(detached_client):
+    """The name comes from the URL. Recorded, it reached the status page as
+    whatever string the client sent -- markup included."""
     run_id = _new_id()
     response = detached_client.post(
-        "/run/No_Such_Tool",
+        "/run/<img src=x onerror=alert(1)>",
         data={"text_1": "a"},
         headers=dict(AUTH, **DETACHED, **{"X-Run-Id": run_id}),
     )
-    assert response.status_code == 202
-    assert _terminal(run_id)["state"] == "failed"
-    runs.discard(run_id)
+    assert response.status_code == 404
+    assert detached_client.get(f"/runs/{run_id}", headers=AUTH).status_code == 404
 
 
 # ----------------------------------------------------------------------

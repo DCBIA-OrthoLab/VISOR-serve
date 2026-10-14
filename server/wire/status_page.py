@@ -134,9 +134,8 @@ STATUS_PAGE = """<!doctype html>
   function gib(n) { return (n == null) ? "?" : (n / 1073741824).toFixed(1) + "G"; }
 
   function escaped(text) {
-    // The only place this page builds markup from data. Both values come from
-    // the server's own campaign file rather than from a client, but building
-    // HTML from anything unescaped is a habit worth not having.
+    // Every value this page writes into markup goes through here: a tool name
+    // reached the run table unescaped once, from a client's own URL.
     var box = document.createElement("div");
     box.textContent = String(text == null ? "" : text);
     return box.innerHTML;
@@ -178,8 +177,8 @@ STATUS_PAGE = """<!doctype html>
         var cls = r.state === "running" ? "run" : (r.phase === "queued_gpu" ? "wait" : "");
         var indent = r.depth ? '<span class="nest">' +
           new Array(r.depth + 1).join("\\u2007\\u2007\\u2514 ") + "</span>" : "";
-        return "<tr><td>" + indent + (r.tool || "?") +
-          '</td><td><span class="tag ' + cls + '">' + r.phase + "</span></td>" +
+        return "<tr><td>" + indent + escaped(r.tool || "?") +
+          '</td><td><span class="tag ' + cls + '">' + escaped(r.phase) + "</span></td>" +
           '<td class="n">' + (r.fraction == null ? "" : Math.round(r.fraction * 100) + "%") +
           '</td><td class="n">' + ago(r.started_at) + "</td></tr>";
       }).join("");
@@ -196,7 +195,7 @@ STATUS_PAGE = """<!doctype html>
       ? "<table><thead><tr><th>tool</th><th>vram</th><th>ram</th><th>runs</th></tr></thead><tbody>" +
         names.map(function (n) {
           var c = costs[n];
-          return "<tr><td>" + n + (c.input_dependent
+          return "<tr><td>" + escaped(n) + (c.input_dependent
             ? ' <span class="varies">memory varies \\u00d7' + c.vram_spread.toFixed(1) + "</span>"
             : "") + '</td><td class="n">' + gib(c.vram_bytes) +
             '</td><td class="n">' + gib(c.ram_bytes) +

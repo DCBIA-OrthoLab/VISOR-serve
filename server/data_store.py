@@ -196,7 +196,10 @@ class LocalDataStore(DataStore):
     def _resolve(self, tool_name: str, kind: str, filename: str, scope: str = "") -> str:
         # First line of defense: filename must be a bare name, not a path
         # (rejects "../../etc/passwd" style traversal before touching disk).
-        if not filename or os.path.basename(filename) != filename:
+        # A leading dot covers "." and ".." -- "." named the whole folder,
+        # handing out every scope zipped -- and the hidden entries `_list`
+        # never offers anyway.
+        if not filename or os.path.basename(filename) != filename or filename.startswith("."):
             raise DataNotFoundError(f"Invalid file name: '{filename}'")
 
         # The scope is one bare folder name too. It was assumed to come only
