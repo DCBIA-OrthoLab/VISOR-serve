@@ -11,6 +11,7 @@ only way that order changes. What they must guarantee:
   the controls do not exist.
 """
 
+import json
 import math
 import threading
 
@@ -282,8 +283,11 @@ def test_the_admin_token_can_mark_a_run_and_status_shows_it(admin):
     response = client.post("/admin/runs/some-run/priority", json={"priority": "high"}, headers=admin)
     assert response.status_code == 200
     assert response.json()["priorities"] == {"some-run": "high"}
+    # /status answers every workstation, so it names the run by a handle
+    # rather than by the id that would let them act on it.
     status = client.get("/status", headers=AUTH).json()
-    assert status["admission"]["priorities"] == {"some-run": "high"}
+    assert status["admission"]["priorities"] == {main._run_handle("some-run"): "high"}
+    assert "some-run" not in json.dumps(status)
 
 
 def test_bad_requests_are_named(admin):

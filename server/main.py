@@ -7,12 +7,15 @@
 import contextlib
 import functools
 import gzip
+import hashlib
+import hmac
 import json
 import logging
 import math
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -718,6 +721,37 @@ def _extensions_of(spec) -> Optional[dict]:
     return per_type or None
 
 
+# A run id is a capability: whoever holds it reads the run's events, downloads
+# its result through the reference the last event carries, cancels it, and
+# feeds corrections into it when it pauses. /status answers every workstation
+# holding the shared token, so it names a run by a keyed hash instead -- stable
+# for the life of the process, so a page can follow a run from poll to poll,
+# and useless as an id. The operator panel reads the real ids through
+# /admin-panel.json, behind the admin token.
+_RUN_HANDLE_KEY = secrets.token_bytes(32)
+_RUN_ID_KEYS = ("run_id", "parent")
+
+
+def _run_handle(run_id: str) -> str:
+    return "~" + hmac.new(_RUN_HANDLE_KEY, run_id.encode("utf-8"), hashlib.sha256).hexdigest()[:20]
+
+
+def _masked_run_ids(value):
+    if isinstance(value, list):
+        return [_masked_run_ids(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    masked = {}
+    for key, item in value.items():
+        if key in _RUN_ID_KEYS and isinstance(item, str):
+            masked[key] = _run_handle(item)
+        elif key == "priorities" and isinstance(item, dict):
+            masked[key] = {_run_handle(str(name)): level for name, level in item.items()}
+        else:
+            masked[key] = _masked_run_ids(item)
+    return masked
+
+
 @app.get("/status", dependencies=[Depends(verify_token)])
 def server_status() -> dict:
     # NOT named `status`: `fastapi.status` is imported in this module and a
@@ -747,7 +781,7 @@ def server_status() -> dict:
     except Exception:  # noqa: BLE001 - a status page must not fail on a probe
         pass
     learned = costs.known()
-    return {
+    return _masked_run_ids({
         "budget": {
             "cpus": allocation.cpus,
             "ram_bytes": allocation.ram_bytes,
@@ -778,7 +812,7 @@ def server_status() -> dict:
             }
             for name, cost in learned.items() if cost
         },
-    }
+    })
 
 
 class _Maintenance(BaseModel):
