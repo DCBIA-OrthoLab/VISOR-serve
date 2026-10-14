@@ -1070,7 +1070,9 @@ def cmd_status(args) -> dict:
         "service": service,
         "clone": clone,
         "container": container_status(service),
-        "server": {"url": url, "healthy": health(url)},
+        # `tailnet_url`: the only address a client may be given (url_for).
+        # "" until setup-tailscale.sh has run.
+        "server": {"url": url, "tailnet_url": public_url(), "healthy": health(url)},
         # Deliberately no token here: a status dump lands in log panes and bug
         # reports. `server_ctl.py token` is the one way to read it.
         "env": {
@@ -1214,6 +1216,7 @@ def cmd_up(args) -> dict:
         "deps_install_skipped": deps_skipped,
         "service": service,
         "url": url,
+        "tailnet_url": public_url(),
         "healthy": healthy,
         "token": token,
         "data_dir": data_dir(),
