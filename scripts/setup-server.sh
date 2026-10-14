@@ -100,10 +100,17 @@
 
 set -eu
 
+# One word, single-quoted for a shell to read back verbatim: every ' becomes
+# '\'' and nothing else inside single quotes is special, so $(...), ` and $
+# in an argument stay text.
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # The arguments as given, quoted, for the re-run under the docker group below.
 ORIGINAL_ARGS=""
 for _arg in "$@"; do
-    ORIGINAL_ARGS="$ORIGINAL_ARGS '$(printf '%s' "$_arg" | sed "s/'/'\\\\''/g")'"
+    ORIGINAL_ARGS="$ORIGINAL_ARGS $(shell_quote "$_arg")"
 done
 
 REPO="${REPO:-DCBIA-OrthoLab/VISOR-serve}"
@@ -436,7 +443,10 @@ if ! docker info >/dev/null 2>&1; then
             && getent group docker | grep -qw "$(id -un)" && sg docker -c "docker info" >/dev/null 2>&1; then
         echo "Continuing in the docker group (no need to log out)..."
         export VISOR_SETUP_REEXEC=1 REPO REF REPO_URL INSTALL_DIR
-        eval "exec sg docker -c \"sh \\\"$INSTALL_DIR/scripts/setup-server.sh\\\" $ORIGINAL_ARGS\""
+        # No eval: the command string is read ONCE, by the shell sg starts, and
+        # every word in it is single-quoted. An eval here re-expanded the
+        # arguments, so a token holding $(...) was executed.
+        exec sg docker -c "sh $(shell_quote "$INSTALL_DIR/scripts/setup-server.sh")$ORIGINAL_ARGS"
     fi
     echo
     echo "Docker is installed but this user cannot reach its daemon yet."
