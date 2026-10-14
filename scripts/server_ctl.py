@@ -959,16 +959,19 @@ GHOST_AFTER_SECONDS = 900
 BUSY_STATES = ("pending", "running")
 
 
-def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0):
+def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0, admin: bool = False):
     """One JSON request to the server, or None if it could not be made.
 
     None is deliberately not distinguished from an error: every caller below
     treats "I could not ask" and "the answer was no" the same way, which is to
     not proceed with an update. Raising here would only move that decision.
+
+    `admin` sends `token` as the operator's admin token (X-Admin-Token)
+    instead of a Bearer API token: the two never travel together.
     """
     request = urllib.request.Request(
         f"{url.rstrip('/')}{path}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={ADMIN_HEADER: token} if admin else {"Authorization": f"Bearer {token}"},
     )
     if payload is not None:
         request.data = json.dumps(payload).encode("utf-8")
@@ -987,11 +990,20 @@ def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0):
         return None
 
 
-def set_accepting(url: str, token: str, accepting: bool,
+# POST /maintenance is an operator's act: authenticated by ADMIN_TOKEN, which
+# no workstation holds (server/wire/security.py).
+ADMIN_HEADER = "X-Admin-Token"
+
+
+def set_accepting(url: str, admin_token: str, accepting: bool,
                   seconds: int = GATE_LEASE_SECONDS, reason: str = ""):
-    """Open or close the server's door. Returns its answer, or None."""
-    return _api(url, token, "/maintenance",
-                {"accepting": accepting, "seconds": seconds, "reason": reason})
+    """Open or close the server's door. Returns its answer, or None -- which
+    is also the answer when no admin token is known, or the server has none
+    (403) or refuses this one (401)."""
+    if not admin_token:
+        return None
+    return _api(url, admin_token, "/maintenance",
+                {"accepting": accepting, "seconds": seconds, "reason": reason}, admin=True)
 
 
 def server_load(url: str, token: str):
@@ -1381,6 +1393,16 @@ def cmd_watch(args) -> dict:
             "No API_TOKEN in the .env, so this cannot ask the server to stop taking "
             "work before it restarts it. Run 'up' first, or set one."
         )
+    # The door is closed with the operator's token, not the API one. Without
+    # it an update would restart the server under runs it never stopped
+    # admitting, so applying is refused here rather than at the first update.
+    args.admin_token = (getattr(args, "admin_token", None) or os.environ.get("ADMIN_TOKEN")
+                        or read_env().get("ADMIN_TOKEN") or "")
+    if mode == AUTO_UPDATE_APPLY and not args.admin_token:
+        raise ServerCtlError(
+            "No ADMIN_TOKEN in the .env, so this cannot close the server to new runs "
+            "before it restarts it. Run 'up' once to generate one, or pass --admin-token."
+        )
 
     log(f"Watching {branch} every {args.poll}s in '{mode}' mode. "
         f"The server is at {url}.")
@@ -1443,9 +1465,11 @@ def _watch_once(branch: str, url: str, service: str, token: str, args,
         return {"head": local}
 
     # Shut the door only now. Everything above happened with it open.
-    gate = set_accepting(url, token, False, GATE_LEASE_SECONDS, f"updating to {remote[:9]}")
+    admin_token = getattr(args, "admin_token", "") or ""
+    gate = set_accepting(url, admin_token, False, GATE_LEASE_SECONDS, f"updating to {remote[:9]}")
     if gate is None:
-        log("The server would not take the maintenance request; not updating.")
+        log("The server would not take the maintenance request; not updating." + (
+            "" if admin_token else " No ADMIN_TOKEN in the .env: the door cannot be closed without it."))
         return {"head": local}
     if gate.get("unsupported"):
         log("This server has no maintenance endpoint (it predates it). Updating "
@@ -1471,7 +1495,7 @@ def _watch_once(branch: str, url: str, service: str, token: str, args,
         # On every path out, including the ones above that return early. The
         # lease is the backstop for this process being killed, not for it
         # taking a branch it forgot to clean up after.
-        set_accepting(url, token, True)
+        set_accepting(url, admin_token, True)
 
 
 # ---------------------------------------------------------------------------
@@ -2001,6 +2025,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Override SADT_AUTO_UPDATE for this invocation. "
                             "Default: whatever the environment or the .env says, "
                             "and 'off' when neither says anything.")
+    watch.add_argument("--admin-token", default=None,
+                       help="What closes the server to new runs during an update. "
+                            "Default: ADMIN_TOKEN from the environment, else the .env. "
+                            "Never printed.")
     watch.add_argument("--once", action="store_true",
                        help="Check once and exit, instead of looping. What a timer "
                             "or a cron entry calls, and what the tests drive.")

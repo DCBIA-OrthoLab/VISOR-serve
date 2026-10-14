@@ -99,6 +99,12 @@ REQUEST_POLL_SECONDS = 2
 # out. If this process is killed, the server reopens by itself this soon after.
 DOOR_LEASE_SECONDS = 90
 LOG_LINES = 40
+# The header POST /maintenance is authenticated by: the operator's admin token,
+# never the API token every workstation holds (server/wire/security.py).
+ADMIN_HEADER = "X-Admin-Token"
+# door()'s answer when the server could not be reached at all, as opposed to
+# one that answered and refused.
+DOOR_UNREACHABLE = "the server did not answer"
 
 def _release_diff_source() -> str:
     """The source of server/wire/release_diff.py as COMMITTED at HEAD.
@@ -385,6 +391,7 @@ class Agent:
         self.update_dir = args.update_dir
         self.url = args.url
         self.token = args.token
+        self.admin_token = getattr(args, "admin_token", "") or ""
         self.state = {"last": None, "applying": None}
         previous = self._read(STATUS_FILE) or {}
         self.state["last"] = previous.get("last")
@@ -448,8 +455,32 @@ class Agent:
         except Exception:  # noqa: BLE001 - a probe answers None
             return None
 
-    def door(self, accepting: bool, reason: str = "") -> None:
-        self._api("/maintenance", {"accepting": accepting, "seconds": DOOR_LEASE_SECONDS, "reason": reason})
+    def door(self, accepting: bool, reason: str = ""):
+        """Open or close the server to new runs. None once the server took it,
+        else why it did not -- DOOR_UNREACHABLE when nothing answered.
+
+        Sent with the ADMIN token: closing a clinic's server is an operator's
+        act, and the API token every workstation holds cannot do it.
+        """
+        if not self.admin_token:
+            return "no ADMIN_TOKEN in the deployment's .env, so the server cannot be closed to new runs"
+        request = urllib.request.Request(
+            f"{self.url.rstrip('/')}/maintenance", method="POST",
+            data=json.dumps({"accepting": accepting, "seconds": DOOR_LEASE_SECONDS,
+                             "reason": reason}).encode("utf-8"),
+            headers={ADMIN_HEADER: self.admin_token, "Content-Type": "application/json"})
+        try:
+            with server_ctl.server_urlopen(request, timeout=10) as response:
+                response.read()
+            return None
+        except urllib.error.HTTPError as exc:
+            if exc.code == 403:
+                return "the server has no ADMIN_TOKEN set, so it cannot be closed to new runs"
+            if exc.code == 401:
+                return "the server refused this deployment's ADMIN_TOKEN"
+            return f"the server answered {exc.code} to closing it"
+        except Exception:  # noqa: BLE001 - reported, the caller decides
+            return DOOR_UNREACHABLE
 
     def in_flight(self):
         """Runs still holding or wanting the machine, or None if unreachable."""
@@ -562,7 +593,14 @@ class Agent:
                 return
 
             self.phase("Closing the server to new runs.")
-            self.door(False, "updating")
+            # A server that answers and refuses will refuse every renewal too:
+            # updating anyway would restart it under runs admitted meanwhile.
+            # One that does not answer is waited for below, and must take the
+            # door before anything changes.
+            refusal = self.door(False, "updating")
+            if refusal and refusal != DOOR_UNREACHABLE:
+                message = f"Not updated: {refusal}."
+                return
             keeper = self.hold_door()
             while True:
                 if not os.path.exists(self._path(REQUEST_FILE)):
@@ -578,6 +616,10 @@ class Agent:
                                ", ".join(sorted({r.get('tool') or '?' for r in busy})))
                 time.sleep(REQUEST_POLL_SECONDS * 2)
 
+            refusal = self.door(False, "updating")
+            if refusal:
+                message = f"Not updated: {refusal}. Nothing was changed."
+                return
             # The point of no return: the request is consumed, the pull begins.
             try:
                 os.remove(self._path(REQUEST_FILE))
@@ -909,6 +951,9 @@ def main(argv=None) -> int:
                         help="Where models and test files are downloaded (the server's DATA/).")
     parser.add_argument("--url", default=None, help="Default: this deployment's own address.")
     parser.add_argument("--token", default=None, help="Default: API_TOKEN from the .env.")
+    parser.add_argument("--admin-token", default=None,
+                        help="What closes the server during an update. Default: ADMIN_TOKEN from the "
+                             "environment, else the .env. Never printed.")
     parser.add_argument("--service", default=None, help="The compose service to restart.")
     parser.add_argument("--restart-cmd", default=None,
                         help="A shell command that restarts the server, instead of docker compose.")
@@ -932,6 +977,7 @@ def main(argv=None) -> int:
                              or server_ctl.DEFAULT_SERVER_IMAGE)
     args.url = args.url or server_ctl.url_for()
     args.token = args.token or os.environ.get("API_TOKEN") or env.get("API_TOKEN") or ""
+    args.admin_token = args.admin_token or os.environ.get("ADMIN_TOKEN") or env.get("ADMIN_TOKEN") or ""
     Agent(args).run()
     return 0
 

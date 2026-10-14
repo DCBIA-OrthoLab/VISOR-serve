@@ -668,3 +668,63 @@ def test_the_release_classifier_is_read_from_head_not_the_working_tree(agent_mod
                        capture_output=True, text=True, check=True).stdout
     assert agent_module._release_diff_source() == committed
     assert agent_module.release_diff.__file__.startswith("<HEAD:")
+
+
+def test_the_door_is_closed_with_the_admin_token_not_the_api_token(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path, admin_token="adm")
+    sent = []
+
+    class _Answer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    monkeypatch.setattr(agent_module.server_ctl, "server_urlopen",
+                        lambda request, timeout=None: sent.append(request) or _Answer())
+    assert agent.door(False, "updating") is None
+    request = sent[0]
+    assert request.full_url.endswith("/maintenance") and request.get_method() == "POST"
+    assert request.get_header("X-admin-token") == "adm"
+    assert request.get_header("Authorization") is None, "the API token must not travel with it"
+    assert json.loads(request.data)["accepting"] is False
+
+
+def test_with_no_admin_token_the_door_cannot_close(agent_module, repos, tmp_path):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path)
+    assert "ADMIN_TOKEN" in agent.door(False)
+
+
+def test_a_server_that_refuses_the_door_is_not_updated(agent_module, repos, tmp_path, monkeypatch):
+    """403: the server has no ADMIN_TOKEN. Restarting it without holding the
+    door would kill whatever run it admits meanwhile."""
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    agent = _agent(agent_module, checkout, tmp_path, admin_token="adm", restart_cmd="exit 1")
+    server = _FakeServer()
+    server.install(agent)
+    agent.door = lambda accepting, reason="": server.door_calls.append(accepting) or (
+        None if accepting else "the server has no ADMIN_TOKEN set, so it cannot be closed to new runs")
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "ADMIN_TOKEN" in last["message"]
+    assert (checkout / "server" / "main.py").read_text() != "v2", "nothing may be pulled"
+
+
+def test_a_door_that_never_closes_stops_the_update_before_the_pull(agent_module, repos, tmp_path, monkeypatch):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    agent = _agent(agent_module, checkout, tmp_path, admin_token="adm", restart_cmd="exit 1")
+    server = _FakeServer()
+    server.install(agent)
+    agent.door = lambda accepting, reason="": None if accepting else agent_module.DOOR_UNREACHABLE
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "Nothing was changed" in last["message"]
+    assert (checkout / "server" / "main.py").read_text() != "v2"

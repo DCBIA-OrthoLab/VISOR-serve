@@ -211,6 +211,7 @@ class _Args:
     drain_timeout = None
     timeout = 60
     once = True
+    admin_token = "admin"
 
 
 def test_a_change_needing_an_image_is_refused_without_pulling(monkeypatch):
@@ -397,3 +398,69 @@ def test_a_stale_pid_file_is_not_mistaken_for_a_running_agent(tmp_path, monkeypa
     pid_path.write_text(str(os.getpid()))        # this process is not the agent
     monkeypatch.setattr(ctl, "AGENT_PID", str(pid_path))
     assert ctl.agent_pid() is None
+
+
+def test_the_door_is_closed_with_the_admin_token(monkeypatch):
+    """POST /maintenance answers only to X-Admin-Token: the API token every
+    workstation holds must neither be sent nor be enough."""
+    git = _Git(local="aaaaaaa", changed=["server/main.py"])
+    sent = []
+    monkeypatch.setattr(ctl, "_git", git)
+    monkeypatch.setattr(ctl, "remote_head", lambda *a, **k: "bbbbbbb")
+    monkeypatch.setattr(ctl, "wait_until_idle", lambda *a, **k: True)
+    monkeypatch.setattr(ctl, "server_load", lambda *a, **k: _load(running=1))
+    monkeypatch.setattr(ctl, "_api", lambda url, token, path, payload=None, timeout=10.0, admin=False:
+                        sent.append((token, path, admin)) or {"accepting": payload["accepting"]})
+
+    ctl._watch_once("deploy", "http://x", "inference", "api", _Args())
+
+    assert sent and all(call == ("admin", "/maintenance", True) for call in sent)
+
+
+def test_no_admin_token_means_no_update(monkeypatch):
+    """Without it the door cannot close, so nothing is pulled."""
+    git = _Git(local="aaaaaaa", changed=["server/main.py"])
+    monkeypatch.setattr(ctl, "_git", git)
+    monkeypatch.setattr(ctl, "remote_head", lambda *a, **k: "bbbbbbb")
+    monkeypatch.setattr(ctl, "wait_until_idle", lambda *a, **k: True)
+    monkeypatch.setattr(ctl, "_api", lambda *a, **k: pytest.fail("nothing may be sent without the admin token"))
+
+    class _NoAdmin(_Args):
+        admin_token = ""
+
+    outcome = ctl._watch_once("deploy", "http://x", "inference", "api", _NoAdmin())
+
+    assert not git.pulled and "applied" not in outcome
+
+
+def test_the_admin_header_carries_the_admin_token_alone(monkeypatch):
+    seen = []
+
+    class _Answer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    monkeypatch.setattr(ctl, "server_urlopen", lambda request, timeout=None: seen.append(request) or _Answer())
+    ctl.set_accepting("https://x", "adm", False)
+    assert seen[0].get_header("X-admin-token") == "adm"
+    assert seen[0].get_header("Authorization") is None
+
+
+def test_apply_mode_refuses_to_start_without_an_admin_token(monkeypatch):
+    monkeypatch.delenv("ADMIN_TOKEN", raising=False)
+    monkeypatch.setattr(ctl, "read_env", lambda *a, **k: {"API_TOKEN": "api"})
+    monkeypatch.setattr(ctl, "_upstream", lambda *a, **k: "origin/deploy")
+    monkeypatch.setattr(ctl, "pick_service", lambda *a, **k: "inference")
+    monkeypatch.setattr(ctl, "_watch_once", lambda *a, **k: pytest.fail("it must refuse before polling"))
+    args = _Args()
+    args.mode = ctl.AUTO_UPDATE_APPLY
+    args.admin_token = None
+    args.service = None
+    with pytest.raises(ctl.ServerCtlError, match="ADMIN_TOKEN"):
+        ctl.cmd_watch(args)
