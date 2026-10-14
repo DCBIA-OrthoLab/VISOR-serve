@@ -141,6 +141,39 @@ def ensure_certificate() -> tuple:
     return cert, key
 
 
+def is_loopback(address: str) -> bool:
+    """Whether a publish address keeps the port on this machine."""
+    import ipaddress
+
+    address = (address or "").strip().strip("[]").lower()
+    if address in ("localhost", ""):
+        return address == "localhost"
+    try:
+        return ipaddress.ip_address(address).is_loopback
+    except ValueError:
+        return False
+
+
+def public_certificate_problem(cert: str, hostname: str = "") -> str:
+    """Why `cert` is not a publicly signed server certificate, or "".
+
+    Checked by `openssl verify` against the system's public authorities --
+    the same ones every client verifies against -- with the intermediates
+    taken from the file itself, so it must be the FULL chain (Let's Encrypt's
+    fullchain.pem, an institution's bundle). `hostname`, when known, must be
+    a name the certificate covers.
+    """
+    command = [_openssl(), "verify", "-purpose", "sslserver", "-untrusted", cert]
+    if hostname:
+        command += ["-verify_hostname", hostname]
+    command.append(cert)
+    checked = subprocess.run(command, capture_output=True, text=True, check=False)
+    if checked.returncode == 0:
+        return ""
+    reason = (checked.stderr or checked.stdout).strip().splitlines()
+    return reason[-1] if reason else "openssl verify failed"
+
+
 def require_active() -> None:
     """Refuse to serve unless serve.py configured the listener with TLS."""
     if os.environ.get(ACTIVE_ENV) != "1":

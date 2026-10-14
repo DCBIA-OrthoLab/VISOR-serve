@@ -80,14 +80,14 @@ container toolkit is installed. Force it with `--device gpu|cpu`.
 
 ### A word on where it listens
 
-The port is published on **`127.0.0.1`** and nowhere else, whatever starts
-the container: `docker-compose.yml` hard-codes it, and `--bind` / `BIND_ADDR`
-no longer change anything. The server speaks HTTPS only, with a self-signed
-certificate meant for `tailscale serve` alone; clients - this script and the
-update agent included - reach it at the `https://<name>.<tailnet>.ts.net` URL
-Tailscale publishes, and verify its publicly signed certificate. Until
-`setup-tailscale.sh` has run, `up` waits on the container's own healthcheck
-and says that no client can reach the server yet.
+The port is published on **`127.0.0.1`** unless `PUBLISH_ADDR` in `.env` says
+otherwise, and the server then refuses to start without a publicly signed
+certificate of its own (`server/README.md`, "HTTPS only"). `--bind` /
+`BIND_ADDR` no longer change anything. Clients - this script and the update
+agent included - are given `PUBLIC_URL`, or the URL `tailscale serve`
+publishes when it is unset, and verify its publicly signed certificate. Until
+one of them exists, `up` waits on the container's own healthcheck and says
+that no client can reach the server yet.
 
 `--port` moves the **host** side only (the container always serves 8000
 internally) and is remembered in `.env`, so it is passed once and not on every

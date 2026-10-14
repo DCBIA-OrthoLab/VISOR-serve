@@ -13,6 +13,7 @@ as the `uvicorn` command did.
 import argparse
 import os
 import sys
+import urllib.parse
 
 import uvicorn
 
@@ -43,6 +44,34 @@ def _weak_secrets() -> str:
     return ""
 
 
+def _exposure_problem(cert: str) -> str:
+    """Why this server may not be published where it is, or "".
+
+    On loopback it may listen with anything: only a front end on this machine
+    reaches it, and that front end presents the public certificate. Published
+    on a network address, clients reach THIS listener directly, so its own
+    certificate must be one they can verify: publicly signed, full chain, and
+    covering PUBLIC_URL's host. The self-signed one is never published.
+    """
+    public = settings.PUBLIC_URL.strip()
+    if public and urllib.parse.urlsplit(public).scheme != "https":
+        return f"PUBLIC_URL must be an https:// URL; {public!r} is not."
+    if tls.is_loopback(settings.PUBLISH_ADDR):
+        return ""
+    if not settings.TLS_CERT_FILE.strip():
+        return (f"PUBLISH_ADDR={settings.PUBLISH_ADDR} puts this server on the network, "
+                "which needs a publicly signed certificate: set TLS_CERT_FILE (full chain) "
+                "and TLS_KEY_FILE, or publish on 127.0.0.1 behind tailscale serve or a reverse proxy.")
+    hostname = urllib.parse.urlsplit(settings.PUBLIC_URL).hostname or ""
+    if not hostname:
+        return "PUBLISH_ADDR is a network address: set PUBLIC_URL to the https URL clients use."
+    problem = tls.public_certificate_problem(cert, hostname)
+    if problem:
+        return (f"TLS_CERT_FILE is not a publicly signed certificate for {hostname} "
+                f"({problem}). Clients would refuse it.")
+    return ""
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1")
@@ -63,6 +92,10 @@ def main(argv=None) -> int:
         cert, key = tls.ensure_certificate()
     except tls.TLSConfigurationError as exc:
         print(f"serve.py: {exc}", file=sys.stderr)
+        return 1
+    exposure = _exposure_problem(cert)
+    if exposure:
+        print(f"serve.py: {exposure}", file=sys.stderr)
         return 1
     # Every patient file the server holds -- uploads, job directories, results
     # kept by reference, run state -- lives under TEMP_DIR, created by this

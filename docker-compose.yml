@@ -21,6 +21,8 @@ x-inference-base: &inference-base
   shm_size: 8gb
   working_dir: /workspace/server
   volumes:
+    # See `inference-venvs`: a public certificate, when TLS_CERT_FILE names one.
+    - ./tls:/etc/visor-tls:ro
     - ./server:/workspace/server
     - ./DATA:/data:ro
     - ./scripts:/workspace/scripts:ro
@@ -45,15 +47,16 @@ x-inference-base: &inference-base
     # to generate.
     - ${UV_PYTHON_STORE:-./docker/fixtures}:${UV_PYTHON_STORE:-/workspace/docker/fixtures}:ro
   ports:
-    # Loopback only, and deliberately not configurable. The one way in from
-    # another machine is `tailscale serve`, which presents the publicly signed
-    # certificate every client verifies; behind it the server speaks HTTPS too
-    # (server/tls.py), with a self-signed certificate no client trusts. A port
-    # published on a network address would offer exactly that certificate to
-    # the network, so there is no BIND_ADDR here any more.
+    # Loopback by default: clients reach the server through a front end on
+    # this machine that presents a publicly signed certificate -- `tailscale
+    # serve`, or a reverse proxy -- and the server's own self-signed one never
+    # leaves it. PUBLISH_ADDR puts the port on a network address instead, for a
+    # server that presents a public certificate ITSELF (TLS_CERT_FILE); the
+    # same value reaches serve.py, which refuses to start published anywhere
+    # but loopback without one (server/serve.py, _exposure_problem).
     #
     # HOST_PORT moves the HOST side only; the container always serves 8000.
-    - "127.0.0.1:${HOST_PORT:-8000}:8000"
+    - "${PUBLISH_ADDR:-127.0.0.1}:${HOST_PORT:-8000}:8000"
   # The container's own probe (serve.py --check): it verifies the server
   # against the certificate file it listens with, from inside, and is what
   # server_ctl.py waits on before a public URL exists.
@@ -141,6 +144,13 @@ services:
       # uvicorn takes the right-most untrusted hop, which nginx appends, so a
       # client cannot name another machine by sending the header itself.
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
+      # How clients reach it (see `ports` and server/serve.py). The
+      # certificate files, when it presents a public one itself, are read
+      # from ./tls, mounted read-only below.
+      - PUBLISH_ADDR=${PUBLISH_ADDR:-127.0.0.1}
+      - PUBLIC_URL=${PUBLIC_URL:-}
+      - TLS_CERT_FILE=${TLS_CERT_FILE:-}
+      - TLS_KEY_FILE=${TLS_KEY_FILE:-}
 
     deploy:
       resources:
@@ -181,6 +191,13 @@ services:
       - SCHEMA_CACHE_DIR=/tmp/schema-cache
       # Trusted proxies for `X-Forwarded-For`; see the `inference` service.
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
+      # How clients reach it (see `ports` and server/serve.py). The
+      # certificate files, when it presents a public one itself, are read
+      # from ./tls, mounted read-only below.
+      - PUBLISH_ADDR=${PUBLISH_ADDR:-127.0.0.1}
+      - PUBLIC_URL=${PUBLIC_URL:-}
+      - TLS_CERT_FILE=${TLS_CERT_FILE:-}
+      - TLS_KEY_FILE=${TLS_KEY_FILE:-}
 
   # The pytest suite in the same environment as `inference`, without the GPU
   # reservation: asking for a GPU here would make the pre-push hook fail on any
@@ -281,8 +298,19 @@ services:
       - TLS_DIR=/var/cache/sadt/tls
       # Trusted proxies for `X-Forwarded-For`; see the `inference` service.
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
+      # How clients reach it (see `ports` and server/serve.py). The
+      # certificate files, when it presents a public one itself, are read
+      # from ./tls, mounted read-only below.
+      - PUBLISH_ADDR=${PUBLISH_ADDR:-127.0.0.1}
+      - PUBLIC_URL=${PUBLIC_URL:-}
+      - TLS_CERT_FILE=${TLS_CERT_FILE:-}
+      - TLS_KEY_FILE=${TLS_KEY_FILE:-}
     volumes:
       - sadt-cache:/var/cache/sadt
+      # A publicly signed certificate, when this server presents one itself
+      # (TLS_CERT_FILE=/etc/visor-tls/fullchain.pem in .env). Read-only; the
+      # key must be readable by the container's user (uid 999).
+      - ./tls:/etc/visor-tls:ro
       # Read-only, and outside the image: an image gets copied around, a mount
       # does not.
       - ./DATA:/DATA:ro
@@ -299,7 +327,7 @@ services:
     # the tools are moved over one at a time. Loopback only, for the same
     # reason as `inference`: tailscale serve is the only way in.
     ports:
-      - "127.0.0.1:${VENVS_HOST_PORT:-8001}:8000"
+      - "${PUBLISH_ADDR:-127.0.0.1}:${VENVS_HOST_PORT:-8001}:8000"
     healthcheck:
       test: ["CMD", "/opt/sadt/.venv/bin/python", "serve.py", "--check", "--port", "8000"]
       interval: 15s

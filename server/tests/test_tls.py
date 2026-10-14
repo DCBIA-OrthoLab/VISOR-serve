@@ -146,3 +146,67 @@ def test_every_response_carries_the_security_headers():
     assert response.headers["Strict-Transport-Security"].startswith("max-age=")
     assert response.headers["X-Frame-Options"] == "DENY"
     assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+def _issue(tmp_path, hostname="visor.example.org"):
+    """A throwaway authority and a server certificate it signed, as full chain."""
+    run = lambda *args: subprocess.run(["openssl", *args], check=True, capture_output=True)
+    ca_key, ca = tmp_path / "ca.key", tmp_path / "ca.pem"
+    run("req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        "-days", "2", "-subj", "/CN=Test Root", "-keyout", str(ca_key), "-out", str(ca))
+    key, csr, leaf = tmp_path / "key.pem", tmp_path / "leaf.csr", tmp_path / "leaf.pem"
+    run("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+        "-subj", f"/CN={hostname}", "-keyout", str(key), "-out", str(csr))
+    extensions = tmp_path / "ext.cnf"
+    extensions.write_text(f"subjectAltName=DNS:{hostname}\nextendedKeyUsage=serverAuth\n")
+    run("x509", "-req", "-in", str(csr), "-CA", str(ca), "-CAkey", str(ca_key), "-CAcreateserial",
+        "-days", "1", "-extfile", str(extensions), "-out", str(leaf))
+    return str(ca), str(leaf), str(key)
+
+
+@pytest.fixture
+def published(monkeypatch, tls_dir):
+    monkeypatch.setattr(settings, "PUBLISH_ADDR", "0.0.0.0")
+    monkeypatch.setattr(settings, "PUBLIC_URL", "https://visor.example.org")
+
+
+def test_loopback_may_listen_with_the_self_signed_certificate(tls_dir):
+    cert, _key = tls.ensure_certificate()
+    assert serve._exposure_problem(cert) == ""
+
+
+def test_published_without_an_operator_certificate_is_refused(published):
+    cert, _key = tls.ensure_certificate()
+    assert "publicly signed certificate" in serve._exposure_problem(cert)
+
+
+def test_published_with_the_self_signed_certificate_is_refused(published, monkeypatch):
+    cert, key = tls.ensure_certificate()
+    monkeypatch.setattr(settings, "TLS_CERT_FILE", cert)
+    monkeypatch.setattr(settings, "TLS_KEY_FILE", key)
+    assert "not a publicly signed certificate" in serve._exposure_problem(cert)
+
+
+def test_published_with_a_certificate_an_authority_signed_starts(published, monkeypatch, tmp_path):
+    ca, leaf, key = _issue(tmp_path)
+    # The test alone makes its authority a "public" one; production reads the
+    # system store and nothing else.
+    monkeypatch.setenv("SSL_CERT_FILE", ca)
+    monkeypatch.setattr(settings, "TLS_CERT_FILE", leaf)
+    monkeypatch.setattr(settings, "TLS_KEY_FILE", key)
+    assert serve._exposure_problem(leaf) == ""
+    monkeypatch.setattr(settings, "PUBLIC_URL", "https://another.example.org")
+    assert "not a publicly signed certificate" in serve._exposure_problem(leaf)
+
+
+def test_a_plain_http_public_url_is_refused(monkeypatch, tls_dir):
+    monkeypatch.setattr(settings, "PUBLIC_URL", "http://visor.example.org")
+    cert, _key = tls.ensure_certificate()
+    assert "https://" in serve._exposure_problem(cert)
+
+
+def test_server_ctl_gives_clients_the_configured_public_url_and_never_http(monkeypatch):
+    monkeypatch.setattr(server_ctl, "read_env", lambda: {"PUBLIC_URL": "https://visor.example.org/"})
+    assert server_ctl.public_url() == "https://visor.example.org"
+    monkeypatch.setattr(server_ctl, "read_env", lambda: {"PUBLIC_URL": "http://visor.example.org"})
+    assert server_ctl.public_url() == ""

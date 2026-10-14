@@ -753,8 +753,9 @@ else
     echo
     echo "This deployment is NOT reachable by any client yet. It listens over HTTPS"
     echo "on 127.0.0.1 only, with a self-signed certificate no client accepts:"
-    echo "clients verify a publicly signed certificate, which only Tailscale gives"
-    echo "it. Re-run with --tailscale (this machine's own Slicer included)."
+    echo "clients verify a publicly signed certificate. Re-run with --tailscale, or"
+    echo "put a reverse proxy or the server's own certificate in front and set"
+    echo "PUBLIC_URL (server/README.md, \"HTTPS only\")."
 fi
 
 print_hints

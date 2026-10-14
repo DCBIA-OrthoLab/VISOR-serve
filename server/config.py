@@ -39,6 +39,16 @@ class Settings(BaseSettings):
     TLS_CERT_FILE: str = ""
     TLS_KEY_FILE: str = ""
     TLS_DIR: str = os.path.join(_SERVER_DIR, ".tls")
+    # Where the port is published (docker-compose.yml passes the same value it
+    # publishes on). Loopback by default: the self-signed certificate is for a
+    # front end on this machine -- `tailscale serve`, a reverse proxy -- and
+    # never for a client. Anywhere else, serve.py refuses to start unless the
+    # certificate it listens with is publicly signed (tls.public_certificate_problem).
+    PUBLISH_ADDR: str = "127.0.0.1"
+    # The address clients are given, whatever presents its public certificate:
+    # `tailscale serve`, a reverse proxy, or this server itself. Empty: the
+    # URL `tailscale serve` publishes, if any (scripts/server_ctl.py).
+    PUBLIC_URL: str = ""
 
     # --- running a tool -----------------------------------------------
     # "subprocess" runs a tool in its own virtualenv through runner.py, so the

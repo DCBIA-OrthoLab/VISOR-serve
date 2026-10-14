@@ -371,6 +371,20 @@ def url_for(port=None, bind_addr=None) -> str:
 
 
 def public_url() -> str:
+    """The https URL clients are given: PUBLIC_URL from .env, else Tailscale's.
+
+    PUBLIC_URL names whatever presents the public certificate -- a reverse
+    proxy, or the server itself with TLS_CERT_FILE -- and Tailscale is the
+    fallback, not the requirement. An http:// value is not an address any
+    client accepts, so it is not returned.
+    """
+    configured = read_env().get("PUBLIC_URL", "").strip().rstrip("/")
+    if configured:
+        return configured if configured.startswith("https://") else ""
+    return tailnet_url()
+
+
+def tailnet_url() -> str:
     """The https URL `tailscale serve` publishes on this machine, or ""."""
     if not shutil.which("tailscale"):
         return ""
@@ -792,6 +806,20 @@ def data_dir() -> str:
     return os.path.join(REPO_ROOT, "DATA")
 
 
+def ensure_tls_dir() -> str:
+    """Create ./tls before docker can, for the same reason as DATA/.
+
+    It is mounted read-only as /etc/visor-tls and holds a publicly signed
+    certificate only when the operator puts one there (TLS_CERT_FILE).
+    """
+    root = os.path.join(REPO_ROOT, "tls")
+    try:
+        os.makedirs(root, mode=0o755, exist_ok=True)
+    except OSError as exc:
+        raise ServerCtlError(f"Could not create {root}: {exc}") from None
+    return root
+
+
 def ensure_data_dir() -> str:
     """Create DATA/ as the invoking user, BEFORE docker can create it as root.
 
@@ -1070,9 +1098,9 @@ def cmd_status(args) -> dict:
         "service": service,
         "clone": clone,
         "container": container_status(service),
-        # `tailnet_url`: the only address a client may be given (url_for).
-        # "" until setup-tailscale.sh has run.
-        "server": {"url": url, "tailnet_url": public_url(), "healthy": health(url)},
+        # `public_url`: the only address a client may be given (url_for).
+        # "" until PUBLIC_URL is set or setup-tailscale.sh has run.
+        "server": {"url": url, "public_url": public_url(), "healthy": health(url)},
         # Deliberately no token here: a status dump lands in log panes and bug
         # reports. `server_ctl.py token` is the one way to read it.
         "env": {
@@ -1179,6 +1207,7 @@ def cmd_up(args) -> dict:
     port = args.port or effective_port()
     _preflight(service, port)
     ensure_data_dir()
+    ensure_tls_dir()
     token = ensure_env(service, args.bind, token=args.token, port=port)
     # After ensure_env, so a --port lands in .env before the URL is derived
     # from it -- compose and the health check must not read different ports.
@@ -1216,7 +1245,7 @@ def cmd_up(args) -> dict:
         "deps_install_skipped": deps_skipped,
         "service": service,
         "url": url,
-        "tailnet_url": public_url(),
+        "public_url": public_url(),
         "healthy": healthy,
         "token": token,
         "data_dir": data_dir(),
@@ -1286,6 +1315,7 @@ def cmd_update(args) -> dict:
     result["pulled_image"] = True
 
     ensure_data_dir()
+    ensure_tls_dir()
     ensure_env(service, args.bind)
     if _stream(compose_base(service) + ["up", "-d", "--force-recreate", service], cwd=REPO_ROOT) != 0:
         raise ServerCtlError(f"'docker compose up --force-recreate' failed for service '{service}'.")

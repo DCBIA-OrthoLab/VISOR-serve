@@ -145,12 +145,34 @@ it with `python serve.py` (the image and `docker-compose.yml` do), never with
 ./venv/bin/python serve.py --host 127.0.0.1 --port 8000
 ```
 
-`serve.py` listens with `TLS_CERT_FILE`/`TLS_KEY_FILE` when set, and otherwise
-with a self-signed certificate it generates once into `TLS_DIR` (`server/tls.py`).
-That certificate is for `tailscale serve` alone, which reaches it on 127.0.0.1:
-**every client verifies a publicly signed certificate**, the one Tailscale
-presents at `https://<name>.<tailnet>.ts.net` (`scripts/setup-tailscale.sh`),
-and nothing else - no `-k`, no custom CA, no pinning, this machine included.
+Every client verifies a **publicly signed certificate** - no `-k`, no custom
+CA, no pinning, this machine included - and is given one address, `PUBLIC_URL`.
+Three ways to present that certificate, all equivalent to a client:
+
+1. **`tailscale serve`** (`scripts/setup-tailscale.sh`): Tailscale fetches and
+   renews the certificate for `https://<name>.<tailnet>.ts.net`, and is used
+   when `PUBLIC_URL` is not set.
+2. **A reverse proxy** (nginx, Caddy...) on the same machine, with a Let's
+   Encrypt or institutional certificate, forwarding to `https://127.0.0.1:8000`.
+   Set `PUBLIC_URL` to its address.
+3. **The server itself**, for a general server with its own domain: put the
+   full chain and the key in `./tls/` (key readable by uid 999), and in `.env`:
+
+   ```
+   PUBLISH_ADDR=0.0.0.0
+   PUBLIC_URL=https://visor.example.org
+   TLS_CERT_FILE=/etc/visor-tls/fullchain.pem
+   TLS_KEY_FILE=/etc/visor-tls/privkey.pem
+   ```
+
+   The certificate is loaded at start: restart the container after a renewal.
+
+Without `TLS_CERT_FILE`, `serve.py` listens with a self-signed certificate it
+generates once into `TLS_DIR` (`server/tls.py`), for a front end on 127.0.0.1
+only. The port is published on loopback unless `PUBLISH_ADDR` says otherwise,
+and `serve.py` **refuses to start** published anywhere else unless
+`TLS_CERT_FILE` verifies, with `openssl verify` against the system's public
+authorities, as a certificate for `PUBLIC_URL`'s host.
 
 ## Testing with curl
 
