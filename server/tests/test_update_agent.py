@@ -646,3 +646,16 @@ def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path, mon
         assert agent._post_run("Bad", {}, 10) == (422, "no such input")
     finally:
         httpd.shutdown()
+
+
+def test_the_release_classifier_is_read_from_head_not_the_working_tree(agent_module):
+    """server/ is writable from the container; what the agent executes must be
+    what the operator committed."""
+    import subprocess as sp
+    root = agent_module.REPO_ROOT
+    if not os.path.exists(os.path.join(root, ".git")):
+        pytest.skip("no git checkout mounted here")
+    committed = sp.run(["git", "-C", root, "show", "HEAD:server/wire/release_diff.py"],
+                       capture_output=True, text=True, check=True).stdout
+    assert agent_module._release_diff_source() == committed
+    assert agent_module.release_diff.__file__.startswith("<HEAD:")

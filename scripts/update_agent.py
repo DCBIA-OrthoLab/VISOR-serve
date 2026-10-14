@@ -64,6 +64,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import uuid
 import urllib.error
 import urllib.request
@@ -99,13 +100,33 @@ REQUEST_POLL_SECONDS = 2
 DOOR_LEASE_SECONDS = 90
 LOG_LINES = 40
 
+def _release_diff_source() -> str:
+    """The source of server/wire/release_diff.py as COMMITTED at HEAD.
+
+    Never the working tree: the server container bind-mounts server/ read-write,
+    so a file there is whatever the container last wrote, and executing it here
+    would run container-controlled code on the host. HEAD is what the operator
+    fetched, and the container sees .git read-only. A tree with no .git at all
+    (a test image mounting scripts/ and server/ alone) has no HEAD to read and
+    no agent deployed in it, and falls back to the file.
+    """
+    relative = "server/wire/release_diff.py"
+    if not os.path.exists(os.path.join(REPO_ROOT, ".git")):
+        with open(os.path.join(REPO_ROOT, *relative.split("/")), encoding="utf-8") as handle:
+            return handle.read()
+    done = subprocess.run(["git", "-C", REPO_ROOT, "show", f"HEAD:{relative}"],
+                          capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        raise RuntimeError(f"cannot read {relative} at HEAD: {done.stderr.strip() or 'git refused'}")
+    return done.stdout
+
+
 def _load_release_diff():
-    """The classification the server's own "Check for updates" uses, loaded by
-    path so the panel and this agent can never disagree about a commit."""
-    path = os.path.join(REPO_ROOT, "server", "wire", "release_diff.py")
-    spec = importlib.util.spec_from_file_location("release_diff_for_agent", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    """The classification the server's own "Check for updates" uses, so the
+    panel and this agent can never disagree about a commit."""
+    module = types.ModuleType("release_diff_for_agent")
+    module.__file__ = "<HEAD:server/wire/release_diff.py>"
+    exec(compile(_release_diff_source(), module.__file__, "exec"), module.__dict__)
     return module
 
 
