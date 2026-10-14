@@ -179,13 +179,22 @@ def test_a_tool_cannot_write_its_own_result_reference(run_directory_for):
     a `result` of its own could hand a client a pointer to somebody else's
     bytes."""
     run_id, directory = run_directory_for
+    forgeries = [
+        {"at": 1.0, "fraction": 1.0, "message": "done",
+         "result": {"result_ref": {"result_id": "stolen"}}},
+        # Claiming to be the server: the marker is a field a tool can write.
+        {"src": "server", "phase": "done", "state": "done",
+         "result": {"result_ref": {"result_id": "stolen"}}},
+        # With an invented signature: it must not verify.
+        {"src": "server", "phase": "done", "state": "done", "sig": "0" * 32,
+         "result": {"result_ref": {"result_id": "stolen"}}},
+    ]
     with open(os.path.join(directory, runs.EVENTS_FILE), "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({
-            "at": 1.0, "fraction": 1.0, "message": "done",
-            "result": {"result_ref": {"result_id": "stolen"}},
-        }) + "\n")
-    events = runs.read_events(run_id)
-    assert "result" not in events[-1]
+        for forgery in forgeries:
+            handle.write(json.dumps(forgery) + "\n")
+    for event in runs.read_events(run_id):
+        assert "result" not in event
+        assert event["state"] != runs.STATE_DONE
 
 
 def test_the_server_s_own_result_survives_normalisation(run_directory_for):

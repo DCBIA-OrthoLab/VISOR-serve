@@ -12,6 +12,7 @@ as the `uvicorn` command did.
 
 import argparse
 import os
+import secrets
 import sys
 import urllib.parse
 
@@ -106,6 +107,11 @@ def main(argv=None) -> int:
     # Inherited by --reload's worker process, which is the one that runs the
     # lifespan check.
     os.environ[tls.ACTIVE_ENV] = "1"
+    # One signing key for the whole server, so every worker agrees on which run
+    # events are the server's own; inherited by the workers, stripped from the
+    # tools (execution/dispatch.SERVER_SECRETS). Set only if absent, so a
+    # --reload worker keeps the parent's.
+    os.environ.setdefault("SADT_EVENT_SIGNING_KEY", secrets.token_urlsafe(32))
     uvicorn.run("main:app", host=args.host, port=args.port, reload=args.reload,
                 ssl_certfile=cert, ssl_keyfile=key)
     return 0

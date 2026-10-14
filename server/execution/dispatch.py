@@ -581,7 +581,9 @@ def _thread_limits(cpus=None, channels: int = 1) -> dict:
 
 # What a tool process never inherits. Every subprocess the server starts goes
 # through `child_environment_base()`, not only a run.
-SERVER_SECRETS = ("API_TOKEN", "ADMIN_TOKEN", "TLS_KEY_FILE")
+SERVER_SECRETS = ("API_TOKEN", "ADMIN_TOKEN", "TLS_KEY_FILE",
+                  # So a tool cannot sign a run event as the server (wire/runs.py).
+                  "SADT_EVENT_SIGNING_KEY")
 
 
 def child_environment_base() -> dict:
