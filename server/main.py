@@ -164,6 +164,27 @@ def _is_observer(path: str) -> bool:
                for prefix in _UNCOUNTED_PATHS)
 
 
+# On every response. HSTS: this server is HTTPS only, so a browser that has
+# seen it once never tries it in the clear. The rest protects the operator
+# pages (the admin token lives in their localStorage): no framing, no MIME
+# sniffing, no referrer carrying a run id or a path to another site.
+_SECURITY_HEADERS = {
+    "Strict-Transport-Security": "max-age=31536000",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
+
+
 @app.middleware("http")
 async def _count_inflight(request: Request, call_next):
     """How many requests are being served at this instant, for `/admin-panel`.
