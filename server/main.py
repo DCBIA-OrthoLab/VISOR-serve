@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import traceback
 import zlib
 from typing import Optional
 
@@ -2064,6 +2065,26 @@ async def upload_status(upload_id: str) -> dict:
     }
 
 
+async def _read_bounded(request: Request, limit: int) -> bytes:
+    received = bytearray()
+    async for piece in request.stream():
+        received += piece
+        if len(received) > limit:
+            raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                                detail=f"A part is at most {limit} bytes.")
+    return bytes(received)
+
+
+def _gunzip_bounded(data: bytes, limit: int) -> bytes:
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = inflater.decompress(data, limit + 1)
+    if len(out) > limit or inflater.unconsumed_tail:
+        raise ValueError(f"it inflates past {limit} bytes")
+    if not inflater.eof:
+        raise ValueError("it is truncated")
+    return out
+
+
 @app.put("/uploads/{upload_id}/parts/{index}", dependencies=[Depends(verify_token)])
 async def upload_part(upload_id: str, index: int, request: Request) -> dict:
     """Receive one part, verify it, write it at its offset.
@@ -2073,11 +2094,16 @@ async def upload_part(upload_id: str, index: int, request: Request) -> dict:
     compressed (an uncompressed .nii or .vtk is 3-4x smaller deflated), and
     `X-Part-SHA256` is checked against what lands on disk either way.
     """
-    body = await request.body()
+    # No part is ever larger than the largest chunk the server hands out, so
+    # nothing bigger is read -- nor inflated: a gzip part is decompressed with
+    # a ceiling, or one small bomb holds the whole server's memory.
+    # Gzip can grow incompressible bytes a little, hence the margin.
+    body = await _read_bounded(request, transfer.MAX_CHUNK_BYTES + 1024 * 1024)
     if request.headers.get("Content-Encoding", "").lower() == "gzip":
         try:
-            body = await anyio.to_thread.run_sync(gzip.decompress, body)
-        except (OSError, EOFError, zlib.error) as exc:
+            body = await anyio.to_thread.run_sync(
+                _gunzip_bounded, body, transfer.MAX_CHUNK_BYTES)
+        except (OSError, EOFError, zlib.error, ValueError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Part {index} is not readable gzip: {exc}",
@@ -2923,10 +2949,21 @@ def _stage_corrections(tool, job_dir: str, form) -> list:
         landed = os.path.join(destination, name)
         with open(landed, "wb") as handle:
             shutil.copyfileobj(value.file, handle)
+        if os.path.getsize(landed) > settings.MAX_UPLOAD_MB * 1024 * 1024:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=f"The correction for '{slot}' exceeds the {settings.MAX_UPLOAD_MB} MB limit.")
         if landed.lower().endswith(".zip"):
             # Untrusted: `extract_zip` refuses zip slip, symlink members and
-            # anything over MAX_EXTRACTED_MB before a byte is written.
-            file_utils.extract_zip(landed, destination)
+            # anything over MAX_EXTRACTED_MB before a byte is written -- when
+            # it is given that limit, which it does not apply on its own.
+            try:
+                file_utils.extract_zip(landed, destination,
+                                       max_total_bytes=_MAX_EXTRACTED_BYTES)
+            except file_utils.BadArchiveError as exc:
+                shutil.rmtree(destination, ignore_errors=True)
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
             os.remove(landed)
         if not any(os.scandir(destination)):
             # An empty replacement would put NOTHING where the step's output
@@ -3526,8 +3563,14 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # the run id and so only it can record how the run ended.
         _discard(work_dir, scratch_dirs)
         raise
-    except Exception:
-        logger.exception("endpoint=/run/%s status=500", tool_name)
+    except Exception as exc:
+        # Not logger.exception: a ToolExecutionError's message is the tool's
+        # stderr tail, which names the files it was working on -- a patient's.
+        # The redacted diagnosis says where and why; the frames (code, never
+        # values) say which line of this server, for a bug of its own.
+        logger.error("endpoint=/run/%s status=500 failure: %s\n%s", tool_name,
+                     _described(_diagnosis(exc, tool_name)),
+                     "".join(traceback.format_tb(exc.__traceback__)).rstrip())
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=500, detail="Tool execution failed.")
     finally:

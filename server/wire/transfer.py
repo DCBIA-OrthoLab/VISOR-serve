@@ -201,6 +201,11 @@ def create_upload(filename: str, size: int, chunk_size: Optional[int] = None) ->
     return session
 
 
+# The largest part the server ever hands out, and so the most a part request
+# may carry once inflated.
+MAX_CHUNK_BYTES = 64 * 1024 * 1024
+
+
 def _clamped_chunk_size(requested: Optional[int]) -> int:
     """The client may ask for a part size; the server decides.
 
@@ -208,10 +213,10 @@ def _clamped_chunk_size(requested: Optional[int]) -> int:
     too-large one gives the parallelism nothing to work with -- one 2 GB part
     is the single-stream transfer this module exists to replace.
     """
-    default = settings.UPLOAD_CHUNK_MB * 1024 * 1024
+    default = min(settings.UPLOAD_CHUNK_MB * 1024 * 1024, MAX_CHUNK_BYTES)
     if not requested:
         return default
-    return max(1024 * 1024, min(int(requested), 64 * 1024 * 1024))
+    return max(1024 * 1024, min(int(requested), MAX_CHUNK_BYTES))
 
 
 def get_upload(upload_id: str) -> UploadSession:
