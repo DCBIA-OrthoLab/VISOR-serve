@@ -438,8 +438,8 @@ def test_a_tools_image_update_drains_pulls_recreates_and_reopens(agent_module, r
     server.install(agent)
     pulled = []
 
-    def pull(image):
-        pulled.append(image)
+    def pull(image, digest=""):
+        pulled.append((image, digest))
         registry.local["digest"] = registry.remote
         return True
 
@@ -447,7 +447,8 @@ def test_a_tools_image_update_drains_pulls_recreates_and_reopens(agent_module, r
     agent.apply(_request(agent))
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is True and "tools to tools-2026.10.13-1" in last["message"]
-    assert pulled == [TOOLS_IMAGE]
+    # The digest the survey compared, not whatever the tag names by then.
+    assert pulled == [(TOOLS_IMAGE, "sha256:bbb")]
     assert server.door_calls[0] is False and server.door_calls[-1] is True
 
 
@@ -457,7 +458,7 @@ def test_a_failed_image_pull_restarts_nothing_and_reopens(agent_module, repos, t
     agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE, restart_cmd="exit 1")
     server = _FakeServer()
     server.install(agent)
-    agent.pull_image = lambda image: False
+    agent.pull_image = lambda image, digest="": False
     agent.apply(_request(agent))
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is False and "Nothing was restarted" in last["message"]
@@ -479,12 +480,12 @@ def test_a_server_commit_needing_an_image_waits_for_the_published_one(agent_modu
 
     registry.remote = "sha256:bbb"
     pulled = []
-    agent.pull_image = lambda image: pulled.append(image) or True
+    agent.pull_image = lambda image, digest="": pulled.append((image, digest)) or True
     agent.apply(_request(agent))
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is True
     assert (checkout / "docker" / "server.Dockerfile").read_text() == "FROM y"
-    assert pulled == ["ghcr.io/lab/visor-serve:deploy"]
+    assert pulled == [("ghcr.io/lab/visor-serve:deploy", "sha256:bbb")]
 
 
 def test_apply_mode_files_an_update_for_a_new_tools_image(agent_module, repos, tmp_path, monkeypatch):
@@ -646,6 +647,14 @@ def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path, mon
         assert agent._post_run("Bad", {}, 10) == (422, "no such input")
     finally:
         httpd.shutdown()
+
+
+def test_a_pull_is_pinned_to_the_digest_that_was_compared(agent_module):
+    pinned = agent_module._pinned
+    assert pinned("ghcr.io/lab/tools:deploy", "sha256:abc") == "ghcr.io/lab/tools@sha256:abc"
+    assert pinned("localhost:5000/tools:deploy", "sha256:abc") == "localhost:5000/tools@sha256:abc"
+    assert pinned("ghcr.io/lab/tools", "sha256:abc") == "ghcr.io/lab/tools@sha256:abc"
+    assert pinned("ghcr.io/lab/tools:deploy", "") == "ghcr.io/lab/tools:deploy"
 
 
 def test_the_release_classifier_is_read_from_head_not_the_working_tree(agent_module):

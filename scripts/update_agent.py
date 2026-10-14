@@ -287,6 +287,17 @@ def inspect_image(image: str, kind: str, fetch: bool = True, cache: dict = None)
     return info
 
 
+def _pinned(image: str, digest: str) -> str:
+    """`image` with its tag replaced by `digest` (`name@sha256:...`), or
+    `image` itself when no digest is known."""
+    if not digest or not digest.startswith("sha256:"):
+        return image
+    name = image.split("@", 1)[0]
+    if ":" in name.rsplit("/", 1)[-1]:
+        name = name.rsplit(":", 1)[0]
+    return f"{name}@{digest}"
+
+
 def blockers(info: dict) -> list:
     """Why this checkout cannot be updated from the panel, or []."""
     reasons = []
@@ -577,7 +588,7 @@ class Agent:
             for info in parts:
                 if info.get("image"):
                     self.phase(f"Pulling {info['image']} ({info['target']}).")
-                    if not self.pull_image(info["image"]):
+                    if not self.pull_image(info["image"], info.get("pending_digest", "")):
                         message = f"Pulling {info['image']} failed; see the log. Nothing was restarted."
                         return
                     applied[info["kind"]] = info["target"]
@@ -594,7 +605,8 @@ class Agent:
                     restart = RECREATE
                 if info["kind"] == "server" and info["changes"]["action"] == IMAGE:
                     self.phase(f"Pulling the published server image {self.args.server_image}.")
-                    if not self.pull_image(self.args.server_image):
+                    if not self.pull_image(self.args.server_image,
+                                           self.server_image.get("pending_digest", "")):
                         message = ("The server code is pulled but its image could not be; "
                                    "the server was not restarted.")
                         return
@@ -749,15 +761,28 @@ class Agent:
         threading.Thread(target=renew, name="door-keeper", daemon=True).start()
         return released
 
-    def pull_image(self, image: str) -> bool:
-        """`docker pull`, its notable lines kept for the panel's log."""
-        process = subprocess.Popen(["docker", "pull", image], stdout=subprocess.PIPE,
+    def pull_image(self, image: str, digest: str = "") -> bool:
+        """`docker pull`, its notable lines kept for the panel's log.
+
+        With `digest` -- the one the survey compared -- the exact manifest is
+        pulled and then tagged as `image`, so what is installed is what was
+        judged, not whatever the tag points at by the time the pull starts.
+        """
+        reference = _pinned(image, digest)
+        process = subprocess.Popen(["docker", "pull", reference], stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True)
         for line in process.stdout:
             line = line.rstrip()
             if line and not line.endswith(("Waiting", "Pulling fs layer", "Download complete")):
                 self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
-        return process.wait() == 0
+        if process.wait() != 0:
+            return False
+        if reference == image:
+            return True
+        done = subprocess.run(["docker", "tag", reference, image], capture_output=True, text=True)
+        if done.returncode != 0:
+            self.log_lines = (self.log_lines + [(done.stderr or "docker tag failed").strip()])[-LOG_LINES:]
+        return done.returncode == 0
 
     def wait_idle(self, why: str) -> None:
         """Block until nothing is in flight. The last check before a restart:
