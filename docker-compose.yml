@@ -80,7 +80,7 @@ x-inference-base: &inference-base
            echo 'DEPENDENCY-INSTALL-SKIPPED: pip failed (offline?); continuing with what is already installed' >&2;
            python -c 'import fastapi, uvicorn' ||
            { echo 'DEPENDENCY-INSTALL-FATAL: fastapi is not importable and pip could not install it. This container needs network access once.' >&2; exit 1; };
-           uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+           python serve.py --host 0.0.0.0 --port 8000 --reload"
   restart: unless-stopped
 
 # Shared by the two test services, which differ only in whether they get the
@@ -270,6 +270,10 @@ services:
       # The admin panel and its controls answer only to this. Unset, the panel stays closed.
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DEVICE=${DEVICE:-cuda}
+      # The server's self-signed certificate (server/tls.py), in the cache
+      # volume so it survives a recreate and a pinned client keeps trusting it.
+      # Repeated from the Dockerfile for images built before it said so.
+      - TLS_DIR=/var/cache/sadt/tls
       # Trusted proxies for `X-Forwarded-For`; see the `inference` service.
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
     volumes:
@@ -283,6 +287,9 @@ services:
       # could not be configured at all. Mounted over the image's own copy, which
       # stays the default for a deployment that mounts nothing here.
       - ./server/deployment.toml:/opt/sadt/server/deployment.toml:ro
+    # HTTPS only (server/tls.py). Repeated from the Dockerfile's CMD for
+    # images built before it said so, which still start `uvicorn` in the clear.
+    command: ["/opt/sadt/.venv/bin/python", "serve.py", "--host", "0.0.0.0", "--port", "8000"]
     # Port 8001 by default, so it can run beside the in-process server while
     # the tools are moved over one at a time.
     ports:

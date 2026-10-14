@@ -212,6 +212,9 @@ ENV SADT_DISPATCH_MODE=subprocess \
     DEPLOYMENT_CONFIG=/opt/sadt/server/deployment.toml \
     DATA_DIR=/DATA \
     TEMP_DIR=/jobs \
+    # The self-signed certificate server/tls.py generates when the operator
+    # supplies none: persistent (the cache volume) and writable by `sadt`.
+    TLS_DIR=/var/cache/sadt/tls \
     PYTHONDONTWRITEBYTECODE=1
 
 # Third-party code from fifteen upstreams runs in this container, on
@@ -229,4 +232,5 @@ WORKDIR /opt/sadt/server
 EXPOSE 8000
 
 # No --reload: this image is the artifact, not a mount of a working tree.
-CMD ["/opt/sadt/.venv/bin/uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# serve.py, never `uvicorn` directly: it is what makes the listener HTTPS-only.
+CMD ["/opt/sadt/.venv/bin/python", "serve.py", "--host", "0.0.0.0", "--port", "8000"]

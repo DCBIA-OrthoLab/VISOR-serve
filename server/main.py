@@ -46,6 +46,7 @@ import resources
 import benchmark_jobs
 import benchmark_presets
 import telemetry
+import tls
 from wire import (benchmark_launch_page, benchmark_page, debug_page, doc_page,
                   maintenance, runs, status_page, transfer)
 from base import (
@@ -111,6 +112,8 @@ async def _trace_loop() -> None:
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # Before anything else: a server started without TLS does not start at all.
+    tls.require_active()
     # Said out loud, once, before anything runs. A budget that did not take
     # effect -- a variable set in the wrong file, a container limit nobody
     # applied -- has no symptom other than a server that feels slow, so the
@@ -1508,18 +1511,17 @@ def _custom_plan(spec: dict) -> dict:
 
 
 def _local_base(request: Request) -> str:
-    """`http://127.0.0.1:<port>`: this server, on its own loopback.
+    """`https://127.0.0.1:<port>`: this server, on its own loopback.
 
     The battery runs in the same container as uvicorn, so it never needs to
-    leave it: loopback traffic does not reach the Docker network, the host or
-    anything beyond, which is the property that makes plain HTTP acceptable
-    here -- the same plain HTTP the reverse proxy already speaks to uvicorn
-    after terminating TLS, only shorter. The port is the one uvicorn accepted
+    leave it, and it still speaks TLS: this server has no plain-HTTP listener
+    to speak anything else to (tls.py). It pins the server's own certificate
+    (benchmark_jobs passes its path). The port is the one uvicorn accepted
     this request on.
     """
     server = request.scope.get("server") or (None, 8000)
     port = server[1] or 8000
-    return f"http://127.0.0.1:{port}"
+    return f"https://127.0.0.1:{port}"
 
 
 @app.post("/benchmark/run", dependencies=[Depends(verify_admin), Depends(maintenance.require_accepting)])
@@ -1787,6 +1789,7 @@ def tool_pairs(tool_name: str, wanted: _PairsRequest) -> dict:
             completed = subprocess.run(
                 [interpreter, settings.RUNNER_PATH, "--job", os.path.join(job_dir, "job.json")],
                 capture_output=True, text=True, timeout=_PAIRS_TIMEOUT_SECONDS, cwd=job_dir,
+                env=dispatch.child_environment_base(),
             )
         except subprocess.TimeoutExpired:
             raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -1795,7 +1798,9 @@ def tool_pairs(tool_name: str, wanted: _PairsRequest) -> dict:
             with open(os.path.join(job_dir, "result.json"), encoding="utf-8") as handle:
                 body = json.load(handle)
         except (OSError, ValueError):
-            logger.error("pairs for %s failed without a result: %s", tool.name, completed.stderr[-2000:])
+            # Its input is patient file names, so its stderr is scrubbed first.
+            logger.error("pairs for %s failed without a result: %s", tool.name,
+                         redact.scrub(completed.stderr[-2000:]))
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                 detail=f"{tool.name} could not pair these inputs.")
         if "error" in body:

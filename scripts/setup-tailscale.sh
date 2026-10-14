@@ -10,15 +10,17 @@
 #   1. installs Tailscale (https://tailscale.com/install.sh, their own script),
 #   2. joins the tailnet with an auth key, asked for without echoing it,
 #   3. checks the tailnet has HTTPS certificates turned on,
-#   4. publishes http://127.0.0.1:PORT as https://<name>.<tailnet>.ts.net with
-#      `tailscale serve`, which fetches and renews the certificate itself,
+#   4. publishes https+insecure://127.0.0.1:PORT as https://<name>.<tailnet>.ts.net
+#      with `tailscale serve`, which fetches and renews the certificate itself,
 #   5. checks the server answers there, and prints the URL to hand out.
 #
-# `tailscale serve` is the TLS terminator SECURITY.md asks for, in place of
-# nginx: the server keeps speaking plain HTTP on loopback, and the only way in
-# from another machine is the encrypted tailnet. That only holds if the port
-# is NOT also published on a network address, which is why this warns when
-# .env has BIND_ADDR set to anything but 127.0.0.1.
+# `tailscale serve` presents the publicly signed certificate clients verify.
+# Behind it the server speaks HTTPS too -- it has no plain-HTTP listener at all
+# (server/tls.py) -- with a self-signed certificate, which is what the
+# `+insecure` means: tailscaled does not verify a certificate no authority
+# signed, on a hop that never leaves this machine. It is still encrypted. The
+# only way in from another machine should be the tailnet, which is why this
+# warns when .env has BIND_ADDR set to anything but 127.0.0.1.
 #
 # The auth key comes from the tailnet's admin console (Settings -> Keys ->
 # Generate auth key). For a server: NOT reusable, tagged (tag:server), so the
@@ -221,8 +223,10 @@ fi
 
 # --- 4. publish ----------------------------------------------------------
 # Kept across reboots by tailscaled itself; nothing has to run at start-up.
-echo "Publishing http://127.0.0.1:$PORT as https://$FQDN ..."
-tailscale serve --bg "http://127.0.0.1:$PORT" >/dev/null
+# Re-running replaces a configuration an older version of this script wrote,
+# which pointed at http:// -- a backend the server no longer answers.
+echo "Publishing https+insecure://127.0.0.1:$PORT as https://$FQDN ..."
+tailscale serve --bg "https+insecure://127.0.0.1:$PORT" >/dev/null
 
 if [ "$AUTO_UPDATE" -eq 1 ]; then
     # A machine holding medical images should not sit on a stale VPN client.

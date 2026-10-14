@@ -125,10 +125,10 @@ def test_a_battery_reaches_this_server_on_its_loopback_not_the_public_address(ad
                            headers={**admin, "Host": "public.example.org",
                                     "X-Forwarded-Proto": "https"})
     assert response.status_code == 200, response.text
-    assert seen["base"].startswith("http://127.0.0.1:")
+    assert seen["base"].startswith("https://127.0.0.1:")
 
 
 def test_the_loopback_keeps_the_port_uvicorn_listens_on():
     class Request:
         scope = {"server": ("172.18.0.2", 8001)}
-    assert main._local_base(Request()) == "http://127.0.0.1:8001"
+    assert main._local_base(Request()) == "https://127.0.0.1:8001"

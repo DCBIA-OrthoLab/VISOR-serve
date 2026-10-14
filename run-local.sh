@@ -25,14 +25,15 @@ LOG="${LOG:-$HERE/local-server.log}"
 echo "tools   : $TOOLS_DIR"
 echo "data    : $DATA_DIR"
 echo "token   : $API_TOKEN"
-echo "url     : http://127.0.0.1:8001"
+echo "url     : https://localhost:8001  (self-signed: server/.tls/cert.pem)"
 echo "log     : $LOG"
 echo
 
-# The venv was created at another path, so its console scripts carry a dead
-# shebang; invoking uvicorn as a module sidesteps that.
+# serve.py rather than `uvicorn`: it is the only way to start the server, and
+# it only ever listens over HTTPS (server/tls.py), here with a self-signed
+# certificate kept in server/.tls/.
 cd "$HERE/server"
 # Logged as well as shown: a tool failure is a traceback in here, and it is the
 # only place it exists -- the client gets a status code and a one-line message.
-exec "$HERE/server/venv/bin/python" -m uvicorn main:app \
+exec "$HERE/server/venv/bin/python" serve.py \
     --host 127.0.0.1 --port 8001 "$@" 2>&1 | tee -a "$LOG"

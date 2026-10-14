@@ -14,6 +14,7 @@ remote, and lets the agent look. What must hold:
 import importlib.util
 import json
 import os
+import ssl
 import subprocess
 import sys
 
@@ -128,7 +129,7 @@ class _FakeServer:
 def _agent(agent_module, checkout, tmp_path, **extra):
     args = agent_module.argparse.Namespace(
         server_repo=str(checkout), tools_repo="", update_dir=str(tmp_path / "update"),
-        url="http://127.0.0.1:1", token="t", service=None, restart_cmd="true", poll=60,
+        url="https://127.0.0.1:1", token="t", service=None, restart_cmd="true", poll=60,
         data_dir=str(tmp_path / "DATA"),
         health_timeout=5, no_sync=True, once=True)
     for key, value in extra.items():
@@ -621,10 +622,19 @@ def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path):
             pass
 
     httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    # Over TLS, as the real server is: the agent refuses http:// outright and
+    # pins what this loopback presents.
+    cert, key = str(tmp_path / "cert.pem"), str(tmp_path / "key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                    "-nodes", "-days", "1", "-subj", "/CN=test", "-keyout", key, "-out", cert],
+                   check=True, capture_output=True)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         _writer, checkout = repos
-        agent = _agent(agent_module, checkout, tmp_path, url=f"http://127.0.0.1:{httpd.server_port}")
+        agent = _agent(agent_module, checkout, tmp_path, url=f"https://127.0.0.1:{httpd.server_port}")
         assert agent._post_run("Good", {"scans": "test.nii.gz"}, 10) == (200, "")
         assert seen["path"] == "/run/Good" and seen["run_id"]
         assert 'name="scans"' in seen["body"] and "test.nii.gz" in seen["body"]

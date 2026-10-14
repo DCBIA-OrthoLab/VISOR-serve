@@ -38,6 +38,7 @@ from typing import Any, Optional
 import file_utils
 import resources
 import telemetry
+import tls
 from execution import admission, concurrency, costs, nested, reports
 from base import ToolUnavailableError
 from config import settings
@@ -578,17 +579,30 @@ def _thread_limits(cpus=None, channels: int = 1) -> dict:
     return {name: threads for name in _THREAD_VARIABLES}
 
 
+# What a tool process never inherits. Every subprocess the server starts goes
+# through `child_environment_base()`, not only a run.
+SERVER_SECRETS = ("API_TOKEN", "ADMIN_TOKEN", "TLS_KEY_FILE")
+
+
+def child_environment_base() -> dict:
+    """os.environ minus the server's secrets, for any process it starts."""
+    environment = dict(os.environ)
+    for secret in SERVER_SECRETS:
+        environment.pop(secret, None)
+    return environment
+
+
 def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = None,
                        progress_file: Optional[str] = None) -> dict:
     """The environment the tool process runs in.
 
     Inherited rather than rebuilt: tools legitimately need PATH, HOME,
     LD_LIBRARY_PATH, CUDA_VISIBLE_DEVICES and whatever else the deployment
-    sets. API_TOKEN is removed -- it is the server's credential, a tool has no
-    use for it, and the tool venvs hold third-party code.
+    sets. The server's credentials are removed -- API_TOKEN, ADMIN_TOKEN and
+    where its TLS key lives -- a tool has no use for them, and the tool venvs
+    hold third-party code.
     """
-    environment = dict(os.environ)
-    environment.pop("API_TOKEN", None)
+    environment = child_environment_base()
     environment.update(_thread_limits())
     if timeout:
         # An ABSOLUTE instant on the monotonic clock, not a duration: the clock's
@@ -614,6 +628,9 @@ def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = Non
     environment.update(
         {
             "SADT_API": settings.SADT_API,
+            # The server speaks only HTTPS (tls.py); a tool reading SADT_API
+            # verifies against this certificate, the one it is listening with.
+            "SADT_API_CAFILE": tls.certificate_paths()[0],
             "SADT_JOB_ID": job_id,
             "SADT_JOB_DIR": job_dir,
             # What a nested level needs to size ITSELF, since it cannot import

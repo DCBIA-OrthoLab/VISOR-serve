@@ -35,11 +35,13 @@ import os
 import secrets
 import shutil
 import socket
+import ssl
 import signal
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -372,7 +374,50 @@ def url_for(port=None, bind_addr=None) -> str:
     # that -- so localhost stays the right thing to talk to.
     if bind_addr and bind_addr not in ("127.0.0.1", "localhost", "0.0.0.0", "::"):
         host = f"[{bind_addr}]" if ":" in bind_addr else bind_addr
-    return f"http://{host}:{port or effective_port()}"
+    return f"https://{host}:{port or effective_port()}"
+
+
+_LOOPBACK = ("localhost", "127.0.0.1", "::1")
+_PINNED = {}
+
+
+def tls_context(url: str) -> ssl.SSLContext:
+    """How to verify the server at `url`, which only ever speaks HTTPS.
+
+    A remote address is verified the ordinary way: it is reached through
+    `tailscale serve`, whose certificate an authority signed. The server on
+    THIS machine presents a self-signed certificate it generated itself
+    (server/tls.py), and there is no authority to check it against, so it is
+    pinned on first use over loopback. That is only acceptable because the
+    bytes never leave the machine: anything able to answer on this machine's
+    loopback can already read what is being sent. An `http://` URL is refused
+    outright, so nothing here can send the token in the clear.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https":
+        raise ValueError(f"The server only speaks HTTPS; refusing {parsed.scheme or 'a schemeless'} URL.")
+    host = (parsed.hostname or "").lower()
+    if host not in _LOOPBACK:
+        return ssl.create_default_context()
+    port = parsed.port or 443
+    if (host, port) not in _PINNED:
+        try:
+            pem = ssl.get_server_certificate((host, port), timeout=5)
+        except TypeError:  # Python < 3.10 has no timeout here
+            pem = ssl.get_server_certificate((host, port))
+        context = ssl.create_default_context(cadata=pem)
+        # The certificate itself is pinned, so the name adds nothing -- and an
+        # operator's own certificate names the public address, not localhost.
+        context.check_hostname = False
+        context.verify_flags |= getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+        _PINNED[(host, port)] = context
+    return _PINNED[(host, port)]
+
+
+def server_urlopen(target, timeout: float):
+    """`urllib.request.urlopen` for this server: HTTPS, verified (tls_context)."""
+    url = target.full_url if isinstance(target, urllib.request.Request) else target
+    return urllib.request.urlopen(target, timeout=timeout, context=tls_context(url))
 
 
 def ensure_env(service: str, bind_addr=None, token=None, port=None) -> str:
@@ -630,7 +675,7 @@ def health(url=None, timeout: float = 5.0) -> bool:
     """GET /health. Never raises - an unreachable server just means "not up"."""
     url = url or url_for()
     try:
-        with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as response:
+        with server_urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as response:
             if response.status != 200:
                 return False
             return json.loads(response.read().decode("utf-8")).get("status") == "ok"
@@ -899,7 +944,7 @@ def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0):
         request.data = json.dumps(payload).encode("utf-8")
         request.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with server_urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -1101,6 +1146,30 @@ def _preflight(service: str, port=None) -> None:
         )
 
 
+def warn_if_tailscale_serves_http(port: int) -> bool:
+    """Say so when `tailscale serve` still forwards to plain http:// here.
+
+    An older setup-tailscale.sh published `http://127.0.0.1:PORT`. The server
+    has no plain-HTTP listener any more (server/tls.py), so every remote client
+    of such a machine gets a 502 while the local health check passes. Fixing it
+    needs root, so this only says how.
+    """
+    if not shutil.which("tailscale"):
+        return False
+    try:
+        listing = subprocess.run(["tailscale", "serve", "status"], capture_output=True,
+                                 text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    stale = any(f"http://127.0.0.1:{port}" in line or f"http://localhost:{port}" in line
+                for line in listing.splitlines())
+    if stale:
+        log(f"WARNING: `tailscale serve` forwards to http://127.0.0.1:{port}, which this server "
+            "no longer answers: remote clients get an error. Re-run, as root: "
+            f"sh {os.path.join(_SCRIPT_DIR, 'setup-tailscale.sh')} --port {port}")
+    return stale
+
+
 def cmd_up(args) -> dict:
     service = pick_service(args.device)
     port = args.port or effective_port()
@@ -1138,6 +1207,7 @@ def cmd_up(args) -> dict:
 
     healthy = wait_for_health(url, args.timeout, service) if args.wait else False
     deps_skipped = warn_if_deps_skipped(service) if healthy else False
+    warn_if_tailscale_serves_http(port)
     return {
         "deps_install_skipped": deps_skipped,
         "service": service,
@@ -1816,7 +1886,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if with_url:
             sub.add_argument("--url", default=None,
-                             help="Where to health-check. Default: http://localhost:<HOST_PORT>.")
+                             help="Where to health-check. Default: https://localhost:<HOST_PORT>.")
 
     status = subparsers.add_parser("status", help="Report every prerequisite, the clone, and the container.")
     add_common(status)

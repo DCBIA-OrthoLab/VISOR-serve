@@ -161,7 +161,7 @@ print_hints() {
     _ctl="$INSTALL_DIR/scripts/server_ctl.py"
     _port="$(sed -n 's/^HOST_PORT=//p' "$INSTALL_DIR/.env" 2>/dev/null | tail -n1)"
     _port="${_port:-${PORT:-8000}}"
-    _url="http://localhost:${_port}"
+    _url="https://localhost:${_port}"
     if command -v tailscale >/dev/null 2>&1; then
         _ts_url="$(tailscale serve status 2>/dev/null | grep -o 'https://[^ ]*' | head -n1)"
         [ -n "$_ts_url" ] && _url="$_ts_url"
@@ -753,9 +753,9 @@ if [ "$TAILSCALE" -eq 1 ]; then
     fi
 else
     echo
-    echo "This deployment listens on ${BIND} over plain HTTP. That is fine for"
-    echo "localhost; putting it on a network address requires a TLS terminator in"
-    echo "front -- see SECURITY.md, or re-run with --tailscale."
+    echo "This deployment listens on ${BIND} over HTTPS only, with a self-signed"
+    echo "certificate: a client on this machine pins it, a client on another one"
+    echo "cannot verify it. To serve other machines, re-run with --tailscale."
 fi
 
 print_hints

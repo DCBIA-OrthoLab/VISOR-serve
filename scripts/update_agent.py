@@ -411,7 +411,7 @@ class Agent:
             request.data = json.dumps(payload).encode("utf-8")
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with server_ctl.server_urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8") or "{}")
         except Exception:  # noqa: BLE001 - a probe answers None
             return None
@@ -439,7 +439,7 @@ class Agent:
 
     def healthy(self) -> bool:
         try:
-            with urllib.request.urlopen(f"{self.url.rstrip('/')}/health", timeout=5) as response:
+            with server_ctl.server_urlopen(f"{self.url.rstrip('/')}/health", timeout=5) as response:
                 return response.status == 200
         except Exception:  # noqa: BLE001
             return False
@@ -696,7 +696,7 @@ class Agent:
             headers={"Authorization": f"Bearer {self.token}", "X-Run-Id": str(uuid.uuid4()),
                      "Content-Type": f"multipart/form-data; boundary={boundary}"})
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with server_ctl.server_urlopen(request, timeout=timeout) as response:
                 while response.read(1 << 20):
                     pass
                 return response.status, ""
