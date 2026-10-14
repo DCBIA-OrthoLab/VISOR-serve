@@ -3260,6 +3260,26 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         if spec is not None and spec.server_selectable:
             server_file_args[field_name] = args.pop(field_name)
 
+    # Whatever file argument is left must arrive as bytes: an upload, or an
+    # `__uploads__` reference. A plain form string would otherwise reach the
+    # tool as a path ON THIS SERVER (base.Tool._coerce wraps any string), so a
+    # workstation could point a tool at another run's inputs under TEMP_DIR,
+    # at /proc/self/environ, or at a "model" of its own making.
+    # An empty value, or one sent beside the upload of the same field, is the
+    # form's placeholder and says nothing: the bytes win, or the argument is
+    # simply absent.
+    for field_name in list(args):
+        spec = tool.arguments.get(field_name)
+        if spec is None or not spec.is_file:
+            continue
+        if (args[field_name] in ("", None) or field_name in uploaded_files
+                or field_name in upload_references):
+            args.pop(field_name)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"'{field_name}' is a file: upload it, it cannot be named by a path.")
+
 
     work_dir = None
     input_paths = []
