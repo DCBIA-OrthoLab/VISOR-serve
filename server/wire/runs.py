@@ -39,11 +39,14 @@ from it, and the client gets exactly the monotonic key the contract promises.
 
 import contextvars
 import errno
+import hashlib
+import hmac
 import json
 import logging
 import math
 import os
 import re
+import secrets
 import shutil
 import time
 from typing import List, Optional
@@ -131,6 +134,41 @@ _TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,64}")
 # which would end every watcher's stream while the run had hours left.
 _SOURCE_KEY = "src"
 _SERVER_SOURCE = "server"
+
+# A tool appends to this same file, so `src: server` is a field it can write
+# too -- the docstring above scopes that marker as accident-prevention, not a
+# boundary. Where the server's word actually matters (the terminal phase that
+# ends a watcher's stream, the `result_ref` it then collects, the `measured`
+# cost the budget believes), a record is trusted only when it carries a valid
+# signature. The key is generated once per server (serve.py puts it in the
+# environment so every uvicorn worker shares the one value) and stripped from
+# the tool's environment beside the other secrets (execution/dispatch.py), so
+# a tool cannot compute it. A tool may still REPLAY a genuine server record it
+# can read, which only ever repeats what the server already said.
+_SIG_KEY_ENV = "SADT_EVENT_SIGNING_KEY"
+_SIG_FIELD = "sig"
+
+
+def _signing_key() -> bytes:
+    key = os.environ.get(_SIG_KEY_ENV)
+    if not key:
+        # No serve.py in front (a test, an import): one per process is enough,
+        # since nothing else writes this run's file.
+        key = secrets.token_urlsafe(32)
+        os.environ[_SIG_KEY_ENV] = key
+    return key.encode("utf-8")
+
+
+def _signature(record: dict) -> str:
+    material = json.dumps({k: v for k, v in record.items() if k != _SIG_FIELD},
+                          separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return hmac.new(_signing_key(), material, hashlib.sha256).hexdigest()[:32]
+
+
+def _is_server_record(raw: dict) -> bool:
+    signature = raw.get(_SIG_FIELD)
+    return (isinstance(signature, str)
+            and hmac.compare_digest(signature, _signature(raw)))
 
 # A record longer than this cannot be appended atomically, so it is not
 # appended at all. Unreachable with a truncated message -- 200 characters of
@@ -514,6 +552,9 @@ def append(run_id: str, phase: str, fraction=None, message: str = "",
         record["result"] = result
     if measured is not None:
         record["measured"] = measured
+    # Signed last, over everything above, so a reader can tell this from a
+    # tool's line in the same file (see _is_server_record).
+    record[_SIG_FIELD] = _signature(record)
     _append_record(directory, record)
 
 
@@ -610,8 +651,9 @@ def _normalised(raw: dict, seq: int, seen_at: float) -> dict:
       seen, which the 0.25s poll keeps within a quarter second of the truth,
       and an implausible `depth` reads as the root's.
     """
+    server_signed = _is_server_record(raw)
     phase = raw.get("phase")
-    if raw.get(_SOURCE_KEY) == _SERVER_SOURCE and phase in _STATE_OF_PHASE:
+    if server_signed and phase in _STATE_OF_PHASE:
         state = _STATE_OF_PHASE[phase]
     else:
         state, phase = STATE_RUNNING, PHASE_RUNNING
@@ -635,7 +677,7 @@ def _normalised(raw: dict, seq: int, seen_at: float) -> dict:
     call = raw.get("call")
     call = call if isinstance(call, str) and _CALL_ID.fullmatch(call) else None
 
-    if raw.get("kind") == LOG_KIND and raw.get(_SOURCE_KEY) != _SERVER_SOURCE:
+    if raw.get("kind") == LOG_KIND and not server_signed:
         # A log line. `state` and `phase` ride along as a running tool's, so
         # that anything reading `event["state"]` -- the terminal check above
         # all -- reads a log line as harmless; it carries no fraction, because
@@ -685,11 +727,11 @@ def _normalised(raw: dict, seq: int, seen_at: float) -> dict:
     # Only ever from the server, and for the same reason a phase is: a TOOL
     # appends to this same file, and a tool able to write its own `result`
     # could hand the client a pointer to somebody else's bytes.
-    if raw.get(_SOURCE_KEY) == _SERVER_SOURCE and isinstance(raw.get("result"), dict):
+    if server_signed and isinstance(raw.get("result"), dict):
         event["result"] = raw["result"]
     # Server-sourced for the same reason, and for a sharper one: a tool able to
     # write its own cost could tell the budget it is free.
-    if raw.get(_SOURCE_KEY) == _SERVER_SOURCE:
+    if server_signed:
         measured = _clean_measured(raw.get("measured"))
         if measured:
             event["measured"] = measured
@@ -790,7 +832,7 @@ class _ProgressTree:
 
     def feed(self, event: dict, raw: dict) -> dict:
         """Fold one tool record into the tree; return it with the run's fraction."""
-        if raw.get(_SOURCE_KEY) == _SERVER_SOURCE:
+        if _is_server_record(raw):
             return event
         call = event.get("call")
         if event.get("tool"):

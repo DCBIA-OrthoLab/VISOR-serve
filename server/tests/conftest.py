@@ -23,6 +23,9 @@ import pytest
 
 # Set before anything builds config.Settings().
 os.environ.setdefault("API_TOKEN", "test-token")
+# What serve.py sets once the listener has its certificate; the in-process
+# TestClient has no listener, so main.py's lifespan check is told it has one.
+os.environ.setdefault("SADT_TLS_ACTIVE", "1")
 
 import config
 import file_utils

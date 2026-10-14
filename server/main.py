@@ -7,16 +7,20 @@
 import contextlib
 import functools
 import gzip
+import hashlib
+import hmac
 import json
 import logging
 import math
 import mimetypes
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import tempfile
 import time
+import traceback
 import zlib
 from typing import Optional
 
@@ -46,6 +50,7 @@ import resources
 import benchmark_jobs
 import benchmark_presets
 import telemetry
+import tls
 from wire import (benchmark_launch_page, benchmark_page, debug_page, doc_page,
                   maintenance, runs, status_page, transfer)
 from base import (
@@ -111,6 +116,8 @@ async def _trace_loop() -> None:
 
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
+    # Before anything else: a server started without TLS does not start at all.
+    tls.require_active()
     # Said out loud, once, before anything runs. A budget that did not take
     # effect -- a variable set in the wrong file, a container limit nobody
     # applied -- has no symptom other than a server that feels slow, so the
@@ -155,6 +162,27 @@ _UNCOUNTED_PATHS = ("/admin-panel", "/server-debug", "/status", "/health", "/run
 def _is_observer(path: str) -> bool:
     return any(path == prefix.rstrip("/") or path.startswith(prefix)
                for prefix in _UNCOUNTED_PATHS)
+
+
+# On every response. HSTS: this server is HTTPS only, so a browser that has
+# seen it once never tries it in the clear. The rest protects the operator
+# pages (the admin token lives in their localStorage): no framing, no MIME
+# sniffing, no referrer carrying a run id or a path to another site.
+_SECURITY_HEADERS = {
+    "Strict-Transport-Security": "max-age=31536000",
+    "X-Frame-Options": "DENY",
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for name, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
 
 
 @app.middleware("http")
@@ -518,6 +546,27 @@ def _log_served(tool_name: str, start_time: float, received: int, sent: Optional
     )
 
 
+def _confined_outputs(outputs: list, roots) -> list:
+    """`outputs`, refused unless each lies inside one of this request's `roots`.
+
+    A tool's result names its outputs, and the server used to stream, zip,
+    move into the result store and then DELETE whatever it named: another
+    run's directory under TEMP_DIR, /proc/self/environ, the TLS key. The roots
+    are the directories this request created or was handed -- its work dir,
+    its tracked scratch dirs (the job directory among them), and the job
+    directory a resume picks up -- and nothing a tool writes can add to them.
+    """
+    allowed = [os.path.realpath(root) for root in roots if root]
+    for path in outputs:
+        if os.path.islink(path):
+            raise ValueError(f"An output is a symbolic link: {os.path.basename(path)}")
+        resolved = os.path.realpath(path)
+        if not any(resolved == root or os.path.commonpath([root, resolved]) == root
+                   for root in allowed):
+            raise ValueError("A tool returned an output outside its own directories.")
+    return outputs
+
+
 def _output_roots(outputs: list, work_dir: str) -> set:
     """TEMP_DIR folders holding the tool's outputs, excluding the request's own
     work dir (already scheduled for cleanup by the caller)."""
@@ -715,6 +764,37 @@ def _extensions_of(spec) -> Optional[dict]:
     return per_type or None
 
 
+# A run id is a capability: whoever holds it reads the run's events, downloads
+# its result through the reference the last event carries, cancels it, and
+# feeds corrections into it when it pauses. /status answers every workstation
+# holding the shared token, so it names a run by a keyed hash instead -- stable
+# for the life of the process, so a page can follow a run from poll to poll,
+# and useless as an id. The operator panel reads the real ids through
+# /admin-panel.json, behind the admin token.
+_RUN_HANDLE_KEY = secrets.token_bytes(32)
+_RUN_ID_KEYS = ("run_id", "parent")
+
+
+def _run_handle(run_id: str) -> str:
+    return "~" + hmac.new(_RUN_HANDLE_KEY, run_id.encode("utf-8"), hashlib.sha256).hexdigest()[:20]
+
+
+def _masked_run_ids(value):
+    if isinstance(value, list):
+        return [_masked_run_ids(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    masked = {}
+    for key, item in value.items():
+        if key in _RUN_ID_KEYS and isinstance(item, str):
+            masked[key] = _run_handle(item)
+        elif key == "priorities" and isinstance(item, dict):
+            masked[key] = {_run_handle(str(name)): level for name, level in item.items()}
+        else:
+            masked[key] = _masked_run_ids(item)
+    return masked
+
+
 @app.get("/status", dependencies=[Depends(verify_token)])
 def server_status() -> dict:
     # NOT named `status`: `fastapi.status` is imported in this module and a
@@ -744,7 +824,7 @@ def server_status() -> dict:
     except Exception:  # noqa: BLE001 - a status page must not fail on a probe
         pass
     learned = costs.known()
-    return {
+    return _masked_run_ids({
         "budget": {
             "cpus": allocation.cpus,
             "ram_bytes": allocation.ram_bytes,
@@ -775,7 +855,7 @@ def server_status() -> dict:
             }
             for name, cost in learned.items() if cost
         },
-    }
+    })
 
 
 class _Maintenance(BaseModel):
@@ -786,7 +866,7 @@ class _Maintenance(BaseModel):
     reason: str = ""
 
 
-@app.post("/maintenance", dependencies=[Depends(verify_token)])
+@app.post("/maintenance", dependencies=[Depends(verify_admin)])
 def set_maintenance(wanted: _Maintenance) -> dict:
     """Close or reopen this server to new work.
 
@@ -806,6 +886,13 @@ def set_maintenance(wanted: _Maintenance) -> dict:
     `/status` to confirm nothing slipped in, pulls, and lets the restart clear
     the flag. What is held is the restart, not the drain.
     """
+    # The operator's credential, not the API token every workstation holds:
+    # with that one, any workstation could close the server to everyone, for
+    # ever by renewing, or reopen a closure an operator had made. The updater
+    # runs on the host and reads ADMIN_TOKEN from the same .env.
+    if wanted.seconds is not None and not math.isfinite(wanted.seconds):
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                            detail="seconds must be a finite number.")
     if not wanted.accepting:
         granted = maintenance.close(
             wanted.seconds if wanted.seconds is not None else 60.0, wanted.reason
@@ -1508,18 +1595,17 @@ def _custom_plan(spec: dict) -> dict:
 
 
 def _local_base(request: Request) -> str:
-    """`http://127.0.0.1:<port>`: this server, on its own loopback.
+    """`https://127.0.0.1:<port>`: this server, on its own loopback.
 
     The battery runs in the same container as uvicorn, so it never needs to
-    leave it: loopback traffic does not reach the Docker network, the host or
-    anything beyond, which is the property that makes plain HTTP acceptable
-    here -- the same plain HTTP the reverse proxy already speaks to uvicorn
-    after terminating TLS, only shorter. The port is the one uvicorn accepted
+    leave it, and it still speaks TLS: this server has no plain-HTTP listener
+    to speak anything else to (tls.py). It pins the server's own certificate
+    (benchmark_jobs passes its path). The port is the one uvicorn accepted
     this request on.
     """
     server = request.scope.get("server") or (None, 8000)
     port = server[1] or 8000
-    return f"http://127.0.0.1:{port}"
+    return f"https://127.0.0.1:{port}"
 
 
 @app.post("/benchmark/run", dependencies=[Depends(verify_admin), Depends(maintenance.require_accepting)])
@@ -1787,6 +1873,7 @@ def tool_pairs(tool_name: str, wanted: _PairsRequest) -> dict:
             completed = subprocess.run(
                 [interpreter, settings.RUNNER_PATH, "--job", os.path.join(job_dir, "job.json")],
                 capture_output=True, text=True, timeout=_PAIRS_TIMEOUT_SECONDS, cwd=job_dir,
+                env=dispatch.child_environment_base(),
             )
         except subprocess.TimeoutExpired:
             raise HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT,
@@ -1795,7 +1882,9 @@ def tool_pairs(tool_name: str, wanted: _PairsRequest) -> dict:
             with open(os.path.join(job_dir, "result.json"), encoding="utf-8") as handle:
                 body = json.load(handle)
         except (OSError, ValueError):
-            logger.error("pairs for %s failed without a result: %s", tool.name, completed.stderr[-2000:])
+            # Its input is patient file names, so its stderr is scrubbed first.
+            logger.error("pairs for %s failed without a result: %s", tool.name,
+                         redact.scrub(completed.stderr[-2000:]))
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                                 detail=f"{tool.name} could not pair these inputs.")
         if "error" in body:
@@ -1901,6 +1990,13 @@ async def download_testfile(tool_name: str, filename: str,
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
+    # Only a scope this tool's deployment declares: the query string is the
+    # client's, and data_store re-checks it regardless.
+    declared = {spec.selectable_scope for spec in tool.arguments.values()
+                if getattr(spec, "selectable_scope", None)}
+    if scope and scope not in declared:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"No test file '{filename}' for tool '{tool.name}'.")
     try:
         resolved = data_store.resolve_testfile(
             deployment_config.data_slug(tool.name), filename,
@@ -2025,6 +2121,26 @@ async def upload_status(upload_id: str) -> dict:
     }
 
 
+async def _read_bounded(request: Request, limit: int) -> bytes:
+    received = bytearray()
+    async for piece in request.stream():
+        received += piece
+        if len(received) > limit:
+            raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                                detail=f"A part is at most {limit} bytes.")
+    return bytes(received)
+
+
+def _gunzip_bounded(data: bytes, limit: int) -> bytes:
+    inflater = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    out = inflater.decompress(data, limit + 1)
+    if len(out) > limit or inflater.unconsumed_tail:
+        raise ValueError(f"it inflates past {limit} bytes")
+    if not inflater.eof:
+        raise ValueError("it is truncated")
+    return out
+
+
 @app.put("/uploads/{upload_id}/parts/{index}", dependencies=[Depends(verify_token)])
 async def upload_part(upload_id: str, index: int, request: Request) -> dict:
     """Receive one part, verify it, write it at its offset.
@@ -2034,11 +2150,16 @@ async def upload_part(upload_id: str, index: int, request: Request) -> dict:
     compressed (an uncompressed .nii or .vtk is 3-4x smaller deflated), and
     `X-Part-SHA256` is checked against what lands on disk either way.
     """
-    body = await request.body()
+    # No part is ever larger than the largest chunk the server hands out, so
+    # nothing bigger is read -- nor inflated: a gzip part is decompressed with
+    # a ceiling, or one small bomb holds the whole server's memory.
+    # Gzip can grow incompressible bytes a little, hence the margin.
+    body = await _read_bounded(request, transfer.MAX_CHUNK_BYTES + 1024 * 1024)
     if request.headers.get("Content-Encoding", "").lower() == "gzip":
         try:
-            body = await anyio.to_thread.run_sync(gzip.decompress, body)
-        except (OSError, EOFError, zlib.error) as exc:
+            body = await anyio.to_thread.run_sync(
+                _gunzip_bounded, body, transfer.MAX_CHUNK_BYTES)
+        except (OSError, EOFError, zlib.error, ValueError) as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Part {index} is not readable gzip: {exc}",
@@ -2487,6 +2608,13 @@ def _registered_run(request: Request, tool_name: str) -> Optional[str]:
     raw = request.headers.get(_RUN_ID_HEADER)
     if not raw:
         return None
+    # Only a tool this server serves is recorded. The name comes from the URL,
+    # and a run registered under an unknown one used to be kept -- and shown
+    # on the status page -- as whatever string the client sent.
+    try:
+        get_tool(tool_name)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     # Which batch of a divided cohort this is, when the client says so. Read
     # here, with the id, so the dashboard can group the runs from the moment
     # they exist and the gate in `_batch_turn` can order them.
@@ -2881,13 +3009,30 @@ def _stage_corrections(tool, job_dir: str, form) -> list:
         shutil.rmtree(destination, ignore_errors=True)
         os.makedirs(destination, exist_ok=True)
         name = os.path.basename(value.filename or slot)
+        # A client's name, written to disk: "." and ".." are directories, and
+        # anything hidden or empty is not a correction anyone meant to send.
+        if not name or name.startswith(".") or "\x00" in name:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail=f"The correction for '{slot}' needs a file name.")
         landed = os.path.join(destination, name)
         with open(landed, "wb") as handle:
             shutil.copyfileobj(value.file, handle)
+        if os.path.getsize(landed) > settings.MAX_UPLOAD_MB * 1024 * 1024:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail=f"The correction for '{slot}' exceeds the {settings.MAX_UPLOAD_MB} MB limit.")
         if landed.lower().endswith(".zip"):
             # Untrusted: `extract_zip` refuses zip slip, symlink members and
-            # anything over MAX_EXTRACTED_MB before a byte is written.
-            file_utils.extract_zip(landed, destination)
+            # anything over MAX_EXTRACTED_MB before a byte is written -- when
+            # it is given that limit, which it does not apply on its own.
+            try:
+                file_utils.extract_zip(landed, destination,
+                                       max_total_bytes=_MAX_EXTRACTED_BYTES)
+            except file_utils.BadArchiveError as exc:
+                shutil.rmtree(destination, ignore_errors=True)
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
             os.remove(landed)
         if not any(os.scandir(destination)):
             # An empty replacement would put NOTHING where the step's output
@@ -3188,6 +3333,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             work_dir=None, scratch_dirs=file_utils.track_scratch_dirs(),
             result=await _run_tool_call(
                 functools.partial(dispatch.dispatch, tool, {}, resume_from=resume_from)),
+            confine_to=(resume_from,),
         )
 
     # Generic argument collection: whatever scalar fields and/or files the
@@ -3254,6 +3400,26 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         spec = tool.arguments.get(field_name)
         if spec is not None and spec.server_selectable:
             server_file_args[field_name] = args.pop(field_name)
+
+    # Whatever file argument is left must arrive as bytes: an upload, or an
+    # `__uploads__` reference. A plain form string would otherwise reach the
+    # tool as a path ON THIS SERVER (base.Tool._coerce wraps any string), so a
+    # workstation could point a tool at another run's inputs under TEMP_DIR,
+    # at /proc/self/environ, or at a "model" of its own making.
+    # An empty value, or one sent beside the upload of the same field, is the
+    # form's placeholder and says nothing: the bytes win, or the argument is
+    # simply absent.
+    for field_name in list(args):
+        spec = tool.arguments.get(field_name)
+        if spec is None or not spec.is_file:
+            continue
+        if (args[field_name] in ("", None) or field_name in uploaded_files
+                or field_name in upload_references):
+            args.pop(field_name)
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"'{field_name}' is a file: upload it, it cannot be named by a path.")
 
 
     work_dir = None
@@ -3467,8 +3633,14 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # the run id and so only it can record how the run ended.
         _discard(work_dir, scratch_dirs)
         raise
-    except Exception:
-        logger.exception("endpoint=/run/%s status=500", tool_name)
+    except Exception as exc:
+        # Not logger.exception: a ToolExecutionError's message is the tool's
+        # stderr tail, which names the files it was working on -- a patient's.
+        # The redacted diagnosis says where and why; the frames (code, never
+        # values) say which line of this server, for a bug of its own.
+        logger.error("endpoint=/run/%s status=500 failure: %s\n%s", tool_name,
+                     _described(_diagnosis(exc, tool_name)),
+                     "".join(traceback.format_tb(exc.__traceback__)).rstrip())
         _discard(work_dir, scratch_dirs)
         raise HTTPException(status_code=500, detail="Tool execution failed.")
     finally:
@@ -3495,7 +3667,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
 
 async def _finish_stopped_run(tool, tool_name: str, start_time: float,
                               background_tasks: BackgroundTasks, work_dir,
-                              scratch_dirs, record: dict, size):
+                              scratch_dirs, record: dict, size, confine_to=()):
     """Deliver a run that stopped at a checkpoint.
 
     What goes back is the record -- which checkpoint, and what was produced
@@ -3503,7 +3675,8 @@ async def _finish_stopped_run(tool, tool_name: str, start_time: float,
     directory stays where it is: it is what a resume reads, and packing is a
     copy out of it rather than a move.
     """
-    outputs = file_utils.output_paths(record)
+    outputs = _confined_outputs(file_utils.output_paths(record),
+                                [work_dir, *scratch_dirs, *confine_to])
     reference = None
     # The archive is built in a directory of its OWN, never in the request's
     # work dir. That work dir is where an uploaded folder was unpacked, and
@@ -3549,7 +3722,7 @@ async def _finish_stopped_run(tool, tool_name: str, start_time: float,
 async def _finish_run(tool, tool_name: str, start_time: float,
                       background_tasks: BackgroundTasks, detached: bool,
                       work_dir, scratch_dirs, result, size=None,
-                      wants_reference: bool = False):
+                      wants_reference: bool = False, confine_to=()):
     """Turn what a tool returned into what the caller receives.
 
     Split out of `_run_tool` so a RESUME reaches it too. Everything here is
@@ -3583,7 +3756,8 @@ async def _finish_run(tool, tool_name: str, start_time: float,
         # look at, and the fact that this run can be told to carry on.
         return await _finish_stopped_run(tool, tool_name, start_time,
                                          background_tasks, work_dir,
-                                         scratch_dirs, result, size)
+                                         scratch_dirs, result, size,
+                                         confine_to=confine_to)
 
     if tool.output_kind in ("file", "segmentation", "files"):
         # `result` is a path to the output file the tool wrote -- or, for
@@ -3597,7 +3771,8 @@ async def _finish_run(tool, tool_name: str, start_time: float,
         # `scratch_dirs` covers file_utils.make_scratch_dir(); _output_roots
         # also catches a tool that wrote under TEMP_DIR by hand.
         try:
-            outputs = file_utils.output_paths(result)
+            outputs = _confined_outputs(file_utils.output_paths(result),
+                                        [work_dir, *scratch_dirs, *confine_to])
             if not outputs:
                 raise ValueError(
                     f"Tool '{tool.name}' declares output_kind={tool.output_kind!r} but "
@@ -3639,10 +3814,9 @@ async def _finish_run(tool, tool_name: str, start_time: float,
                 )
         except Exception:
             logger.exception("endpoint=/run/%s status=500 (packing output)", tool_name)
-            _discard(
-                work_dir,
-                _output_roots(file_utils.output_paths(result), work_dir) | set(scratch_dirs),
-            )
+            # Never the roots of what the tool NAMED: those are exactly what a
+            # rejected output pointed at -- another run's directory, say.
+            _discard(work_dir, list(scratch_dirs) + list(confine_to))
             raise HTTPException(status_code=500, detail="Tool execution failed.")
 
         media_type = _media_type_of(str(result))

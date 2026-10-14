@@ -43,6 +43,7 @@ import hashlib
 import json
 import os
 import secrets
+import ssl
 import statistics
 import threading
 import time
@@ -63,6 +64,24 @@ POLL_TIMEOUT = 30
 UPLOAD_CHUNK = 32 * 1024 * 1024
 UPLOAD_WORKERS = 4
 UPLOADS_FIELD = "__uploads__"
+
+# The server only speaks HTTPS, and this battery reaches it on its own
+# loopback, so it pins the server's certificate rather than looking one up:
+# benchmark_jobs passes its path. Same rules as tls.loopback_context, copied
+# because this script runs standalone.
+CAFILE_ENV = "SADT_TLS_CAFILE"
+_TLS = None
+
+
+def _tls_context():
+    global _TLS
+    if _TLS is None:
+        cafile = os.environ.get(CAFILE_ENV) or None
+        _TLS = ssl.create_default_context(cafile=cafile)
+        if cafile:
+            _TLS.check_hostname = False
+            _TLS.verify_flags |= getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    return _TLS
 
 # The ledger of the runs this battery has started, one line each, which is how
 # the server finds them when the battery is stopped. The runs are the
@@ -114,7 +133,7 @@ def _request(url: str, token: str, data=None, method=None, timeout=POLL_TIMEOUT,
         request.add_header("Content-Type", "application/x-www-form-urlencoded")
     for key, value in (headers or {}).items():
         request.add_header(key, value)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=_tls_context()) as response:
         return response.status, response.read(), dict(response.headers)
 
 
@@ -125,7 +144,7 @@ def _send(url: str, token: str, body: bytes, method: str, content_type: str,
     request.add_header("Content-Type", content_type)
     for key, value in (headers or {}).items():
         request.add_header(key, value)
-    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT, context=_tls_context()) as response:
         return response.status, response.read()
 
 
@@ -462,7 +481,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--base", default="http://127.0.0.1:8000")
+    parser.add_argument("--base", default="https://127.0.0.1:8000")
     parser.add_argument("--runs", default=None,
                         help="file to append the id of every run started to")
     args = parser.parse_args()

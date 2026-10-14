@@ -14,6 +14,7 @@ remote, and lets the agent look. What must hold:
 import importlib.util
 import json
 import os
+import ssl
 import subprocess
 import sys
 
@@ -128,7 +129,7 @@ class _FakeServer:
 def _agent(agent_module, checkout, tmp_path, **extra):
     args = agent_module.argparse.Namespace(
         server_repo=str(checkout), tools_repo="", update_dir=str(tmp_path / "update"),
-        url="http://127.0.0.1:1", token="t", service=None, restart_cmd="true", poll=60,
+        url="https://127.0.0.1:1", token="t", service=None, restart_cmd="true", poll=60,
         data_dir=str(tmp_path / "DATA"),
         health_timeout=5, no_sync=True, once=True)
     for key, value in extra.items():
@@ -437,8 +438,8 @@ def test_a_tools_image_update_drains_pulls_recreates_and_reopens(agent_module, r
     server.install(agent)
     pulled = []
 
-    def pull(image):
-        pulled.append(image)
+    def pull(image, digest=""):
+        pulled.append((image, digest))
         registry.local["digest"] = registry.remote
         return True
 
@@ -446,7 +447,8 @@ def test_a_tools_image_update_drains_pulls_recreates_and_reopens(agent_module, r
     agent.apply(_request(agent))
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is True and "tools to tools-2026.10.13-1" in last["message"]
-    assert pulled == [TOOLS_IMAGE]
+    # The digest the survey compared, not whatever the tag names by then.
+    assert pulled == [(TOOLS_IMAGE, "sha256:bbb")]
     assert server.door_calls[0] is False and server.door_calls[-1] is True
 
 
@@ -456,7 +458,7 @@ def test_a_failed_image_pull_restarts_nothing_and_reopens(agent_module, repos, t
     agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE, restart_cmd="exit 1")
     server = _FakeServer()
     server.install(agent)
-    agent.pull_image = lambda image: False
+    agent.pull_image = lambda image, digest="": False
     agent.apply(_request(agent))
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is False and "Nothing was restarted" in last["message"]
@@ -478,12 +480,12 @@ def test_a_server_commit_needing_an_image_waits_for_the_published_one(agent_modu
 
     registry.remote = "sha256:bbb"
     pulled = []
-    agent.pull_image = lambda image: pulled.append(image) or True
+    agent.pull_image = lambda image, digest="": pulled.append((image, digest)) or True
     agent.apply(_request(agent))
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is True
     assert (checkout / "docker" / "server.Dockerfile").read_text() == "FROM y"
-    assert pulled == ["ghcr.io/lab/visor-serve:deploy"]
+    assert pulled == [("ghcr.io/lab/visor-serve:deploy", "sha256:bbb")]
 
 
 def test_apply_mode_files_an_update_for_a_new_tools_image(agent_module, repos, tmp_path, monkeypatch):
@@ -597,7 +599,7 @@ def test_a_malformed_smoke_file_is_ignored(agent_module, repos, tmp_path, monkey
     assert _last(agent)["ok"] is True
 
 
-def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path):
+def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path, monkeypatch):
     """Against a real HTTP server: the fields arrive as multipart, the run
     carries an id (so the next update waits for it), and a refusal's detail
     is what the report says."""
@@ -621,13 +623,108 @@ def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path):
             pass
 
     httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    # Over TLS, as the real server is: the agent refuses http:// outright and
+    # verifies against the public authorities only. The test alone makes its
+    # throwaway certificate one of those, through the standard SSL_CERT_FILE.
+    cert, key = str(tmp_path / "cert.pem"), str(tmp_path / "key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                    "-nodes", "-days", "1", "-subj", "/CN=test",
+                    "-addext", "subjectAltName=IP:127.0.0.1",
+                    "-addext", "basicConstraints=critical,CA:FALSE",
+                    "-keyout", key, "-out", cert],
+                   check=True, capture_output=True)
+    monkeypatch.setenv("SSL_CERT_FILE", cert)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     try:
         _writer, checkout = repos
-        agent = _agent(agent_module, checkout, tmp_path, url=f"http://127.0.0.1:{httpd.server_port}")
+        agent = _agent(agent_module, checkout, tmp_path, url=f"https://127.0.0.1:{httpd.server_port}")
         assert agent._post_run("Good", {"scans": "test.nii.gz"}, 10) == (200, "")
         assert seen["path"] == "/run/Good" and seen["run_id"]
         assert 'name="scans"' in seen["body"] and "test.nii.gz" in seen["body"]
         assert agent._post_run("Bad", {}, 10) == (422, "no such input")
     finally:
         httpd.shutdown()
+
+
+def test_a_pull_is_pinned_to_the_digest_that_was_compared(agent_module):
+    pinned = agent_module._pinned
+    assert pinned("ghcr.io/lab/tools:deploy", "sha256:abc") == "ghcr.io/lab/tools@sha256:abc"
+    assert pinned("localhost:5000/tools:deploy", "sha256:abc") == "localhost:5000/tools@sha256:abc"
+    assert pinned("ghcr.io/lab/tools", "sha256:abc") == "ghcr.io/lab/tools@sha256:abc"
+    assert pinned("ghcr.io/lab/tools:deploy", "") == "ghcr.io/lab/tools:deploy"
+
+
+def test_the_release_classifier_is_read_from_head_not_the_working_tree(agent_module):
+    """server/ is writable from the container; what the agent executes must be
+    what the operator committed."""
+    import subprocess as sp
+    root = agent_module.REPO_ROOT
+    if not os.path.exists(os.path.join(root, ".git")):
+        pytest.skip("no git checkout mounted here")
+    committed = sp.run(["git", "-C", root, "show", "HEAD:server/wire/release_diff.py"],
+                       capture_output=True, text=True, check=True).stdout
+    assert agent_module._release_diff_source() == committed
+    assert agent_module.release_diff.__file__.startswith("<HEAD:")
+
+
+def test_the_door_is_closed_with_the_admin_token_not_the_api_token(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path, admin_token="adm")
+    sent = []
+
+    class _Answer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    monkeypatch.setattr(agent_module.server_ctl, "server_urlopen",
+                        lambda request, timeout=None: sent.append(request) or _Answer())
+    assert agent.door(False, "updating") is None
+    request = sent[0]
+    assert request.full_url.endswith("/maintenance") and request.get_method() == "POST"
+    assert request.get_header("X-admin-token") == "adm"
+    assert request.get_header("Authorization") is None, "the API token must not travel with it"
+    assert json.loads(request.data)["accepting"] is False
+
+
+def test_with_no_admin_token_the_door_cannot_close(agent_module, repos, tmp_path):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path)
+    assert "ADMIN_TOKEN" in agent.door(False)
+
+
+def test_a_server_that_refuses_the_door_is_not_updated(agent_module, repos, tmp_path, monkeypatch):
+    """403: the server has no ADMIN_TOKEN. Restarting it without holding the
+    door would kill whatever run it admits meanwhile."""
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    agent = _agent(agent_module, checkout, tmp_path, admin_token="adm", restart_cmd="exit 1")
+    server = _FakeServer()
+    server.install(agent)
+    agent.door = lambda accepting, reason="": server.door_calls.append(accepting) or (
+        None if accepting else "the server has no ADMIN_TOKEN set, so it cannot be closed to new runs")
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "ADMIN_TOKEN" in last["message"]
+    assert (checkout / "server" / "main.py").read_text() != "v2", "nothing may be pulled"
+
+
+def test_a_door_that_never_closes_stops_the_update_before_the_pull(agent_module, repos, tmp_path, monkeypatch):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    agent = _agent(agent_module, checkout, tmp_path, admin_token="adm", restart_cmd="exit 1")
+    server = _FakeServer()
+    server.install(agent)
+    agent.door = lambda accepting, reason="": None if accepting else agent_module.DOOR_UNREACHABLE
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "Nothing was changed" in last["message"]
+    assert (checkout / "server" / "main.py").read_text() != "v2"

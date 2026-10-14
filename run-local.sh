@@ -9,7 +9,16 @@ set -euo pipefail
 SADT_TOOLS="${SADT_TOOLS:-$HOME/code/SADT-VISOR}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-export API_TOKEN="${API_TOKEN:-local-dev-token}"
+# A random token, kept across restarts so a configured client keeps working.
+# Never a fixed one: serve.py refuses every token this repository has published.
+TOKEN_FILE="$HERE/server/.local-token"
+if [ -z "${API_TOKEN:-}" ]; then
+    if [ ! -s "$TOKEN_FILE" ]; then
+        (umask 077 && python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$TOKEN_FILE")
+    fi
+    API_TOKEN="$(cat "$TOKEN_FILE")"
+fi
+export API_TOKEN
 export TOOLS_DIR="$SADT_TOOLS/tools"          # <-- the link to SADT-VISOR
 export DESCRIBE_PATH="$SADT_TOOLS/scripts/describe.py"
 export DATA_DIR="${DATA_DIR:-$HERE/DATA}"
@@ -24,15 +33,22 @@ LOG="${LOG:-$HERE/local-server.log}"
 
 echo "tools   : $TOOLS_DIR"
 echo "data    : $DATA_DIR"
-echo "token   : $API_TOKEN"
-echo "url     : http://127.0.0.1:8001"
+# Where the token is, never its value: this output lands in terminals, logs
+# and bug reports.
+if [ -s "$TOKEN_FILE" ] && [ "$API_TOKEN" = "$(cat "$TOKEN_FILE")" ]; then
+    echo "token   : in $TOKEN_FILE"
+else
+    echo "token   : from the API_TOKEN environment variable"
+fi
+echo "url     : https://localhost:8001  (self-signed: server/.tls/cert.pem)"
 echo "log     : $LOG"
 echo
 
-# The venv was created at another path, so its console scripts carry a dead
-# shebang; invoking uvicorn as a module sidesteps that.
+# serve.py rather than `uvicorn`: it is the only way to start the server, and
+# it only ever listens over HTTPS (server/tls.py), here with a self-signed
+# certificate kept in server/.tls/.
 cd "$HERE/server"
 # Logged as well as shown: a tool failure is a traceback in here, and it is the
 # only place it exists -- the client gets a status code and a one-line message.
-exec "$HERE/server/venv/bin/python" -m uvicorn main:app \
+exec "$HERE/server/venv/bin/python" serve.py \
     --host 127.0.0.1 --port 8001 "$@" 2>&1 | tee -a "$LOG"

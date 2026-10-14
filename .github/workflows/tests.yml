@@ -7,6 +7,11 @@ on:
   push:
   pull_request:
 
+# The suite reads the checkout and nothing else: the token GitHub hands it
+# can do no more than that, whatever a dependency it installs tries.
+permissions:
+  contents: read
+
 # A second push to the same branch makes the first run irrelevant.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

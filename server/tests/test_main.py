@@ -8,6 +8,7 @@ import gzip
 import io
 import json
 import os
+import shutil
 import zipfile
 
 # Set before importing main, so config.Settings() picks up a known token
@@ -1438,17 +1439,18 @@ def test_a_single_file_tool_returning_several_paths_is_a_failure(monkeypatch, tm
 
 
 def test_a_single_named_output_is_streamed(monkeypatch, tmp_path):
-    scratch = file_utils.make_scratch_dir(prefix="named_output_")
-    produced = os.path.join(scratch, "result.nii.gz")
-    with open(produced, "wb") as handle:
-        handle.write(b"segmentation")
-
     class OneFile(Tool):
         name = "one_file_probe"
         arguments = {}
         output_kind = "file"
 
         def run(self):
+            # Inside the run, as a tool does: a directory made before the
+            # request is not one of its own, and is refused (test below).
+            scratch = file_utils.make_scratch_dir(prefix="named_output_")
+            produced = os.path.join(scratch, "result.nii.gz")
+            with open(produced, "wb") as handle:
+                handle.write(b"segmentation")
             return {"outputs": {"mandible": produced}}
 
     monkeypatch.setitem(registry.TOOLS, "one_file_probe", OneFile())
@@ -1457,6 +1459,50 @@ def test_a_single_named_output_is_streamed(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert response.content == b"segmentation"
+
+
+def test_an_output_outside_the_runs_own_directories_is_refused_and_left_alone(monkeypatch):
+    """A tool naming another run's file used to get it streamed back -- and its
+    directory deleted afterwards."""
+    elsewhere = file_utils.make_scratch_dir(prefix="another_run_")
+    victim = os.path.join(elsewhere, "their_scan.nii.gz")
+    with open(victim, "wb") as handle:
+        handle.write(b"someone else")
+
+    class Thief(Tool):
+        name = "thief_probe"
+        arguments = {}
+        output_kind = "file"
+
+        def run(self):
+            return victim
+
+    monkeypatch.setitem(registry.TOOLS, "thief_probe", Thief())
+    response = client.post("/run/thief_probe", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert response.status_code == 500
+    assert b"someone else" not in response.content
+    assert os.path.exists(victim), "another run's directory must survive"
+    shutil.rmtree(elsewhere, ignore_errors=True)
+
+
+def test_a_symbolic_link_in_an_output_folder_is_not_followed(monkeypatch, tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("server secret")
+
+    class Linker(Tool):
+        name = "linker_probe"
+        arguments = {}
+        output_kind = "files"
+
+        def run(self):
+            folder = file_utils.make_scratch_dir(prefix="linker_")
+            os.symlink(str(secret), os.path.join(folder, "innocent.txt"))
+            return folder
+
+    monkeypatch.setitem(registry.TOOLS, "linker_probe", Linker())
+    response = client.post("/run/linker_probe", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert response.status_code == 500
+    assert b"server secret" not in response.content
 
 
 # ---------------------------------------------------------------------------

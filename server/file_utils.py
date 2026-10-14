@@ -244,6 +244,10 @@ def _add_to_zip(zf: zipfile.ZipFile, file_path: str, arcname: str, written: set)
     # tool produced. Fail loudly instead.
     if arcname in written:
         raise ValueError(f"Duplicate name in output archive: '{arcname}'")
+    # `zf.write` follows a link, so a tool's output folder holding one would
+    # ship whatever it points at -- another run's input, a key.
+    if os.path.islink(file_path):
+        raise ValueError(f"Refusing a symbolic link in the archive: '{arcname}'")
     written.add(arcname)
     # compress_type=None defers to the archive's default (DEFLATED at
     # settings.ZIP_COMPRESSLEVEL); already-compressed members opt out of it.

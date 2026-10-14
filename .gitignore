@@ -47,3 +47,10 @@ local-server-*.log
 .update/
 # The update agent's log (scripts/server_ctl.py agent)
 update_agent.log
+
+# The certificate run-local.sh generates (server/tls.py)
+server/.tls/
+server/.local-token
+
+# A public certificate an operator drops in (docker-compose.yml mounts it)
+/tls/

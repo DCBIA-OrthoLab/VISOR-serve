@@ -27,6 +27,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -173,6 +174,13 @@ def _entries(manifest: dict, kind: str, only_tools) -> list:
             where = f"tool '{tool}', {kind} entry #{index + 1}"
             if "name" not in entry or "url" not in entry:
                 raise ManifestError(f"{where}: both 'name' and 'url' are required")
+            if not _is_https(entry["url"]):
+                raise ManifestError(f"{where}: 'url' must be https://, got {entry['url']!r}")
+            if not entry.get("sha256") and entry.get("unpinned") is not True:
+                # Without a checksum the bytes installed are whatever the URL
+                # serves that day. An entry may only go without one when the
+                # manifest says so, out loud, beside the reason.
+                raise ManifestError(f"{where}: 'sha256' is required (or 'unpinned: true', stated on purpose)")
             if os.path.basename(entry["name"]) != entry["name"] or entry["name"] in ("", ".", ".."):
                 # The name becomes a path under DATA/: a bare file name is the
                 # only thing that cannot escape it.
@@ -235,12 +243,33 @@ def _target_path(data_dir: str, entry: dict) -> str:
 _LINE_PROGRESS_SECONDS = 3
 
 
+def _is_https(url) -> bool:
+    return isinstance(url, str) and urllib.parse.urlsplit(url).scheme.lower() == "https"
+
+
+class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only to another https:// URL: urllib's default also
+    follows one to http:// or ftp://, which would undo the check below."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_https(newurl):
+            raise urllib.error.HTTPError(newurl, code, "refused a redirect to a non-https URL", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_HttpsOnlyRedirects)
+
+
 def _download(url: str, destination: str, progress) -> str:
     """Stream `url` to `destination`, returning the content's sha256."""
+    if not _is_https(url):
+        # Checked here as well as in the manifest: this is the one function
+        # that opens a URL, and file://, ftp:// or http:// have no business in it.
+        raise ManifestError(f"Refusing to download a non-https URL: {url!r}")
     digest = hashlib.sha256()
     request = urllib.request.Request(url, headers=_HEADERS)
     last_report = 0.0
-    with urllib.request.urlopen(request) as response:  # noqa: S310 - https URLs from the manifest
+    with _OPENER.open(request) as response:  # noqa: S310 - https only, redirects included
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
         with open(destination, "wb") as out:

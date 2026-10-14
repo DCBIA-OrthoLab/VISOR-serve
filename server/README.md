@@ -135,45 +135,63 @@ write the exact layout `data_store.py` reads:
 python3 scripts/fetch_data.py --list         # what's available, and how big
 ```
 
-## Generating a self-signed certificate (development only)
+## HTTPS only
+
+The server has no plain-HTTP listener and no setting that gives it one. Start
+it with `python serve.py` (the image and `docker-compose.yml` do), never with
+`uvicorn main:app`, which `main.py` refuses:
 
 ```bash
-openssl req -x509 -newkey rsa:4096 -nodes \
-  -keyout key.pem -out cert.pem -days 365 \
-  -subj "/CN=localhost"
+./venv/bin/python serve.py --host 127.0.0.1 --port 8000
 ```
 
-This certificate is **for local development only** and will trigger a trust
-warning. **Production must use a real certificate** (Let's Encrypt or an
-institutional CA) - never run this server over plain HTTP outside a fully
-isolated dev environment.
+Every client verifies a **publicly signed certificate** - no `-k`, no custom
+CA, no pinning, this machine included - and is given one address, `PUBLIC_URL`.
+Three ways to present that certificate, all equivalent to a client:
 
-## Running over HTTPS
+1. **`tailscale serve`** (`scripts/setup-tailscale.sh`): Tailscale fetches and
+   renews the certificate for `https://<name>.<tailnet>.ts.net`, and is used
+   when `PUBLIC_URL` is not set.
+2. **A reverse proxy** (nginx, Caddy...) on the same machine, with a Let's
+   Encrypt or institutional certificate, forwarding to `https://127.0.0.1:8000`.
+   Set `PUBLIC_URL` to its address.
+3. **The server itself**, for a general server with its own domain: put the
+   full chain and the key in `./tls/` (key readable by uid 999), and in `.env`:
 
-```bash
-./venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000 \
-  --ssl-keyfile key.pem --ssl-certfile cert.pem
-```
+   ```
+   PUBLISH_ADDR=0.0.0.0
+   PUBLIC_URL=https://visor.example.org
+   TLS_CERT_FILE=/etc/visor-tls/fullchain.pem
+   TLS_KEY_FILE=/etc/visor-tls/privkey.pem
+   ```
+
+   The certificate is loaded at start: restart the container after a renewal.
+
+Without `TLS_CERT_FILE`, `serve.py` listens with a self-signed certificate it
+generates once into `TLS_DIR` (`server/tls.py`), for a front end on 127.0.0.1
+only. The port is published on loopback unless `PUBLISH_ADDR` says otherwise,
+and `serve.py` **refuses to start** published anywhere else unless
+`TLS_CERT_FILE` verifies, with `openssl verify` against the system's public
+authorities, as a certificate for `PUBLIC_URL`'s host.
 
 ## Testing with curl
 
 ```bash
 # Health check, no auth
-curl -k https://localhost:8000/health
+curl https://<name>.<tailnet>.ts.net/health
 
 # Discover registered tools and their expected arguments
-curl -k https://localhost:8000/tools
+curl https://<name>.<tailnet>.ts.net/tools
 
 # Run the test tool
-curl -k -X POST https://localhost:8000/run/Test_Tool \
+curl -X POST https://<name>.<tailnet>.ts.net/run/Test_Tool \
   -H "Authorization: Bearer change-me-to-a-long-random-secret" \
   -F "text_1=hello" \
   -F "text_2=world"
 # -> {"result": "hello world"}
 ```
 
-`-k` disables certificate verification and is only acceptable against the
-self-signed dev certificate above - never use it against a production server.
+Never add `-k`: the certificate is a public one and is always verified.
 
 A tool argument can also expect a file: add `-F "input=@/path/to/data.zip"`
 (field name = argument name) to the same call; the server streams it to a
@@ -192,17 +210,17 @@ model argument is a **400**:
 
 ```bash
 # List the models/testfiles hosted server-side for a tool (Bearer-protected)
-curl -k https://localhost:8000/tools/Surg_Mov_Pred/data \
+curl https://<name>.<tailnet>.ts.net/tools/Surg_Mov_Pred/data \
   -H "Authorization: Bearer change-me-to-a-long-random-secret"
 # -> {"models": ["all_models"], "testfiles": ["TestFiles"]}
 
 # Download one of the listed test files (a folder entry arrives zipped).
 # Test files only - models are selected by name and never leave the server.
-curl -k -O https://localhost:8000/tools/Surg_Mov_Pred/testfiles/TestFiles \
+curl -O https://<name>.<tailnet>.ts.net/tools/Surg_Mov_Pred/testfiles/TestFiles \
   -H "Authorization: Bearer change-me-to-a-long-random-secret"
 
 # Run it: the model is a name, the input is a genuine upload
-curl -k -X POST https://localhost:8000/run/Surg_Mov_Pred \
+curl -X POST https://<name>.<tailnet>.ts.net/run/Surg_Mov_Pred \
   -H "Authorization: Bearer change-me-to-a-long-random-secret" \
   -F "model=all_models" \
   -F "measurements=@/path/to/measurements.xlsx"
@@ -214,20 +232,20 @@ Watching a run, and stopping it, from two terminals:
 RUN_ID=$(python3 -c "import secrets; print(secrets.token_urlsafe(24))")
 
 # Terminal 1 - the run, blocking as it always did
-curl -k -X POST https://localhost:8000/run/AMASSS \
+curl -X POST https://<name>.<tailnet>.ts.net/run/AMASSS \
   -H "Authorization: Bearer change-me-to-a-long-random-secret" \
   -H "X-Run-Id: $RUN_ID" \
   -F "input=@/path/to/scan.nii.gz" -F "model=AMASSS_Models"
 
 # Terminal 2 - the progress, from the moment the id was minted
-curl -kN https://localhost:8000/runs/$RUN_ID/events \
+curl -N https://<name>.<tailnet>.ts.net/runs/$RUN_ID/events \
   -H "Authorization: Bearer change-me-to-a-long-random-secret"
 # -> data: {"seq":0,"at":...,"state":"pending","phase":"received",...}
 #    data: {"seq":1,...,"phase":"staging","message":"input 1 of 1"}
 #    data: {"seq":2,...,"phase":"queued_gpu"}
 
 # Terminal 2 - and stopping it
-curl -k -X DELETE https://localhost:8000/runs/$RUN_ID \
+curl -X DELETE https://<name>.<tailnet>.ts.net/runs/$RUN_ID \
   -H "Authorization: Bearer change-me-to-a-long-random-secret"
 # terminal 1 then answers 499 {"detail": "Run cancelled by the client."}
 ```
@@ -747,11 +765,11 @@ from the code.
 
 ```bash
 # What model bundles / test scans are hosted server-side
-curl -k https://localhost:8000/tools/AMASSS/data \
+curl https://<name>.<tailnet>.ts.net/tools/AMASSS/data \
   -H "Authorization: Bearer $API_TOKEN"
 
 # One scan, mandible + maxilla, merged output
-curl -k -X POST https://localhost:8000/run/AMASSS \
+curl -X POST https://<name>.<tailnet>.ts.net/run/AMASSS \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "model=AMASSS_Models" \
   -F "scans=@/path/to/scan.nii.gz" \
@@ -814,7 +832,7 @@ gave each its own pins - **two tools**:
 
 ```bash
 # One CBCT scan, cranial base only
-curl -k -X POST https://localhost:8000/run/ALI_CBCT \
+curl -X POST https://<name>.<tailnet>.ts.net/run/ALI_CBCT \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "model=ALI_CBCT_Models" \
   -F "input=@/path/to/scan.nii.gz" \
@@ -823,7 +841,7 @@ curl -k -X POST https://localhost:8000/run/ALI_CBCT \
 
 # A whole cohort as one archive, asking for seven landmarks by name
 zip -r cohort.zip cohort/
-curl -k -X POST https://localhost:8000/run/ALI_CBCT \
+curl -X POST https://<name>.<tailnet>.ts.net/run/ALI_CBCT \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "model=ALI_CBCT_Models" -F "input=@cohort.zip" \
   -F "landmarks=Ba,S,N,RPo,LPo,ROr,LOr" --output result.zip
@@ -875,7 +893,7 @@ selects cuda/cpu and is likewise the deployment's business.
 ### Crown_Seg - per-tooth labelling of intraoral scans
 
 ```bash
-curl -k -X POST https://localhost:8000/run/Crown_Seg \
+curl -X POST https://<name>.<tailnet>.ts.net/run/Crown_Seg \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "model=07-21-22_val-loss0.169.pth" \
   -F "meshes=@/path/to/arch.vtk" --output result.zip
@@ -909,7 +927,7 @@ what the next tool in a chain reads.
 ### Batch_Dental_Seg - teeth and jaw structures on dental CT/CBCT
 
 ```bash
-curl -k -X POST https://localhost:8000/run/Batch_Dental_Seg \
+curl -X POST https://<name>.<tailnet>.ts.net/run/Batch_Dental_Seg \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "model=PediatricDentalSeg" \
   -F "scans=@/path/to/cohort.zip" \
@@ -930,7 +948,7 @@ published with every run, for the same reason.
 
 ```bash
 # Fully-automated CBCT: the landmarks are predicted mid-run, by ALI
-curl -k -X POST https://localhost:8000/run/ASO \
+curl -X POST https://<name>.<tailnet>.ts.net/run/ASO \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "modality=CBCT" -F "automation=Fully-Automated" \
   -F "landmark_model=CBCT_landmark_models" \
@@ -966,7 +984,7 @@ backwards is silent.
 ### Surg_Mov_Pred - surgical movement prediction
 
 ```bash
-curl -k -X POST https://localhost:8000/run/Surg_Mov_Pred \
+curl -X POST https://<name>.<tailnet>.ts.net/run/Surg_Mov_Pred \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "model=all_models" \
   -F "measurements=@/path/to/patients.xlsx" --output result.zip
@@ -980,7 +998,7 @@ declares no `device` - so it never queues for the card.
 
 ```bash
 # Semi-Automated CBCT: you send the T1 masks the registration is confined to
-curl -k -X POST https://localhost:8000/run/AREG \
+curl -X POST https://<name>.<tailnet>.ts.net/run/AREG \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "modality=CBCT" -F "automation=Semi-Automated" \
   -F "cbct_regions=Cranial base,Mandible" \
@@ -988,7 +1006,7 @@ curl -k -X POST https://localhost:8000/run/AREG \
   -F "t1_masks=@/path/to/masks.zip" --output result.zip
 
 # Fully-Automated CBCT: AMASSS produces those masks server-side
-curl -k -X POST https://localhost:8000/run/AREG \
+curl -X POST https://<name>.<tailnet>.ts.net/run/AREG \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "modality=CBCT" -F "automation=Fully-Automated" \
   -F "cbct_regions=Cranial base" \
@@ -1057,7 +1075,7 @@ row must not block Apply on the client either.
 
 ```bash
 # The landmarks are predicted server-side; nothing to supply but the scans
-curl -k -X POST https://localhost:8000/run/AREG \
+curl -X POST https://<name>.<tailnet>.ts.net/run/AREG \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "modality=IOS" -F "automation=Semi-Automated" \
   -F "ios_patch=Mucogingival line (lower arch)" \

@@ -30,6 +30,26 @@ class Settings(BaseSettings):
     DATA_DIR: str = "/data"  # DATA_DIR/<tool>/{models,testfiles}, read-only
     DATA_BACKEND: str = "local"  # see data_store.py to plug in another
 
+    # --- TLS (tls.py) ---------------------------------------------------
+    # The server only ever listens over HTTPS; nothing here can turn that off.
+    # An operator's certificate, both files or neither. Neither: a self-signed
+    # pair is generated into TLS_DIR once and kept, so a pinned client keeps
+    # trusting it across restarts -- which is why TLS_DIR must be persistent
+    # and writable (the image points it into its cache volume).
+    TLS_CERT_FILE: str = ""
+    TLS_KEY_FILE: str = ""
+    TLS_DIR: str = os.path.join(_SERVER_DIR, ".tls")
+    # Where the port is published (docker-compose.yml passes the same value it
+    # publishes on). Loopback by default: the self-signed certificate is for a
+    # front end on this machine -- `tailscale serve`, a reverse proxy -- and
+    # never for a client. Anywhere else, serve.py refuses to start unless the
+    # certificate it listens with is publicly signed (tls.public_certificate_problem).
+    PUBLISH_ADDR: str = "127.0.0.1"
+    # The address clients are given, whatever presents its public certificate:
+    # `tailscale serve`, a reverse proxy, or this server itself. Empty: the
+    # URL `tailscale serve` publishes, if any (scripts/server_ctl.py).
+    PUBLIC_URL: str = ""
+
     # --- running a tool -----------------------------------------------
     # "subprocess" runs a tool in its own virtualenv through runner.py, so the
     # server never imports torch and releases the tool's VRAM when it exits.
@@ -85,7 +105,7 @@ class Settings(BaseSettings):
     # container is /workspace, where docker-compose.yml mounts `.git` read-only.
     SERVER_REPO: str = os.path.dirname(_SERVER_DIR)
     DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
-    SADT_API: str = "http://127.0.0.1:8000"  # reaches this server from a tool
+    SADT_API: str = "https://127.0.0.1:8000"  # reaches this server from a tool
     # The operator dashboard's controls -- reordering the queue, giving a run
     # priority -- answer only to this token, never to API_TOKEN: every
     # workstation holds that one, and a control any of them can use is one any

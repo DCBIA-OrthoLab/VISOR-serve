@@ -21,7 +21,7 @@
 #                   Nothing is downloaded by default: the full set is ~29 GB, and
 #                   which tools a given site uses is not something to assume.
 #   --device gpu|cpu   force the compose service instead of detecting it
-#   --bind ADDR     host address the port is published on (default: 127.0.0.1)
+#   --bind ADDR     ignored: the port is published on 127.0.0.1 only
 #   --port N        host port to publish on (default: 8000). Only needed when
 #                   something else already holds it; it is remembered in .env.
 #   --no-start      clone and check prerequisites, but do not start anything
@@ -100,10 +100,17 @@
 
 set -eu
 
+# One word, single-quoted for a shell to read back verbatim: every ' becomes
+# '\'' and nothing else inside single quotes is special, so $(...), ` and $
+# in an argument stay text.
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 # The arguments as given, quoted, for the re-run under the docker group below.
 ORIGINAL_ARGS=""
 for _arg in "$@"; do
-    ORIGINAL_ARGS="$ORIGINAL_ARGS '$(printf '%s' "$_arg" | sed "s/'/'\\\\''/g")'"
+    ORIGINAL_ARGS="$ORIGINAL_ARGS $(shell_quote "$_arg")"
 done
 
 REPO="${REPO:-DCBIA-OrthoLab/VISOR-serve}"
@@ -161,7 +168,7 @@ print_hints() {
     _ctl="$INSTALL_DIR/scripts/server_ctl.py"
     _port="$(sed -n 's/^HOST_PORT=//p' "$INSTALL_DIR/.env" 2>/dev/null | tail -n1)"
     _port="${_port:-${PORT:-8000}}"
-    _url="http://localhost:${_port}"
+    _url="https://localhost:${_port}"
     if command -v tailscale >/dev/null 2>&1; then
         _ts_url="$(tailscale serve status 2>/dev/null | grep -o 'https://[^ ]*' | head -n1)"
         [ -n "$_ts_url" ] && _url="$_ts_url"
@@ -238,18 +245,12 @@ fi
 
 ask PORT "Host port to publish the server on" "8000"
 
-# Tailscale decides the address, so it is settled first. Only --tailscale turns
-# it on: an operator who wants it says so, and nothing is asked otherwise.
-if [ "$TAILSCALE" -eq 1 ]; then
-    # Anything else would leave the same port open in plain HTTP beside the
-    # tailnet, which is the one thing Tailscale was brought in to prevent.
-    if [ "$BIND" != "127.0.0.1" ]; then
-        echo "setup-server: --tailscale publishes through Tailscale only; binding 127.0.0.1, not $BIND." >&2
-    fi
-    BIND="127.0.0.1"
-else
-    ask BIND "Host address to publish it on (127.0.0.1 keeps it off the network)" "127.0.0.1"
+# The port is published on 127.0.0.1 and nowhere else (docker-compose.yml):
+# Tailscale, with its publicly signed certificate, is the only way in.
+if [ "$BIND" != "127.0.0.1" ]; then
+    echo "setup-server: --bind is ignored; the server is published on 127.0.0.1 only and reached through Tailscale." >&2
 fi
+BIND="127.0.0.1"
 ask REF  "Branch this deployment follows" "$REF"
 ask AUTO_UPDATE "Follow that branch automatically? off | notify | apply" "off"
 
@@ -442,7 +443,10 @@ if ! docker info >/dev/null 2>&1; then
             && getent group docker | grep -qw "$(id -un)" && sg docker -c "docker info" >/dev/null 2>&1; then
         echo "Continuing in the docker group (no need to log out)..."
         export VISOR_SETUP_REEXEC=1 REPO REF REPO_URL INSTALL_DIR
-        eval "exec sg docker -c \"sh \\\"$INSTALL_DIR/scripts/setup-server.sh\\\" $ORIGINAL_ARGS\""
+        # No eval: the command string is read ONCE, by the shell sg starts, and
+        # every word in it is single-quoted. An eval here re-expanded the
+        # arguments, so a token holding $(...) was executed.
+        exec sg docker -c "sh $(shell_quote "$INSTALL_DIR/scripts/setup-server.sh")$ORIGINAL_ARGS"
     fi
     echo
     echo "Docker is installed but this user cannot reach its daemon yet."
@@ -471,13 +475,31 @@ esac
 # must survive, which is the same rule server_ctl.py's write_env follows.
 set_env() {
     _file="$INSTALL_DIR/.env"
-    [ -f "$_file" ] || { printf '%s\n' "# Written by scripts/setup-server.sh." > "$_file"; }
-    if grep -q "^$1=" "$_file" 2>/dev/null; then
-        _tmp="$_file.tmp.$$"
-        sed "s|^$1=.*|$1=$2|" "$_file" > "$_tmp" && mv "$_tmp" "$_file"
-    else
-        printf '%s=%s\n' "$1" "$2" >> "$_file"
-    fi
+    _tmp="$_file.tmp.$$"
+    # It holds the API and admin tokens: the new file is created 0600 from the
+    # start (umask in a subshell), never written under the default umask and
+    # narrowed afterwards. The old line is dropped by an exact key match and
+    # the new one appended with printf, so no character of the value (|, &,
+    # \) is ever read as a sed expression.
+    (
+        umask 077
+        if [ -f "$_file" ]; then
+            awk -v key="$1" 'index($0, key "=") != 1' "$_file" > "$_tmp"
+        else
+            printf '%s\n' "# Written by scripts/setup-server.sh." > "$_tmp"
+        fi
+        printf '%s=%s\n' "$1" "$2" >> "$_tmp"
+    ) && mv "$_tmp" "$_file"
+    chmod 600 "$_file"
+}
+
+# Drop KEY from .env, the same way set_env replaces it.
+unset_env() {
+    _file="$INSTALL_DIR/.env"
+    [ -f "$_file" ] || return 0
+    _tmp="$_file.tmp.$$"
+    (umask 077; awk -v key="$1" 'index($0, key "=") != 1' "$_file" > "$_tmp") && mv "$_tmp" "$_file"
+    chmod 600 "$_file"
 }
 
 # --- the tools -----------------------------------------------------------
@@ -659,7 +681,7 @@ if [ -n "$TOOLS_IMAGE" ]; then
     # mount a checkout nothing reads any more.
     for _key in SADT_TOOLS UV_PYTHON_STORE; do
         if [ -f "$INSTALL_DIR/.env" ] && grep -q "^$_key=" "$INSTALL_DIR/.env"; then
-            sed "/^$_key=/d" "$INSTALL_DIR/.env" > "$INSTALL_DIR/.env.tmp.$$" && mv "$INSTALL_DIR/.env.tmp.$$" "$INSTALL_DIR/.env"
+            unset_env "$_key"
         fi
     done
 elif [ -n "$TOOLS_ROOT" ]; then
@@ -753,9 +775,11 @@ if [ "$TAILSCALE" -eq 1 ]; then
     fi
 else
     echo
-    echo "This deployment listens on ${BIND} over plain HTTP. That is fine for"
-    echo "localhost; putting it on a network address requires a TLS terminator in"
-    echo "front -- see SECURITY.md, or re-run with --tailscale."
+    echo "This deployment is NOT reachable by any client yet. It listens over HTTPS"
+    echo "on 127.0.0.1 only, with a self-signed certificate no client accepts:"
+    echo "clients verify a publicly signed certificate. Re-run with --tailscale, or"
+    echo "put a reverse proxy or the server's own certificate in front and set"
+    echo "PUBLIC_URL (server/README.md, \"HTTPS only\")."
 fi
 
 print_hints

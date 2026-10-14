@@ -46,6 +46,7 @@ import threading
 import time
 from typing import Optional
 
+import tls
 from execution import dispatch
 from wire import runs
 
@@ -132,6 +133,7 @@ def start(plan: dict, summary_dir: str, base_url: str, token: str,
 
         environment = dict(os.environ)
         environment["API_TOKEN"] = token
+        environment["SADT_TLS_CAFILE"] = tls.certificate_paths()[0]
         client = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "benchmark_client.py")
         process = subprocess.Popen(

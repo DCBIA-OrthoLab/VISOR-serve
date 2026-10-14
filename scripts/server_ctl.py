@@ -35,11 +35,13 @@ import os
 import secrets
 import shutil
 import socket
+import ssl
 import signal
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -353,26 +355,69 @@ def effective_port() -> int:
 
 
 def url_for(port=None, bind_addr=None) -> str:
-    """Where this deployment answers, seen from the machine running it.
+    """Where this deployment answers: its public `https://<name>.ts.net` URL.
 
-    `localhost` is right when the port is published on loopback or on EVERY
-    interface. It is wrong when it is published on one specific address, which
-    is exactly what `--bind <vpn address>` is for: the port is then simply not
-    on 127.0.0.1, so a health check against localhost polls an address nothing
-    listens on and reports a perfectly healthy server as dead.
+    The ONLY address anything outside the container talks to, this script
+    included: it presents a publicly signed certificate, and that is the only
+    kind any client here verifies against. The port uvicorn listens on is
+    published on 127.0.0.1 alone, for `tailscale serve`, with a self-signed
+    certificate nobody else trusts. "" when this machine publishes no such URL
+    yet -- a first start, before setup-tailscale.sh -- which callers read as
+    "cannot reach it through the front door" (see wait_for_health).
 
-    Read from `.env` rather than passed around, so every caller agrees without
-    having to thread the value through. `cmd_up` calls `ensure_env` first, so
-    what is read here is already the binding the container is about to get.
+    `port` and `bind_addr` are accepted and ignored: callers still pass them.
     """
-    if bind_addr is None:
-        bind_addr = read_env().get("BIND_ADDR", "127.0.0.1")
-    host = "localhost"
-    # "" and 0.0.0.0/:: all mean "every interface", and loopback is included in
-    # that -- so localhost stays the right thing to talk to.
-    if bind_addr and bind_addr not in ("127.0.0.1", "localhost", "0.0.0.0", "::"):
-        host = f"[{bind_addr}]" if ":" in bind_addr else bind_addr
-    return f"http://{host}:{port or effective_port()}"
+    return public_url()
+
+
+def public_url() -> str:
+    """The https URL clients are given: PUBLIC_URL from .env, else Tailscale's.
+
+    PUBLIC_URL names whatever presents the public certificate -- a reverse
+    proxy, or the server itself with TLS_CERT_FILE -- and Tailscale is the
+    fallback, not the requirement. An http:// value is not an address any
+    client accepts, so it is not returned.
+    """
+    configured = read_env().get("PUBLIC_URL", "").strip().rstrip("/")
+    if configured:
+        return configured if configured.startswith("https://") else ""
+    return tailnet_url()
+
+
+def tailnet_url() -> str:
+    """The https URL `tailscale serve` publishes on this machine, or ""."""
+    if not shutil.which("tailscale"):
+        return ""
+    try:
+        listing = subprocess.run(["tailscale", "serve", "status"], capture_output=True,
+                                 text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for word in listing.split():
+        if word.startswith("https://"):
+            return word.rstrip("/").split(" ")[0]
+    return ""
+
+
+def tls_context(url: str) -> ssl.SSLContext:
+    """How to verify the server at `url`: against the PUBLIC authorities, always.
+
+    No certificate is trusted on sight, none is pinned, and no custom
+    authority is accepted, whatever the address: the server is reached through
+    `tailscale serve`, whose certificate a public authority signed, and nothing
+    else is something a client may trust. An `http://` URL is refused
+    outright, whatever its host, so nothing here can send a token in the clear.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https":
+        raise ValueError(f"The server only speaks HTTPS; refusing {parsed.scheme or 'a schemeless'} URL.")
+    return ssl.create_default_context()
+
+
+def server_urlopen(target, timeout: float):
+    """`urllib.request.urlopen` for this server: HTTPS, verified (tls_context)."""
+    url = target.full_url if isinstance(target, urllib.request.Request) else target
+    return urllib.request.urlopen(target, timeout=timeout, context=tls_context(url))
 
 
 def ensure_env(service: str, bind_addr=None, token=None, port=None) -> str:
@@ -603,10 +648,18 @@ def container_status(service: str) -> dict:
         return info
 
     info["exists"] = True
-    rc, state, err = _capture(["docker", "inspect", "--format", "{{.State.Status}}", container], timeout=30)
+    rc, state, err = _capture(
+        ["docker", "inspect", "--format",
+         "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", container],
+        timeout=30)
     if rc == 0:
-        info["state"] = state
-        info["running"] = state == "running"
+        status, _sep, healthcheck = state.strip().partition(" ")
+        info["state"] = status
+        info["running"] = status == "running"
+        # The container's own healthcheck (`serve.py --check`): it verifies
+        # the server against the certificate file it listens with, from inside
+        # the container. What says "up" before a public URL exists.
+        info["healthy"] = healthcheck.strip() == "healthy"
     else:
         info["error"] = err or "docker inspect failed"
     return info
@@ -629,8 +682,10 @@ def port_in_use(port: int = DEFAULT_PORT, host: str = "127.0.0.1") -> bool:
 def health(url=None, timeout: float = 5.0) -> bool:
     """GET /health. Never raises - an unreachable server just means "not up"."""
     url = url or url_for()
+    if not url:
+        return False
     try:
-        with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as response:
+        with server_urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as response:
             if response.status != 200:
                 return False
             return json.loads(response.read().decode("utf-8")).get("status") == "ok"
@@ -650,12 +705,18 @@ def wait_for_health(url: str, timeout: int, service: str) -> bool:
     killed just before it would have worked.
     """
     deadline = time.monotonic() + timeout
-    log(f"Waiting for {url}/health (up to {timeout // 60} min)...")
+    # With no public URL yet there is nothing a client may verify, so the
+    # container's own healthcheck is what is waited on instead.
+    where = f"{url}/health" if url else f"the '{service}' container's healthcheck"
+    log(f"Waiting for {where} (up to {timeout // 60} min)...")
     while time.monotonic() < deadline:
-        if health(url):
-            log("The server is up.")
-            return True
         state = container_status(service)
+        if health(url) if url else state.get("healthy"):
+            log("The server is up.")
+            if not url:
+                log("It has no public URL yet: run scripts/setup-tailscale.sh, the only way "
+                    "a client can reach it.")
+            return True
         # "restarting" belongs here with the dead states: `restart:
         # unless-stopped` turns a container that fails at boot into a loop, and
         # a loop never becomes healthy - without this the caller waited out the
@@ -687,7 +748,7 @@ def wait_for_health(url: str, timeout: int, service: str) -> bool:
             cmd_logs_tail(service, 40)
             return False
         time.sleep(HEALTH_POLL_SECONDS)
-    log(f"Still no answer from {url}/health after {timeout}s. Last log lines:")
+    log(f"Still no answer from {where} after {timeout}s. Last log lines:")
     cmd_logs_tail(service, 40)
     return False
 
@@ -743,6 +804,20 @@ def _load_fetch_data():
 
 def data_dir() -> str:
     return os.path.join(REPO_ROOT, "DATA")
+
+
+def ensure_tls_dir() -> str:
+    """Create ./tls before docker can, for the same reason as DATA/.
+
+    It is mounted read-only as /etc/visor-tls and holds a publicly signed
+    certificate only when the operator puts one there (TLS_CERT_FILE).
+    """
+    root = os.path.join(REPO_ROOT, "tls")
+    try:
+        os.makedirs(root, mode=0o755, exist_ok=True)
+    except OSError as exc:
+        raise ServerCtlError(f"Could not create {root}: {exc}") from None
+    return root
 
 
 def ensure_data_dir() -> str:
@@ -884,22 +959,25 @@ GHOST_AFTER_SECONDS = 900
 BUSY_STATES = ("pending", "running")
 
 
-def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0):
+def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0, admin: bool = False):
     """One JSON request to the server, or None if it could not be made.
 
     None is deliberately not distinguished from an error: every caller below
     treats "I could not ask" and "the answer was no" the same way, which is to
     not proceed with an update. Raising here would only move that decision.
+
+    `admin` sends `token` as the operator's admin token (X-Admin-Token)
+    instead of a Bearer API token: the two never travel together.
     """
     request = urllib.request.Request(
         f"{url.rstrip('/')}{path}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={ADMIN_HEADER: token} if admin else {"Authorization": f"Bearer {token}"},
     )
     if payload is not None:
         request.data = json.dumps(payload).encode("utf-8")
         request.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with server_urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -912,11 +990,20 @@ def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0):
         return None
 
 
-def set_accepting(url: str, token: str, accepting: bool,
+# POST /maintenance is an operator's act: authenticated by ADMIN_TOKEN, which
+# no workstation holds (server/wire/security.py).
+ADMIN_HEADER = "X-Admin-Token"
+
+
+def set_accepting(url: str, admin_token: str, accepting: bool,
                   seconds: int = GATE_LEASE_SECONDS, reason: str = ""):
-    """Open or close the server's door. Returns its answer, or None."""
-    return _api(url, token, "/maintenance",
-                {"accepting": accepting, "seconds": seconds, "reason": reason})
+    """Open or close the server's door. Returns its answer, or None -- which
+    is also the answer when no admin token is known, or the server has none
+    (403) or refuses this one (401)."""
+    if not admin_token:
+        return None
+    return _api(url, admin_token, "/maintenance",
+                {"accepting": accepting, "seconds": seconds, "reason": reason}, admin=True)
 
 
 def server_load(url: str, token: str):
@@ -1023,7 +1110,9 @@ def cmd_status(args) -> dict:
         "service": service,
         "clone": clone,
         "container": container_status(service),
-        "server": {"url": url, "healthy": health(url)},
+        # `public_url`: the only address a client may be given (url_for).
+        # "" until PUBLIC_URL is set or setup-tailscale.sh has run.
+        "server": {"url": url, "public_url": public_url(), "healthy": health(url)},
         # Deliberately no token here: a status dump lands in log panes and bug
         # reports. `server_ctl.py token` is the one way to read it.
         "env": {
@@ -1101,11 +1190,36 @@ def _preflight(service: str, port=None) -> None:
         )
 
 
+def warn_if_tailscale_serves_http(port: int) -> bool:
+    """Say so when `tailscale serve` still forwards to plain http:// here.
+
+    An older setup-tailscale.sh published `http://127.0.0.1:PORT`. The server
+    has no plain-HTTP listener any more (server/tls.py), so every remote client
+    of such a machine gets a 502 while the local health check passes. Fixing it
+    needs root, so this only says how.
+    """
+    if not shutil.which("tailscale"):
+        return False
+    try:
+        listing = subprocess.run(["tailscale", "serve", "status"], capture_output=True,
+                                 text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    stale = any(f"http://127.0.0.1:{port}" in line or f"http://localhost:{port}" in line
+                for line in listing.splitlines())
+    if stale:
+        log(f"WARNING: `tailscale serve` forwards to http://127.0.0.1:{port}, which this server "
+            "no longer answers: remote clients get an error. Re-run, as root: "
+            f"sh {os.path.join(_SCRIPT_DIR, 'setup-tailscale.sh')} --port {port}")
+    return stale
+
+
 def cmd_up(args) -> dict:
     service = pick_service(args.device)
     port = args.port or effective_port()
     _preflight(service, port)
     ensure_data_dir()
+    ensure_tls_dir()
     token = ensure_env(service, args.bind, token=args.token, port=port)
     # After ensure_env, so a --port lands in .env before the URL is derived
     # from it -- compose and the health check must not read different ports.
@@ -1138,10 +1252,12 @@ def cmd_up(args) -> dict:
 
     healthy = wait_for_health(url, args.timeout, service) if args.wait else False
     deps_skipped = warn_if_deps_skipped(service) if healthy else False
+    warn_if_tailscale_serves_http(port)
     return {
         "deps_install_skipped": deps_skipped,
         "service": service,
         "url": url,
+        "public_url": public_url(),
         "healthy": healthy,
         "token": token,
         "data_dir": data_dir(),
@@ -1197,8 +1313,10 @@ def cmd_update(args) -> dict:
     # --- the container half -----------------------------------------------
     _preflight(service, port)
     up_to_date = not result["pulled"] and not result["switched_branch"]
-    running = container_status(service)["running"]
-    if up_to_date and running and health(url) and not args.force:
+    current = container_status(service)
+    running = current["running"]
+    answering = health(url) if url else current.get("healthy")
+    if up_to_date and running and answering and not args.force:
         log("Nothing to update and the server is answering. Leaving it alone.")
         result["healthy"] = True
         return result
@@ -1209,6 +1327,7 @@ def cmd_update(args) -> dict:
     result["pulled_image"] = True
 
     ensure_data_dir()
+    ensure_tls_dir()
     ensure_env(service, args.bind)
     if _stream(compose_base(service) + ["up", "-d", "--force-recreate", service], cwd=REPO_ROOT) != 0:
         raise ServerCtlError(f"'docker compose up --force-recreate' failed for service '{service}'.")
@@ -1274,6 +1393,16 @@ def cmd_watch(args) -> dict:
             "No API_TOKEN in the .env, so this cannot ask the server to stop taking "
             "work before it restarts it. Run 'up' first, or set one."
         )
+    # The door is closed with the operator's token, not the API one. Without
+    # it an update would restart the server under runs it never stopped
+    # admitting, so applying is refused here rather than at the first update.
+    args.admin_token = (getattr(args, "admin_token", None) or os.environ.get("ADMIN_TOKEN")
+                        or read_env().get("ADMIN_TOKEN") or "")
+    if mode == AUTO_UPDATE_APPLY and not args.admin_token:
+        raise ServerCtlError(
+            "No ADMIN_TOKEN in the .env, so this cannot close the server to new runs "
+            "before it restarts it. Run 'up' once to generate one, or pass --admin-token."
+        )
 
     log(f"Watching {branch} every {args.poll}s in '{mode}' mode. "
         f"The server is at {url}.")
@@ -1336,9 +1465,11 @@ def _watch_once(branch: str, url: str, service: str, token: str, args,
         return {"head": local}
 
     # Shut the door only now. Everything above happened with it open.
-    gate = set_accepting(url, token, False, GATE_LEASE_SECONDS, f"updating to {remote[:9]}")
+    admin_token = getattr(args, "admin_token", "") or ""
+    gate = set_accepting(url, admin_token, False, GATE_LEASE_SECONDS, f"updating to {remote[:9]}")
     if gate is None:
-        log("The server would not take the maintenance request; not updating.")
+        log("The server would not take the maintenance request; not updating." + (
+            "" if admin_token else " No ADMIN_TOKEN in the .env: the door cannot be closed without it."))
         return {"head": local}
     if gate.get("unsupported"):
         log("This server has no maintenance endpoint (it predates it). Updating "
@@ -1364,7 +1495,7 @@ def _watch_once(branch: str, url: str, service: str, token: str, args,
         # On every path out, including the ones above that return early. The
         # lease is the backstop for this process being killed, not for it
         # taking a branch it forgot to clean up after.
-        set_accepting(url, token, True)
+        set_accepting(url, admin_token, True)
 
 
 # ---------------------------------------------------------------------------
@@ -1816,7 +1947,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if with_url:
             sub.add_argument("--url", default=None,
-                             help="Where to health-check. Default: http://localhost:<HOST_PORT>.")
+                             help="Where to health-check. Default: https://localhost:<HOST_PORT>.")
 
     status = subparsers.add_parser("status", help="Report every prerequisite, the clone, and the container.")
     add_common(status)
@@ -1894,6 +2025,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Override SADT_AUTO_UPDATE for this invocation. "
                             "Default: whatever the environment or the .env says, "
                             "and 'off' when neither says anything.")
+    watch.add_argument("--admin-token", default=None,
+                       help="What closes the server to new runs during an update. "
+                            "Default: ADMIN_TOKEN from the environment, else the .env. "
+                            "Never printed.")
     watch.add_argument("--once", action="store_true",
                        help="Check once and exit, instead of looping. What a timer "
                             "or a cron entry calls, and what the tests drive.")

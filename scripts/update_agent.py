@@ -64,6 +64,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import uuid
 import urllib.error
 import urllib.request
@@ -98,14 +99,40 @@ REQUEST_POLL_SECONDS = 2
 # out. If this process is killed, the server reopens by itself this soon after.
 DOOR_LEASE_SECONDS = 90
 LOG_LINES = 40
+# The header POST /maintenance is authenticated by: the operator's admin token,
+# never the API token every workstation holds (server/wire/security.py).
+ADMIN_HEADER = "X-Admin-Token"
+# door()'s answer when the server could not be reached at all, as opposed to
+# one that answered and refused.
+DOOR_UNREACHABLE = "the server did not answer"
+
+def _release_diff_source() -> str:
+    """The source of server/wire/release_diff.py as COMMITTED at HEAD.
+
+    Never the working tree: the server container bind-mounts server/ read-write,
+    so a file there is whatever the container last wrote, and executing it here
+    would run container-controlled code on the host. HEAD is what the operator
+    fetched, and the container sees .git read-only. A tree with no .git at all
+    (a test image mounting scripts/ and server/ alone) has no HEAD to read and
+    no agent deployed in it, and falls back to the file.
+    """
+    relative = "server/wire/release_diff.py"
+    if not os.path.exists(os.path.join(REPO_ROOT, ".git")):
+        with open(os.path.join(REPO_ROOT, *relative.split("/")), encoding="utf-8") as handle:
+            return handle.read()
+    done = subprocess.run(["git", "-C", REPO_ROOT, "show", f"HEAD:{relative}"],
+                          capture_output=True, text=True, timeout=60)
+    if done.returncode != 0:
+        raise RuntimeError(f"cannot read {relative} at HEAD: {done.stderr.strip() or 'git refused'}")
+    return done.stdout
+
 
 def _load_release_diff():
-    """The classification the server's own "Check for updates" uses, loaded by
-    path so the panel and this agent can never disagree about a commit."""
-    path = os.path.join(REPO_ROOT, "server", "wire", "release_diff.py")
-    spec = importlib.util.spec_from_file_location("release_diff_for_agent", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    """The classification the server's own "Check for updates" uses, so the
+    panel and this agent can never disagree about a commit."""
+    module = types.ModuleType("release_diff_for_agent")
+    module.__file__ = "<HEAD:server/wire/release_diff.py>"
+    exec(compile(_release_diff_source(), module.__file__, "exec"), module.__dict__)
     return module
 
 
@@ -266,6 +293,17 @@ def inspect_image(image: str, kind: str, fetch: bool = True, cache: dict = None)
     return info
 
 
+def _pinned(image: str, digest: str) -> str:
+    """`image` with its tag replaced by `digest` (`name@sha256:...`), or
+    `image` itself when no digest is known."""
+    if not digest or not digest.startswith("sha256:"):
+        return image
+    name = image.split("@", 1)[0]
+    if ":" in name.rsplit("/", 1)[-1]:
+        name = name.rsplit(":", 1)[0]
+    return f"{name}@{digest}"
+
+
 def blockers(info: dict) -> list:
     """Why this checkout cannot be updated from the panel, or []."""
     reasons = []
@@ -353,6 +391,7 @@ class Agent:
         self.update_dir = args.update_dir
         self.url = args.url
         self.token = args.token
+        self.admin_token = getattr(args, "admin_token", "") or ""
         self.state = {"last": None, "applying": None}
         previous = self._read(STATUS_FILE) or {}
         self.state["last"] = previous.get("last")
@@ -411,13 +450,37 @@ class Agent:
             request.data = json.dumps(payload).encode("utf-8")
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with server_ctl.server_urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8") or "{}")
         except Exception:  # noqa: BLE001 - a probe answers None
             return None
 
-    def door(self, accepting: bool, reason: str = "") -> None:
-        self._api("/maintenance", {"accepting": accepting, "seconds": DOOR_LEASE_SECONDS, "reason": reason})
+    def door(self, accepting: bool, reason: str = ""):
+        """Open or close the server to new runs. None once the server took it,
+        else why it did not -- DOOR_UNREACHABLE when nothing answered.
+
+        Sent with the ADMIN token: closing a clinic's server is an operator's
+        act, and the API token every workstation holds cannot do it.
+        """
+        if not self.admin_token:
+            return "no ADMIN_TOKEN in the deployment's .env, so the server cannot be closed to new runs"
+        request = urllib.request.Request(
+            f"{self.url.rstrip('/')}/maintenance", method="POST",
+            data=json.dumps({"accepting": accepting, "seconds": DOOR_LEASE_SECONDS,
+                             "reason": reason}).encode("utf-8"),
+            headers={ADMIN_HEADER: self.admin_token, "Content-Type": "application/json"})
+        try:
+            with server_ctl.server_urlopen(request, timeout=10) as response:
+                response.read()
+            return None
+        except urllib.error.HTTPError as exc:
+            if exc.code == 403:
+                return "the server has no ADMIN_TOKEN set, so it cannot be closed to new runs"
+            if exc.code == 401:
+                return "the server refused this deployment's ADMIN_TOKEN"
+            return f"the server answered {exc.code} to closing it"
+        except Exception:  # noqa: BLE001 - reported, the caller decides
+            return DOOR_UNREACHABLE
 
     def in_flight(self):
         """Runs still holding or wanting the machine, or None if unreachable."""
@@ -439,7 +502,7 @@ class Agent:
 
     def healthy(self) -> bool:
         try:
-            with urllib.request.urlopen(f"{self.url.rstrip('/')}/health", timeout=5) as response:
+            with server_ctl.server_urlopen(f"{self.url.rstrip('/')}/health", timeout=5) as response:
                 return response.status == 200
         except Exception:  # noqa: BLE001
             return False
@@ -530,7 +593,14 @@ class Agent:
                 return
 
             self.phase("Closing the server to new runs.")
-            self.door(False, "updating")
+            # A server that answers and refuses will refuse every renewal too:
+            # updating anyway would restart it under runs admitted meanwhile.
+            # One that does not answer is waited for below, and must take the
+            # door before anything changes.
+            refusal = self.door(False, "updating")
+            if refusal and refusal != DOOR_UNREACHABLE:
+                message = f"Not updated: {refusal}."
+                return
             keeper = self.hold_door()
             while True:
                 if not os.path.exists(self._path(REQUEST_FILE)):
@@ -546,6 +616,10 @@ class Agent:
                                ", ".join(sorted({r.get('tool') or '?' for r in busy})))
                 time.sleep(REQUEST_POLL_SECONDS * 2)
 
+            refusal = self.door(False, "updating")
+            if refusal:
+                message = f"Not updated: {refusal}. Nothing was changed."
+                return
             # The point of no return: the request is consumed, the pull begins.
             try:
                 os.remove(self._path(REQUEST_FILE))
@@ -556,7 +630,7 @@ class Agent:
             for info in parts:
                 if info.get("image"):
                     self.phase(f"Pulling {info['image']} ({info['target']}).")
-                    if not self.pull_image(info["image"]):
+                    if not self.pull_image(info["image"], info.get("pending_digest", "")):
                         message = f"Pulling {info['image']} failed; see the log. Nothing was restarted."
                         return
                     applied[info["kind"]] = info["target"]
@@ -573,7 +647,8 @@ class Agent:
                     restart = RECREATE
                 if info["kind"] == "server" and info["changes"]["action"] == IMAGE:
                     self.phase(f"Pulling the published server image {self.args.server_image}.")
-                    if not self.pull_image(self.args.server_image):
+                    if not self.pull_image(self.args.server_image,
+                                           self.server_image.get("pending_digest", "")):
                         message = ("The server code is pulled but its image could not be; "
                                    "the server was not restarted.")
                         return
@@ -696,7 +771,7 @@ class Agent:
             headers={"Authorization": f"Bearer {self.token}", "X-Run-Id": str(uuid.uuid4()),
                      "Content-Type": f"multipart/form-data; boundary={boundary}"})
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with server_ctl.server_urlopen(request, timeout=timeout) as response:
                 while response.read(1 << 20):
                     pass
                 return response.status, ""
@@ -728,15 +803,28 @@ class Agent:
         threading.Thread(target=renew, name="door-keeper", daemon=True).start()
         return released
 
-    def pull_image(self, image: str) -> bool:
-        """`docker pull`, its notable lines kept for the panel's log."""
-        process = subprocess.Popen(["docker", "pull", image], stdout=subprocess.PIPE,
+    def pull_image(self, image: str, digest: str = "") -> bool:
+        """`docker pull`, its notable lines kept for the panel's log.
+
+        With `digest` -- the one the survey compared -- the exact manifest is
+        pulled and then tagged as `image`, so what is installed is what was
+        judged, not whatever the tag points at by the time the pull starts.
+        """
+        reference = _pinned(image, digest)
+        process = subprocess.Popen(["docker", "pull", reference], stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True)
         for line in process.stdout:
             line = line.rstrip()
             if line and not line.endswith(("Waiting", "Pulling fs layer", "Download complete")):
                 self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
-        return process.wait() == 0
+        if process.wait() != 0:
+            return False
+        if reference == image:
+            return True
+        done = subprocess.run(["docker", "tag", reference, image], capture_output=True, text=True)
+        if done.returncode != 0:
+            self.log_lines = (self.log_lines + [(done.stderr or "docker tag failed").strip()])[-LOG_LINES:]
+        return done.returncode == 0
 
     def wait_idle(self, why: str) -> None:
         """Block until nothing is in flight. The last check before a restart:
@@ -863,6 +951,9 @@ def main(argv=None) -> int:
                         help="Where models and test files are downloaded (the server's DATA/).")
     parser.add_argument("--url", default=None, help="Default: this deployment's own address.")
     parser.add_argument("--token", default=None, help="Default: API_TOKEN from the .env.")
+    parser.add_argument("--admin-token", default=None,
+                        help="What closes the server during an update. Default: ADMIN_TOKEN from the "
+                             "environment, else the .env. Never printed.")
     parser.add_argument("--service", default=None, help="The compose service to restart.")
     parser.add_argument("--restart-cmd", default=None,
                         help="A shell command that restarts the server, instead of docker compose.")
@@ -886,6 +977,7 @@ def main(argv=None) -> int:
                              or server_ctl.DEFAULT_SERVER_IMAGE)
     args.url = args.url or server_ctl.url_for()
     args.token = args.token or os.environ.get("API_TOKEN") or env.get("API_TOKEN") or ""
+    args.admin_token = args.admin_token or os.environ.get("ADMIN_TOKEN") or env.get("ADMIN_TOKEN") or ""
     Agent(args).run()
     return 0
 
