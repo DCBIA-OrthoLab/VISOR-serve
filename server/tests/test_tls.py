@@ -120,3 +120,9 @@ def test_a_tool_inherits_none_of_the_servers_secrets(monkeypatch):
     monkeypatch.setenv("TLS_KEY_FILE", "/key.pem")
     environment = dispatch.child_environment_base()
     assert not set(dispatch.SERVER_SECRETS) & set(environment)
+
+
+def test_this_machines_own_addresses_are_pinned_and_others_are_not():
+    assert server_ctl.is_this_machine("localhost") and server_ctl.is_this_machine("::1")
+    assert not server_ctl.is_this_machine("192.0.2.1")  # TEST-NET-1, never local
+    assert not server_ctl.is_this_machine("visor.example.invalid")

@@ -381,6 +381,33 @@ _LOOPBACK = ("localhost", "127.0.0.1", "::1")
 _PINNED = {}
 
 
+def is_this_machine(host: str) -> bool:
+    """Whether `host` is loopback or one of this machine's own addresses.
+
+    A deployment bound to one address (`--bind <vpn address>`) is not on
+    127.0.0.1 at all, yet traffic to an address this machine holds is routed
+    through its loopback and never reaches a wire. Binding to it is how the
+    standard library can tell: only a local address can be bound.
+    """
+    host = (host or "").strip("[]").lower()
+    if host in _LOOPBACK or host.endswith(".localhost"):
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except OSError:
+        return False
+    addresses = {info[4][0] for info in infos}
+    if not addresses:
+        return False
+    for family, address in {(info[0], info[4][0]) for info in infos}:
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.bind((address, 0))
+        except OSError:
+            return False
+    return True
+
+
 def tls_context(url: str) -> ssl.SSLContext:
     """How to verify the server at `url`, which only ever speaks HTTPS.
 
@@ -388,16 +415,17 @@ def tls_context(url: str) -> ssl.SSLContext:
     `tailscale serve`, whose certificate an authority signed. The server on
     THIS machine presents a self-signed certificate it generated itself
     (server/tls.py), and there is no authority to check it against, so it is
-    pinned on first use over loopback. That is only acceptable because the
-    bytes never leave the machine: anything able to answer on this machine's
-    loopback can already read what is being sent. An `http://` URL is refused
+    pinned on first use -- over loopback, or to an address this machine holds
+    (is_this_machine). That is only acceptable because the bytes never leave
+    the machine: anything able to answer there can already read what is being
+    sent. An `http://` URL is refused
     outright, so nothing here can send the token in the clear.
     """
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https":
         raise ValueError(f"The server only speaks HTTPS; refusing {parsed.scheme or 'a schemeless'} URL.")
     host = (parsed.hostname or "").lower()
-    if host not in _LOOPBACK:
+    if not is_this_machine(host):
         return ssl.create_default_context()
     port = parsed.port or 443
     if (host, port) not in _PINNED:
