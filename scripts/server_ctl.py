@@ -355,91 +355,49 @@ def effective_port() -> int:
 
 
 def url_for(port=None, bind_addr=None) -> str:
-    """Where this deployment answers, seen from the machine running it.
+    """Where this deployment answers: its public `https://<name>.ts.net` URL.
 
-    `localhost` is right when the port is published on loopback or on EVERY
-    interface. It is wrong when it is published on one specific address, which
-    is exactly what `--bind <vpn address>` is for: the port is then simply not
-    on 127.0.0.1, so a health check against localhost polls an address nothing
-    listens on and reports a perfectly healthy server as dead.
+    The ONLY address anything outside the container talks to, this script
+    included: it presents a publicly signed certificate, and that is the only
+    kind any client here verifies against. The port uvicorn listens on is
+    published on 127.0.0.1 alone, for `tailscale serve`, with a self-signed
+    certificate nobody else trusts. "" when this machine publishes no such URL
+    yet -- a first start, before setup-tailscale.sh -- which callers read as
+    "cannot reach it through the front door" (see wait_for_health).
 
-    Read from `.env` rather than passed around, so every caller agrees without
-    having to thread the value through. `cmd_up` calls `ensure_env` first, so
-    what is read here is already the binding the container is about to get.
+    `port` and `bind_addr` are accepted and ignored: callers still pass them.
     """
-    if bind_addr is None:
-        bind_addr = read_env().get("BIND_ADDR", "127.0.0.1")
-    host = "localhost"
-    # "" and 0.0.0.0/:: all mean "every interface", and loopback is included in
-    # that -- so localhost stays the right thing to talk to.
-    if bind_addr and bind_addr not in ("127.0.0.1", "localhost", "0.0.0.0", "::"):
-        host = f"[{bind_addr}]" if ":" in bind_addr else bind_addr
-    return f"https://{host}:{port or effective_port()}"
+    return public_url()
 
 
-_LOOPBACK = ("localhost", "127.0.0.1", "::1")
-_PINNED = {}
-
-
-def is_this_machine(host: str) -> bool:
-    """Whether `host` is loopback or one of this machine's own addresses.
-
-    A deployment bound to one address (`--bind <vpn address>`) is not on
-    127.0.0.1 at all, yet traffic to an address this machine holds is routed
-    through its loopback and never reaches a wire. Binding to it is how the
-    standard library can tell: only a local address can be bound.
-    """
-    host = (host or "").strip("[]").lower()
-    if host in _LOOPBACK or host.endswith(".localhost"):
-        return True
+def public_url() -> str:
+    """The https URL `tailscale serve` publishes on this machine, or ""."""
+    if not shutil.which("tailscale"):
+        return ""
     try:
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except OSError:
-        return False
-    addresses = {info[4][0] for info in infos}
-    if not addresses:
-        return False
-    for family, address in {(info[0], info[4][0]) for info in infos}:
-        try:
-            with socket.socket(family, socket.SOCK_STREAM) as probe:
-                probe.bind((address, 0))
-        except OSError:
-            return False
-    return True
+        listing = subprocess.run(["tailscale", "serve", "status"], capture_output=True,
+                                 text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for word in listing.split():
+        if word.startswith("https://"):
+            return word.rstrip("/").split(" ")[0]
+    return ""
 
 
 def tls_context(url: str) -> ssl.SSLContext:
-    """How to verify the server at `url`, which only ever speaks HTTPS.
+    """How to verify the server at `url`: against the PUBLIC authorities, always.
 
-    A remote address is verified the ordinary way: it is reached through
-    `tailscale serve`, whose certificate an authority signed. The server on
-    THIS machine presents a self-signed certificate it generated itself
-    (server/tls.py), and there is no authority to check it against, so it is
-    pinned on first use -- over loopback, or to an address this machine holds
-    (is_this_machine). That is only acceptable because the bytes never leave
-    the machine: anything able to answer there can already read what is being
-    sent. An `http://` URL is refused
-    outright, so nothing here can send the token in the clear.
+    No certificate is trusted on sight, none is pinned, and no custom
+    authority is accepted, whatever the address: the server is reached through
+    `tailscale serve`, whose certificate a public authority signed, and nothing
+    else is something a client may trust. An `http://` URL is refused
+    outright, whatever its host, so nothing here can send a token in the clear.
     """
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https":
         raise ValueError(f"The server only speaks HTTPS; refusing {parsed.scheme or 'a schemeless'} URL.")
-    host = (parsed.hostname or "").lower()
-    if not is_this_machine(host):
-        return ssl.create_default_context()
-    port = parsed.port or 443
-    if (host, port) not in _PINNED:
-        try:
-            pem = ssl.get_server_certificate((host, port), timeout=5)
-        except TypeError:  # Python < 3.10 has no timeout here
-            pem = ssl.get_server_certificate((host, port))
-        context = ssl.create_default_context(cadata=pem)
-        # The certificate itself is pinned, so the name adds nothing -- and an
-        # operator's own certificate names the public address, not localhost.
-        context.check_hostname = False
-        context.verify_flags |= getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
-        _PINNED[(host, port)] = context
-    return _PINNED[(host, port)]
+    return ssl.create_default_context()
 
 
 def server_urlopen(target, timeout: float):
@@ -676,10 +634,18 @@ def container_status(service: str) -> dict:
         return info
 
     info["exists"] = True
-    rc, state, err = _capture(["docker", "inspect", "--format", "{{.State.Status}}", container], timeout=30)
+    rc, state, err = _capture(
+        ["docker", "inspect", "--format",
+         "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", container],
+        timeout=30)
     if rc == 0:
-        info["state"] = state
-        info["running"] = state == "running"
+        status, _sep, healthcheck = state.strip().partition(" ")
+        info["state"] = status
+        info["running"] = status == "running"
+        # The container's own healthcheck (`serve.py --check`): it verifies
+        # the server against the certificate file it listens with, from inside
+        # the container. What says "up" before a public URL exists.
+        info["healthy"] = healthcheck.strip() == "healthy"
     else:
         info["error"] = err or "docker inspect failed"
     return info
@@ -702,6 +668,8 @@ def port_in_use(port: int = DEFAULT_PORT, host: str = "127.0.0.1") -> bool:
 def health(url=None, timeout: float = 5.0) -> bool:
     """GET /health. Never raises - an unreachable server just means "not up"."""
     url = url or url_for()
+    if not url:
+        return False
     try:
         with server_urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as response:
             if response.status != 200:
@@ -723,12 +691,18 @@ def wait_for_health(url: str, timeout: int, service: str) -> bool:
     killed just before it would have worked.
     """
     deadline = time.monotonic() + timeout
-    log(f"Waiting for {url}/health (up to {timeout // 60} min)...")
+    # With no public URL yet there is nothing a client may verify, so the
+    # container's own healthcheck is what is waited on instead.
+    where = f"{url}/health" if url else f"the '{service}' container's healthcheck"
+    log(f"Waiting for {where} (up to {timeout // 60} min)...")
     while time.monotonic() < deadline:
-        if health(url):
-            log("The server is up.")
-            return True
         state = container_status(service)
+        if health(url) if url else state.get("healthy"):
+            log("The server is up.")
+            if not url:
+                log("It has no public URL yet: run scripts/setup-tailscale.sh, the only way "
+                    "a client can reach it.")
+            return True
         # "restarting" belongs here with the dead states: `restart:
         # unless-stopped` turns a container that fails at boot into a loop, and
         # a loop never becomes healthy - without this the caller waited out the
@@ -760,7 +734,7 @@ def wait_for_health(url: str, timeout: int, service: str) -> bool:
             cmd_logs_tail(service, 40)
             return False
         time.sleep(HEALTH_POLL_SECONDS)
-    log(f"Still no answer from {url}/health after {timeout}s. Last log lines:")
+    log(f"Still no answer from {where} after {timeout}s. Last log lines:")
     cmd_logs_tail(service, 40)
     return False
 
@@ -1295,8 +1269,10 @@ def cmd_update(args) -> dict:
     # --- the container half -----------------------------------------------
     _preflight(service, port)
     up_to_date = not result["pulled"] and not result["switched_branch"]
-    running = container_status(service)["running"]
-    if up_to_date and running and health(url) and not args.force:
+    current = container_status(service)
+    running = current["running"]
+    answering = health(url) if url else current.get("healthy")
+    if up_to_date and running and answering and not args.force:
         log("Nothing to update and the server is answering. Leaving it alone.")
         result["healthy"] = True
         return result

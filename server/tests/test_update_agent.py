@@ -598,7 +598,7 @@ def test_a_malformed_smoke_file_is_ignored(agent_module, repos, tmp_path, monkey
     assert _last(agent)["ok"] is True
 
 
-def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path):
+def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path, monkeypatch):
     """Against a real HTTP server: the fields arrive as multipart, the run
     carries an id (so the next update waits for it), and a refusal's detail
     is what the report says."""
@@ -623,11 +623,16 @@ def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path):
 
     httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
     # Over TLS, as the real server is: the agent refuses http:// outright and
-    # pins what this loopback presents.
+    # verifies against the public authorities only. The test alone makes its
+    # throwaway certificate one of those, through the standard SSL_CERT_FILE.
     cert, key = str(tmp_path / "cert.pem"), str(tmp_path / "key.pem")
     subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
-                    "-nodes", "-days", "1", "-subj", "/CN=test", "-keyout", key, "-out", cert],
+                    "-nodes", "-days", "1", "-subj", "/CN=test",
+                    "-addext", "subjectAltName=IP:127.0.0.1",
+                    "-addext", "basicConstraints=critical,CA:FALSE",
+                    "-keyout", key, "-out", cert],
                    check=True, capture_output=True)
+    monkeypatch.setenv("SSL_CERT_FILE", cert)
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(cert, key)
     httpd.socket = context.wrap_socket(httpd.socket, server_side=True)

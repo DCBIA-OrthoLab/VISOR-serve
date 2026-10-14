@@ -45,19 +45,24 @@ x-inference-base: &inference-base
     # to generate.
     - ${UV_PYTHON_STORE:-./docker/fixtures}:${UV_PYTHON_STORE:-/workspace/docker/fixtures}:ro
   ports:
-    # Unset BIND_ADDR publishes on every interface, which is what a lab GPU
-    # server behind a TLS terminator wants. server_ctl.py writes
-    # BIND_ADDR=127.0.0.1 for a local install instead: that one speaks plain
-    # HTTP, and plain HTTP carrying medical images must not leave the machine.
-    #
-    # The `:+` form keeps "unset" meaning NO host address rather than the
-    # literal 0.0.0.0: with no address docker publishes on both stacks, while
-    # an explicit 0.0.0.0 is IPv4 only and would silently drop IPv6 clients.
-    # The inner `:-` is not redundant -- without it compose warns "The
-    # BIND_ADDR variable is not set" on every command.
+    # Loopback only, and deliberately not configurable. The one way in from
+    # another machine is `tailscale serve`, which presents the publicly signed
+    # certificate every client verifies; behind it the server speaks HTTPS too
+    # (server/tls.py), with a self-signed certificate no client trusts. A port
+    # published on a network address would offer exactly that certificate to
+    # the network, so there is no BIND_ADDR here any more.
     #
     # HOST_PORT moves the HOST side only; the container always serves 8000.
-    - "${BIND_ADDR:+${BIND_ADDR:-}:}${HOST_PORT:-8000}:8000"
+    - "127.0.0.1:${HOST_PORT:-8000}:8000"
+  # The container's own probe (serve.py --check): it verifies the server
+  # against the certificate file it listens with, from inside, and is what
+  # server_ctl.py waits on before a public URL exists.
+  healthcheck:
+    test: ["CMD-SHELL", "cd /opt/sadt/server 2>/dev/null || cd /workspace/server; for p in /opt/sadt/.venv/bin/python python3 python; do command -v $$p >/dev/null 2>&1 && exec $$p serve.py --check --port 8000; done; exit 1"]
+    interval: 15s
+    timeout: 10s
+    retries: 3
+    start_period: 30m
   # The image already carries requirements-api.txt, so this install is a
   # no-op that needs no network -- it only acts when a pull changed the API's
   # requirements ahead of the image. It must still NOT gate uvicorn: the
@@ -291,9 +296,16 @@ services:
     # images built before it said so, which still start `uvicorn` in the clear.
     command: ["/opt/sadt/.venv/bin/python", "serve.py", "--host", "0.0.0.0", "--port", "8000"]
     # Port 8001 by default, so it can run beside the in-process server while
-    # the tools are moved over one at a time.
+    # the tools are moved over one at a time. Loopback only, for the same
+    # reason as `inference`: tailscale serve is the only way in.
     ports:
-      - "${BIND_ADDR:+${BIND_ADDR:-}:}${VENVS_HOST_PORT:-8001}:8000"
+      - "127.0.0.1:${VENVS_HOST_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD", "/opt/sadt/.venv/bin/python", "serve.py", "--check", "--port", "8000"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 10m
     # Docker gives a container 64 MB, and nnUNet passes data between its
     # export workers through shared memory. Without this AMASSS and
     # Batch_Dental_Seg die with "Background workers died ... your RAM was

@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import main
+import serve
 import tls
 from config import settings
 from execution import dispatch
@@ -82,7 +83,7 @@ def test_serve_py_answers_https_and_never_plain_http(tls_dir, tmp_path):
     try:
         url = f"https://localhost:{port}/health"
         deadline = time.monotonic() + 60
-        while not server_ctl.health(f"https://localhost:{port}", timeout=2):
+        while serve.check(port) != 0:
             assert process.poll() is None, "serve.py exited"
             assert time.monotonic() < deadline, "serve.py never answered over HTTPS"
             time.sleep(0.3)
@@ -99,6 +100,9 @@ def test_serve_py_answers_https_and_never_plain_http(tls_dir, tmp_path):
             except (ConnectionResetError, socket.timeout):
                 reply = b""
         assert not reply.startswith(b"HTTP/"), reply
+        # And no client trusts it: a self-signed certificate is not a public one,
+        # whatever address it is reached on.
+        assert server_ctl.health(f"https://localhost:{port}", timeout=5) is False
     finally:
         process.terminate()
         process.wait(timeout=30)
@@ -110,11 +114,6 @@ def test_server_ctl_refuses_a_plain_http_url():
     assert server_ctl.health("http://localhost:8000") is False
 
 
-def test_a_remote_server_is_verified_against_the_public_authorities():
-    context = server_ctl.tls_context("https://visor.example.ts.net")
-    assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
-
-
 def test_a_tool_inherits_none_of_the_servers_secrets(monkeypatch):
     monkeypatch.setenv("ADMIN_TOKEN", "admin")
     monkeypatch.setenv("TLS_KEY_FILE", "/key.pem")
@@ -122,7 +121,15 @@ def test_a_tool_inherits_none_of_the_servers_secrets(monkeypatch):
     assert not set(dispatch.SERVER_SECRETS) & set(environment)
 
 
-def test_this_machines_own_addresses_are_pinned_and_others_are_not():
-    assert server_ctl.is_this_machine("localhost") and server_ctl.is_this_machine("::1")
-    assert not server_ctl.is_this_machine("192.0.2.1")  # TEST-NET-1, never local
-    assert not server_ctl.is_this_machine("visor.example.invalid")
+
+def test_every_address_is_verified_against_the_public_authorities():
+    for url in ("https://localhost:8000", "https://127.0.0.1:8000", "https://visor.example.ts.net"):
+        context = server_ctl.tls_context(url)
+        assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_plain_http_is_refused_whatever_the_host():
+    for url in ("http://localhost:8000", "http://127.0.0.1:8000", "http://[::1]:8000",
+                "http://visor.example.ts.net"):
+        with pytest.raises(ValueError, match="HTTPS"):
+            server_ctl.tls_context(url)

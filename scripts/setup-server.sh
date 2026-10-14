@@ -21,7 +21,7 @@
 #                   Nothing is downloaded by default: the full set is ~29 GB, and
 #                   which tools a given site uses is not something to assume.
 #   --device gpu|cpu   force the compose service instead of detecting it
-#   --bind ADDR     host address the port is published on (default: 127.0.0.1)
+#   --bind ADDR     ignored: the port is published on 127.0.0.1 only
 #   --port N        host port to publish on (default: 8000). Only needed when
 #                   something else already holds it; it is remembered in .env.
 #   --no-start      clone and check prerequisites, but do not start anything
@@ -238,18 +238,12 @@ fi
 
 ask PORT "Host port to publish the server on" "8000"
 
-# Tailscale decides the address, so it is settled first. Only --tailscale turns
-# it on: an operator who wants it says so, and nothing is asked otherwise.
-if [ "$TAILSCALE" -eq 1 ]; then
-    # Anything else would leave the same port open in plain HTTP beside the
-    # tailnet, which is the one thing Tailscale was brought in to prevent.
-    if [ "$BIND" != "127.0.0.1" ]; then
-        echo "setup-server: --tailscale publishes through Tailscale only; binding 127.0.0.1, not $BIND." >&2
-    fi
-    BIND="127.0.0.1"
-else
-    ask BIND "Host address to publish it on (127.0.0.1 keeps it off the network)" "127.0.0.1"
+# The port is published on 127.0.0.1 and nowhere else (docker-compose.yml):
+# Tailscale, with its publicly signed certificate, is the only way in.
+if [ "$BIND" != "127.0.0.1" ]; then
+    echo "setup-server: --bind is ignored; the server is published on 127.0.0.1 only and reached through Tailscale." >&2
 fi
+BIND="127.0.0.1"
 ask REF  "Branch this deployment follows" "$REF"
 ask AUTO_UPDATE "Follow that branch automatically? off | notify | apply" "off"
 
@@ -478,6 +472,9 @@ set_env() {
     else
         printf '%s=%s\n' "$1" "$2" >> "$_file"
     fi
+    # It holds the API and admin tokens. sed+mv writes a new file with the
+    # umask's mode, which undid the 0600 server_ctl.py set.
+    chmod 600 "$_file"
 }
 
 # --- the tools -----------------------------------------------------------
@@ -660,6 +657,7 @@ if [ -n "$TOOLS_IMAGE" ]; then
     for _key in SADT_TOOLS UV_PYTHON_STORE; do
         if [ -f "$INSTALL_DIR/.env" ] && grep -q "^$_key=" "$INSTALL_DIR/.env"; then
             sed "/^$_key=/d" "$INSTALL_DIR/.env" > "$INSTALL_DIR/.env.tmp.$$" && mv "$INSTALL_DIR/.env.tmp.$$" "$INSTALL_DIR/.env"
+            chmod 600 "$INSTALL_DIR/.env"
         fi
     done
 elif [ -n "$TOOLS_ROOT" ]; then
@@ -753,9 +751,10 @@ if [ "$TAILSCALE" -eq 1 ]; then
     fi
 else
     echo
-    echo "This deployment listens on ${BIND} over HTTPS only, with a self-signed"
-    echo "certificate: a client on this machine pins it, a client on another one"
-    echo "cannot verify it. To serve other machines, re-run with --tailscale."
+    echo "This deployment is NOT reachable by any client yet. It listens over HTTPS"
+    echo "on 127.0.0.1 only, with a self-signed certificate no client accepts:"
+    echo "clients verify a publicly signed certificate, which only Tailscale gives"
+    echo "it. Re-run with --tailscale (this machine's own Slicer included)."
 fi
 
 print_hints

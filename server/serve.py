@@ -17,6 +17,7 @@ import sys
 import uvicorn
 
 import tls
+from config import settings
 
 
 def main(argv=None) -> int:
@@ -25,19 +26,49 @@ def main(argv=None) -> int:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--reload", action="store_true",
                         help="restart on a code change (development only)")
+    parser.add_argument("--check", action="store_true",
+                        help="probe this server's own /health instead of starting it")
     args = parser.parse_args(argv)
+    if args.check:
+        return check(args.port)
 
     try:
         cert, key = tls.ensure_certificate()
     except tls.TLSConfigurationError as exc:
         print(f"serve.py: {exc}", file=sys.stderr)
         return 1
+    # Every patient file the server holds -- uploads, job directories, results
+    # kept by reference, run state -- lives under TEMP_DIR, created by this
+    # user with whatever umask the host has (0002 on a lab workstation, so
+    # group- or world-readable). One closed door at the root covers all of it.
+    os.makedirs(settings.TEMP_DIR, mode=0o700, exist_ok=True)
+    os.chmod(settings.TEMP_DIR, 0o700)
     # Inherited by --reload's worker process, which is the one that runs the
     # lifespan check.
     os.environ[tls.ACTIVE_ENV] = "1"
     uvicorn.run("main:app", host=args.host, port=args.port, reload=args.reload,
                 ssl_certfile=cert, ssl_keyfile=key)
     return 0
+
+
+def check(port: int) -> int:
+    """The container's healthcheck: 0 when this server answers on its loopback.
+
+    The one probe that does not go through the public URL, because it runs
+    where that URL may not exist yet (a first start, before `tailscale serve`).
+    It never leaves the container, sends no token, and verifies the server
+    against the exact certificate file it listens with -- nothing is trusted on
+    sight.
+    """
+    import urllib.request
+
+    try:
+        cert, _key = tls.certificate_paths()
+        with urllib.request.urlopen(f"https://127.0.0.1:{port}/health", timeout=5,
+                                    context=tls.loopback_context(cert)) as response:
+            return 0 if response.status == 200 else 1
+    except Exception:  # noqa: BLE001 - a probe answers 1, it never raises
+        return 1
 
 
 if __name__ == "__main__":

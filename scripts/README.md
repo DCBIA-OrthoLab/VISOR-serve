@@ -80,15 +80,14 @@ container toolkit is installed. Force it with `--device gpu|cpu`.
 
 ### A word on where it listens
 
-`server_ctl.py up` publishes the port on **`127.0.0.1`** by default, because
-this deployment speaks plain HTTP. `docker compose up` by hand still binds
-every interface - IPv4 *and* IPv6 - unchanged, for the lab server that sits
-behind a TLS terminator. Putting a plain-HTTP deployment on a network address
-means medical images crossing the network in the clear - see `SECURITY.md`.
-
-`BIND_ADDR` unset is not the same as `BIND_ADDR=0.0.0.0`: with no host address
-docker publishes on both stacks, while an explicit `0.0.0.0` is IPv4 only.
-Leave it out unless you mean to restrict.
+The port is published on **`127.0.0.1`** and nowhere else, whatever starts
+the container: `docker-compose.yml` hard-codes it, and `--bind` / `BIND_ADDR`
+no longer change anything. The server speaks HTTPS only, with a self-signed
+certificate meant for `tailscale serve` alone; clients - this script and the
+update agent included - reach it at the `https://<name>.<tailnet>.ts.net` URL
+Tailscale publishes, and verify its publicly signed certificate. Until
+`setup-tailscale.sh` has run, `up` waits on the container's own healthcheck
+and says that no client can reach the server yet.
 
 `--port` moves the **host** side only (the container always serves 8000
 internally) and is remembered in `.env`, so it is passed once and not on every
