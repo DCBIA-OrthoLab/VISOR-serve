@@ -47,3 +47,30 @@ sh -c "printf '[%s]\\n' $ORIGINAL_ARGS"
 def test_the_re_run_uses_no_eval():
     text = open(_SCRIPT, encoding="utf-8").read()
     assert not re.search(r"^\s*eval .*sg docker", text, re.M)
+
+
+def test_set_env_keeps_any_value_verbatim_and_the_file_private(tmp_path):
+    """A value with |, & or \\ used to be a sed expression; and the rewritten
+    file was created under the default umask before being narrowed."""
+    env = tmp_path / ".env"
+    env.write_text("API_TOKEN=old\nKEEP=1\nAPI_TOKEN_X=2\nSADT_TOOLS=/x\n")
+    env.chmod(0o644)
+    body = _function("set_env") + _function("unset_env") + '''
+umask 022
+INSTALL_DIR="$1"
+set_env API_TOKEN "$2"
+set_env NEW v
+unset_env SADT_TOOLS
+'''
+    _sh(body, str(tmp_path), "a|b&c\\d/e$x")
+    assert env.read_text().splitlines() == ["KEEP=1", "API_TOKEN_X=2", "API_TOKEN=a|b&c\\d/e$x", "NEW=v"]
+    assert (env.stat().st_mode & 0o777) == 0o600
+
+
+def test_set_env_creates_a_private_file(tmp_path):
+    body = _function("set_env") + 'umask 022\nINSTALL_DIR="$1"\nset_env API_TOKEN t\n'
+    _sh(body, str(tmp_path))
+    env = tmp_path / ".env"
+    assert env.read_text().splitlines()[-1] == "API_TOKEN=t"
+    assert (env.stat().st_mode & 0o777) == 0o600
+    assert not list(tmp_path.glob(".env.tmp.*"))

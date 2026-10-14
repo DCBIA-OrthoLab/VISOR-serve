@@ -475,15 +475,30 @@ esac
 # must survive, which is the same rule server_ctl.py's write_env follows.
 set_env() {
     _file="$INSTALL_DIR/.env"
-    [ -f "$_file" ] || { printf '%s\n' "# Written by scripts/setup-server.sh." > "$_file"; }
-    if grep -q "^$1=" "$_file" 2>/dev/null; then
-        _tmp="$_file.tmp.$$"
-        sed "s|^$1=.*|$1=$2|" "$_file" > "$_tmp" && mv "$_tmp" "$_file"
-    else
-        printf '%s=%s\n' "$1" "$2" >> "$_file"
-    fi
-    # It holds the API and admin tokens. sed+mv writes a new file with the
-    # umask's mode, which undid the 0600 server_ctl.py set.
+    _tmp="$_file.tmp.$$"
+    # It holds the API and admin tokens: the new file is created 0600 from the
+    # start (umask in a subshell), never written under the default umask and
+    # narrowed afterwards. The old line is dropped by an exact key match and
+    # the new one appended with printf, so no character of the value (|, &,
+    # \) is ever read as a sed expression.
+    (
+        umask 077
+        if [ -f "$_file" ]; then
+            awk -v key="$1" 'index($0, key "=") != 1' "$_file" > "$_tmp"
+        else
+            printf '%s\n' "# Written by scripts/setup-server.sh." > "$_tmp"
+        fi
+        printf '%s=%s\n' "$1" "$2" >> "$_tmp"
+    ) && mv "$_tmp" "$_file"
+    chmod 600 "$_file"
+}
+
+# Drop KEY from .env, the same way set_env replaces it.
+unset_env() {
+    _file="$INSTALL_DIR/.env"
+    [ -f "$_file" ] || return 0
+    _tmp="$_file.tmp.$$"
+    (umask 077; awk -v key="$1" 'index($0, key "=") != 1' "$_file" > "$_tmp") && mv "$_tmp" "$_file"
     chmod 600 "$_file"
 }
 
@@ -666,8 +681,7 @@ if [ -n "$TOOLS_IMAGE" ]; then
     # mount a checkout nothing reads any more.
     for _key in SADT_TOOLS UV_PYTHON_STORE; do
         if [ -f "$INSTALL_DIR/.env" ] && grep -q "^$_key=" "$INSTALL_DIR/.env"; then
-            sed "/^$_key=/d" "$INSTALL_DIR/.env" > "$INSTALL_DIR/.env.tmp.$$" && mv "$INSTALL_DIR/.env.tmp.$$" "$INSTALL_DIR/.env"
-            chmod 600 "$INSTALL_DIR/.env"
+            unset_env "$_key"
         fi
     done
 elif [ -n "$TOOLS_ROOT" ]; then
