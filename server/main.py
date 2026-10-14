@@ -1962,6 +1962,13 @@ async def download_testfile(tool_name: str, filename: str,
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
+    # Only a scope this tool's deployment declares: the query string is the
+    # client's, and data_store re-checks it regardless.
+    declared = {spec.selectable_scope for spec in tool.arguments.values()
+                if getattr(spec, "selectable_scope", None)}
+    if scope and scope not in declared:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                            detail=f"No test file '{filename}' for tool '{tool.name}'.")
     try:
         resolved = data_store.resolve_testfile(
             deployment_config.data_slug(tool.name), filename,
