@@ -9,7 +9,16 @@ set -euo pipefail
 SADT_TOOLS="${SADT_TOOLS:-$HOME/code/SADT-VISOR}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-export API_TOKEN="${API_TOKEN:-local-dev-token}"
+# A random token, kept across restarts so a configured client keeps working.
+# Never a fixed one: serve.py refuses every token this repository has published.
+TOKEN_FILE="$HERE/server/.local-token"
+if [ -z "${API_TOKEN:-}" ]; then
+    if [ ! -s "$TOKEN_FILE" ]; then
+        (umask 077 && python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$TOKEN_FILE")
+    fi
+    API_TOKEN="$(cat "$TOKEN_FILE")"
+fi
+export API_TOKEN
 export TOOLS_DIR="$SADT_TOOLS/tools"          # <-- the link to SADT-VISOR
 export DESCRIBE_PATH="$SADT_TOOLS/scripts/describe.py"
 export DATA_DIR="${DATA_DIR:-$HERE/DATA}"

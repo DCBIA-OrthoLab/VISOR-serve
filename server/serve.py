@@ -20,6 +20,29 @@ import tls
 from config import settings
 
 
+# Every token that has ever been written down as a default in this repository.
+# A server holding one of them is open to anyone who has read the repository.
+KNOWN_DEFAULT_TOKENS = frozenset({
+    "dev-token", "local-dev-token", "test-token", "change-me",
+    "change-me-to-a-long-random-secret",
+})
+MIN_TOKEN_LENGTH = 24
+
+
+def _weak_secrets() -> str:
+    """Why the configured tokens may not guard patient data, or ""."""
+    for name, value, required in (("API_TOKEN", settings.API_TOKEN, True),
+                                  ("ADMIN_TOKEN", settings.ADMIN_TOKEN, False)):
+        if not value and not required:
+            continue
+        if value in KNOWN_DEFAULT_TOKENS or len(value) < MIN_TOKEN_LENGTH:
+            return (f"{name} is empty, a published default, or shorter than "
+                    f"{MIN_TOKEN_LENGTH} characters. Generate one: "
+                    "python3 -c 'import secrets; print(secrets.token_urlsafe(32))' "
+                    "(scripts/server_ctl.py up does it for you).")
+    return ""
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--host", default="127.0.0.1")
@@ -32,6 +55,10 @@ def main(argv=None) -> int:
     if args.check:
         return check(args.port)
 
+    weak = _weak_secrets()
+    if weak:
+        print(f"serve.py: {weak}", file=sys.stderr)
+        return 1
     try:
         cert, key = tls.ensure_certificate()
     except tls.TLSConfigurationError as exc:

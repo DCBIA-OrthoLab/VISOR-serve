@@ -50,3 +50,4 @@ update_agent.log
 
 # The certificate run-local.sh generates (server/tls.py)
 server/.tls/
+server/.local-token

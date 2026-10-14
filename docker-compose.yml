@@ -119,7 +119,7 @@ services:
   inference:
     <<: *inference-base
     environment:
-      - API_TOKEN=${API_TOKEN:-dev-token}
+      - API_TOKEN=${API_TOKEN:-}
       # The admin panel and its controls answer only to this. Unset, the panel stays closed.
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DATA_DIR=/data
@@ -167,7 +167,7 @@ services:
     <<: *inference-base
     profiles: ["cpu"]
     environment:
-      - API_TOKEN=${API_TOKEN:-dev-token}
+      - API_TOKEN=${API_TOKEN:-}
       # The admin panel and its controls answer only to this. Unset, the panel stays closed.
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DATA_DIR=/data
@@ -271,7 +271,7 @@ services:
       additional_contexts:
         tools: ${TOOLS_CONTEXT:-docker/fixtures}
     environment:
-      - API_TOKEN=${API_TOKEN:-dev-token}
+      - API_TOKEN=${API_TOKEN:-}
       # The admin panel and its controls answer only to this. Unset, the panel stays closed.
       - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DEVICE=${DEVICE:-cuda}

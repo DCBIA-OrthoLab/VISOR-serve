@@ -75,7 +75,7 @@ def _free_port() -> int:
 def test_serve_py_answers_https_and_never_plain_http(tls_dir, tmp_path):
     port = _free_port()
     environment = dict(os.environ, TLS_DIR=str(tls_dir), TEMP_DIR=str(tmp_path / "temp"),
-                       HISTORY_DIR="", API_TOKEN="test-token")
+                       HISTORY_DIR="", API_TOKEN="a-long-random-token-for-this-test-only")
     environment.pop(tls.ACTIVE_ENV, None)
     process = subprocess.Popen([sys.executable, "serve.py", "--port", str(port)],
                                cwd=SERVER_DIR, env=environment,
@@ -133,3 +133,16 @@ def test_plain_http_is_refused_whatever_the_host():
                 "http://visor.example.ts.net"):
         with pytest.raises(ValueError, match="HTTPS"):
             server_ctl.tls_context(url)
+
+
+def test_a_published_or_short_token_stops_the_start(monkeypatch):
+    for token in ("dev-token", "local-dev-token", "short"):
+        monkeypatch.setattr(settings, "API_TOKEN", token)
+        assert serve.main(["--port", "1"]) == 1
+
+
+def test_every_response_carries_the_security_headers():
+    response = TestClient(main.app).get("/health")
+    assert response.headers["Strict-Transport-Security"].startswith("max-age=")
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
