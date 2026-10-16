@@ -871,25 +871,26 @@ tools:
   # CNE -- clinical note engine. NOT PORTED YET.
   #
   # The only tool whose weights are NOT on GitHub: two quantized GGUF LLMs on
-  # Hugging Face, pulled by CNE.getModelPath(). Its test files are bundled in
-  # the client repo (CNE/Resources/testfiles), so there is nothing to fetch.
+  # Hugging Face, in the DCBIA-OrthoLab organization, pulled by
+  # CNE.getModelPath(). Its test files are bundled in the client repo
+  # (CNE/Resources/testfiles), so there is nothing to fetch.
   #
-  # The second model the client declares,
-  # dcbia/Meta-Llama-3.1-8B-Instruct-Ortho/model-q4_0.gguf ("Ortho"), answers
-  # 404 today -- the repo is private, renamed, or gone. Left out rather than
-  # listed as a URL that cannot work; restore it once it resolves.
+  # Both are pinned to a commit revision and the sha256 of the file it holds.
+  # The Ortho repository only ever held model-q4_k_m.gguf; the
+  # model-q4_0.gguf the client used to ask for never existed.
   # =========================================================================
   CNE:
     models:
       - name: qwen-ft-q4_k_m.gguf
         dest: TMJ/qwen-ft-q4_k_m.gguf
-        url: https://huggingface.co/dcbia/Qwen-2.5-7B-Instruct-TMJ/resolve/main/qwen-ft-q4_k_m.gguf
+        url: https://huggingface.co/DCBIA-OrthoLab/Qwen-2.5-7B-Instruct-TMJ/resolve/eac9ce7d93af4b9b704eb958af8c0b3f4dccc876/qwen-ft-q4_k_m.gguf
         size: 4683073408
-        # NOT PINNED: `resolve/main` follows the branch and no sha256 is
-        # declared, so this installs whatever the repository holds that day.
-        # TODO(maintainer): replace `main` by a commit revision and add its
-        # sha256, then drop this line.
-        unpinned: true
+        sha256: 66b7e2be8da810233953c7b8cb58f6935d2e9561ca70454778d1ff7419220410
+      - name: model-q4_k_m.gguf
+        dest: Ortho/model-q4_k_m.gguf
+        url: https://huggingface.co/DCBIA-OrthoLab/Llama-3.1-8B-Instruct-Ortho/resolve/34e4f976743f59bc5353b44208b8876122b2162f/model-q4_k_m.gguf
+        size: 4920738880
+        sha256: 6aad2eb367b169f600c5180a6199cebcb2418eae0230c1703ec2b315c7931ded
     testfiles:
       # One of the synthetic TMJ consult notes the module ships in its own
       # repository -- not patient data, and the only note anywhere public.
