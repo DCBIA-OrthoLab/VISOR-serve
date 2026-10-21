@@ -452,6 +452,67 @@ def test_a_tools_image_update_drains_pulls_recreates_and_reopens(agent_module, r
     assert server.door_calls[0] is False and server.door_calls[-1] is True
 
 
+def test_the_image_an_update_replaced_is_removed_once_the_server_answers(agent_module, repos, tmp_path,
+                                                                        monkeypatch):
+    _writer, checkout = repos
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    _FakeServer().install(agent)
+    ids = {TOOLS_IMAGE: "sha256:" + "a" * 64}
+    removed = []
+    agent.image_id = lambda image: ids[image]
+
+    def pull(image, digest=""):
+        ids[image] = "sha256:" + "b" * 64
+        registry.local["digest"] = registry.remote
+        return True
+
+    agent.pull_image = pull
+    monkeypatch.setattr(agent_module.subprocess, "run", lambda cmd, **kw: (
+        removed.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")))
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True
+    assert ["docker", "image", "rm", "sha256:" + "a" * 64] in removed
+    assert not any("--force" in cmd or "prune" in cmd for cmd in removed)
+    assert any("Removed the previous" in line for line in last["log"])
+
+
+def test_nothing_is_removed_when_the_server_does_not_come_back(agent_module, repos, tmp_path, monkeypatch):
+    """The old image is the way back until the new one has answered."""
+    _writer, checkout = repos
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    _FakeServer().install(agent)
+    ids = {TOOLS_IMAGE: "sha256:" + "a" * 64}
+    removed = []
+    agent.image_id = lambda image: ids[image]
+    agent.healthy = lambda: False
+    agent.args.health_timeout = 0
+    agent.drop_replaced = lambda replaced: removed.append(replaced)
+
+    def pull(image, digest=""):
+        ids[image] = "sha256:" + "b" * 64
+        registry.local["digest"] = registry.remote
+        return True
+
+    agent.pull_image = pull
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and removed == []
+
+
+def test_an_image_that_did_not_change_is_not_removed(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    agent.image_id = lambda image: "sha256:" + "a" * 64
+    calls = []
+    monkeypatch.setattr(agent_module.subprocess, "run", lambda *a, **k: calls.append(a))
+    agent.drop_replaced({TOOLS_IMAGE: "sha256:" + "a" * 64, "gone": ""})
+    assert calls == []
+
+
 def test_a_failed_image_pull_restarts_nothing_and_reopens(agent_module, repos, tmp_path, monkeypatch):
     _writer, checkout = repos
     _Registry(agent_module, monkeypatch, remote="sha256:bbb")
