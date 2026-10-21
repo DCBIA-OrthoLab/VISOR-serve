@@ -627,6 +627,10 @@ class Agent:
                 pass
             restart = RESTART
             applied = {}
+            # What each image is NOW, before the pull moves its tag: once the
+            # new one is running, this is the copy to drop.
+            replaced = {info["image"]: self.image_id(info["image"])
+                        for info in parts if info.get("image")}
             for info in parts:
                 if info.get("image"):
                     self.phase(f"Pulling {info['image']} ({info['target']}).")
@@ -693,6 +697,7 @@ class Agent:
                 message = "The server did not come back after the restart; look at its logs."
                 return
             ok = True
+            self.drop_replaced(replaced)
             message = "Updated " + ", ".join(f"{kind} to {sha}" for kind, sha in applied.items()) + "."
         except Exception as exc:  # noqa: BLE001 - an update must always end with the door open
             message = f"The update stopped on an unexpected error: {exc}"
@@ -825,6 +830,40 @@ class Agent:
         if done.returncode != 0:
             self.log_lines = (self.log_lines + [(done.stderr or "docker tag failed").strip()])[-LOG_LINES:]
         return done.returncode == 0
+
+    def image_id(self, image: str) -> str:
+        """The local ID of `image` (`sha256:...`), or "" when it is not here."""
+        try:
+            done = subprocess.run(["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+                                  capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return done.stdout.strip() if done.returncode == 0 else ""
+
+    def drop_replaced(self, replaced: dict) -> None:
+        """Remove the images an update has just replaced, once the new ones answer.
+
+        A pull leaves the previous image on the disk without a name, and a
+        tools image is 25 GB: two updates fill a disk the size of a system
+        partition, and the third dies on `No space left on device` with the
+        server down. Only here, after the health check passed: until then the
+        old image is the way back.
+
+        By ID, never a prune -- the machine may hold images that are not ours --
+        and without `--force`, so Docker itself refuses one a container still
+        uses. A refusal is logged and is not a failed update.
+        """
+        for image, before in replaced.items():
+            if not before or before == self.image_id(image):
+                continue
+            try:
+                done = subprocess.run(["docker", "image", "rm", before], capture_output=True,
+                                      text=True, timeout=120)
+                line = (f"Removed the previous {image} ({before[7:19]})." if done.returncode == 0 else
+                        f"Could not remove the previous {image}: {(done.stderr or 'docker refused').strip()}")
+            except (OSError, subprocess.SubprocessError) as exc:
+                line = f"Could not remove the previous {image}: {exc}"
+            self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
 
     def wait_idle(self, why: str) -> None:
         """Block until nothing is in flight. The last check before a restart:
