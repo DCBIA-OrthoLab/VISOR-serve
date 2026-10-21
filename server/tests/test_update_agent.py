@@ -789,3 +789,36 @@ def test_a_door_that_never_closes_stops_the_update_before_the_pull(agent_module,
     last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
     assert last["ok"] is False and "Nothing was changed" in last["message"]
     assert (checkout / "server" / "main.py").read_text() != "v2"
+
+
+def test_a_server_that_stays_down_does_not_hold_the_restart_for_ever(agent_module, repos, tmp_path, monkeypatch):
+    """An update can take the running server down before the container that
+    would bring it back is recreated; waiting for an answer then never ends."""
+    _writer, checkout = repos
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    agent.in_flight = lambda: None
+    agent.wait_idle("Before restarting", unreachable_grace=0)
+    assert any("has not answered" in line for line in agent.log_lines)
+
+
+def test_a_server_with_a_run_in_flight_is_still_waited_for(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    answers = iter([[{"tool": "ASO"}], [{"tool": "ASO"}], []])
+    seen = []
+    agent.in_flight = lambda: seen.append(1) or next(answers)
+    agent.wait_idle("Before restarting", unreachable_grace=0)
+    assert len(seen) == 3
+
+
+def test_the_agent_notices_that_its_own_code_changed(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    script = tmp_path / "update_agent.py"
+    script.write_text("v1")
+    monkeypatch.setattr(agent_module, "__file__", str(script))
+    agent = _agent(agent_module, checkout, tmp_path)
+    assert agent._code_changed() is False
+    os.utime(script, ns=(1, 1))
+    assert agent._code_changed() is True
