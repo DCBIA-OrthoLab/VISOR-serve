@@ -95,6 +95,12 @@ SYNC_COMMAND = ["uv", "sync", "--frozen", "--all-extras", "--quiet"]
 # How often the request file is looked for. Cheap -- one stat -- and it is the
 # delay between an operator's click and the door closing.
 REQUEST_POLL_SECONDS = 2
+# How long the last wait before a restart tolerates a server that does not
+# answer. An update that changes the server's own code can take the running one
+# down before the container is recreated -- which is the restart that would
+# bring it back -- so waiting for an answer then waits for ever. A server that
+# is down has no run in flight to protect.
+UNREACHABLE_GRACE_SECONDS = 120
 # The door's lease while an update is in progress, renewed well before it runs
 # out. If this process is killed, the server reopens by itself this soon after.
 DOOR_LEASE_SECONDS = 90
@@ -380,6 +386,14 @@ def data_summary(tools_repo: str, data_dir: str) -> dict:
 # The agent
 # ---------------------------------------------------------------------------
 
+def _code_stamp() -> int:
+    """When this file last changed, or 0 when that cannot be read."""
+    try:
+        return os.stat(os.path.abspath(__file__)).st_mtime_ns
+    except OSError:
+        return 0
+
+
 class Agent:
     def __init__(self, args):
         # Images are followed only when named: arguments built by an older
@@ -401,6 +415,11 @@ class Agent:
         self.server_image = {}
         self.image_cache = {}
         self.log_lines = []
+        self._code_stamp = _code_stamp()
+
+    def _code_changed(self) -> bool:
+        """Whether this file is not the one the running agent was started from."""
+        return _code_stamp() != self._code_stamp
 
     # -- files ---------------------------------------------------------
     def _path(self, name):
@@ -677,7 +696,7 @@ class Agent:
                                        f"The code is pulled; the server was not restarted.")
                             return
 
-            self.wait_idle("Before restarting")
+            self.wait_idle("Before restarting", unreachable_grace=UNREACHABLE_GRACE_SECONDS)
             self.phase("Restarting the server." if restart == RESTART else "Recreating the server's container.")
             if self.args.restart_cmd:
                 done = subprocess.run(self.args.restart_cmd, shell=True, capture_output=True, text=True, timeout=600)
@@ -865,13 +884,26 @@ class Agent:
                 line = f"Could not remove the previous {image}: {exc}"
             self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
 
-    def wait_idle(self, why: str) -> None:
+    def wait_idle(self, why: str, unreachable_grace: float = None) -> None:
         """Block until nothing is in flight. The last check before a restart:
-        whatever slipped in while the door was open must finish first."""
+        whatever slipped in while the door was open must finish first.
+
+        With `unreachable_grace`, a server that has not answered for that many
+        seconds stops being waited for: it is down, so nothing runs on it, and
+        the restart that follows is what brings it back."""
+        silent_since = None
         while True:
             busy = self.in_flight()
             if busy == []:
                 return
+            if busy is not None:
+                silent_since = None
+            elif unreachable_grace is not None:
+                silent_since = silent_since if silent_since is not None else time.monotonic()
+                if time.monotonic() - silent_since >= unreachable_grace:
+                    self.phase(f"{why}: the server has not answered for {int(unreachable_grace)} s; "
+                               "nothing can be running, going on.")
+                    return
             self.phase(f"{why}: waiting for " + (
                 "the server to answer" if busy is None else
                 f"{len(busy)} run(s): " + ", ".join(sorted({r.get('tool') or '?' for r in busy}))))
@@ -932,6 +964,12 @@ class Agent:
         next_survey = time.monotonic() + self.args.poll
         while True:
             request = self._read(REQUEST_FILE)
+            if not request and self._code_changed():
+                # Pulled by an update that never finished, or by hand: the agent
+                # in memory would go on talking to the server the way it did
+                # when it started, which may no longer be the way it answers.
+                log("The agent's own code changed on disk; restarting on it.")
+                os.execv(sys.executable, [sys.executable] + sys.argv)
             if request:
                 if request.get("kind") == "data":
                     self.apply_data(request)
