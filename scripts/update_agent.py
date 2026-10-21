@@ -833,8 +833,11 @@ class Agent:
 
     def image_id(self, image: str) -> str:
         """The local ID of `image` (`sha256:...`), or "" when it is not here."""
-        done = subprocess.run(["docker", "image", "inspect", image, "--format", "{{.Id}}"],
-                              capture_output=True, text=True)
+        try:
+            done = subprocess.run(["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+                                  capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return ""
         return done.stdout.strip() if done.returncode == 0 else ""
 
     def drop_replaced(self, replaced: dict) -> None:
@@ -853,9 +856,13 @@ class Agent:
         for image, before in replaced.items():
             if not before or before == self.image_id(image):
                 continue
-            done = subprocess.run(["docker", "image", "rm", before], capture_output=True, text=True)
-            line = (f"Removed the previous {image} ({before[7:19]})." if done.returncode == 0 else
-                    f"Could not remove the previous {image}: {(done.stderr or 'docker refused').strip()}")
+            try:
+                done = subprocess.run(["docker", "image", "rm", before], capture_output=True,
+                                      text=True, timeout=120)
+                line = (f"Removed the previous {image} ({before[7:19]})." if done.returncode == 0 else
+                        f"Could not remove the previous {image}: {(done.stderr or 'docker refused').strip()}")
+            except (OSError, subprocess.SubprocessError) as exc:
+                line = f"Could not remove the previous {image}: {exc}"
             self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
 
     def wait_idle(self, why: str) -> None:
