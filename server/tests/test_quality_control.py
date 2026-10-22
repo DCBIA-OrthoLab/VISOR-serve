@@ -12,6 +12,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -1682,3 +1684,41 @@ def test_a_case_that_is_a_directory_is_not_a_file(tmp_path):
     (cohort / "P1").mkdir()
 
     assert dispatch.narrow_to_cases(job, _NarrowingTool(), ["P1"]) == ""
+
+
+def test_a_stopped_run_s_outputs_are_accepted_from_the_job_directory_it_holds(tmp_path):
+    """Every stop answered 500 once outputs were confined to the request's
+    directories. The pause takes the job directory OFF the request's scratch
+    list, so the request's cleanup leaves it to the resume -- and that list is
+    what the confinement read, so everything the checkpoint produced, which
+    lies in that job directory, was refused as "outside its own directories".
+    """
+    import anyio, main
+    from wire import runs
+
+    job = tempfile.mkdtemp(dir=main.settings.TEMP_DIR)
+    produced = os.path.join(job, "01_ALI_CBCT")
+    os.makedirs(produced)
+    with open(os.path.join(produced, "landmarks.mrk.json"), "w", encoding="utf-8") as handle:
+        handle.write("{}")
+    run_id = runs.register(uuid.uuid4().hex, tool="ASO")
+    runs.pause(run_id, job, "ALI_CBCT")
+    record = {"quality_control": True, "stopped_after": "ALI_CBCT",
+              "produced": ["01_ALI_CBCT"], "outputs": {"01_ALI_CBCT": produced}}
+
+    async def deliver():
+        token = runs.CURRENT_RUN.set(run_id)
+        try:
+            return await main._finish_stopped_run(
+                None, "ASO", 0.0, _Background(), None, [], record, 0)
+        finally:
+            runs.CURRENT_RUN.reset(token)
+
+    try:
+        response = anyio.run(deliver)
+        body = json.loads(response.body)
+        assert body["stopped_after"] == "ALI_CBCT"
+        assert body["result_ref"], "what the checkpoint produced was not delivered"
+    finally:
+        runs.finish(run_id, runs.PHASE_DONE)
+        shutil.rmtree(job, ignore_errors=True)

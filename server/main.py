@@ -3675,8 +3675,15 @@ async def _finish_stopped_run(tool, tool_name: str, start_time: float,
     directory stays where it is: it is what a resume reads, and packing is a
     copy out of it rather than a move.
     """
+    # The pause took the job directory, and what the request staged, OFF the
+    # request's scratch list so its cleanup leaves them to the resume. They
+    # are still this run's own, and the job directory is where everything a
+    # checkpoint produced lies: confined to the list alone, every stop was
+    # refused as an output outside its own directories.
+    paused = runs.paused_at(runs.CURRENT_RUN.get(None) or "")
+    held = [paused["job_dir"], *(paused.get("keep") or ())] if paused else []
     outputs = _confined_outputs(file_utils.output_paths(record),
-                                [work_dir, *scratch_dirs, *confine_to])
+                                [work_dir, *scratch_dirs, *confine_to, *held])
     reference = None
     # The archive is built in a directory of its OWN, never in the request's
     # work dir. That work dir is where an uploaded folder was unpacked, and
