@@ -134,7 +134,7 @@ DEFAULT_RETURN_KIND = "text"
 _ARGUMENT_KEYS = (
     "type", "required", "default", "description", "extensions", "choices",
     "section", "ui", "groups", "visible_when", "options_when", "label", "hidden",
-    "option_help", "min_selected",
+    "option_help", "min_selected", "required_when",
     # MULTICHOICE only: offer a "select all" / "select none" pair above the
     # options. For a catalogue nobody would tick one box at a time.
     "select_all",
@@ -298,7 +298,7 @@ def read_schema(folder: str) -> dict:
 # and nothing arrived. In one function because there are four places an ArgSpec
 # is built and three of them are easy to forget.
 _PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label",
-                      "option_help", "min_selected", "select_all",
+                      "option_help", "min_selected", "select_all", "required_when",
                       "x_labels", "y_labels", "x_label", "y_label",
                       "section_columns", "cell")
 

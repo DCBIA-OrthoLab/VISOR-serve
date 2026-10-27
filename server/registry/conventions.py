@@ -234,8 +234,11 @@ def paired_batch_plan(paired, arguments: dict, declared: ToolDeployment,
         return None
     for axis in axes:
         declaration = arguments.get(axis)
-        if not isinstance(declaration, dict) or declaration.get("type") != "path" \
-                or not declaration.get("required"):
+        # A path, not necessarily a required one: AREG's `t1`/`t2` are optional
+        # since a cohort may arrive as one folder per patient instead, and a
+        # request in that layout fills neither. A client splits the axes a
+        # request fills.
+        if not isinstance(declaration, dict) or declaration.get("type") != "path":
             return None
     max_mb, max_files = defaults
     if declared.batch_max_mb is not None:

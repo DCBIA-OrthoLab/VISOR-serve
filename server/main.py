@@ -1723,6 +1723,10 @@ def list_tools() -> list:
                     "label": spec.label,
                     "section": spec.section,
                     "visible_when": spec.visible_when,
+                    # Required only while these hold; `required` is false then.
+                    # Published only where declared, so every other tool's
+                    # schema stays byte for byte what clients already read.
+                    **({"required_when": spec.required_when} if spec.required_when else {}),
                     "options_when": spec.options_when,
                     # True: do not render this at all. Still published, because
                     # a client that hides it must still know it exists rather

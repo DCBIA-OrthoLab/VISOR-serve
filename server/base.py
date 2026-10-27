@@ -107,6 +107,12 @@ UI_LAYOUTS = ("tabs", "grid", "inline", "chips")
 # drag sets both at once and the knob sits where the point sits.
 VEC2_LAYOUTS = ("joystick",)
 
+# How a single "choice" is offered. Without it the argument is a drop-down;
+# "segmented" draws every option as a row of segments, one pressed, for a two-
+# or three-way decision that changes what the rest of the panel asks for --
+# AREG's data organisation, one folder per type or one per patient.
+CHOICE_LAYOUTS = ("segmented",)
+
 # The layouts that are meaningless without ArgSpec.groups: a tab bar with no
 # tabs and a chart with no rows are both nothing.
 _GROUPED_LAYOUTS = ("tabs", "grid")
@@ -229,6 +235,15 @@ class ArgSpec:
     # default applies. It does NOT replace the tool's own cross-argument
     # validation, which still has to hold for a direct API call.
     visible_when: Optional[dict] = None
+
+    # {other_arg: value(s)}, written like visible_when: the argument is
+    # required whenever those hold. For an input needed in one shape of the
+    # request and absent from another -- AREG's T1 and T2 with one folder per
+    # type, its folder of patients with one per patient -- which `required`
+    # cannot say, being one answer for every request. Presentation only, like
+    # visible_when: the panel marks the field and holds Apply until it is
+    # filled, and the tool's own check is still what refuses a direct call.
+    required_when: Optional[dict] = None
 
     # Narrow this argument's own options instead of hiding it:
     # {other_arg: {its value: [option, ...]}}. `visible_when` can only show or
@@ -494,17 +509,21 @@ class Tool(ABC):
             )
 
         if spec.ui is not None:
-            # Two kinds of argument offer a choice of layout, and they do not
+            # Three kinds of argument offer a choice of layout, and they do not
             # share a vocabulary: a multichoice arranges check boxes, a vec2
-            # decides whether its two numbers also get a pad.
+            # decides whether its two numbers also get a pad, a choice whether
+            # it is a drop-down or a row of segments.
             if spec.types[0] == VEC2_TYPE:
                 allowed = VEC2_LAYOUTS
             elif spec.types[0] == MULTICHOICE_TYPE:
                 allowed = UI_LAYOUTS
+            elif spec.types[0] == CHOICE_TYPE:
+                allowed = CHOICE_LAYOUTS
             else:
                 raise ToolSchemaError(
-                    f"{where}: 'ui' lays out a multichoice's check boxes or a vec2's "
-                    f"pad, and this argument is a {spec.types[0]!r}."
+                    f"{where}: 'ui' lays out a multichoice's check boxes, a vec2's "
+                    f"pad or a choice's segments, and this argument is a "
+                    f"{spec.types[0]!r}."
                 )
             if spec.ui not in allowed:
                 raise ToolSchemaError(
@@ -551,21 +570,30 @@ class Tool(ABC):
                 )
 
         self._check_options_when(where, spec)
+        self._check_condition(where, "visible_when", spec.visible_when)
+        self._check_condition(where, "required_when", spec.required_when)
 
-        if spec.visible_when is None:
+    def _check_condition(self, where: str, key: str, conditions) -> None:
+        """Reject a visible_when or required_when that can never hold.
+
+        The two are written alike -- {choice argument: value(s)} -- and go
+        wrong alike: a typo hides a field for good, or marks one required in a
+        state the panel can never reach.
+        """
+        if conditions is None:
             return
-        if not isinstance(spec.visible_when, dict) or not spec.visible_when:
-            raise ToolSchemaError(f"{where}: 'visible_when' must be a non-empty dict.")
-        for other_name, expected in spec.visible_when.items():
+        if not isinstance(conditions, dict) or not conditions:
+            raise ToolSchemaError(f"{where}: '{key}' must be a non-empty dict.")
+        for other_name, expected in conditions.items():
             other = self.arguments.get(other_name)
             if other is None:
                 raise ToolSchemaError(
-                    f"{where}: 'visible_when' refers to '{other_name}', which this tool "
+                    f"{where}: '{key}' refers to '{other_name}', which this tool "
                     f"does not declare."
                 )
             if other.types[0] != CHOICE_TYPE:
                 raise ToolSchemaError(
-                    f"{where}: 'visible_when' can only test a 'choice' argument, and "
+                    f"{where}: '{key}' can only test a 'choice' argument, and "
                     f"'{other_name}' is a {other.types[0]!r}. Only a choice argument has a "
                     f"fixed set of values to compare against."
                 )
@@ -573,7 +601,7 @@ class Tool(ABC):
             unknown = [value for value in wanted if value not in other.choices]
             if unknown:
                 raise ToolSchemaError(
-                    f"{where}: 'visible_when' expects '{other_name}' to be {unknown}, which "
+                    f"{where}: '{key}' expects '{other_name}' to be {unknown}, which "
                     f"is not among its choices ({sorted(other.choices)})."
                 )
 

@@ -62,6 +62,15 @@ def test_a_declaration_the_arguments_do_not_support_publishes_nothing(paired):
     assert conventions.paired_batch_plan(paired, TWO, ToolDeployment(), (400, 25)) is None
 
 
+def test_optional_axes_still_get_a_plan():
+    """AREG's T1 and T2 are optional since a cohort may come as one folder per
+    patient; with a per-type request they are still what a batch splits."""
+    optional = {name: dict(spec, required=False) for name, spec in TWO.items()}
+    plan = conventions.paired_batch_plan(
+        {"axes": ["t1", "t2"]}, optional, ToolDeployment(), (400, 25))
+    assert plan == {"axes": ["t1", "t2"], "max_mb": 400, "max_files": 25}
+
+
 def test_batch_false_turns_a_paired_plan_off_too():
     declared = ToolDeployment(batch_enabled=False)
     assert conventions.paired_batch_plan({"axes": ["t1", "t2"]}, TWO, declared, (400, 25)) is None
