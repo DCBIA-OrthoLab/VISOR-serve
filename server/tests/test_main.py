@@ -1056,6 +1056,16 @@ def test_presentation_hints_are_validated_at_startup():
         "an empty label": {"opt": base.ArgSpec(type=str, label="   ")},
         "a non-string label": {"opt": base.ArgSpec(type=str, label=3)},
         "ui on a non-multichoice": {"opt": base.ArgSpec(type=str, ui="tabs")},
+        "required_when expecting a value outside the choices": {
+            "mode": mode,
+            "opt": base.ArgSpec(type=str, required_when={"mode": "MRI"}),
+        },
+        "required_when on an argument the tool does not declare": {
+            "opt": base.ArgSpec(type=str, required_when={"absent": "CBCT"})
+        },
+        "a check-box layout on a single choice": {
+            "opt": base.ArgSpec(type="choice", choices={"a": True, "b": False}, ui="tabs")
+        },
         "unknown layout": {"opt": base.ArgSpec(ui="carousel", **picks)},
         "grouped layout without groups": {"opt": base.ArgSpec(ui="tabs", **picks)},
         "groups without a grouped layout": {
@@ -1094,6 +1104,34 @@ def test_presentation_hints_are_validated_at_startup():
             ),
         }
     ).check_schema()
+
+
+def test_a_single_choice_may_be_drawn_as_segments():
+    """AREG's data organisation: two layouts of equal standing, both on screen."""
+    import base
+
+    tool = type("T", (base.Tool,), {
+        "name": "t",
+        "arguments": {"layout": base.ArgSpec(
+            type="choice", choices={"per type": True, "per patient": False}, ui="segmented")},
+        "run": lambda self: None,
+    })()
+    tool.check_schema()
+
+
+def test_an_input_may_be_required_in_one_layout_only():
+    """AREG's T1: required with one folder per type, unused with one per patient."""
+    import base
+
+    tool = type("T", (base.Tool,), {
+        "name": "t",
+        "arguments": {
+            "layout": base.ArgSpec(type="choice", choices={"type": True, "patient": False}),
+            "t1": base.ArgSpec(type=str, required=False, required_when={"layout": "type"}),
+        },
+        "run": lambda self: None,
+    })()
+    tool.check_schema()
 
 
 def test_tools_exposes_presentation_hints():
