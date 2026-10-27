@@ -403,6 +403,20 @@ def test_an_entry_without_a_pin_is_never_downloaded_again(fetch_data, tmp_path, 
     assert served["downloads"] == 1
 
 
+def test_the_state_of_an_entry_is_read_from_its_stamp(fetch_data, tmp_path, served):
+    """What the update agent surveys every minute: no hashing."""
+    assert fetch_data.entry_state(_model(b"v1"), str(tmp_path)) == fetch_data.MISSING
+    fetch_data._fetch(_model(b"v1"), str(tmp_path), False, None)
+    assert fetch_data.entry_state(_model(b"v1"), str(tmp_path)) == fetch_data.CURRENT
+    assert fetch_data.entry_state(_model(b"v2"), str(tmp_path)) == fetch_data.OUTDATED
+
+
+def test_an_unstamped_file_reads_as_current_until_a_fetch_checks_it(fetch_data, tmp_path, monkeypatch):
+    _write(tmp_path / "AMASSS" / "models" / "weights.pth", b"old")
+    monkeypatch.setattr(fetch_data, "_sha256_of", lambda path: pytest.fail("a survey must not hash"))
+    assert fetch_data.entry_state(_model(b"v1"), str(tmp_path)) == fetch_data.CURRENT
+
+
 def test_a_replaced_cohort_rebuilds_its_views(fetch_data, tmp_path, served):
     """A view kept from the old cohort would serve the old scans."""
     entry = {"tool": "AREG", "kind": "testfiles", "name": "cohort.zip",

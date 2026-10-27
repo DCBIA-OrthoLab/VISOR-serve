@@ -78,6 +78,8 @@ import server_ctl  # noqa: E402 - beside this file, and stdlib only too
 REPO_ROOT = server_ctl.REPO_ROOT
 STATUS_FILE = "status.json"
 REQUEST_FILE = "request.json"
+# The tool a data request names to bring every installed tool up to date.
+ALL_DATA = "all"
 # The runs that prove an update left the tools working, beside status.json
 # unless --smoke-file names another. Deployment-specific on purpose: which
 # tools and which hosted test files are worth a check is this deployment's
@@ -370,16 +372,31 @@ def data_summary(tools_repo: str, data_dir: str) -> dict:
             for entry in sections.get(kind, []):
                 if "name" not in entry:
                     continue
-                target = engine._target_path(data_dir, {**entry, "tool": key, "kind": kind})
+                located = {**entry, "tool": key, "kind": kind}
+                if hasattr(engine, "entry_state"):
+                    state = engine.entry_state(located, data_dir)
+                else:  # a tools library carrying an older engine: presence only
+                    state = "current" if os.path.exists(engine._target_path(data_dir, located)) else "missing"
                 entries.append({
                     "kind": kind,
                     "name": entry.get("dest") or entry["name"],
                     "size": entry.get("size"),
-                    "present": os.path.exists(target),
+                    "present": state != "missing",
+                    "state": state,
                 })
         tools[key] = {"provides": sections.get("provides") or [], "entries": entries}
     return {"error": "", "manifest": os.path.relpath(manifest_path, tools_repo or REPO_ROOT),
-            "data_dir": data_dir, "tools": tools}
+            "data_dir": data_dir, "tools": tools, "refresh": refresh_targets(tools)}
+
+
+def refresh_targets(tools: dict) -> list:
+    """The tools whose data an update brings up to date: every tool with
+    something on disk and something not current -- replaced in the manifest,
+    or added to it. A tool with nothing on disk was never installed here, and
+    is left for an operator to download on purpose."""
+    return sorted(key for key, info in tools.items()
+                  if any(e["present"] for e in info["entries"])
+                  and any(e["state"] != "current" for e in info["entries"]))
 
 
 # ---------------------------------------------------------------------------
@@ -546,8 +563,10 @@ class Agent:
         self.write_status()
 
     def apply_data(self, request: dict) -> None:
-        """Download one tool's data from the manifest. No door, no restart: the
-        server reads DATA/ live, and a tool reads its data when it runs."""
+        """Download one tool's data from the manifest -- or, for the tool
+        `all`, bring every installed tool's data up to date (refresh_targets).
+        No door, no restart: the server reads DATA/ live, and a tool reads its
+        data when it runs."""
         tool = request.get("tool") or ""
         force = bool(request.get("force"))
         self.log_lines = []
@@ -559,29 +578,14 @@ class Agent:
                 os.remove(self._path(REQUEST_FILE))
             except FileNotFoundError:
                 pass
-            engine, manifest = manifest_paths(self.args.tools_repo)
-            if not engine:
-                message = "No data manifest found in the tools library."
-                return
-            command = [sys.executable, engine, "--manifest", manifest, "--data-dir", self.args.data_dir,
-                       "--tool", tool, "--progress", "always"] + (["--force"] if force else [])
-            self.phase(("Re-downloading" if force else "Downloading what is missing for") + f" {tool}.")
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            last_write = 0.0
-            for line in process.stdout:
-                line = line.rstrip()
-                if not line:
-                    continue
-                self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
-                self.state["applying"]["phase"] = line.strip()
-                self.state["applying"]["log"] = self.log_lines
-                if time.monotonic() - last_write > 1:
-                    self.write_status()
-                    last_write = time.monotonic()
-            process.wait()
-            ok = process.returncode == 0
-            message = (f"The data of {tool} is in place." if ok
-                       else f"Some of {tool}'s data could not be downloaded; see the log.")
+            if tool == ALL_DATA:
+                tools = data_summary(self.args.tools_repo, self.args.data_dir).get("refresh") or []
+                if not tools:
+                    ok, message = True, "Every installed tool's data is already up to date."
+                    return
+            else:
+                tools = [tool]
+            ok, message = self.fetch_data(tools, force)
         except Exception as exc:  # noqa: BLE001
             message = f"The download stopped on an unexpected error: {exc}"
         finally:
@@ -590,6 +594,35 @@ class Agent:
             self.state["applying"] = None
             log(message)
             self.survey(fetch=False)
+
+    def fetch_data(self, tools: list, force: bool = False):
+        """Run the manifest's engine for `tools`, streaming its output into the
+        status. Returns `(ok, message)`; never raises for a failed download."""
+        engine, manifest = manifest_paths(self.args.tools_repo)
+        if not engine:
+            return False, "No data manifest found in the tools library."
+        named = ", ".join(tools)
+        command = [sys.executable, engine, "--manifest", manifest, "--data-dir", self.args.data_dir,
+                   "--progress", "always"] + [arg for t in tools for arg in ("--tool", t)]
+        command += ["--force"] if force else []
+        self.phase(("Re-downloading" if force else "Downloading what is missing or changed for") + f" {named}.")
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        last_write = 0.0
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            self.log_lines = (self.log_lines + [line])[-LOG_LINES:]
+            if self.state.get("applying") is not None:
+                self.state["applying"]["phase"] = line.strip()
+                self.state["applying"]["log"] = self.log_lines
+            if time.monotonic() - last_write > 1:
+                self.write_status()
+                last_write = time.monotonic()
+        process.wait()
+        if process.returncode == 0:
+            return True, f"The data of {named} is in place."
+        return False, f"Some of the data of {named} could not be downloaded; see the log."
 
     # -- applying ------------------------------------------------------
     def apply(self, request: dict) -> None:
@@ -731,6 +764,7 @@ class Agent:
                 pass
             smoke = None
             if ok:
+                message += self.refresh_data()
                 # After the door reopens: /run refuses everyone while it is
                 # shut, this check included, and clients need not wait for it.
                 smoke = self.run_smoke()
@@ -745,6 +779,23 @@ class Agent:
             self.state["applying"] = None
             log(message)
             self.survey(fetch=False)
+
+    def refresh_data(self) -> str:
+        """After an update: download what the manifest now pins and DATA/ does
+        not hold yet, for every installed tool. Run with the door open: a file
+        is downloaded and checked beside its target and only then put in place
+        (the old one removed, the new one renamed), so a run in flight could
+        find it absent for an instant at most. Before the
+        smoke test, which may need it. A failure is reported, never undoes the update. Returns the
+        sentence to add to the update's message."""
+        try:
+            tools = data_summary(self.args.tools_repo, self.args.data_dir).get("refresh") or []
+            if not tools:
+                return ""
+            done, message = self.fetch_data(tools)
+        except Exception as exc:  # noqa: BLE001 - the update itself is applied
+            done, message = False, f"The data could not be refreshed: {exc}"
+        return " Models and test files: " + (f"brought up to date for {', '.join(tools)}." if done else message)
 
     # -- the smoke test ------------------------------------------------
     def smoke_plan(self) -> list:

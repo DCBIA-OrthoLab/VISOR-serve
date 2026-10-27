@@ -13,6 +13,9 @@ RESTART, RECREATE, IMAGE = "restart", "recreate", "image"
 _RECREATE_PATHS = ("docker-compose.yml",)
 _RECREATE_PREFIXES = ("server/requirements",)
 _IMAGE_PREFIXES = ("docker/",)
+# Where either repository lists the models and test files: a change to it is
+# what the update agent downloads once the update is applied.
+DATA_MANIFEST = "scripts/data-manifest.yml"
 
 
 def classify_server(paths) -> dict:
@@ -28,7 +31,7 @@ def classify_server(paths) -> dict:
             if action != IMAGE:
                 action = RECREATE
             heavy.append(path)
-    return {"action": action, "heavy": heavy}
+    return {"action": action, "heavy": heavy, "data": DATA_MANIFEST in paths}
 
 
 _SOURCE_PATH = re.compile(r'^\s*([A-Za-z0-9_.\-]+)\s*=\s*\{[^}]*\bpath\s*=\s*"([^"]+)"')
@@ -112,6 +115,7 @@ def classify_tools(paths, dependencies=None) -> dict:
         "environments": sorted(environments),
         "reinstall": {env: sorted(set(names)) for env, names in reinstall.items()},
         "other": other[:20],
+        "data": DATA_MANIFEST in paths,
     }
 
 

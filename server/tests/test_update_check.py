@@ -95,3 +95,11 @@ def test_the_endpoint_checks_both_checkouts_and_the_panel_carries_it(repos, monk
     panel = client.get("/admin-panel/updates.json", headers=admin).json()
     assert panel["check"]["server"]["local"] == result["server"]["local"]
     assert client.post("/admin/updates/check", headers={"Authorization": f"Bearer {settings.API_TOKEN}"}).status_code == 401
+
+
+def test_a_change_to_the_data_manifest_is_flagged_in_either_repository():
+    """What tells the panel an update will also download models or test files."""
+    assert release_diff.classify_server(["scripts/data-manifest.yml"])["data"] is True
+    assert release_diff.classify_server(["server/main.py"])["data"] is False
+    assert release_diff.classify_tools(["scripts/data-manifest.yml", "tools/AMASSS/a.py"])["data"] is True
+    assert release_diff.classify_tools(["tools/AMASSS/a.py"])["data"] is False

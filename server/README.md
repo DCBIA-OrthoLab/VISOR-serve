@@ -135,6 +135,13 @@ write the exact layout `data_store.py` reads:
 python3 scripts/fetch_data.py --list         # what's available, and how big
 ```
 
+Once a tool's data is on disk, the update agent keeps it current: after every
+applied update it downloads, for each tool with something in `DATA/`, what the
+manifest now pins and the disk does not hold (a file replaced under a new
+sha256, an entry added). A tool with nothing on disk is left alone. The admin
+panel's Updates dialog lists what is outdated or missing, with a button that
+does the same without waiting for an update.
+
 ## HTTPS only
 
 The server has no plain-HTTP listener and no setting that gives it one. Start
