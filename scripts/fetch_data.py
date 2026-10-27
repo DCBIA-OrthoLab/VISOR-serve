@@ -419,6 +419,26 @@ def _is_current(entry: dict, target: str, data_dir: str, label: str) -> bool:
     return installed == expected
 
 
+MISSING, OUTDATED, CURRENT = "missing", "outdated", "current"
+
+
+def entry_state(entry: dict, data_dir: str) -> str:
+    """MISSING, OUTDATED or CURRENT, from the stamps alone.
+
+    Cheap enough for a survey every minute: nothing is hashed. A target with no
+    stamp yet reads as CURRENT; the next fetch hashes and stamps it
+    (`_is_current`), and replaces it if it turns out to differ.
+    """
+    target = _target_path(data_dir, entry)
+    if not os.path.exists(target):
+        return MISSING
+    expected = entry.get("sha256")
+    installed = _load_stamps(data_dir).get(os.path.relpath(target, data_dir))
+    if expected and installed is not None and installed != expected:
+        return OUTDATED
+    return CURRENT
+
+
 def _fetch(entry: dict, data_dir: str, force: bool, progress) -> str:
     """Fetch one entry, then its views. Returns "skipped", "fetched", or raises."""
     status = _fetch_entry(entry, data_dir, force, progress)

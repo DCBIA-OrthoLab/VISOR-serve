@@ -252,6 +252,38 @@ def test_a_data_request_runs_the_download_for_that_tool_only(agent_module, repos
     assert any("AMASSS" in line for line in last["log"])
 
 
+def test_only_installed_tools_with_something_not_current_are_refreshed(agent_module, tmp_path):
+    repo = _manifest_repo(tmp_path)
+    data = tmp_path / "DATA"
+    summary = agent_module.data_summary(str(repo), str(data))
+    assert summary["refresh"] == [], "a tool with nothing on disk was never installed here"
+    (data / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    summary = agent_module.data_summary(str(repo), str(data))
+    assert summary["refresh"] == ["AMASSS"], "its test file was added to the manifest since"
+    entries = {e["name"]: e["state"] for e in summary["tools"]["AMASSS"]["entries"]}
+    assert entries == {"AMASSS_Models": "current", "scan.nii.gz": "missing"}
+
+
+def test_a_request_for_all_data_with_nothing_stale_downloads_nothing(agent_module, repos, tmp_path):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path, tools_repo=str(_manifest_repo(tmp_path)))
+    os.makedirs(agent.update_dir, exist_ok=True)
+    agent.fetch_data = lambda tools, force=False: pytest.fail("nothing to download")
+    agent.apply_data({"id": "d2", "kind": "data", "tool": "all"})
+    assert _last(agent)["ok"] is True and "already up to date" in _last(agent)["message"]
+
+
+def test_a_request_for_all_data_downloads_every_stale_tool(agent_module, repos, tmp_path):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path, tools_repo=str(_manifest_repo(tmp_path)))
+    (tmp_path / "DATA" / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    os.makedirs(agent.update_dir, exist_ok=True)
+    asked = []
+    agent.fetch_data = lambda tools, force=False: (asked.append(tools), (True, "done"))[1]
+    agent.apply_data({"id": "d3", "kind": "data", "tool": "all"})
+    assert asked == [["AMASSS"]] and _last(agent)["ok"] is True
+
+
 def test_a_change_to_a_shared_package_rebuilds_every_environment_that_copies_it(agent_module, repos):
     """A package installed from a folder of the library is a COPY in each
     dependent environment: changing it must reinstall it there."""
@@ -651,6 +683,42 @@ def test_each_check_runs_after_the_door_reopens_and_is_reported(agent_module, re
     assert last["ok"] is True, "the update itself was applied"
     assert "Smoke test FAILED for 1 of 2: Broken (Tool execution failed.)" in last["message"]
     assert [entry["ok"] for entry in last["smoke"]] == [True, False]
+
+
+def test_an_update_then_refreshes_the_data_with_the_door_open(agent_module, repos, tmp_path, monkeypatch):
+    smoke = [{"tool": "Fast", "form": {}}]
+    agent, server = _updated_agent(agent_module, repos, tmp_path, monkeypatch, smoke)
+    agent.args.tools_repo = str(_manifest_repo(tmp_path))
+    (tmp_path / "DATA" / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    order = []
+
+    def fetch(tools, force=False):
+        order.append(("data", tools, server.door_calls[-1]))
+        return True, "done"
+
+    agent.fetch_data = fetch
+    agent._post_run = lambda tool, form, timeout: (order.append(("smoke", tool, server.door_calls[-1])), (200, ""))[1]
+    agent.apply(_request(agent))
+    assert order == [("data", ["AMASSS"], True), ("smoke", "Fast", True)], "data first, door open"
+    assert "Models and test files: brought up to date for AMASSS." in _last(agent)["message"]
+
+
+def test_a_failed_data_refresh_does_not_undo_the_update(agent_module, repos, tmp_path, monkeypatch):
+    agent, _server = _updated_agent(agent_module, repos, tmp_path, monkeypatch)
+    agent.args.tools_repo = str(_manifest_repo(tmp_path))
+    (tmp_path / "DATA" / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    agent.fetch_data = lambda tools, force=False: (False, "Some of the data of AMASSS could not be downloaded.")
+    agent.apply(_request(agent))
+    last = _last(agent)
+    assert last["ok"] is True and "could not be downloaded" in last["message"]
+
+
+def test_an_update_with_every_tool_current_downloads_nothing(agent_module, repos, tmp_path, monkeypatch):
+    agent, _server = _updated_agent(agent_module, repos, tmp_path, monkeypatch)
+    agent.args.tools_repo = str(_manifest_repo(tmp_path))
+    agent.fetch_data = lambda tools, force=False: pytest.fail("nothing installed, nothing to refresh")
+    agent.apply(_request(agent))
+    assert _last(agent)["ok"] is True and "Models and test files" not in _last(agent)["message"]
 
 
 def test_a_malformed_smoke_file_is_ignored(agent_module, repos, tmp_path, monkeypatch):

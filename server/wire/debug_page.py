@@ -1576,7 +1576,8 @@ DEBUG_PAGE = r"""<!doctype html>
       el("m-server").innerHTML = repoSummary(view.server, "Server");
       el("m-tools").innerHTML = repoSummary(view.tools, "Tools library");
     }
-    var waiting = ((view.server || {}).behind || 0) + ((view.tools || {}).behind || 0);
+    var waiting = ((view.server || {}).behind || 0) + ((view.tools || {}).behind || 0) +
+      (alive ? ((st.data || {}).refresh || []).length : 0);
     var checkedAt = alive ? upd.agent.heartbeat : (upd.check || {}).at;
     el("m-act").innerHTML = '<button class="' + (waiting ? "primary" : "") + '" data-updates="1">' +
       (waiting ? "Review" + (alive ? " &amp; update" : "") : "Details") + "</button>" +
@@ -1622,6 +1623,9 @@ DEBUG_PAGE = r"""<!doctype html>
           recreate: "Dependencies or compose changed: the container is recreated (" + esc((info.changes.heavy || []).join(", ")) + ").",
           image: "The image changes: " + esc((info.changes.heavy || []).join(", ")) }[info.changes.action] || "") + "</div>";
       }
+      if (info.behind && (info.changes || {}).data) {
+        detail += '<div class="s">Changes the models and test files: what it changes is downloaded once the update is applied.</div>';
+      }
       return section(label + (info.branch ? " \u00b7 " + info.branch + " @ " + (info.local || "") : ""),
         (reasons.length ? '<div class="warnbox">Cannot be updated from here: ' + esc(reasons.join("; ")) + "</div>" : "") +
         detail + commitsHtml(info) +
@@ -1645,7 +1649,30 @@ DEBUG_PAGE = r"""<!doctype html>
       ((st.applying || {}).log ? '<div class="con" style="margin-top:8px;max-height:160px">' + st.applying.log.map(function (l) {
         return '<div class="ln"><span class="tx">' + esc(l) + "</span></div>"; }).join("") + "</div>" : "") + "</div>" : "";
     return head + '<div class="dbody">' + howto + progress + (busy ? "" : '<div class="two">' + block(srv, "Server", "server") +
-      block(tl, "Tools library", "tools") + "</div>") + (last ? section("Last update", last) : "") + "</div>";
+      block(tl, "Tools library", "tools") + "</div>" + (alive ? dataBlock(st.data || {}) : "")) +
+      (last ? section("Last update", last) : "") + "</div>";
+  }
+  // The models and test files of every tool installed here, against the
+  // manifest the deployment runs. An update downloads what it lists; the
+  // button does the same without waiting for one.
+  function dataBlock(data) {
+    if (data.error) { return section("Models and test files", '<div class="warnbox">' + esc(data.error) + "</div>"); }
+    var tools = data.tools || {}, refresh = data.refresh || [];
+    if (!refresh.length) {
+      return section("Models and test files", '<div class="empty" style="text-align:left">Every installed tool\'s data matches the manifest.</div>');
+    }
+    var rows = refresh.map(function (key) {
+      var entries = (tools[key] || {}).entries || [];
+      var changed = entries.filter(function (e) { return e.state === "outdated"; }).length;
+      var missing = entries.filter(function (e) { return !e.present; });
+      var bytesMissing = missing.reduce(function (a, e) { return a + (e.size || 0); }, 0);
+      return "<tr><td><b>" + esc(key) + "</b></td><td>" +
+        (changed ? '<span class="pill paused">' + changed + " outdated</span> " : "") +
+        (missing.length ? '<span class="pill failed">' + missing.length + " missing</span>" : "") +
+        '</td><td class="mono" style="text-align:right">' + (bytesMissing ? bytes(bytesMissing) : "") + "</td></tr>";
+    }).join("");
+    return section("Models and test files", '<table class="io"><tbody>' + rows + "</tbody></table>" +
+      '<div style="margin-top:8px"><button class="primary" data-fetch="all">Download what changed</button></div>');
   }
 
   // ---- the full history ------------------------------------------------
@@ -1804,20 +1831,23 @@ DEBUG_PAGE = r"""<!doctype html>
       manifest = '<div class="empty" style="text-align:left">The tools library\'s manifest lists nothing for this tool.</div>';
     } else {
       var entries = m.info.entries || [], missing = entries.filter(function (e) { return !e.present; });
+      var outdated = entries.filter(function (e) { return e.state === "outdated"; });
       var missingBytes = missing.reduce(function (a, e) { return a + (e.size || 0); }, 0);
       var running = st.applying && st.applying.kind === "data" && st.applying.tool === m.key;
       var busy = st.applying || upd.request;
       manifest = '<div style="font-size:12.5px;color:var(--soft);margin-bottom:6px">' + (entries.length - missing.length) + " of " +
         entries.length + " entries on disk" + (missing.length ? " \u00b7 " + bytes(missingBytes) + " missing" : "") +
+        (outdated.length ? " \u00b7 " + outdated.length + " changed in the manifest" : "") +
         " \u00b7 manifest key <b>" + esc(m.key) + "</b></div>" +
         '<table class="io"><tbody>' + entries.map(function (e) {
           return "<tr><td>" + esc(e.kind) + "</td><td>" + esc(e.name) + '</td><td class="mono" style="text-align:right">' +
-            bytes(e.size) + "</td><td>" + (e.present ? '<span class="pill done">on disk</span>' : '<span class="pill failed">missing</span>') +
+            bytes(e.size) + "</td><td>" + (e.state === "outdated" ? '<span class="pill paused">outdated</span>'
+              : e.present ? '<span class="pill done">on disk</span>' : '<span class="pill failed">missing</span>') +
             "</td></tr>";
         }).join("") + "</tbody></table>" +
         (running ? '<div class="warnbox" style="margin-top:8px"><b>Downloading</b> \u00b7 ' + esc(st.applying.phase || "") + "</div>"
           : '<div class="doorctl" style="margin-top:10px">' +
-            '<button class="primary" data-fetch="' + esc(m.key) + '"' + (missing.length && !busy ? "" : " disabled") + ">Download missing</button>" +
+            '<button class="primary" data-fetch="' + esc(m.key) + '"' + ((missing.length || outdated.length) && !busy ? "" : " disabled") + ">Download missing or changed</button>" +
             '<button data-fetch="' + esc(m.key) + '" data-force="1"' + (busy ? " disabled" : "") + ">Re-download everything</button>" +
             (busy && !running ? '<span class="s">the agent is busy with another request</span>' : "") + "</div>");
       if (st.last && st.last.kind === "data" && st.last.tool === m.key && now() - st.last.at < 3600) {
