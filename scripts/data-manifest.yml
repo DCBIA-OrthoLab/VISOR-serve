@@ -372,8 +372,10 @@ tools:
     # TIMEPOINT of one modality (`t1 = "testfile:CBCT_T1"`), so `split` also
     # publishes CBCT_T1/, CBCT_T2/, IOS_T1/ and IOS_T2/ as hardlinked views.
     # Without them a fresh deployment had no folder its AREG pickers could
-    # list. IOSCBCT takes no split: its four inputs all draw from the whole
-    # cohort.
+    # list. IOSCBCT is split the same way, `split: IOSCBCT`: its archives hold
+    # T1/ (the intraoral meshes), T2/ (the CBCT) and, for the registration-only
+    # set, `IOS Landmarks/` and `CBCT Landmarks/`. Each picker draws from its
+    # own view, so the intraoral one lists meshes and the CBCT one a scan.
     testfiles:
       - name: AREG_test_scans.zip
         dest: IOS/AREG_test_scans
@@ -419,6 +421,7 @@ tools:
       # semi- and fully-automated ones. Near-identical sizes, distinct content.
       - name: RegTestFiles.zip
         dest: IOSCBCT/IOSCBCT_RegTestFiles
+        split: IOSCBCT
         url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile020_IOSCBCT_UL_lm.zip
         release_name: TestFile020_IOSCBCT_UL_lm.zip
         size: 222374572
@@ -426,6 +429,7 @@ tools:
         sha256: 7d31e904db0ad8d03ee4fa074a37437fd8f90af59f56da756b2dc12a2af27c3c
       - name: TestFile.zip
         dest: IOSCBCT/IOSCBCT_TestFile
+        split: IOSCBCT
         url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile019_IOSCBCT_UL.zip
         release_name: TestFile019_IOSCBCT_UL.zip
         size: 222369355
