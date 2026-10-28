@@ -264,6 +264,46 @@ def test_only_installed_tools_with_something_not_current_are_refreshed(agent_mod
     assert entries == {"AMASSS_Models": "current", "scan.nii.gz": "missing"}
 
 
+def _split_repo(tmp_path):
+    repo = tmp_path / "split-lib"
+    (repo / "scripts").mkdir(parents=True)
+    engine = os.path.join(_SCRIPTS, "fetch_data.py")
+    (repo / "scripts" / "fetch_data.py").write_text(open(engine).read())
+    (repo / "scripts" / "data-manifest.yml").write_text(
+        "tools:\n"
+        "  AREG:\n"
+        "    testfiles:\n"
+        "      - name: cohort.zip\n"
+        "        dest: PAIR/PAIR_cohort\n"
+        "        split: PAIR\n"
+        "        url: https://example.invalid/cohort.zip\n"
+        "        sha256: " + "0" * 64 + "\n"
+        "        extract: true\n")
+    return repo
+
+
+def test_an_entry_missing_one_of_its_split_views_is_refreshed(agent_module, tmp_path):
+    """Found on a deployment: a manifest gave present archives a `split`, and
+    with every archive on disk nothing read as stale. No update built the
+    views, the panel's download button stayed disabled, and the pickers scoped
+    to them listed nothing."""
+    repo = _split_repo(tmp_path)
+    data = tmp_path / "DATA"
+    cohort = data / "AREG" / "testfiles" / "PAIR" / "PAIR_cohort"
+    (cohort / "T1").mkdir(parents=True)
+    (cohort / "T2").mkdir()
+    (data / "AREG" / "testfiles" / "PAIR_T1" / "PAIR_cohort").mkdir(parents=True)
+
+    summary = agent_module.data_summary(str(repo), str(data))
+    assert summary["tools"]["AREG"]["entries"][0]["state"] == "outdated"
+    assert summary["refresh"] == ["AREG"]
+
+    (data / "AREG" / "testfiles" / "PAIR_T2" / "PAIR_cohort").mkdir(parents=True)
+    summary = agent_module.data_summary(str(repo), str(data))
+    assert summary["tools"]["AREG"]["entries"][0]["state"] == "current"
+    assert summary["refresh"] == []
+
+
 def test_a_request_for_all_data_with_nothing_stale_downloads_nothing(agent_module, repos, tmp_path):
     _writer, checkout = repos
     agent = _agent(agent_module, checkout, tmp_path, tools_repo=str(_manifest_repo(tmp_path)))

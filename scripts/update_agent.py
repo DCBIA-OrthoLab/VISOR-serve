@@ -377,6 +377,9 @@ def data_summary(tools_repo: str, data_dir: str) -> dict:
                     state = engine.entry_state(located, data_dir)
                 else:  # a tools library carrying an older engine: presence only
                     state = "current" if os.path.exists(engine._target_path(data_dir, located)) else "missing"
+                if state == "current" and _views_missing(engine, located, data_dir):
+                    # A fetch builds the missing views and downloads nothing.
+                    state = "outdated"
                 entries.append({
                     "kind": kind,
                     "name": entry.get("dest") or entry["name"],
@@ -387,6 +390,33 @@ def data_summary(tools_repo: str, data_dir: str) -> dict:
         tools[key] = {"provides": sections.get("provides") or [], "entries": entries}
     return {"error": "", "manifest": os.path.relpath(manifest_path, tools_repo or REPO_ROOT),
             "data_dir": data_dir, "tools": tools, "refresh": refresh_targets(tools)}
+
+
+def _views_missing(engine, entry: dict, data_dir: str) -> bool:
+    """True when an entry with `split` is on disk without one of its views.
+
+    Checked here rather than in the engine, because the engine is the tools
+    library's and may predate views: the IOS-CBCT split reached a deployment
+    whose archives were all present, so nothing read as stale, no update
+    built the views, and the admin panel's download button stayed disabled
+    while every picker scoped to them listed nothing.
+
+    Mirrors the engine's `_split`: each top-level subfolder `<sub>` of the
+    extracted entry is published as `<kind dir>/<split>_<sub>/<entry>/`.
+    """
+    prefix = entry.get("split")
+    if not prefix:
+        return False
+    target = engine._target_path(data_dir, entry)
+    if not os.path.isdir(target):
+        return False
+    kind_dir = os.path.join(data_dir, entry["tool"], entry["kind"])
+    for sub in os.listdir(target):
+        if sub.startswith(".") or sub == "__MACOSX" or not os.path.isdir(os.path.join(target, sub)):
+            continue
+        if not os.path.isdir(os.path.join(kind_dir, f"{prefix}_{sub}", os.path.basename(target))):
+            return True
+    return False
 
 
 def refresh_targets(tools: dict) -> list:
