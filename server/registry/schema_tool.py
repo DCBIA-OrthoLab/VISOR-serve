@@ -124,6 +124,10 @@ DEFAULT_RETURN_KIND = "text"
 #                is what keeps a tool with two modalities from asking a CBCT
 #                user about intra-oral meshes.
 #   label        what the field is called, when the argument name is not it.
+#   note         one short line drawn under the label, always visible: what a
+#                reader needs before touching the field (what comes back
+#                anyway, where the rest is written). The description stays the
+#                label's tooltip.
 #   hidden       never rendered, whatever the panel holds.
 #
 # The five presentation keys were dropped here for a while, and the effect was
@@ -134,7 +138,7 @@ DEFAULT_RETURN_KIND = "text"
 _ARGUMENT_KEYS = (
     "type", "required", "default", "description", "extensions", "choices",
     "section", "ui", "groups", "visible_when", "options_when", "label", "hidden",
-    "option_help", "min_selected", "required_when",
+    "option_help", "note", "min_selected", "required_when",
     # MULTICHOICE only: offer a "select all" / "select none" pair above the
     # options. For a catalogue nobody would tick one box at a time.
     "select_all",
@@ -298,7 +302,7 @@ def read_schema(folder: str) -> dict:
 # and nothing arrived. In one function because there are four places an ArgSpec
 # is built and three of them are easy to forget.
 _PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label",
-                      "option_help", "min_selected", "select_all", "required_when",
+                      "option_help", "note", "min_selected", "select_all", "required_when",
                       "x_labels", "y_labels", "x_label", "y_label",
                       "section_columns", "cell")
 
@@ -345,9 +349,14 @@ def _presentation(declaration: dict, argument_name: str = "") -> dict:
 # stay standard-library only; the two are pinned equal by a test.
 KEEP_INTERMEDIATE_ARGUMENT = "keep_intermediate"
 
-# Its own box on the panel. Named once here: the tools do not declare the
+# The box it lands in: Quality control, beside `stop_after`. What a step
+# produced is in that step's own space, for checking how a run went; what a
+# reader takes away is the tool's own `outputs`, written in the result's
+# space. Showing the two side by side under "Outputs" read as two ways of
+# asking for the same files. Named once here: the tools do not declare the
 # argument, so there is nowhere else this could be written.
-KEEP_INTERMEDIATE_SECTION = "Intermediate results"
+KEEP_INTERMEDIATE_SECTION = "Quality control"
+KEEP_INTERMEDIATE_LABEL = "Raw intermediate files"
 
 # The section the client fills with the output folder. An argument landing
 # in it is the marker for "everything after this is about the result".
@@ -375,15 +384,17 @@ def _keep_intermediate_spec(calls: tuple, layout: dict) -> ArgSpec:
         required=False,
         choices={tool: False for tool in calls},
         description=(
-            "Return what a step produced, beside this tool's own results. Each "
-            "one is written under `intermediate/` in the output folder."
+            "Return what a step produced, as it produced it and in its own "
+            "space, for checking the run. Each one is written under "
+            "`intermediate/` in the output folder."
         ),
-        label=layout.get("label") or "Steps to keep",
-        # A section of its own, and NOT "Advanced": this decides what comes back
-        # from the run, which is a question about the result rather than a knob
-        # on how it is computed. Placed just above Outputs by `_ordered_with`.
+        label=layout.get("label") or KEEP_INTERMEDIATE_LABEL,
+        # NOT "Advanced": it decides what comes back from the run. Quality
+        # control, with the stops, because both are about checking the chain
+        # rather than about the result. Placed just above Outputs by
+        # `_ordered_with`.
         section=layout.get("section") or KEEP_INTERMEDIATE_SECTION,
-        ui=layout.get("ui") or "inline",
+        ui=layout.get("ui") or CHAIN_STEPS_UI,
         select_all=True,
         option_help=layout.get("option_help"),
         visible_when=layout.get("visible_when"),
@@ -396,6 +407,11 @@ def _keep_intermediate_spec(calls: tuple, layout: dict) -> ArgSpec:
 # should STOP -- and both are questions about a chain rather than about a
 # tool, so both are answered once here instead of in every orchestrator.
 STOP_AFTER_ARGUMENT = "stop_after"
+# How both lists of chain steps (`stop_after`, `keep_intermediate`) are drawn
+# unless a tool says otherwise: chips that wrap over as many lines as they
+# need. A single "inline" row grew with the chain, and six steps pushed the
+# panel wider than the module column.
+CHAIN_STEPS_UI = "chips"
 STOP_AFTER_SECTION = "Quality control"
 
 # How a stop names a point INSIDE a nested call: `ASO/ALI_CBCT` is "in the ASO
@@ -523,7 +539,7 @@ def _stop_after_spec(options, layout: dict, kinds=None) -> ArgSpec:
         # walk through the chain rather than a nonsense state.
         select_all=True,
         section=layout.get("section") or STOP_AFTER_SECTION,
-        ui=layout.get("ui") or "inline",
+        ui=layout.get("ui") or CHAIN_STEPS_UI,
         option_help=layout.get("option_help"),
         # What a reader may do at each of them, so a panel can offer a
         # way BACK to the ones that can be edited and not to the ones
