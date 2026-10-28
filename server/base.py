@@ -324,6 +324,11 @@ class ArgSpec:
     # description covers all of them at once. The words are the tool's, exactly
     # as `groups`' names are: this server knows the key and never a landmark.
     option_help: Optional[dict] = None
+    # One short line drawn under the field's label, always visible. Not the
+    # description, which stays the label's tooltip: this is for the one fact a
+    # reader needs before ticking anything -- what is written whatever they
+    # tick, where the rest lands -- and is kept to a line for that reason.
+    note: Optional[str] = None
     # `{option: what a reader may do there}` -- "view", "landmarks",
     # "registration". Only `stop_after` carries it, and only so a panel can
     # tell a checkpoint a reader may come BACK to from one they may only look

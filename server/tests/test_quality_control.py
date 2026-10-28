@@ -82,11 +82,19 @@ def test_the_two_injected_boxes_read_in_the_order_they_are_decided(tmp_path):
     assert list(tool.arguments) == ["scans", "stop_after", "keep_intermediate", "out"]
 
 
-def test_it_has_a_section_of_its_own(tmp_path):
+def test_the_stops_and_the_raw_steps_share_the_quality_control_section(tmp_path):
+    """Both are about checking the chain. What a reader takes away is the
+    tool's own `outputs`, under Outputs, and the two no longer sit together."""
     tool = _tool(tmp_path, supervisor=True, calls=["Leaf"])
     assert tool.arguments["stop_after"].section == schema_tool.STOP_AFTER_SECTION
-    assert tool.arguments["stop_after"].section != \
-        tool.arguments["keep_intermediate"].section
+    assert tool.arguments["keep_intermediate"].section == schema_tool.STOP_AFTER_SECTION
+
+
+def test_both_lists_of_steps_wrap_instead_of_widening_the_panel(tmp_path):
+    """One inline row grew with the chain until the panel scrolled sideways."""
+    tool = _tool(tmp_path, supervisor=True, calls=["Leaf"])
+    assert tool.arguments["stop_after"].ui == schema_tool.CHAIN_STEPS_UI == "chips"
+    assert tool.arguments["keep_intermediate"].ui == schema_tool.CHAIN_STEPS_UI
 
 
 def test_the_argument_name_is_the_same_on_both_sides():
