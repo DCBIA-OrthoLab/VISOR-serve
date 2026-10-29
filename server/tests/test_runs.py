@@ -998,3 +998,58 @@ def test_a_resumed_run_is_listed_running_again(run_id, tmp_path):
     runs.clear_pause(run_id)
     runs.append(run_id, phase=runs.PHASE_RUNNING)
     assert _listed(run_id)["phase"] == runs.PHASE_RUNNING
+
+
+# ---------------------------------------------------------------------------
+# An operator may hold a paused run longer
+# ---------------------------------------------------------------------------
+
+def _pause_idle_for(run_id, job_dir, seconds):
+    runs.pause(run_id, str(job_dir), "ASO")
+    directory = runs.run_directory(run_id)
+    then = time.time() - seconds
+    os.utime(directory, (then, then))
+    return directory
+
+
+def test_a_held_pause_outlives_its_idle_timeout(run_id, tmp_path):
+    job = tmp_path / "job"; job.mkdir()
+    directory = _pause_idle_for(run_id, job, settings.PAUSED_RUN_TTL_SECONDS - 60)
+    runs.extend_pause(run_id, 3600)
+    os.utime(directory, (time.time() - settings.PAUSED_RUN_TTL_SECONDS - 60,) * 2)
+    runs.reap_expired()
+    assert os.path.isdir(directory) and job.is_dir()
+
+
+def test_an_unheld_pause_is_still_dropped_at_its_idle_timeout(run_id, tmp_path):
+    job = tmp_path / "job"; job.mkdir()
+    directory = _pause_idle_for(run_id, job, settings.PAUSED_RUN_TTL_SECONDS + 60)
+    runs.reap_expired()
+    assert not os.path.exists(directory) and not job.exists()
+
+
+def test_two_holds_add_up_and_never_pass_the_cap(run_id, tmp_path):
+    _pause_idle_for(run_id, tmp_path, 0)
+    now = time.time()
+    first = runs.extend_pause(run_id, 3600, now=now)
+    assert runs.extend_pause(run_id, 3600, now=now) == pytest.approx(first + 3600)
+    capped = runs.extend_pause(run_id, settings.PAUSED_RUN_MAX_HOLD_SECONDS, now=now)
+    assert capped == pytest.approx(now + settings.PAUSED_RUN_MAX_HOLD_SECONDS)
+
+
+def test_the_listing_gives_a_paused_run_its_deadline(run_id, tmp_path):
+    _pause_idle_for(run_id, tmp_path, 0)
+    deadline = runs.extend_pause(run_id, 7200)
+    assert _listed(run_id)["expires_at"] == pytest.approx(deadline)
+
+
+def test_a_run_that_is_not_paused_cannot_be_held(run_id):
+    with pytest.raises(runs.RunError):
+        runs.extend_pause(run_id, 3600)
+
+
+def test_a_hold_adds_what_it_says_and_does_not_restart_the_idle_clock(run_id, tmp_path):
+    directory = _pause_idle_for(run_id, tmp_path, 3600)
+    before = runs._expires_at(directory)
+    runs.extend_pause(run_id, 600)
+    assert runs._expires_at(directory) == pytest.approx(before + 600, abs=1)

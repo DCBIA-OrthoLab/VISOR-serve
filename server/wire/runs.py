@@ -360,11 +360,56 @@ def _kept_by(directory: str) -> list:
     return [str(entry) for entry in held if entry]
 
 
-def _ttl_of(directory: str) -> float:
-    """How long this run may sit idle: longer while somebody is reading it."""
-    if os.path.exists(os.path.join(directory, PAUSED_FILE)):
-        return settings.PAUSED_RUN_TTL_SECONDS
-    return settings.RUN_TTL_SECONDS
+def _expires_at(directory: str) -> float:
+    """When the reaper may take this run: idle for its TTL, and past any hold.
+
+    A paused run is given longer, because what it waits for is a person; an
+    operator may push that further with `extend_pause`, which records a
+    `hold_until` the idle clock cannot shorten.
+    """
+    idle_since = os.path.getmtime(directory)
+    try:
+        with open(os.path.join(directory, PAUSED_FILE), encoding="utf-8") as handle:
+            record = json.load(handle)
+    except FileNotFoundError:
+        return idle_since + settings.RUN_TTL_SECONDS
+    except (OSError, ValueError):
+        return idle_since + settings.PAUSED_RUN_TTL_SECONDS
+    expires = idle_since + settings.PAUSED_RUN_TTL_SECONDS
+    hold = record.get("hold_until") if isinstance(record, dict) else None
+    if isinstance(hold, (int, float)):
+        expires = max(expires, float(hold))
+    return expires
+
+
+def extend_pause(run_id: str, seconds: float, now: Optional[float] = None) -> float:
+    """Give a paused run `seconds` more before it is dropped. Returns the new deadline.
+
+    Counted from the later of now and the current deadline, so two clicks add
+    up; capped at PAUSED_RUN_MAX_HOLD_SECONDS from now, so no click can hold a
+    staged cohort on this machine indefinitely.
+    """
+    directory = run_directory(run_id)
+    path = os.path.join(directory, PAUSED_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        raise RunError(f"Run '{run_id}' is not stopped at a checkpoint.", status_code=404)
+    at = time.time() if now is None else now
+    deadline = min(max(_expires_at(directory), at) + float(seconds),
+                   at + settings.PAUSED_RUN_MAX_HOLD_SECONDS)
+    record["hold_until"] = deadline
+    # The directory's mtime IS the idle clock, and renaming a file into it
+    # moves that clock to now: kept as it was, so a hold adds what it says
+    # rather than also restarting the idle timeout.
+    idle = os.stat(directory)
+    staging = f"{path}.{os.getpid()}"
+    with open(staging, "w", encoding="utf-8") as handle:
+        json.dump(record, handle)
+    os.replace(staging, path)
+    os.utime(directory, ns=(idle.st_atime_ns, idle.st_mtime_ns))
+    return deadline
 
 
 def reap_expired(now: Optional[float] = None) -> int:
@@ -397,7 +442,7 @@ def reap_expired(now: Optional[float] = None) -> int:
     for entry in entries:
         directory = os.path.join(root, entry)
         try:
-            if os.path.getmtime(directory) > deadline_now - _ttl_of(directory):
+            if _expires_at(directory) > deadline_now:
                 continue
         except OSError:
             # Gone between listdir and getmtime: another worker won.
@@ -1343,8 +1388,13 @@ def active(limit: int = 500, with_chain: bool = False) -> list:
         # and removed on resume. Read too, so a pause shows as one even when its
         # signed event cannot be checked -- written under the key of a server
         # that has since been restarted with another.
+        expires_at = None
         if state not in TERMINAL_STATES and os.path.exists(os.path.join(directory, PAUSED_FILE)):
             state, phase = STATE_PAUSED, PHASE_PAUSED
+            try:
+                expires_at = _expires_at(directory)
+            except OSError:
+                pass
         entry = {
             "run_id": name,
             "tool": tool,
@@ -1358,6 +1408,8 @@ def active(limit: int = 500, with_chain: bool = False) -> list:
         }
         if batch:
             entry["batch"] = batch
+        if expires_at is not None:
+            entry["expires_at"] = expires_at
         if with_chain:
             # Tool names only, which `_clean_tool_name` already restricted to
             # identifiers: the operator page may say a run is inside ALI_CBCT

@@ -544,12 +544,11 @@ def record_run_end(run_id: str, outcome: str, phase: str = "",
             record["ended_at"] = time.time()
             record["outcome"] = str(outcome)[:40]
             record["phase"] = str(phase)[:40] if phase else None
-            record["seconds"] = round(
-                max(0.0, record["ended_at"] - record["started_at"]), 2)
             if timeline:
                 record["spans"] = timeline.get("spans") or []
                 record["nested"] = timeline.get("nested") or []
                 record["measured"] = timeline.get("measured")
+            _set_durations(record)
             if failure:
                 record["failure"] = dict(failure)
             if logs:
@@ -630,6 +629,28 @@ def configure_history(directory: Optional[str]) -> int:
     return len(loaded)
 
 
+def paused_seconds(spans) -> float:
+    """How long a run spent stopped at a pause, out of its phase spans."""
+    total = 0.0
+    for span in spans or ():
+        if span.get("phase") == "paused":
+            try:
+                total += max(0.0, float(span["end"]) - float(span["start"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+    return total
+
+
+def _set_durations(record: dict) -> None:
+    """`seconds` is the time the run WORKED; `paused_seconds` the time it waited
+    at a pause for the clinician. A pause can last an hour while the tool runs
+    for three minutes, so counting it made a tool's mean the reader's pace."""
+    paused = paused_seconds(record.get("spans"))
+    total = max(0.0, (record.get("ended_at") or 0.0) - (record.get("started_at") or 0.0))
+    record["seconds"] = round(max(0.0, total - paused), 2)
+    record["paused_seconds"] = round(paused, 2)
+
+
 def _read_history(path: str) -> list:
     records = []
     if not os.path.exists(path):
@@ -641,6 +662,10 @@ def _read_history(path: str) -> list:
             except ValueError:
                 continue    # a line torn by a crash mid-append
             if isinstance(record, dict) and record.get("run_id"):
+                # Written before pauses were taken out of `seconds`: the
+                # spans it kept are enough to take them out now.
+                if "paused_seconds" not in record and record.get("ended_at"):
+                    _set_durations(record)
                 records.append(record)
     return records
 

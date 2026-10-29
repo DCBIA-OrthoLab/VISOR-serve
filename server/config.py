@@ -325,6 +325,10 @@ class Settings(BaseSettings):
     # never comes back must still cost this machine nothing by the end of the
     # day, the run holding a staged cohort of patient data the whole time.
     PAUSED_RUN_TTL_SECONDS: int = 14400
+    # How far ahead an operator may push one paused run's deadline from the
+    # admin panel: a review that runs over is given more time, a reader who
+    # never comes back still costs this machine nothing after three days.
+    PAUSED_RUN_MAX_HOLD_SECONDS: int = 259200
     # How often GET /runs/{id}/events tails the file. Small because it is the
     # latency a clinician sees on a progress bar, and cheap because it is one
     # read of the bytes appended since the last poll.
