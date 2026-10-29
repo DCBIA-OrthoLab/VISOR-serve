@@ -163,9 +163,12 @@ BENCHMARK_PAGE = """<!doctype html>
                  max-width: min(46vw, 380px); }
   .stamp { font-size: 12px; color: var(--faint); font-variant-numeric: tabular-nums; }
 
+  /* Only the bar is frosted: a backdrop blur on every card is redone on each
+     scrolled frame (see debug_page). The cards stay translucent over the
+     ground's glows, which are already soft. */
   header#bar, section, .legend {
-    background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
-    border: 1px solid var(--panel-edge); box-shadow: var(--shadow); }
+    background: var(--panel); border: 1px solid var(--panel-edge); box-shadow: var(--shadow); }
+  header#bar { -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur); }
   section { border-radius: var(--radius); padding: 0 var(--pad) 16px; min-width: 0; }
 
   /* Summary strip */
@@ -446,7 +449,7 @@ BENCHMARK_PAGE = """<!doctype html>
   #arms .fdiv { margin: 18px 4px 10px; padding: 0; border: none; }
   #arms .fdiv:first-child { margin-top: 10px; }
   #arms .fdiv .fkey { font-size: 15px; }
-  .arm { background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
+  .arm { background: var(--panel);
          border: 1px solid var(--panel-edge); box-shadow: var(--shadow); border-radius: var(--radius);
          padding: 0 var(--pad) 16px; margin: 0 0 14px; transition: box-shadow .2s, border-color .2s; }
   .arm:hover { box-shadow: var(--shadow), 0 0 0 1px var(--accent-soft); }
