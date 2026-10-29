@@ -45,6 +45,38 @@ def _weak_secrets() -> str:
     return ""
 
 
+EVENT_KEY_FILE = ".event-signing-key"
+
+
+def event_signing_key(temp_dir: str) -> str:
+    """The key run events are signed with, the same one across restarts.
+
+    Kept beside the runs it signs, in TEMP_DIR, which `main` closes to this
+    user. A key drawn afresh at each start made every event written before a
+    restart fail its check: the reader then took a paused run's `paused`, and
+    a finished run's `done`, for a tool's unsigned word and showed `running`.
+    A run directory and its key go together -- whoever wipes TEMP_DIR wipes
+    both.
+    """
+    path = os.path.join(temp_dir, EVENT_KEY_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            key = handle.read().strip()
+        if key:
+            return key
+    except FileNotFoundError:
+        pass
+    key = secrets.token_urlsafe(32)
+    # Written whole under a temporary name then renamed, so a reader never
+    # sees half a key; 0600 from the first byte.
+    staging = f"{path}.{os.getpid()}"
+    descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+        handle.write(key)
+    os.replace(staging, path)
+    return key
+
+
 def _exposure_problem(cert: str) -> str:
     """Why this server may not be published where it is, or "".
 
@@ -111,7 +143,7 @@ def main(argv=None) -> int:
     # events are the server's own; inherited by the workers, stripped from the
     # tools (execution/dispatch.SERVER_SECRETS). Set only if absent, so a
     # --reload worker keeps the parent's.
-    os.environ.setdefault("SADT_EVENT_SIGNING_KEY", secrets.token_urlsafe(32))
+    os.environ.setdefault("SADT_EVENT_SIGNING_KEY", event_signing_key(settings.TEMP_DIR))
     uvicorn.run("main:app", host=args.host, port=args.port, reload=args.reload,
                 ssl_certfile=cert, ssl_keyfile=key)
     return 0

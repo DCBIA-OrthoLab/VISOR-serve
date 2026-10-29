@@ -72,6 +72,20 @@ def _is_usable(interpreter: str) -> bool:
     return probe.returncode == 0
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _session_temp_dir(tmp_path_factory):
+    """No test writes into the TEMP_DIR a server on this machine serves from.
+
+    The default is that server's own, so a test that registered a run without
+    moving TEMP_DIR first put the run in the live registry, where its panel
+    listed it as running. A test that moves TEMP_DIR itself still does.
+    """
+    original = settings.TEMP_DIR
+    settings.TEMP_DIR = str(tmp_path_factory.mktemp("inference_server"))
+    yield
+    settings.TEMP_DIR = original
+
+
 @pytest.fixture(autouse=True)
 def schema_cache(tmp_path, monkeypatch):
     """A .schema.json is a cache the server may regenerate, so no test is

@@ -976,3 +976,25 @@ def test_nothing_measurable_is_not_an_empty_measurement(run_id):
     """"Not measured" and "measured as empty" must not render the same."""
     runs.append(run_id, runs.PHASE_RUNNING, measured={"scan": "patient.nii.gz"})
     assert "measured" not in runs.read_events(run_id)[-1]
+
+
+# ---------------------------------------------------------------------------
+# A pause outlives a restart that changed the signing key
+# ---------------------------------------------------------------------------
+
+def _listed(identifier):
+    return next(entry for entry in runs.active() if entry["run_id"] == identifier)
+
+
+def test_a_paused_run_is_listed_paused_after_the_signing_key_changed(run_id, tmp_path, monkeypatch):
+    runs.append(run_id, phase=runs.PHASE_RUNNING)
+    runs.pause(run_id, str(tmp_path), "ASO")
+    monkeypatch.setenv("SADT_EVENT_SIGNING_KEY", "the key of the next server")
+    assert (_listed(run_id)["state"], _listed(run_id)["phase"]) == (runs.STATE_PAUSED, runs.PHASE_PAUSED)
+
+
+def test_a_resumed_run_is_listed_running_again(run_id, tmp_path):
+    runs.pause(run_id, str(tmp_path), "ASO")
+    runs.clear_pause(run_id)
+    runs.append(run_id, phase=runs.PHASE_RUNNING)
+    assert _listed(run_id)["phase"] == runs.PHASE_RUNNING
