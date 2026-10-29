@@ -755,6 +755,41 @@ def test_the_resume_endpoint_marks_the_run_finished(tmp_path, monkeypatch):
     real_finish(run_id, runs.PHASE_DONE)
 
 
+def test_a_run_resumed_after_a_restart_is_listed_under_its_tool(tmp_path, monkeypatch):
+    """The ledger lives in memory and keeps finished runs only, so a server
+    restarted while a run waited at its checkpoint resumed it with no record:
+    the admin panel then listed the run as "(unnamed)"."""
+    from fastapi.testclient import TestClient
+    import main
+    import telemetry
+    from wire import runs
+
+    job = _ran(tmp_path, "01_ALI_CBCT")
+    with open(os.path.join(job, "job.json"), "w", encoding="utf-8") as handle:
+        json.dump({"tool": "Test_Tool"}, handle)
+    run_id = runs.register(uuid.uuid4().hex, tool="Test_Tool", client="a-workstation")
+    runs.pause(run_id, job, "ALI_CBCT")
+    telemetry.reset()  # the restart
+
+    async def carried_on(tool_name, request, background_tasks, resume_from=None):
+        return {"carried": "on"}
+
+    monkeypatch.setattr(main, "_run_tool", carried_on)
+    real_finish = runs.finish
+    monkeypatch.setattr(runs, "finish", lambda rid, phase, **kw: None)
+
+    client = TestClient(main.app)
+    response = client.post(
+        f"/runs/{run_id}/resume",
+        headers={"Authorization": "Bearer " + main.settings.API_TOKEN},
+    )
+    assert response.status_code == 200
+    record = telemetry.ledger_record(run_id)
+    assert record is not None
+    assert (record["tool"], record["client"]) == ("Test_Tool", "a-workstation")
+    real_finish(run_id, runs.PHASE_DONE)
+
+
 class _Background:
     """Enough of BackgroundTasks to record what was queued."""
 
