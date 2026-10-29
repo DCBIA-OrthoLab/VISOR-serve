@@ -232,6 +232,32 @@ def test_the_ledger_is_bounded_and_keeps_the_newest():
     assert ledger[0]["run_id"] == f"run-{telemetry.LEDGER_SIZE + 19}"
 
 
+def test_a_run_resumed_after_a_restart_keeps_its_name():
+    """A restart while a run waits at its checkpoint drops its record; the
+    grant after the resume used to make a blank one, listed under no tool."""
+    telemetry.record_run_resumed("run-r", "AREG", "a-workstation",
+                                 started_at=1000.0)
+    telemetry.record_run_grant("run-r", channels=1)
+    telemetry.record_run_end("run-r", "done", "done")
+
+    record = telemetry.run_ledger()[0]
+    assert record["tool"] == "AREG"
+    assert record["client"] == "a-workstation"
+    assert record["started_at"] == 1000.0
+    assert [row["tool"] for row in telemetry.tool_uptime()] == ["AREG"]
+
+
+def test_a_resume_does_not_rename_a_run_the_ledger_already_knows():
+    telemetry.record_run_start("run-k", "AREG", "first")
+    started = telemetry.run_ledger()[0]["started_at"]
+    telemetry.record_run_resumed("run-k", "ASO", "second",
+                                 started_at=started + 60)
+
+    record = telemetry.run_ledger()[0]
+    assert (record["tool"], record["client"]) == ("AREG", "first")
+    assert record["started_at"] == started
+
+
 def test_ending_a_run_nobody_started_is_ignored():
     telemetry.record_run_end("never-seen", "done")
     assert telemetry.run_ledger() == []

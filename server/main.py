@@ -3302,6 +3302,13 @@ async def resume_run(run_id: str, request: Request,
         tool = get_tool(tool_name)
     except KeyError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    # A restart while the run waited at its checkpoint dropped its ledger
+    # record; the name it was registered under is still beside its events.
+    registered = await anyio.to_thread.run_sync(runs.meta, run_id)
+    telemetry.record_run_resumed(
+        run_id, registered.get("tool") or tool_name,
+        registered.get("client"), batch=registered.get("batch"),
+        started_at=registered.get("at"))
     if not already_staged:
         # A rewind stages before it narrows, and the upload's handles are
         # read once: staging the same form twice would find every file empty

@@ -372,6 +372,38 @@ def record_run_start(run_id: str, tool: str, client: str = None,
         pass
 
 
+def record_run_resumed(run_id: str, tool: str, client: str = None,
+                       batch: Optional[dict] = None,
+                       started_at: Optional[float] = None) -> None:
+    """A paused run is carried on. Fills in only what the ledger lacks.
+
+    A run that paused before this process started is not in the ledger: the
+    history keeps finished runs only, so a restart while a run waits at its
+    checkpoint loses the record `record_run_start` made. Without this, the
+    first grant after the resume creates a blank one and the run is listed
+    under no tool at all. `started_at` is when the run was first registered,
+    so it reads the same as a run that paused and resumed without a restart.
+    """
+    try:
+        with _ledger_lock:
+            record = _ledger_record(run_id)
+            if record is None:
+                return
+            if not record["tool"] and tool:
+                record["tool"] = str(tool)[:100]
+            if not record["client"] and client:
+                record["client"] = str(client)[:64]
+            if not record["batch"] and batch:
+                record["batch"] = dict(batch)
+            if started_at and record["ended_at"] is None:
+                try:
+                    record["started_at"] = min(record["started_at"], float(started_at))
+                except (TypeError, ValueError):
+                    pass
+    except Exception:  # noqa: BLE001 - telemetry must never fail a run
+        pass
+
+
 # How many files a single input is walked over before its size is reported as
 # partial. Deliberately smaller than the disk sweep's: this runs on the request
 # path, microseconds before the tool is invoked, and an unpacked cohort can be
