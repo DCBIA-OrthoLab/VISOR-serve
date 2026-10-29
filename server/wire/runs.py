@@ -1337,12 +1337,20 @@ def active(limit: int = 500, with_chain: bool = False) -> list:
                 started_at = float(recorded)
         except (OSError, ValueError):
             pass
+        state = latest["state"] if latest else STATE_PENDING
+        phase = latest["phase"] if latest else PHASE_RECEIVED
+        # The pause record is the server's own file, written beside the events
+        # and removed on resume. Read too, so a pause shows as one even when its
+        # signed event cannot be checked -- written under the key of a server
+        # that has since been restarted with another.
+        if state not in TERMINAL_STATES and os.path.exists(os.path.join(directory, PAUSED_FILE)):
+            state, phase = STATE_PAUSED, PHASE_PAUSED
         entry = {
             "run_id": name,
             "tool": tool,
             "client": client,
-            "state": latest["state"] if latest else STATE_PENDING,
-            "phase": latest["phase"] if latest else PHASE_RECEIVED,
+            "state": state,
+            "phase": phase,
             "fraction": latest["fraction"] if latest else None,
             "depth": latest["depth"] if latest else 0,
             "started_at": started_at,
