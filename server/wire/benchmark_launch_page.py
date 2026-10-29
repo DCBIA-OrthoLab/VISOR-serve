@@ -69,8 +69,11 @@ LAUNCH_PAGE = """<!doctype html>
   .seg button.on { background: var(--panel-strong); color: var(--ink); font-weight: 600;
                    box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 0 0 .5px rgba(0,0,0,.04); }
 
-  .card, header#bar { background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
-          border: 1px solid var(--panel-edge); box-shadow: var(--shadow); }
+  /* Only the bar is frosted: a backdrop blur on every card is redone on each
+     scrolled frame (see debug_page). The cards stay translucent over the
+     ground's glows, which are already soft. */
+  .card, header#bar { background: var(--panel); border: 1px solid var(--panel-edge); box-shadow: var(--shadow); }
+  header#bar { -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur); }
   .card { border-radius: var(--radius); margin-bottom: 14px; min-width: 0; }
   .card > h2 { margin: 0; padding: 13px 16px 10px; font-size: 15px; font-weight: 600; letter-spacing: -.01em;
                display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }

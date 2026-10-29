@@ -85,8 +85,12 @@ DEBUG_PAGE = r"""<!doctype html>
            color: var(--accent); cursor: pointer; }
   .fchip i { font-style: normal; opacity: .7; }
 
-  .card, #vitals, header#bar { background: var(--panel); -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur);
-          border: 1px solid var(--panel-edge); box-shadow: var(--shadow); }
+  /* Only the bar is frosted. A 28 px backdrop blur on every card is redone over
+     the whole card on each scrolled frame, which held scrolling near 20 fps.
+     The cards stay translucent: what shows through them is the ground's wide
+     glows, already soft, so the blur added almost nothing to see. */
+  .card, #vitals, header#bar { background: var(--panel); border: 1px solid var(--panel-edge); box-shadow: var(--shadow); }
+  header#bar { -webkit-backdrop-filter: var(--blur); backdrop-filter: var(--blur); }
   .card { border-radius: var(--radius); display: flex; flex-direction: column; min-width: 0; }
   .card > h2 { margin: 0; padding: 13px 16px 10px; font-size: 15px; font-weight: 600; letter-spacing: -.01em;
                display: flex; align-items: center; gap: 8px; border-bottom: 1px solid var(--line); }
