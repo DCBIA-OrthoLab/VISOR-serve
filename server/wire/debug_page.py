@@ -126,10 +126,6 @@ DEBUG_PAGE = r"""<!doctype html>
   #queue { flex: 1 1 auto; }
   #queue .body { min-height: 420px; }
   #q-list { max-height: 640px; overflow: auto; }
-  #paused { flex: 0 0 auto; }
-  #p-list { max-height: 150px; overflow: auto; }
-  #paused .qitem { padding: 5px 9px; margin-bottom: 5px; }
-  #paused .qitem .pos { width: 20px; height: 20px; font-size: 10px; }
   @media (max-width: 1200px) { #main { grid-template-columns: 1fr; } }
   #left { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
 
@@ -142,10 +138,8 @@ DEBUG_PAGE = r"""<!doctype html>
                 place-items: center; font-size: 12px; font-weight: 700; color: #fff; background: var(--warn); }
   .qitem .n { font-weight: 650; font-size: 13.5px; }
   .qitem .m { font-size: 11.5px; color: var(--soft); }
-  .qitem.held { background: transparent; border-style: dashed; }
   .qitem.slot { background: transparent; }
   .qitem.slot .pos { background: var(--staging); }
-  .qitem.held .pos { background: var(--ghost); }
   .rank { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; }
   .rank .nm { width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .track { flex: 1; height: 6px; background: var(--bar); border-radius: 3px; overflow: hidden; }
@@ -168,6 +162,13 @@ DEBUG_PAGE = r"""<!doctype html>
   .progress i { display: block; height: 100%; background: var(--ok); border-radius: 3px; transition: width .5s ease; }
   .progress.indet i { width: 30% !important; animation: slide 1.4s ease-in-out infinite; }
   .run.q .progress i { background: var(--warn); }
+  .run.p { border-color: color-mix(in srgb, var(--warn) 55%, transparent);
+           background: color-mix(in srgb, var(--warn) 9%, transparent); }
+  .run.p .pc { color: var(--warn); }
+  .run.p .held { font-size: 11.5px; color: var(--warn); margin-top: 8px; display: flex; align-items: center; gap: 6px; }
+  .run.p .held .grow { flex: 1; }
+  .run.p .held button { padding: 2px 9px; font-size: 11.5px; }
+  td .ps { font-size: 11px; color: var(--warn); }
   @keyframes slide { 0% { transform: translateX(-100%); } 100% { transform: translateX(340%); } }
   .chain { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-top: 8px; font-size: 12px; }
   .chain .link { padding: 1px 8px; border-radius: 999px; background: var(--sunk); border: 1px solid var(--line); }
@@ -430,6 +431,7 @@ DEBUG_PAGE = r"""<!doctype html>
       The token stays in this browser and is never written into this page.</p>
     <div style="display:flex;gap:8px;flex-wrap:wrap">
       <input id="token" type="password" placeholder="Admin token" autocomplete="off">
+      <button id="reveal" type="button" class="ghost" title="show what is typed" aria-pressed="false">Show</button>
       <button id="save" type="button">Connect</button>
     </div>
     <div class="err" id="gateerr"></div>
@@ -445,10 +447,11 @@ DEBUG_PAGE = r"""<!doctype html>
     </div>
     <span class="grow"></span>
     <span id="filters"></span>
-    <input id="find" style="min-width:200px;width:220px" type="search" placeholder="Filter: run id, tool or address" autocomplete="off" spellcheck="false">
+    <input id="find" style="min-width:180px;width:200px" type="search" placeholder="Filter: run id, tool or address" autocomplete="off" spellcheck="false">
     <span id="live"><span class="dot" id="dot"></span><span id="livetext">live</span></span>
     <button id="toggle" type="button" class="ghost">Pause</button>
     <a class="navlink" href="benchmark" title="the campaigns already measured, and the presets to measure next">Benchmarks</a>
+    <button id="copyapi" type="button" class="ghost" title="put the API token a workstation connects with on the clipboard, without showing it">API token</button>
     <button id="adminbtn" type="button" class="ghost" title="forget the admin token in this browser">Lock</button>
     <button id="theme" type="button" class="ghost" title="theme">Theme</button>
   </header>
@@ -472,10 +475,6 @@ DEBUG_PAGE = r"""<!doctype html>
         <div class="body">
           <div id="q-list"></div>
         </div>
-      </section>
-      <section class="card" id="paused">
-        <h2>Paused <span class="count" id="p-count">0</span><span class="note">waiting for a person</span></h2>
-        <div class="body"><div id="p-list"></div></div>
       </section>
     </div>
 
@@ -1119,17 +1118,6 @@ DEBUG_PAGE = r"""<!doctype html>
         (r.client ? " \u00b7 " + esc(r.client) : "") + "</div></div>" + ctl + "</div>";
     }).join("") : '<div class="empty">' + (anyFilter() ? "Nothing waiting matches this filter." : "Nothing waiting.") + "</div>";
 
-    var held = (d.runs || []).filter(function (r) { return r.phase === "paused" && matches(r, byId[r.run_id]); });
-    var ttl = ((d.server || {}).paused_ttl_seconds) || 0;
-    el("p-count").textContent = held.length;
-    el("p-list").innerHTML = held.length ? held.map(function (r) {
-      var left = ttl ? Math.max(0, ttl - (now() - r.started_at)) : null;
-      return '<div class="qitem held" data-run="' + esc(r.run_id) + '"><span class="pos">⏸</span>' +
-        '<div><div class="n">' + esc(r.tool || "?") + "</div>" +
-        '<div class="m mono">held ' + ago(r.started_at) + (left === null ? "" : " · dropped in " + dur(left)) +
-        "</div></div></div>";
-    }).join("") : '<div class="empty">Nothing paused.</div>';
-
     var ranked = (q.ranked || []).filter(function (r) { return r.total_wait > 0; }).slice(0, 6);
     var worst = ranked.length ? (ranked[0].total_wait || 1) : 1;
     el("q-rank").innerHTML = ranked.length ? ranked.map(function (r) {
@@ -1175,8 +1163,11 @@ DEBUG_PAGE = r"""<!doctype html>
       return inFlight(r) && r.phase !== "paused" && r.phase !== "queued_gpu" && r.phase !== "received" &&
         matches(r, byId[r.run_id]);
     });
-    el("r-count").textContent = rows.length;
-    if (!rows.length) {
+    // A paused run holds no machine, so it is not counted as running: it is
+    // listed after them, in the colour of a run waiting for a person.
+    var held = (d.runs || []).filter(function (r) { return r.phase === "paused" && matches(r, byId[r.run_id]); });
+    el("r-count").textContent = rows.length + (held.length ? " \u00b7 " + held.length + " paused" : "");
+    if (!rows.length && !held.length) {
       el("r-list").innerHTML = '<div class="empty">' + (anyFilter() ? "Nothing running matches this filter." : "Nothing running.") + "</div>";
       return;
     }
@@ -1202,6 +1193,24 @@ DEBUG_PAGE = r"""<!doctype html>
         '<div class="cell"><u>vram</u><b>' + gib(led.vram_bytes) + "</b></div>" +
         '<div class="cell"><u>files</u><b>' + (led.files == null ? "—" : led.files) + "</b></div>" +
         "</div>" + callCells(calls[r.run_id]) + "</div>";
+    }).join("") + held.map(function (r) {
+      var chain = r.chain || [];
+      // The deadline is the server's: its idle timeout, or later if an
+      // operator held the run.
+      var left = r.expires_at == null ? null : Math.max(0, r.expires_at - now());
+      return '<div class="run p" data-run="' + esc(r.run_id) + '">' +
+        '<div class="hd"><span class="nm">' + esc(r.tool || "?") + "</span>" + pill(r.phase) +
+        (r.batch ? '<span class="tag">batch ' + r.batch.index + "/" + r.batch.total + "</span>" : "") +
+        '<span class="pc mono">\u23f8</span></div>' +
+        '<div class="sub mono">waiting for a person ' + ago(r.updated_at) +
+        " \u00b7 started " + ago(r.started_at) + " ago" +
+        (r.client ? " \u00b7 " + esc(r.client) : "") + "</div>" +
+        (chain.length ? chainHtml(r.tool, chain) : "") +
+        '<div class="held mono"><span>holds no machine' + (left === null ? "" : " \u00b7 its files are dropped in " + dur(left)) +
+        '</span><span class="grow"></span>' +
+        '<button class="ghost" data-hold="3600" data-id="' + esc(r.run_id) + '" title="keep this pause one hour longer">+1 h</button>' +
+        '<button class="ghost" data-hold="14400" data-id="' + esc(r.run_id) + '" title="keep this pause four hours longer">+4 h</button>' +
+        "</div></div>";
     }).join("");
   }
 
@@ -1345,7 +1354,7 @@ DEBUG_PAGE = r"""<!doctype html>
           '<td style="color:var(--soft)">' + esc(called.join(", ") || "—") + "</td>" +
           '<td class="mono">' + esc(r.client || "—") + "</td><td>" + pill(r.outcome) + "</td>" +
           "<td>" + phaseBar(r.spans, r.seconds) + "</td>" +
-          "<td class='r mono'>" + dur(r.seconds) + "</td>" +
+          "<td class='r mono'>" + dur(r.seconds) + (r.paused_seconds ? '<div class="ps">+ ' + dur(r.paused_seconds) + " paused</div>" : "") + "</td>" +
           "<td class='r mono'>" + (r.waited == null ? "—" : dur(r.waited)) + "</td>" +
           "<td class='r mono'>" + (r.channels == null ? "—" : r.channels) + "</td>" +
           "<td class='r mono'>" + gib((r.measured || {}).vram_bytes != null ? r.measured.vram_bytes : r.vram_bytes) + "</td>" +
@@ -1767,7 +1776,7 @@ DEBUG_PAGE = r"""<!doctype html>
           "<td>" + phaseBar(r.spans, r.seconds) + "</td>" +
           "<td class='r mono'>" + dur(ranSeconds(r)) + "</td>" +
           "<td class='r mono'>" + (r.waited == null ? "\u2014" : dur(r.waited)) + "</td>" +
-          "<td class='r mono'>" + dur(r.seconds) + "</td>" +
+          "<td class='r mono'>" + dur(r.seconds) + (r.paused_seconds ? '<div class="ps">+ ' + dur(r.paused_seconds) + " paused</div>" : "") + "</td>" +
           "<td class='r mono'>" + (r.channels == null ? "\u2014" : r.channels) + "</td>" +
           "<td class='r mono'>" + (r.cpus == null ? "\u2014" : r.cpus) + "</td>" +
           "<td class='r mono'>" + gib(m.vram_bytes) + "</td><td class='r mono'>" + gib(m.ram_bytes) + "</td>" +
@@ -2059,6 +2068,22 @@ DEBUG_PAGE = r"""<!doctype html>
     load();
   });
   el("token").addEventListener("keydown", function (event) { if (event.key === "Enter") { el("save").click(); } });
+  el("reveal").addEventListener("click", function () {
+    var shown = el("token").type === "password";
+    el("token").type = shown ? "text" : "password";
+    el("reveal").textContent = shown ? "Hide" : "Show";
+    el("reveal").setAttribute("aria-pressed", shown ? "true" : "false");
+  });
+  // Fetched at the click and handed straight to the clipboard: the API token
+  // is never in the page, in a variable that outlives the click, or on screen.
+  el("copyapi").addEventListener("click", function () {
+    if (!token) { return; }
+    fetch("admin-panel/api-token", { headers: { "X-Admin-Token": token }, cache: "no-store" })
+      .then(function (r) { if (!r.ok) { throw new Error("The server answered " + r.status + "."); } return r.json(); })
+      .then(function (body) { return navigator.clipboard.writeText(body.token || ""); })
+      .then(function () { toast("API token copied to the clipboard."); })
+      .catch(function (e) { toast("Could not copy the API token: " + (e && e.message ? e.message : e)); });
+  });
   el("toggle").addEventListener("click", function () {
     live = !live;
     el("toggle").textContent = live ? "Pause" : "Resume";
@@ -2173,6 +2198,13 @@ DEBUG_PAGE = r"""<!doctype html>
       var level2 = rl.getAttribute("data-rule");
       adminAction("admin/clients/" + encodeURIComponent(rl.getAttribute("data-addr")) + "/policy",
         { batches: level2 }, level2 === "parallel" ? "Batches of this workstation now run in parallel." : "Batches of this workstation now run one at a time.");
+      return;
+    }
+    var hb = t.closest("[data-hold]");
+    if (hb) {
+      var extra = Number(hb.getAttribute("data-hold"));
+      adminAction("admin/runs/" + encodeURIComponent(hb.getAttribute("data-id")) + "/hold",
+        { seconds: extra }, "Pause kept " + dur(extra) + " longer.");
       return;
     }
     var pr = t.closest("[data-prio]");

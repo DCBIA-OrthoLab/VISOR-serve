@@ -1078,6 +1078,43 @@ def admin_priority(run_id: str, wanted: _Priority) -> dict:
     return snapshot
 
 
+class _Hold(BaseModel):
+    seconds: float
+
+
+@app.post("/admin/runs/{run_id}/hold", dependencies=[Depends(verify_admin)])
+def admin_hold_pause(run_id: str, wanted: _Hold) -> dict:
+    """Give a paused run more time before its work is dropped.
+
+    For a review that runs over: the idle timeout cannot tell a reader still
+    working through a cohort from one who left, and an operator can.
+    """
+    if not math.isfinite(wanted.seconds) or not 0 < wanted.seconds <= settings.PAUSED_RUN_MAX_HOLD_SECONDS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=f"'seconds' must be above 0 and at most {settings.PAUSED_RUN_MAX_HOLD_SECONDS}.",
+        )
+    try:
+        deadline = runs.extend_pause(run_id, wanted.seconds)
+    except runs.RunError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
+    logger.info("Operator held paused run %s for %.0f s more", run_id, wanted.seconds)
+    return {"run_id": run_id, "expires_at": deadline}
+
+
+@app.get("/admin-panel/api-token", dependencies=[Depends(verify_admin)])
+def admin_api_token() -> JSONResponse:
+    """The API token, for an operator setting up a workstation.
+
+    Behind the admin token, and asked for only when the panel's copy button is
+    pressed: the page puts it on the clipboard and never shows it, and it is
+    never part of the page or of `/admin-panel.json`, which are read every two
+    seconds. Not cached anywhere on the way.
+    """
+    return JSONResponse({"token": settings.API_TOKEN},
+                        headers={"Cache-Control": "no-store"})
+
+
 @app.get("/admin-panel.json", dependencies=[Depends(verify_admin)])
 def server_debug_data() -> dict:
     """Everything `/status` reports, plus what the machine says about itself.

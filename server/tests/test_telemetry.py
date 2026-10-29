@@ -16,7 +16,9 @@ exists at all:
   claim about a machine nobody measured.
 """
 
+import json
 import os
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -160,6 +162,50 @@ def test_the_ledger_records_what_a_run_held_and_how_it_ended():
     assert record["files"] == 40
     assert record["outcome"] == "done"
     assert record["seconds"] is not None
+
+
+def _paused_run(run_id, worked, paused):
+    """A run that worked `worked` seconds around one pause of `paused`."""
+    telemetry.record_run_start(run_id, "AREG")
+    start = time.time() - worked - paused
+    spans = [
+        {"phase": "running", "start": start, "end": start + worked / 2},
+        {"phase": "paused", "start": start + worked / 2, "end": start + worked / 2 + paused},
+        {"phase": "running", "start": start + worked / 2 + paused, "end": start + worked + paused},
+    ]
+    with telemetry._ledger_lock:
+        telemetry._ledger[run_id]["started_at"] = start
+    telemetry.record_run_end(run_id, "done", "done", timeline={"spans": spans})
+    return telemetry.ledger_record(run_id)
+
+
+def test_a_pause_is_not_counted_in_the_time_a_run_took():
+    record = _paused_run("run-p", worked=120.0, paused=3000.0)
+    assert record["seconds"] == pytest.approx(120.0, abs=1.0)
+    assert record["paused_seconds"] == pytest.approx(3000.0, abs=1.0)
+
+
+def test_a_tool_mean_is_its_working_time_not_the_clinicians_pace():
+    _paused_run("run-p1", worked=100.0, paused=3000.0)
+    _paused_run("run-p2", worked=100.0, paused=0.0)
+    row = next(row for row in telemetry.tool_uptime() if row["tool"] == "AREG")
+    assert row["mean"] == pytest.approx(100.0, abs=1.0)
+
+
+def test_history_written_before_pauses_were_taken_out_is_corrected_on_read(tmp_path):
+    start = 1000.0
+    old = {"run_id": "old", "tool": "AREG", "started_at": start, "ended_at": start + 3100.0,
+           "seconds": 3100.0, "outcome": "done",
+           "spans": [{"phase": "running", "start": start, "end": start + 100.0},
+                     {"phase": "paused", "start": start + 100.0, "end": start + 3100.0}]}
+    (tmp_path / telemetry.HISTORY_FILE).write_text(json.dumps(old) + "\n")
+    telemetry.configure_history(str(tmp_path))
+    try:
+        record = telemetry.ledger_record("old")
+    finally:
+        telemetry.configure_history(None)
+    assert record["seconds"] == pytest.approx(100.0)
+    assert record["paused_seconds"] == pytest.approx(3000.0)
 
 
 def test_the_ledger_keeps_argument_names_and_never_their_values():

@@ -162,6 +162,8 @@ def test_every_endpoint_that_starts_work_is_gated():
     ALLOWED_OPEN = {"/maintenance", "/admin/queue/{run_id}/move", "/admin/runs/{run_id}/priority",
                     "/admin/clients/{address}/policy", "/admin/door", "/admin/update", "/admin/data",
                     "/admin/updates/check",
+                    # Gives a paused run longer before it is dropped; starts nothing.
+                    "/admin/runs/{run_id}/hold",
                     # Answers which file NAMES go together; starts no run.
                     "/tools/{tool_name}/pairs"}
     # This is also what catches a route that does not exist yet. A benchmark

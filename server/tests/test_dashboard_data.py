@@ -10,6 +10,7 @@ file, so the tests below plant one and check it never comes out.
 
 import json
 import os
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -244,3 +245,42 @@ def test_the_full_history_lists_finished_runs_only_newest_first():
     assert [r["run_id"] for r in payload["runs"]] == ["new-run-000000000000000001", "old-run-000000000000000001"]
     assert payload["held"] == 2
     assert client.get("/admin-panel/history.json", headers=AUTH).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# The API token, for the panel's copy button
+# ---------------------------------------------------------------------------
+
+def test_the_api_token_is_handed_to_the_admin_token_only():
+    assert client.get("/admin-panel/api-token", headers=AUTH).status_code == 401
+    response = client.get("/admin-panel/api-token", headers=_panel())
+    assert response.status_code == 200
+    assert response.json() == {"token": settings.API_TOKEN}
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_the_api_token_is_in_neither_the_page_nor_its_polled_data():
+    page = client.get("/admin-panel").text
+    data = client.get("/admin-panel.json", headers=_panel()).text
+    assert settings.API_TOKEN not in page
+    assert settings.API_TOKEN not in data
+
+
+def test_the_panel_holds_a_paused_run_behind_the_admin_token(tmp_path):
+    run_id = runs.register("held-run-0123456789abcdef", tool="ASO")
+    runs.pause(run_id, str(tmp_path), "ASO")
+    assert client.post(f"/admin/runs/{run_id}/hold", json={"seconds": 3600}, headers=AUTH).status_code == 401
+    response = client.post(f"/admin/runs/{run_id}/hold", json={"seconds": 3600}, headers=_panel())
+    assert response.status_code == 200
+    assert response.json()["expires_at"] > time.time() + 3500
+    too_long = settings.PAUSED_RUN_MAX_HOLD_SECONDS + 1
+    assert client.post(f"/admin/runs/{run_id}/hold", json={"seconds": too_long},
+                       headers=_panel()).status_code == 422
+    runs.discard(run_id)
+
+
+def test_a_run_that_is_not_paused_answers_404_to_a_hold():
+    run_id = runs.register("not-held-0123456789abcdef", tool="ASO")
+    assert client.post(f"/admin/runs/{run_id}/hold", json={"seconds": 60},
+                       headers=_panel()).status_code == 404
+    runs.discard(run_id)
