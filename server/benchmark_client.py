@@ -133,7 +133,8 @@ def _request(url: str, token: str, data=None, method=None, timeout=POLL_TIMEOUT,
         request.add_header("Content-Type", "application/x-www-form-urlencoded")
     for key, value in (headers or {}).items():
         request.add_header(key, value)
-    with urllib.request.urlopen(request, timeout=timeout, context=_tls_context()) as response:
+    # HTTPS URL of the server under benchmark.
+    with urllib.request.urlopen(request, timeout=timeout, context=_tls_context()) as response:  # nosec B310
         return response.status, response.read(), dict(response.headers)
 
 
@@ -144,7 +145,8 @@ def _send(url: str, token: str, body: bytes, method: str, content_type: str,
     request.add_header("Content-Type", content_type)
     for key, value in (headers or {}).items():
         request.add_header(key, value)
-    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT, context=_tls_context()) as response:
+    # HTTPS URL of the server under benchmark.
+    with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT, context=_tls_context()) as response:  # nosec B310
         return response.status, response.read()
 
 

@@ -59,7 +59,8 @@ def _bearer(challenge: str, repository: str) -> str:
     if fields.get("service"):
         query["service"] = fields["service"]
     try:
-        with urllib.request.urlopen(urllib.request.Request(
+        # HTTPS registry realm read from the registry's own challenge.
+        with urllib.request.urlopen(urllib.request.Request(  # nosec B310
                 realm + "?" + urllib.parse.urlencode(query), headers=_HEADERS), timeout=20) as response:
             payload = json.loads(response.read().decode("utf-8") or "{}")
     except (OSError, ValueError):
