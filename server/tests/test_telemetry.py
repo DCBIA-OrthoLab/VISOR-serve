@@ -90,6 +90,46 @@ def test_disk_counts_what_is_under_the_path(tmp_path):
     assert report["here"]["total"] > 0
 
 
+def _stats_under(monkeypatch, root):
+    """Count `os.stat` calls on paths under `root` -- not `root` itself, which
+    the report still checks exists -- made on this thread only."""
+    import threading
+    calls, here, real = [], threading.get_ident(), os.stat
+
+    def counted(path, *args, **kwargs):
+        if threading.get_ident() == here and str(path).startswith(str(root) + os.sep):
+            calls.append(path)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", counted)
+    return calls
+
+
+def test_a_tree_is_walked_once_per_half_minute_not_once_per_poll(tmp_path, monkeypatch):
+    """The panel polls every two seconds, and each poll walked TEMP_DIR and
+    DATA_DIR -- up to 40 000 files each -- to say how much they held."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    for index in range(200):
+        (tree / f"blob-{index}").write_bytes(b"x" * 100)
+    first = telemetry.disk({"here": str(tree)})["here"]["used_here"]
+
+    calls = _stats_under(monkeypatch, tree)
+    assert telemetry.disk({"here": str(tree)})["here"]["used_here"] == first
+    assert len(calls) == 0
+
+
+def test_a_tree_is_walked_again_once_its_figure_is_stale(tmp_path, monkeypatch):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "blob").write_bytes(b"x" * 20000)
+    before = telemetry.disk({"here": str(tree)})["here"]["used_here"]
+    (tree / "another").write_bytes(b"x" * 20000)
+    later = time.monotonic() + telemetry.TREE_BYTES_SECONDS + 1
+    monkeypatch.setattr(telemetry.time, "monotonic", lambda: later)
+    assert telemetry.disk({"here": str(tree)})["here"]["used_here"] >= before + 20000
+
+
 def test_in_flight_requests_count_up_and_back_down():
     telemetry.request_started()
     telemetry.request_started()

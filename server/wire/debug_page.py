@@ -2042,9 +2042,10 @@ DEBUG_PAGE = r"""<!doctype html>
     }
   }
 
+  // Hands back its fetch, so `tick` can wait for the answer.
   function load() {
-    if (!token) { el("gate").hidden = false; el("shell").hidden = true; return; }
-    fetch("admin-panel.json", { headers: { "X-Admin-Token": token } })
+    if (!token) { el("gate").hidden = false; el("shell").hidden = true; return Promise.resolve(); }
+    return fetch("admin-panel.json", { headers: { "X-Admin-Token": token } })
       .then(function (r) {
         if (r.status === 401) { throw new Error("That is not this server's admin token."); }
         if (r.status === 403) { throw new Error("This server has no admin token: set ADMIN_TOKEN in its .env and restart it."); }
@@ -2058,7 +2059,13 @@ DEBUG_PAGE = r"""<!doctype html>
       })
       .catch(function (e) { el("gate").hidden = false; el("shell").hidden = true; el("gateerr").textContent = e.message; });
   }
-  function tick() { if (live) { load(); } window.setTimeout(tick, EVERY); }
+  // Re-armed once the poll has SETTLED, never on a clock of its own: against
+  // a server slow to answer -- exactly when an operator opens this page -- a
+  // timer re-armed regardless stacked one more panel request every two
+  // seconds behind those still waiting, and made the server slower still.
+  function tick() {
+    (live ? load() : Promise.resolve()).finally(function () { window.setTimeout(tick, EVERY); });
+  }
 
   el("save").addEventListener("click", function () {
     token = el("token").value.trim();
@@ -2262,8 +2269,7 @@ DEBUG_PAGE = r"""<!doctype html>
 
   readUrl();
   drawFilters();
-  load();
-  window.setTimeout(tick, EVERY);
+  tick();
 })();
 </script>
 </body>

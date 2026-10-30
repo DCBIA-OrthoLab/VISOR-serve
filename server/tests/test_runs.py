@@ -223,6 +223,40 @@ def test_the_stream_delivers_events_that_arrive_while_it_is_open(run_id):
     ]
 
 
+def test_a_quiet_stream_says_it_is_still_there(run_id, monkeypatch):
+    """A tool silent for longer than the client's 30 s read timeout -- a
+    registration, a model loading -- made the client drop the stream and
+    reconnect, replaying every event from the start. A comment line keeps the
+    connection reading as alive and is never an event."""
+    import main
+    monkeypatch.setattr(settings, "RUN_EVENT_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(main, "_SSE_HEARTBEAT_SECONDS", 0.05, raising=False)
+    runs.append(run_id, runs.PHASE_RUNNING)
+    directory = runs.run_directory(run_id)
+    reads, real = [], runs.EventReader.read
+
+    def read(reader):
+        # The run ends after this many polls, so the stream ends and the test
+        # cannot hang on it.
+        if reader.directory == directory:
+            reads.append(1)
+            if len(reads) == 40:
+                runs.finish(run_id, runs.PHASE_DONE)
+        return real(reader)
+
+    monkeypatch.setattr(runs.EventReader, "read", read)
+    comments, data = [], []
+    with client.stream("GET", f"/runs/{run_id}/events", headers=AUTH, timeout=20) as response:
+        assert response.status_code == 200
+        for line in response.iter_lines():
+            if line.startswith(":"):
+                comments.append(line)
+            elif line.startswith("data: "):
+                data.append(json.loads(line[len("data: "):]))
+    assert len(comments) >= 1
+    assert [event["phase"] for event in data] == [runs.PHASE_RUNNING, runs.PHASE_DONE]
+
+
 def test_the_stream_ends_when_the_run_directory_goes_away(run_id):
     """A run whose request died between the last event and the cleanup. The
     watcher must stop rather than poll a directory that will never change."""
@@ -1053,3 +1087,246 @@ def test_a_hold_adds_what_it_says_and_does_not_restart_the_idle_clock(run_id, tm
     before = runs._expires_at(directory)
     runs.extend_pause(run_id, 600)
     assert runs._expires_at(directory) == pytest.approx(before + 600, abs=1)
+
+
+# ---------------------------------------------------------------------------
+# The live listing does not re-read a run that has not changed
+# ---------------------------------------------------------------------------
+
+def _counting_parses(monkeypatch):
+    """Count `_normalised` calls made on THIS thread only: a reaper or a
+    leftover worker of another test parsing its own run must not be counted."""
+    calls = []
+    here = threading.get_ident()
+    original = runs._normalised
+
+    def counted(*args, **kwargs):
+        if threading.get_ident() == here:
+            calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runs, "_normalised", counted)
+    return calls
+
+
+def test_the_listing_reads_an_unchanged_run_once(tmp_path, monkeypatch):
+    """Every page polls the listing every two seconds; re-reading and
+    re-verifying every event of every run on each poll cost 2.4 ms a run, two
+    and a half seconds a panel poll with 500 runs on disk."""
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    made = [runs.register(_new_id(), tool="AMASSS") for _ in range(20)]
+    for identifier in made:
+        for _ in range(50):
+            runs.append(identifier, runs.PHASE_RUNNING, fraction=0.5)
+    first = runs.active(with_chain=True)
+
+    calls = _counting_parses(monkeypatch)
+    assert runs.active() == [{k: v for k, v in entry.items() if k != "chain"} for entry in first]
+    assert runs.active(with_chain=True) == first
+    assert len(calls) == 0
+
+
+def test_the_listing_rereads_a_run_that_moved(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    identifier = runs.register(_new_id(), tool="AMASSS")
+    runs.append(identifier, runs.PHASE_RUNNING, fraction=0.25)
+    assert _listed(identifier)["fraction"] == 0.25
+    runs.append(identifier, runs.PHASE_RUNNING, fraction=0.75)
+    assert _listed(identifier)["fraction"] == 0.75
+    runs.finish(identifier, runs.PHASE_DONE)
+    assert _listed(identifier)["state"] == runs.STATE_DONE
+
+
+def test_the_listing_forgets_a_run_that_is_gone(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    identifier = runs.register(_new_id(), tool="AMASSS")
+    runs.append(identifier, runs.PHASE_RUNNING)
+    runs.active()
+    directory = runs.run_directory(identifier)
+    assert directory in runs._LISTED
+    runs.discard(identifier)
+    runs.active()
+    assert directory not in runs._LISTED
+
+
+# ---------------------------------------------------------------------------
+# A run the previous server left in flight is ended when the next one starts
+# ---------------------------------------------------------------------------
+
+def _states():
+    return {entry["run_id"]: entry for entry in runs.active()}
+
+
+def test_a_run_a_previous_server_left_in_flight_is_failed_at_startup(tmp_path, monkeypatch):
+    """TEMP_DIR outlives a restart, and nothing else would ever end such a run:
+    the event stream touches its directory every quarter second, so a watched
+    orphan is never reaped, and the client waits for a terminal event for ever."""
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    running = runs.register(_new_id(), tool="AMASSS")
+    runs.append(running, runs.PHASE_RUNNING, fraction=0.4)
+    pending = runs.register(_new_id(), tool="AMASSS")
+    finished = runs.register(_new_id(), tool="AMASSS")
+    runs.finish(finished, runs.PHASE_DONE)
+    idle = os.stat(runs.run_directory(running)).st_mtime_ns
+
+    with TestClient(app):
+        pass
+
+    # Ending it is not the run being active: it keeps the idle clock it had,
+    # so an abandoned one is still reaped on time. Checked first, since
+    # reading the events below is a client's read and does stamp it.
+    assert os.stat(runs.run_directory(running)).st_mtime_ns == idle
+    listed = _states()
+    assert {entry["state"] for entry in listed.values() if entry["run_id"] != finished} \
+        == {runs.STATE_FAILED}
+    assert listed[finished]["state"] == runs.STATE_DONE
+    assert runs.read_events(running)[-1]["message"] == "The server restarted during this run."
+
+
+def test_a_paused_run_survives_a_restart_paused(tmp_path, monkeypatch):
+    """A pause waits for a person and holds no machine: a restart must leave
+    it resumable."""
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    job = tmp_path / "job"
+    job.mkdir()
+    paused = runs.register(_new_id(), tool="AREG")
+    runs.append(paused, runs.PHASE_RUNNING)
+    runs.pause(paused, str(job), "ASO")
+
+    with TestClient(app):
+        pass
+
+    assert _states()[paused]["state"] == runs.STATE_PAUSED
+    assert runs.read_events(paused)[-1]["phase"] == runs.PHASE_PAUSED
+    assert runs.paused_at(paused) is not None
+
+
+# ---------------------------------------------------------------------------
+# The listing reads a live run on from where it stopped
+# ---------------------------------------------------------------------------
+
+def _tool_line(directory, record, newline=True):
+    """Append a line the way a TOOL does: unsigned, O_APPEND, one write."""
+    payload = json.dumps(record) + ("\n" if newline else "")
+    with open(os.path.join(directory, runs.EVENTS_FILE), "a", encoding="utf-8") as handle:
+        handle.write(payload)
+
+
+def test_a_listing_reads_only_what_a_live_run_appended(tmp_path, monkeypatch):
+    """A live run changes between any two listings, and the cap on runs per
+    workstation lists every run at every POST /run: re-reading the whole file
+    on each change cost 634 ms for one run with 100k lines."""
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    identifier = runs.register(_new_id(), tool="AMASSS")
+    for index in range(1500):
+        runs.append(identifier, runs.PHASE_RUNNING, fraction=index / 2000)
+    runs.active()
+    runs.append(identifier, runs.PHASE_RUNNING, fraction=0.9)
+
+    calls = _counting_parses(monkeypatch)
+    assert _listed(identifier)["fraction"] == 0.9
+    assert len(calls) == 1
+
+
+def test_a_tool_writing_after_a_cancelled_event_leaves_the_run_cancelled(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    identifier = runs.register(_new_id(), tool="AMASSS")
+    runs.append(identifier, runs.PHASE_RUNNING)
+    runs.active()
+    runs.finish(identifier, runs.PHASE_CANCELLED)
+    assert _listed(identifier)["state"] == runs.STATE_CANCELLED
+    _tool_line(runs.run_directory(identifier), {"fraction": 0.9, "message": "still going"})
+    assert _listed(identifier)["state"] == runs.STATE_CANCELLED
+    assert _listed(identifier)["phase"] == runs.PHASE_CANCELLED
+
+
+def test_a_rewritten_events_file_is_read_afresh(tmp_path, monkeypatch):
+    """Shorter than where the listing had read to: not an append, so nothing
+    read before it can be trusted."""
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    identifier = runs.register(_new_id(), tool="AMASSS")
+    for _ in range(5):
+        runs.append(identifier, runs.PHASE_RUNNING, fraction=0.5)
+    runs.finish(identifier, runs.PHASE_DONE)
+    assert _listed(identifier)["state"] == runs.STATE_DONE
+    path = os.path.join(runs.run_directory(identifier), runs.EVENTS_FILE)
+    with open(path, "r+", encoding="utf-8") as handle:
+        handle.truncate(0)
+    runs.append(identifier, runs.PHASE_QUEUED_GPU)
+    assert _listed(identifier)["phase"] == runs.PHASE_QUEUED_GPU
+
+
+def _whole_read(identifier):
+    """What the listing would say reading the file from the start, once."""
+    events = runs.EventReader(runs.run_directory(identifier), keep_alive=False).read()
+    latest = events[-1] if events else None
+    return {
+        "state": latest["state"] if latest else runs.STATE_PENDING,
+        "phase": latest["phase"] if latest else runs.PHASE_RECEIVED,
+        "fraction": latest["fraction"] if latest else None,
+        "depth": latest["depth"] if latest else 0,
+        "chain": runs.timeline(events)["chain"],
+    }
+
+
+def _as_listed(identifier):
+    entry = next(e for e in runs.active(with_chain=True) if e["run_id"] == identifier)
+    return {key: entry[key] for key in ("state", "phase", "fraction", "depth", "chain")}
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_reading_on_says_what_reading_from_the_start_says(tmp_path, monkeypatch, seed):
+    """Appends of every kind -- server phases, tool progress, log lines,
+    nested calls opening and closing at several depths, a line torn mid-write,
+    and writes after a terminal event -- listed after each one, compared with
+    a whole read of the same file."""
+    import random
+
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    chance = random.Random(seed)
+    identifier = runs.register(_new_id(), tool="AREG")
+    directory = runs.run_directory(identifier)
+    clock = [1_000_000.0]
+    open_calls = []
+    tools = ("ASO", "ALI_CBCT", "AMASSS", "AREG_CBCT")
+
+    def at():
+        clock[0] += chance.uniform(0.01, 2.0)
+        return clock[0]
+
+    for step in range(80):
+        roll = chance.random()
+        if roll < 0.2:
+            runs.append(identifier, chance.choice(
+                [runs.PHASE_STAGING, runs.PHASE_QUEUED_GPU, runs.PHASE_RUNNING,
+                 runs.PHASE_PACKAGING]), fraction=chance.random())
+        elif roll < 0.45:
+            _tool_line(directory, {"at": at(), "fraction": chance.random(),
+                                   "message": "working", "depth": chance.randint(0, 2)})
+        elif roll < 0.55:
+            _tool_line(directory, {"at": at(), "kind": "log", "level": "info",
+                                   "audience": "admin", "message": "a log line"})
+        elif roll < 0.75:
+            depth = len(open_calls) + 1
+            tool = chance.choice(tools)
+            open_calls.append((tool, depth))
+            _tool_line(directory, {"at": at(), "depth": depth, "tool": tool,
+                                   "call": ".".join(["1"] * depth), "edge": "open"})
+        elif roll < 0.9 and open_calls:
+            tool, depth = open_calls.pop()
+            _tool_line(directory, {"at": at(), "depth": depth, "tool": tool,
+                                   "call": ".".join(["1"] * depth), "edge": "close"})
+        elif roll < 0.95:
+            # A line caught mid-write: the listing must neither parse it in
+            # half nor lose it once it is complete.
+            record = json.dumps({"at": at(), "fraction": 0.5, "message": "torn"})
+            cut = chance.randint(1, len(record) - 1)
+            with open(os.path.join(directory, runs.EVENTS_FILE), "a", encoding="utf-8") as handle:
+                handle.write(record[:cut])
+            assert _as_listed(identifier) == _whole_read(identifier), f"step {step} (torn)"
+            with open(os.path.join(directory, runs.EVENTS_FILE), "a", encoding="utf-8") as handle:
+                handle.write(record[cut:] + "\n")
+        elif step > 40:
+            runs.finish(identifier, chance.choice(
+                [runs.PHASE_DONE, runs.PHASE_FAILED, runs.PHASE_CANCELLED]))
+        assert _as_listed(identifier) == _whole_read(identifier), f"step {step}"

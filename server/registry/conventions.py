@@ -152,6 +152,19 @@ def is_model(argument_name: str) -> bool:
     return any(argument_name == name or argument_name.endswith("_" + name) for name in MODEL_NAMES)
 
 
+# Of MODEL_NAMES, the one that means WEIGHTS: `model` and `*_model`. Never
+# uploaded, whatever a deployment opted them out of (main.py
+# `_reject_upload_for_model`): a model loader unpickles what it is handed, so an
+# uploaded "model" is uploaded code. `*_reference` is not in it -- a reference
+# is a scan or a mesh, FlexReg's other timepoint or AutoMatrix's output grid,
+# and is the clinician's own to send.
+WEIGHTS_NAME = "model"
+
+
+def names_weights(argument_name: str) -> bool:
+    return argument_name == WEIGHTS_NAME or argument_name.endswith("_" + WEIGHTS_NAME)
+
+
 # --- splitting a cohort ----------------------------------------------------
 
 
@@ -276,12 +289,19 @@ def derive(arguments: dict, declared: ToolDeployment, batch_defaults: tuple,
     selectable.update(declared.server_selectable)
     # "none" is a removal, not a kind: it is how a deployment opts an argument
     # out of a convention its NAME would otherwise put it in.
+    opted_out = []
     for name, kind in list(selectable.items()):
         if kind == deployment_module.SERVER_SELECTABLE_NONE:
             del selectable[name]
+            opted_out.append(name)
 
     hidden = {name for name in arguments if name in TECHNICAL}
     hidden.update(declared.hidden)
+    # A model opted out is one the tool finds for itself, and left a plain
+    # `path` it would otherwise be an upload row on every panel -- for a file
+    # the server refuses (see WEIGHTS_NAME). Nobody is asked; the tool's own
+    # default applies, which is what opting it out was for.
+    hidden.update(name for name in opted_out if names_weights(name))
 
     return replace(
         declared,

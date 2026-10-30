@@ -48,6 +48,8 @@ import os
 import re
 import secrets
 import shutil
+import sys
+import threading
 import time
 from typing import List, Optional
 
@@ -1321,6 +1323,132 @@ def progress_file(run_id: Optional[str]) -> Optional[str]:
     return os.path.abspath(os.path.join(directory, EVENTS_FILE))
 
 
+# What a run left in flight by a previous server process is told when the next
+# one starts. Said to the client, so it says what happened and nothing else.
+ORPHAN_MESSAGE = "The server restarted during this run."
+
+
+def fail_orphans() -> int:
+    """End every run a previous server process left pending or running.
+
+    TEMP_DIR outlives a restart, and nothing else would ever end such a run:
+    the process that owned it is gone, so no terminal event is coming, and the
+    event stream touches the directory every quarter second, so a run whose
+    client is still watching is never reaped either. That client waits on a
+    terminal event that cannot arrive, with no timeout of its own. Failing the
+    run tells it what happened, and the next stream read ends.
+
+    A PAUSED run is left alone: it waits for a person, not for a process, and
+    a resume picks it up from its job directory whichever process serves it.
+
+    Ending an orphan is not the run being active, so its idle clock is kept as
+    it was -- the way `extend_pause` keeps it -- and an abandoned one is still
+    reaped on time.
+
+    **Assumes one server process**, which is what serve.py runs: called from
+    the lifespan, it would end the live runs of a sibling `uvicorn --workers`
+    process starting beside them.
+    """
+    ended = 0
+    for entry in active(limit=sys.maxsize):
+        if entry["state"] not in (STATE_PENDING, STATE_RUNNING):
+            continue
+        directory = os.path.join(_runs_root(), entry["run_id"])
+        try:
+            idle = os.stat(directory)
+        except OSError:
+            continue
+        finish(entry["run_id"], PHASE_FAILED, message=ORPHAN_MESSAGE)
+        try:
+            os.utime(directory, ns=(idle.st_atime_ns, idle.st_mtime_ns))
+        except OSError:
+            pass
+        ended += 1
+    if ended:
+        logger.info("Ended %d run(s) a previous server process left in flight", ended)
+    return ended
+
+
+# What the listing knows of each run: directory -> a `_ListedRun` reading that
+# run's events forward. `/status`, both admin pages, the update agent's idle
+# check and the cap on runs per workstation (every POST /run) all list every
+# run, and re-reading a run parsed and re-verified the signature of every
+# event it ever wrote: 2.4 ms a run, two and a half seconds a poll with 500
+# runs on disk -- long enough for `/status` to time out, which the update
+# agent read as a server that was down. Re-reading only the runs whose file
+# had changed was not enough either: a LIVE run changes between any two
+# listings, and one with 100k lines cost 634 ms of every /run.
+#
+# So a run is read on from where the listing stopped, the way the event
+# stream tails it. Replaced whole on each listing rather than edited, which
+# drops a discarded run's entry with it and lets two concurrent listings each
+# publish a complete dict; each entry holds its own lock.
+_LISTED: dict = {}
+
+
+class _ListedRun:
+    """One run as the listing reads it: an `EventReader` kept between
+    listings, the latest event it delivered, and the nested calls still open.
+
+    The reader is the same one a whole read uses, so what it delivers -- the
+    signature checked on every new line, the weighted fraction, the cap, the
+    stop at the terminal event -- is what a whole read would deliver; it is
+    only given the lines in several goes. The open calls are paired exactly
+    as `timeline` pairs them, so the chain is `timeline(events)["chain"]`.
+    """
+
+    __slots__ = ("lock", "directory", "inode", "identity", "reader", "latest", "open_calls")
+
+    def __init__(self, directory: str, inode: int):
+        self.lock = threading.Lock()
+        self.directory = directory
+        self.inode = inode
+        self._start()
+
+    def _start(self) -> None:
+        self.identity = None
+        # keep_alive=False: LOOKING at a run is not the run being alive.
+        # Reading stamps the directory, and the TTL is an idle timeout, so an
+        # operator page polling every couple of seconds would hold every
+        # abandoned run open for as long as the tab stayed on screen.
+        self.reader = EventReader(self.directory, keep_alive=False)
+        self.latest = None
+        self.open_calls = {}
+
+    def refresh(self, identity: tuple, size: int) -> tuple:
+        """(latest event, open chain), reading only what was appended."""
+        with self.lock:
+            if identity != self.identity:
+                if size < self.reader._offset:
+                    # Shorter than what was read: rewritten, not appended to,
+                    # so nothing read before can be trusted.
+                    self._start()
+                try:
+                    # Past a terminal event a whole read stops, and so does
+                    # this: a tool writing on after it changes nothing.
+                    if not self.reader.finished:
+                        self._fold(self.reader.read())
+                    self.identity = identity
+                except Exception:  # noqa: BLE001 - a listing must not fail on one bad run
+                    self._start()
+            return self.latest, self._chain()
+
+    def _fold(self, events: List[dict]) -> None:
+        for event in events:
+            if event.get("kind") == LOG_KIND:
+                continue
+            self.latest = event
+            tool = event.get("tool")
+            if tool:
+                key = (tool, event.get("depth", 0))
+                if self.open_calls.pop(key, None) is None:
+                    self.open_calls[key] = event.get("at")
+
+    def _chain(self) -> list:
+        still_open = sorted(self.open_calls.items(), key=lambda item: (item[0][1], item[1]))
+        return [tool for (tool, _depth), _started in still_open]
+
+
 def active(limit: int = 500, with_chain: bool = False) -> list:
     """Every run the registry still holds, newest first, without its events.
 
@@ -1336,11 +1464,13 @@ def active(limit: int = 500, with_chain: bool = False) -> list:
     on this deployment is every workstation. The phase says what it is doing;
     the message would say whose data it is doing it to.
     """
+    global _LISTED
     root = _runs_root()
     try:
         names = os.listdir(root)
     except OSError:
         return []
+    previous, listed = _LISTED, {}
     found = []
     for name in names:
         if not _scratch.is_valid_id(name):
@@ -1349,20 +1479,17 @@ def active(limit: int = 500, with_chain: bool = False) -> list:
         events_path = os.path.join(directory, EVENTS_FILE)
         try:
             started_at = os.path.getctime(directory)
-            updated_at = os.path.getmtime(events_path)
+            stat = os.stat(events_path)
         except OSError:
             continue
-        latest = None
-        events = []
-        try:
-            # keep_alive=False: LOOKING at a run is not the run being alive.
-            # Reading stamps the directory, and the TTL is an idle timeout, so
-            # an operator page polling every couple of seconds would hold every
-            # abandoned run open for as long as the tab stayed on screen.
-            events = EventReader(directory, keep_alive=False).read()
-            latest = events[-1] if events else None
-        except Exception:  # noqa: BLE001 - a listing must not fail on one bad run
-            pass
+        updated_at = stat.st_mtime
+        known = previous.get(directory)
+        if known is None or known.inode != stat.st_ino:
+            # A new run, or a file replaced under the same name: from the start.
+            known = _ListedRun(directory, stat.st_ino)
+        latest, chain = known.refresh((stat.st_ino, stat.st_size, stat.st_mtime_ns),
+                                      stat.st_size)
+        listed[directory] = known
         tool = None
         client = None
         batch = None
@@ -1414,7 +1541,10 @@ def active(limit: int = 500, with_chain: bool = False) -> list:
             # Tool names only, which `_clean_tool_name` already restricted to
             # identifiers: the operator page may say a run is inside ALI_CBCT
             # without anything a tool wrote reaching it.
-            entry["chain"] = timeline(events)["chain"]
+            entry["chain"] = list(chain)
         found.append(entry)
+    # Only directories still listed survive: a discarded or reaped run is
+    # forgotten on the next poll rather than held for the life of the process.
+    _LISTED = listed
     found.sort(key=lambda entry: entry["started_at"], reverse=True)
     return found[:limit]

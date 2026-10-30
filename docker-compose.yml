@@ -5,6 +5,17 @@
 # Pinned, the stack keeps one identity wherever it is cloned.
 name: visor-serve
 
+# The log every server service keeps: five files of 20 MB, the oldest dropped.
+# Docker's default json-file driver keeps everything a container ever wrote for
+# as long as it exists, and a server up for months -- an access line per panel
+# poll, every two seconds -- fills the disk TEMP_DIR lives on, where a run then
+# fails to stage its upload for a reason nobody looks for in a log.
+x-bounded-log: &bounded-log
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 # Shared by the two server services below, which differ only in whether they
 # get the GPU. Two services rather than one, because a compose device
 # reservation is ALL-OR-NOTHING: a service asking for an nvidia device cannot
@@ -20,6 +31,7 @@ x-inference-base: &inference-base
   image: ${VISOR_SERVER_IMAGE:-ghcr.io/dcbia-ortholab/visor-serve:main}
   shm_size: 8gb
   working_dir: /workspace/server
+  logging: *bounded-log
   volumes:
     # See `inference-venvs`: a public certificate, when TLS_CERT_FILE names one.
     - ./tls:/etc/visor-tls:ro
@@ -282,6 +294,7 @@ services:
   # block as `inference`.
   inference-venvs:
     profiles: ["venvs"]
+    logging: *bounded-log
     build:
       context: .
       dockerfile: docker/Dockerfile

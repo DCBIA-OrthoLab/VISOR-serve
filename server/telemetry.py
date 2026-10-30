@@ -176,6 +176,29 @@ def _tree_bytes(path: str, budget: int = 40000) -> Optional[int]:
     return total
 
 
+# How long a tree's figure is reused. The panel polls every two seconds, and
+# each poll walked TEMP_DIR and DATA_DIR -- up to the budget's 40 000 files
+# each -- to say how much they hold: a number that moves on the scale of an
+# upload, not of a poll. Half a minute stale is invisible on a gauge.
+TREE_BYTES_SECONDS = 30.0
+# path -> (when it was walked, on the monotonic clock; what it held).
+_tree_figures: dict = {}
+
+
+def _recent_tree_bytes(path: str) -> Optional[int]:
+    """`_tree_bytes(path)`, walked at most once every TREE_BYTES_SECONDS."""
+    now = time.monotonic()
+    cached = _tree_figures.get(path)
+    if cached is not None and now - cached[0] < TREE_BYTES_SECONDS:
+        return cached[1]
+    figure = _tree_bytes(path)
+    # A directory that is not there costs one stat to say so, and must read
+    # as present the moment it is.
+    if figure is not None:
+        _tree_figures[path] = (now, figure)
+    return figure
+
+
 def disk(paths: dict) -> dict:
     """Free space on the filesystem holding each path, and what it holds.
 
@@ -192,7 +215,7 @@ def disk(paths: dict) -> dict:
         except OSError:
             entry["free"] = None
             entry["total"] = None
-        entry["used_here"] = _tree_bytes(path)
+        entry["used_here"] = _recent_tree_bytes(path)
         report[label] = entry
     return report
 
@@ -591,7 +614,11 @@ def record_run_end(run_id: str, outcome: str, phase: str = "",
         pass
 
 
-def run_ledger(limit: int = 80, tool: Optional[str] = None) -> list:
+# How many of the newest runs the operator page lists by default.
+LEDGER_PAGE = 80
+
+
+def run_ledger(limit: int = LEDGER_PAGE, tool: Optional[str] = None) -> list:
     """The runs this process has seen, newest first, optionally of one tool."""
     with _ledger_lock:
         records = list(_ledger.values())
@@ -844,5 +871,6 @@ def reset() -> None:
         _ledger.clear()
     with _trace_lock:
         _trace.clear()
+    _tree_figures.clear()
     global _trace_cpu_previous
     _trace_cpu_previous = None

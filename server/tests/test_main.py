@@ -8,7 +8,9 @@ import gzip
 import io
 import json
 import os
+import secrets
 import shutil
+import threading
 import zipfile
 
 # Set before importing main, so config.Settings() picks up a known token
@@ -1784,6 +1786,88 @@ def test_the_gzip_check_runs_off_the_event_loop(monkeypatch, tmp_path):
     )
     assert response.status_code == 200, response.text
     assert seen == ["worker thread"]
+
+
+def _calls_on_the_loop(monkeypatch, *targets):
+    """Record every call to `targets` -- (owner, attribute) pairs -- made on
+    the event loop that serves this test's request, the thread `_run_tool`
+    runs on, and on no other thread."""
+    import main
+    loop_thread, seen = [], []
+    real_run_tool = main._run_tool
+
+    async def run_tool(*args, **kwargs):
+        loop_thread.append(threading.get_ident())
+        return await real_run_tool(*args, **kwargs)
+
+    def spy(name, real):
+        def recorded(*args, **kwargs):
+            if threading.get_ident() in loop_thread:
+                seen.append(name)
+            return real(*args, **kwargs)
+        return recorded
+
+    monkeypatch.setattr(main, "_run_tool", run_tool)
+    for owner, attribute in targets:
+        monkeypatch.setattr(owner, attribute, spy(attribute, getattr(owner, attribute)))
+    return seen
+
+
+def _deletions_on_the_loop(monkeypatch):
+    return _calls_on_the_loop(monkeypatch, (shutil, "rmtree"), (os, "remove"))
+
+
+@pytest.mark.parametrize("watched", [False, True], ids=["no run id", "with a run id"])
+def test_a_refused_runs_inputs_are_deleted_off_the_event_loop(monkeypatch, watched):
+    """Deleting a staged CBCT costs ~105 ms a gigabyte; on the event loop that
+    froze every other request -- uploads, /status, the panel -- for as long.
+    A watched run's directory goes the same way, and so does its ending."""
+
+    class _Probe(Tool):
+        name = "Delete_Thread_Probe"
+        arguments = {"fixed_image": ArgSpec(type="file", required=True),
+                     "moving_image": ArgSpec(type="file", required=True)}
+        output_kind = "text"
+
+        def run(self, fixed_image, moving_image):
+            return "unused"
+
+    monkeypatch.setitem(registry.TOOLS, _Probe.name, _Probe())
+    seen = _deletions_on_the_loop(monkeypatch)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    if watched:
+        headers["X-Run-Id"] = secrets.token_urlsafe(24)
+    response = client.post(
+        f"/run/{_Probe.name}",
+        headers=headers,
+        files={"fixed_image": ("a.nii.gz", gzip.compress(b"a" * 100), "application/gzip")},
+    )
+    assert response.status_code == 422, response.text
+    assert seen == []
+
+
+@pytest.mark.parametrize("arguments, delivery, code", [
+    ({"text_1": "hello", "text_2": "world"}, {}, 200),
+    ({"text_1": "hello"}, {}, 422),
+    ({"text_1": "hello", "text_2": "world"}, {"X-Run-Delivery": "detached"}, 202),
+    ({"text_1": "hello"}, {"X-Run-Delivery": "detached"}, 202),
+], ids=["done", "failed", "detached done", "detached failed"])
+def test_a_watched_runs_ending_is_read_back_off_the_event_loop(monkeypatch, arguments,
+                                                               delivery, code):
+    """`runs.finish` reads the run's whole event file back for the ledger: a
+    chatty tool's 100k lines are half a second, and on the event loop every
+    other request waited for it. The diagnosis of a failure reads it too."""
+    from wire import runs
+    seen = _calls_on_the_loop(monkeypatch, (runs.EventReader, "read"))
+    run_id = secrets.token_urlsafe(24)
+    response = client.post(
+        "/run/Test_Tool",
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Run-Id": run_id, **delivery},
+        data=arguments,
+    )
+    assert response.status_code == code, response.text
+    assert seen == []
+    runs.discard(run_id)
 
 
 def test_a_truncated_gzip_is_refused_rather_than_segmented(monkeypatch, tmp_path):

@@ -42,3 +42,38 @@ def test_an_ordinary_gzip_part_still_lands():
     response = client.put(f"/uploads/{upload_id}/parts/0", headers={**AUTH, "Content-Encoding": "gzip"},
                           content=gzip.compress(b"y" * (1024 * 1024)))
     assert response.status_code == 200, response.text
+
+
+def test_a_part_is_held_in_memory_once_on_its_way_to_disk(tmp_path, monkeypatch):
+    """A part was copied whole twice between the socket and the disk -- once
+    into `bytes`, once by the slice handed to `pwrite` -- so a 64 MB part held
+    three times that, per part, with parts arriving in parallel."""
+    import asyncio
+    import hashlib
+    import tracemalloc
+
+    monkeypatch.setattr(settings, "TEMP_DIR", str(tmp_path))
+    size = 16 * 1024 * 1024
+    session = transfer.create_upload("scan.nii", size, chunk_size=size)
+    piece = b"x" * 65536
+    digest = hashlib.sha256(piece * (size // len(piece))).hexdigest()
+
+    class _Request:
+        async def stream(self):
+            for _ in range(size // len(piece)):
+                yield piece
+
+    async def receive():
+        # Measured inside the coroutine, the way the endpoint awaits it: what
+        # a test harness does with the return value is not the server's.
+        tracemalloc.start()
+        try:
+            body = await main._read_bounded(_Request(), size + 1024 * 1024)
+            transfer.write_part(session, 0, body, digest)
+            return tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+
+    peak = asyncio.run(receive())
+    assert set(session.received_parts()) == {0}
+    assert peak < 1.3 * size, f"peak {peak / size:.2f}x the part"
