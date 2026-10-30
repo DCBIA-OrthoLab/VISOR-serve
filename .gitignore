@@ -43,6 +43,8 @@ local-server-*.log
 
 # The operator page's run history (server/.history, HISTORY_DIR)
 .history/
+# The learned cost table (server/.costs, COST_TABLE_PATH in docker-compose.yml)
+.costs/
 # The update agent and the server leave each other notes here (UPDATE_DIR)
 .update/
 # The update agent's log (scripts/server_ctl.py agent)

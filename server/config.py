@@ -92,6 +92,24 @@ class Settings(BaseSettings):
     # A .schema.json is a cache, and the tool folders are read-only to the
     # process serving them, so a regenerated one cannot live beside its tool.
     SCHEMA_CACHE_DIR: str = os.path.join(_SERVER_DIR, ".schema-cache")
+    # The learned cost table (execution/costs.py): what every run this
+    # deployment ever did measured itself to need. Empty keeps it beside the
+    # schema cache, where every existing deployment already has it -- the
+    # venvs image's cache volume, a checkout's .schema-cache.
+    #
+    # **A setting of its own because the two are not the same kind of thing.**
+    # A schema is a cache: losing it costs minutes of regeneration. The table is
+    # not regenerable at all: losing it puts every tool back to "unmeasured",
+    # which reserves the whole budget and runs it ALONE until it is measured
+    # again -- silently, since nothing fails. The compose `inference` services
+    # keep their schema cache in the container's /tmp, and the table went with
+    # it on every update that recreated the container; they point this at the
+    # bind-mounted checkout instead (server/.costs, gitignored), beside
+    # HISTORY_DIR and UPDATE_DIR, which outlive the container the same way.
+    #
+    # What does reset it is said explicitly by a release, and nothing else
+    # does: see `costs.TABLE_EPOCH` and `[tool.sadt] cost_epoch`.
+    COST_TABLE_PATH: str = ""
     # Where finished runs are kept for the operator page, so its history and
     # per-tool graphs survive an update. Beside the code by default, which in
     # the `inference` service is the bind-mounted checkout and therefore
