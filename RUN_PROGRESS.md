@@ -105,6 +105,13 @@ delivered, or when the run directory disappears.
 events with `"kind": "log"` (§4e). **Without it there are none**: a client
 released before log lines existed would draw one as progress.
 
+After 15 seconds with nothing to send, the stream sends an SSE comment,
+`: ping`. A tool can be silent for minutes -- a registration, a model loading --
+and a client's read timeout is shorter than that; without the comment it
+dropped the stream and reconnected, replaying every event from the start. A
+line starting with `:` is never an event, to the Slicer client or to any SSE
+parser.
+
 The last header is not decoration: nginx buffers a proxied response by default,
 which for a stream means the client sees nothing until the run ends - the exact
 failure the endpoint exists to prevent. `curl` needs `-N` for the same reason.
@@ -368,6 +375,13 @@ Every append and every read stamps the directory, so `RUN_TTL_SECONDS` is an
 **idle** timeout exactly as `TRANSFER_TTL_SECONDS` is - a cohort reporting
 progress for six hours is never reaped under itself. The same `_reaper_loop`
 that sweeps transfers sweeps these.
+
+A run a previous server process left `pending` or `running` -- `TEMP_DIR`
+outlives a restart -- is ended `failed` when the next one starts, with the
+message "The server restarted during this run.": nobody else would ever end
+it, and its client waits on exactly that terminal event. Its idle clock is
+kept as it was. A `paused` run is left alone, since a resume picks it up
+whichever process serves it. This assumes the single process `serve.py` runs.
 
 The reaper is a safety net rather than the normal path. **A run is removed with
 the request that owned it**, on success (as a background task, so the directory

@@ -10,6 +10,7 @@ file, so the tests below plant one and check it never comes out.
 
 import json
 import os
+import threading
 import time
 
 import pytest
@@ -201,6 +202,59 @@ def test_server_debug_json_carries_the_trace_and_each_runs_chain():
     # /status keeps the listing it always had.
     status = client.get("/status", headers=AUTH).json()
     assert all("chain" not in r for r in status["runs"])
+
+
+def test_one_panel_poll_lists_the_runs_once_and_reads_the_ledger_once(monkeypatch):
+    """The panel used to list every run twice (once through `/status`, whose
+    masked copy it then threw away) and copy the whole ledger twice."""
+    import main
+    runs.register("twice-run-0000000000000001", tool="AREG")
+    runs.append("twice-run-0000000000000001", runs.PHASE_RUNNING)
+    for index in range(90):
+        _finish(f"ledger-run-{index:015d}")
+    here = threading.get_ident()
+    calls = {"active": 0, "ledger": 0}
+
+    def counting(name, original):
+        def counted(*args, **kwargs):
+            if threading.get_ident() == here:
+                calls[name] += 1
+            return original(*args, **kwargs)
+        return counted
+
+    monkeypatch.setattr(runs, "active", counting("active", runs.active))
+    monkeypatch.setattr(telemetry, "run_ledger", counting("ledger", telemetry.run_ledger))
+    report = main.server_debug_data()
+    assert calls == {"active": 1, "ledger": 1}
+    # What the page reads is unchanged: the real ids with their chain, and the
+    # newest 80 finished runs.
+    entry = [r for r in report["runs"] if r["run_id"] == "twice-run-0000000000000001"][0]
+    assert entry["chain"] == []
+    assert len(report["ledger"]) == 80
+    assert report["ledger"][0]["run_id"] == "ledger-run-000000000000089"
+
+
+def test_the_card_is_read_once_per_trace_interval_not_once_per_poll(monkeypatch):
+    """Each `/status` and each panel poll exec'd `nvidia-smi`: one process per
+    page per two seconds, on the machine whose card the runs are waiting for."""
+    import main
+    import resources
+    monkeypatch.setattr(main, "_card_reading", None, raising=False)
+    # The budget reads the card once per process, at its first use; resolved
+    # before counting, since that one read is not a poll's.
+    resources.allocation()
+    here, calls = threading.get_ident(), []
+
+    def detect():
+        if threading.get_ident() == here:
+            calls.append(1)
+        return (48 * 1024 ** 3, 40 * 1024 ** 3)
+
+    monkeypatch.setattr(resources, "detect_vram_bytes", detect)
+    for _ in range(3):
+        card = main.server_status()["card"]
+    assert card == {"free_bytes": 40 * 1024 ** 3, "total_bytes": 48 * 1024 ** 3}
+    assert len(calls) <= 1
 
 
 def test_a_reaped_run_is_still_drawn_from_the_ledger():

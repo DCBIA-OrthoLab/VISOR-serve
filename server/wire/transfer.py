@@ -263,9 +263,13 @@ def write_part(session: UploadSession, index: int, data: bytes, sha256: Optional
 
     file_descriptor = os.open(session.blob_path, os.O_WRONLY)
     try:
+        # Through a memoryview: slicing a bytearray copies it, so a short
+        # write's retry -- and the first write, for `data[0:]` -- would hold
+        # the part twice.
+        view = memoryview(data)
         written = 0
-        while written < len(data):
-            written += os.pwrite(file_descriptor, data[written:], offset + written)
+        while written < len(view):
+            written += os.pwrite(file_descriptor, view[written:], offset + written)
     finally:
         os.close(file_descriptor)
 

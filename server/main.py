@@ -18,7 +18,9 @@ import re
 import secrets
 import shutil
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import traceback
 import zlib
@@ -42,6 +44,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 # server -- but the other direction is safe and is what lets the rewind
 # edit the same record the runner wrote. It is standard library only.
 from execution import admission, costs, dispatch, reports, runner
+from execution.dispatch import ToolExecutionError
 from registry import conventions, facade
 from registry.facade import FacadeTool
 import file_utils
@@ -95,16 +98,38 @@ async def _reaper_loop() -> None:
                 logger.exception("reaper sweep failed")
 
 
+# The card's last reading for the pages and the trace: (monotonic time, (total,
+# free)), or None before the first. Each reading is an `nvidia-smi` exec, and
+# `/status` and the panel each took one per poll -- a process every two seconds
+# per open page, on the machine whose card the runs are waiting for. A gauge
+# drawn from a reading a few seconds old is the same gauge. ADMISSION does not
+# read through this: deciding whether a job fits wants the card as it is now.
+_card_reading: Optional[tuple] = None
+_card_lock = threading.Lock()
+
+
+def _card() -> tuple:
+    """`(total, free)` VRAM, read at most once every `telemetry.TRACE_SECONDS`;
+    `(None, None)` when there is no card to read."""
+    global _card_reading
+    with _card_lock:
+        now = time.monotonic()
+        if _card_reading is not None and now - _card_reading[0] < telemetry.TRACE_SECONDS:
+            return _card_reading[1]
+        try:
+            card = resources.detect_vram_bytes()
+        except Exception:  # noqa: BLE001 - no card is a missing line, not an error
+            card = (None, None)
+        _card_reading = (now, card)
+        return card
+
+
 async def _trace_loop() -> None:
     """Sample the machine for the operator page's graphs, for as long as the
     server runs. One point every `telemetry.TRACE_SECONDS`, off the event loop
     because reading the card is a subprocess."""
     def take() -> None:
-        try:
-            card = resources.detect_vram_bytes()
-        except Exception:  # noqa: BLE001 - no card is a missing line, not an error
-            card = (None, None)
-        telemetry.sample_trace(admission.budget().snapshot(), card)
+        telemetry.sample_trace(admission.budget().snapshot(), _card())
 
     while True:
         try:
@@ -137,6 +162,10 @@ async def _lifespan(_app: FastAPI):
     if restored:
         logger.info("Run history: %d finished run(s) read back from %s",
                     restored, settings.HISTORY_DIR)
+    # Before any request is served: a run the previous process left pending or
+    # running has nobody left to end it, and its client is waiting for exactly
+    # that (see runs.fail_orphans, which assumes serve.py's single process).
+    await anyio.to_thread.run_sync(runs.fail_orphans)
     async with anyio.create_task_group() as task_group:
         task_group.start_soon(_reaper_loop)
         task_group.start_soon(_trace_loop)
@@ -479,9 +508,41 @@ def _temp_root_of(path: str) -> Optional[str]:
 
 def _discard(work_dir: Optional[str], scratch_dirs: list) -> None:
     """Remove everything this request created, right now. Used on the error
-    paths, where no response will ever stream and background tasks won't run."""
+    paths, where no response will ever stream and background tasks won't run.
+    Called through `_off_loop`: it is a tree of confidential imaging."""
     for directory in ([work_dir] if work_dir else []) + list(scratch_dirs):
         shutil.rmtree(directory, ignore_errors=True)
+
+
+def _remove_staged(input_paths, resolved_files) -> None:
+    """Delete a request's staged inputs once the tool is done with them.
+
+    Uploaded inputs go; server-side data (DATA_DIR) is persistent and must
+    never be deleted, so of what the data store resolved only a backend's
+    temporary copy does (see ResolvedFile.is_temporary in data_store.py)."""
+    for input_path in input_paths:
+        if os.path.exists(input_path):
+            os.remove(input_path)
+    for resolved in resolved_files:
+        if resolved.is_temporary and os.path.exists(resolved.path):
+            os.remove(resolved.path)
+
+
+async def _off_loop(function, *args):
+    """`function(*args)` in a worker thread, finished even if the request is
+    cancelled.
+
+    For the disk work a request does on its way out -- deleting what it
+    staged, writing a run's terminal event. Deleting a staged CBCT costs about
+    105 ms a gigabyte, and reading back a chatty tool's whole event file half
+    a second; on the event loop either froze every other request for as long.
+    Shielded because these run in `except` and `finally` blocks, very often
+    BECAUSE the request was cancelled (a client that hung up), and a cleanup
+    that a cancellation could interrupt would leave a patient's scan on disk
+    or a run that never ended. Keyword arguments go in a functools.partial.
+    """
+    with anyio.CancelScope(shield=True):
+        return await anyio.to_thread.run_sync(function, *args)
 
 
 def _media_type_of(path: str) -> str:
@@ -816,13 +877,21 @@ def server_status() -> dict:
     name the file it is working on, which is a patient's. Phases and counts say
     what the server is doing without saying whose data it is doing it to.
     """
+    return _status_report(runs.active())
+
+
+def _status_report(listing: list) -> dict:
+    """`/status`, built around a run listing the caller already took.
+
+    Split out so the admin panel, which wants the listing WITH each run's
+    chain, lists the runs once rather than twice: it used to call
+    `server_status()` and then replace the masked listing it carried, so every
+    poll paid for a listing nobody read.
+    """
     allocation = resources.allocation()
     budget = admission.budget()
-    free_vram, total_vram = None, None
-    try:
-        total_vram, free_vram = resources.detect_vram_bytes()
-    except Exception:  # noqa: BLE001 - a status page must not fail on a probe
-        pass
+    # A status page must not fail on a probe, and `_card` never raises.
+    total_vram, free_vram = _card()
     learned = costs.known()
     return _masked_run_ids({
         "budget": {
@@ -843,7 +912,7 @@ def server_status() -> dict:
         # without the server ever restarting.
         "maintenance": maintenance.snapshot(),
         "card": {"free_bytes": free_vram, "total_bytes": total_vram},
-        "runs": runs.active(),
+        "runs": listing,
         "costs": {
             name: {
                 "vram_bytes": cost.vram_bytes,
@@ -1120,7 +1189,7 @@ def server_debug_data() -> dict:
     """Everything `/status` reports, plus what the machine says about itself.
 
     A superset rather than a second opinion: the budget, the admission holds
-    and the learned costs are read through `server_status` so the two endpoints
+    and the learned costs are read through `_status_report` so the two endpoints
     cannot drift into disagreeing about the same number. What is added here is
     the half that `/status` deliberately does not carry -- live CPU, live host
     memory, disk, in-flight requests, and the queue log -- because it is
@@ -1131,7 +1200,12 @@ def server_debug_data() -> dict:
     patient's. Phases and counts say what the machine is doing without saying
     whose data it is doing it to.
     """
-    report = server_status()
+    # The live listing with each run's open nested calls: `/status` keeps the
+    # narrower one it always had, and only this page needs to say that an
+    # AREG is, right now, inside ASO inside ALI_CBCT. Taken once, and the
+    # status report is built around it, so a poll lists the runs once.
+    listing = runs.active(with_chain=True)
+    report = _status_report(listing)
     allocation = resources.allocation()
     try:
         node = os.uname().nodename
@@ -1162,10 +1236,9 @@ def server_debug_data() -> dict:
         # offer them or say why it does not. Never the token itself.
         "admin_enabled": bool(settings.ADMIN_TOKEN),
     }
-    # The live listing again, with each run's open nested calls: `/status`
-    # keeps the narrower one it always had, and only this page needs to say
-    # that an AREG is, right now, inside ASO inside ALI_CBCT.
-    report["runs"] = runs.active(with_chain=True)
+    # Unmasked: the panel is behind the admin token, and its controls act on
+    # the real ids. The status report above carried them masked.
+    report["runs"] = listing
     report["trace"] = telemetry.trace(since=time.time() - TRACE_WINDOW_SECONDS)
     report["cpu_percent"] = telemetry.cpu_percent()
     report["ram"] = telemetry.ram()
@@ -1176,9 +1249,13 @@ def server_debug_data() -> dict:
     # across every worker, while `ledger` is this process's memory of what it
     # admitted and what that cost. The page joins them on `run_id`, and a run
     # present in one and not the other is a fact worth being able to see.
-    report["ledger"] = telemetry.run_ledger()
+    #
+    # Copied out once: the page's rows are the newest of the same history the
+    # client view counts over, which `_client_activity` only reads.
+    history = telemetry.run_ledger(limit=telemetry.LEDGER_SIZE)
+    report["ledger"] = history[:telemetry.LEDGER_PAGE]
     report["uptime"] = telemetry.tool_uptime()
-    report["clients"] = _client_activity(report["runs"], telemetry.run_ledger(limit=telemetry.LEDGER_SIZE))
+    report["clients"] = _client_activity(report["runs"], history)
     # TEMP_DIR is where uploads, results and run directories live -- the space a
     # download actually costs this machine. DATA_DIR is mounted read-only and
     # cannot grow, but it is the other half of "what is this disk holding".
@@ -2163,14 +2240,20 @@ async def upload_status(upload_id: str) -> dict:
     }
 
 
-async def _read_bounded(request: Request, limit: int) -> bytes:
+async def _read_bounded(request: Request, limit: int) -> bytearray:
+    """The body, refused past `limit` bytes, as the bytearray it was read into.
+
+    Not converted to `bytes`: that is a second full copy of a part of up to
+    64 MB, per part, with a client sending several at once. Everything it is
+    handed to -- the gunzip, the checksum, `pwrite` -- reads a bytearray as is.
+    """
     received = bytearray()
     async for piece in request.stream():
         received += piece
         if len(received) > limit:
             raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                                 detail=f"A part is at most {limit} bytes.")
-    return bytes(received)
+    return received
 
 
 def _gunzip_bounded(data: bytes, limit: int) -> bytes:
@@ -2331,6 +2414,14 @@ async def run_snapshot(run_id: str, logs: str = "") -> dict:
         raise _run_error(exc)
 
 
+# How long the event stream may say nothing before it says so. A tool can be
+# silent for minutes -- a registration, a model loading -- and the client's
+# read timeout is 30 s: past it the client dropped the stream, reconnected,
+# and replayed every event from the start. Half that, so one lost comment
+# still leaves the next in time.
+_SSE_HEARTBEAT_SECONDS = 15
+
+
 @app.get("/runs/{run_id}/events", dependencies=[Depends(verify_token)])
 async def run_events(run_id: str, logs: str = "") -> StreamingResponse:
     """Server-Sent Events, oldest first, INCLUDING what was written before this
@@ -2358,8 +2449,10 @@ async def run_events(run_id: str, logs: str = "") -> StreamingResponse:
 
     async def frames():
         reader = runs.EventReader(directory, logs=audiences)
+        quiet = 0.0
         while True:
-            for event in await anyio.to_thread.run_sync(reader.read):
+            events = await anyio.to_thread.run_sync(reader.read)
+            for event in events:
                 yield f"data: {json.dumps(event)}\n\n".encode("utf-8")
             if reader.finished:
                 # A terminal event was delivered, or the directory went away
@@ -2367,7 +2460,15 @@ async def run_events(run_id: str, logs: str = "") -> StreamingResponse:
                 # and holding the connection open would only look like one
                 # still going.
                 return
+            if events:
+                quiet = 0.0
+            elif quiet >= _SSE_HEARTBEAT_SECONDS:
+                # An SSE comment: a line starting with ':' is never an event,
+                # to the client's parser or to any other.
+                yield b": ping\n\n"
+                quiet = 0.0
             await anyio.sleep(settings.RUN_EVENT_POLL_SECONDS)
+            quiet += settings.RUN_EVENT_POLL_SECONDS
 
     return StreamingResponse(
         frames(),
@@ -2611,6 +2712,24 @@ def _reject_upload_for_scalar(spec, field_name: str) -> None:
         )
 
 
+def _reject_upload_for_model(field_name: str) -> None:
+    """A model is never uploaded, whatever the deployment opted it out of.
+
+    `server_selectable = { <x>_model = "none" }` says the tool finds its own
+    weights, and leaves the argument a plain `path` -- which made it an upload.
+    A model loader unpickles what it is handed, so an uploaded model is code
+    run on this server (AREG_IOS loaded its checkpoint with `torch.load`).
+    Refused before a byte is staged. `*_reference` is not a model: see
+    `conventions.WEIGHTS_NAME`.
+    """
+    if conventions.names_weights(field_name):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=(f"'{field_name}' is a model: the server uses its own weights, "
+                    "they cannot be uploaded."),
+        )
+
+
 def _unpacks_to_a_folder(kind: str, extension: str) -> bool:
     """Does this input arrive as an archive that must be extracted first?
 
@@ -2667,6 +2786,94 @@ def _registered_run(request: Request, tool_name: str) -> Optional[str]:
         return runs.register(raw, tool=tool_name, client=_client_address(request), batch=batch)
     except runs.RunError as exc:
         raise _run_error(exc)
+
+
+# Runs this process is serving that no registry entry stands for -- a request
+# that sent no `X-Run-Id` -- per client address. Taken by `_claimed_run`, given
+# back by `_unwatched_run` in a `finally`, so no ending can leak a slot; and in
+# memory, so a restart cannot leave a stale count behind it.
+_unwatched_runs: dict = {}
+_unwatched_lock = threading.Lock()
+
+# Held across the count and the registration (or the unwatched slot), so two
+# requests cannot both count the same free slot and both go past the cap. A
+# threading lock, not an anyio one: the step runs in a worker thread, and a
+# module-level anyio lock binds to the first event loop that uses it.
+_claim_lock = threading.Lock()
+
+
+def _claimed_run(request: Request, tool_name: str, address: Optional[str],
+                 detached: bool) -> Optional[str]:
+    """Refuse past the cap, then register the run -- one step, under
+    `_claim_lock`, in a worker thread: counting lists every run on disk, and
+    on the event loop that held every other request for as long.
+
+    Returns the run id, or None for a run sent without one; such a run then
+    holds an unwatched slot, which `_unwatched_run` gives back. A detached run
+    without an id takes none: it is refused for lacking the id.
+    """
+    with _claim_lock:
+        _refuse_past_the_client_cap(request, address)
+        run_id = _registered_run(request, tool_name)
+        if run_id is None and not detached:
+            with _unwatched_lock:
+                _unwatched_runs[address] = _unwatched_runs.get(address, 0) + 1
+        return run_id
+
+
+@contextlib.contextmanager
+def _unwatched_run(address: Optional[str]):
+    """Give back the slot `_claimed_run` took, however the run ends."""
+    try:
+        yield
+    finally:
+        with _unwatched_lock:
+            left = _unwatched_runs.get(address, 1) - 1
+            if left > 0:
+                _unwatched_runs[address] = left
+            else:
+                _unwatched_runs.pop(address, None)
+
+
+def _runs_in_flight(address: Optional[str]) -> int:
+    """How many runs `address` has in flight: registered and not yet ended --
+    waiting for the card included, paused excluded -- plus the unwatched ones.
+
+    Read from the registry rather than counted up and down, so a run that
+    crashed, was cancelled or was ended at a restart (runs.fail_orphans) frees
+    its slot by the state its own terminal event wrote, with nothing to keep
+    in step.
+    """
+    listed = sum(
+        1 for entry in runs.active(limit=sys.maxsize)
+        if entry.get("client") == address
+        and entry.get("state") in (runs.STATE_PENDING, runs.STATE_RUNNING)
+    )
+    with _unwatched_lock:
+        return listed + _unwatched_runs.get(address, 0)
+
+
+def _refuse_past_the_client_cap(request: Request, address: Optional[str]) -> None:
+    """429 once `address` has `MAX_RUNS_PER_CLIENT` runs in flight.
+
+    Every workstation holds the same API token, so admission alone cannot tell
+    six clinicians from one client sending sixty runs -- and the other five
+    would wait behind all sixty. A battery an operator started is exempt: it is
+    the server measuring itself, several runs at a time on purpose.
+    """
+    cap = settings.MAX_RUNS_PER_CLIENT
+    if cap <= 0 or benchmark_jobs.is_battery(request.headers.get(benchmark_jobs.KEY_HEADER)):
+        return
+    in_flight = _runs_in_flight(address)
+    if in_flight >= cap:
+        logger.warning("endpoint=/run status=429 client=%s in_flight=%d cap=%d",
+                       address, in_flight, cap)
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=(f"This workstation already has {in_flight} run(s) in flight, the "
+                    f"most one workstation may have at once ({cap}). Send this one "
+                    "again once one of them has finished."),
+        )
 
 
 def _client_address(request: Request) -> Optional[str]:
@@ -2845,17 +3052,21 @@ async def _detached_run(tool_name: str, request: Request, run_id: str) -> None:
                         result=_collectable(response))
             logger.info("endpoint=/run/%s paused (detached)", tool_name)
             return
-        runs.finish(run_id, runs.PHASE_DONE, result=_collectable(response))
+        # Every ending, and the diagnosis of a failure, reads the run's whole
+        # event file back: off the event loop (see `_off_loop`).
+        await _off_loop(functools.partial(
+            runs.finish, run_id, runs.PHASE_DONE, result=_collectable(response)))
     except dispatch.RunCancelled:
-        runs.finish(run_id, runs.PHASE_CANCELLED)
+        await _off_loop(runs.finish, run_id, runs.PHASE_CANCELLED)
     except BaseException as exc:  # noqa: BLE001 - nobody is left to raise to
-        diagnosis = _run_diagnosis(exc, run_id, tool_name)
+        diagnosis = await _off_loop(_run_diagnosis, exc, run_id, tool_name)
         # Redacted, like every line about a failure: the exception's own text
         # is a tool's words and may name the file it died on.
         logger.warning("endpoint=/run/%s detached failure: %s", tool_name,
                        _described(diagnosis))
-        runs.finish(run_id, runs.PHASE_FAILED, message=_failure_message(exc),
-                    failure=diagnosis)
+        await _off_loop(functools.partial(
+            runs.finish, run_id, runs.PHASE_FAILED, message=_failure_message(exc),
+            failure=diagnosis))
     finally:
         runs.CURRENT_RUN.reset(token)
         try:
@@ -2881,7 +3092,7 @@ async def _detach(tool_name: str, request: Request, run_id, background_tasks):
         )
     form = await request.form()
     if any(isinstance(value, StarletteUploadFile) for _, value in form.multi_items()):
-        runs.discard(run_id)
+        await _off_loop(runs.discard, run_id)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
@@ -3110,8 +3321,10 @@ async def _tracked_run(run_id: str, label: str, background_tasks: BackgroundTask
     try:
         response = await call()
     except dispatch.RunCancelled:
-        runs.finish(run_id, runs.PHASE_CANCELLED)
-        runs.discard(run_id)
+        # Off the event loop, like every ending: `finish` reads the run's
+        # whole event file back for the ledger (see `_off_loop`).
+        await _off_loop(runs.finish, run_id, runs.PHASE_CANCELLED)
+        await _off_loop(runs.discard, run_id)
         logger.info("endpoint=%s status=%d", label, CLIENT_CLOSED_REQUEST)
         raise HTTPException(
             status_code=CLIENT_CLOSED_REQUEST, detail="Run cancelled by the client."
@@ -3120,9 +3333,10 @@ async def _tracked_run(run_id: str, label: str, background_tasks: BackgroundTask
         # Every failure path, the 404 for an unknown tool included -- the tool
         # is resolved after the run is registered, so that one now has a
         # directory to clean up like any other.
-        runs.finish(run_id, runs.PHASE_FAILED,
-                    failure=_run_diagnosis(exc, run_id))
-        runs.discard(run_id)
+        diagnosis = await _off_loop(_run_diagnosis, exc, run_id)
+        await _off_loop(functools.partial(
+            runs.finish, run_id, runs.PHASE_FAILED, failure=diagnosis))
+        await _off_loop(runs.discard, run_id)
         raise
     finally:
         runs.CURRENT_RUN.reset(token)
@@ -3137,7 +3351,7 @@ async def _tracked_run(run_id: str, label: str, background_tasks: BackgroundTask
         logger.info("endpoint=%s paused", label)
         return response
 
-    runs.finish(run_id, runs.PHASE_DONE)
+    await _off_loop(runs.finish, run_id, runs.PHASE_DONE)
     # Queued rather than done now, so the directory survives until the response
     # has finished streaming -- which gives a watcher the whole download to
     # collect the terminal event. Waiting out the TTL instead is not an option:
@@ -3338,11 +3552,17 @@ async def run_tool(tool_name: str, request: Request, background_tasks: Backgroun
     directory down afterwards. A client that sends no `X-Run-Id` takes the
     first branch and reaches byte-for-byte the behaviour it always had.
     """
-    run_id = _registered_run(request, tool_name)
-    if request.headers.get(_RUN_DELIVERY_HEADER, "").lower() == _RUN_DETACHED:
+    # Before a byte of the form is read. Shielded (`_off_loop`), so a
+    # cancellation cannot land between a slot being taken and the `with`
+    # below that gives it back: nothing awaits in between.
+    address = _client_address(request)
+    detached = request.headers.get(_RUN_DELIVERY_HEADER, "").lower() == _RUN_DETACHED
+    run_id = await _off_loop(_claimed_run, request, tool_name, address, detached)
+    if detached:
         return await _detach(tool_name, request, run_id, background_tasks)
     if run_id is None:
-        return await _run_tool(tool_name, request, background_tasks)
+        with _unwatched_run(address):
+            return await _run_tool(tool_name, request, background_tasks)
 
     # The run id is read by dispatch in the worker thread anyio copies this
     # context into. It is request scope, not tool input, so it travels the way
@@ -3494,6 +3714,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             _reject_upload_for_unknown_argument(tool, field_name)
             spec = tool.arguments.get(field_name)
             _reject_upload_for_scalar(spec, field_name)
+            _reject_upload_for_model(field_name)
             extension = _checked_extension(tool, field_name, upload.filename or "")
             input_path = _staged_input_path(work_dir, field_name,
                                             upload.filename or "", extension)
@@ -3526,6 +3747,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             _reject_upload_for_unknown_argument(tool, field_name)
             spec = tool.arguments.get(field_name)
             _reject_upload_for_scalar(spec, field_name)
+            _reject_upload_for_model(field_name)
             try:
                 session = await anyio.to_thread.run_sync(transfer.get_upload, upload_id)
                 extension = _checked_extension(tool, field_name, session.filename)
@@ -3564,8 +3786,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # work dir goes now. So do the unclaimed sessions: the reaper would get
         # them eventually, but that is a TTL's worth of confidential imaging
         # sitting on disk.
-        if work_dir:
-            shutil.rmtree(work_dir, ignore_errors=True)
+        await _off_loop(_discard, work_dir, ())
         for upload_id in upload_references.values():
             await anyio.to_thread.run_sync(transfer.discard_upload, upload_id)
         raise
@@ -3590,8 +3811,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
                 *( (scope,) if scope else () ),
             )
         except DataNotFoundError as exc:
-            if work_dir:
-                shutil.rmtree(work_dir, ignore_errors=True)
+            await _off_loop(_discard, work_dir, ())
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
         resolved_files.append(resolved)
 
@@ -3612,7 +3832,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
                     functools.partial(_extract_folder_argument, spec, path, work_dir, field_name)
                 )
             except HTTPException:
-                shutil.rmtree(work_dir, ignore_errors=True)
+                await _off_loop(_discard, work_dir, ())
                 raise
         args[field_name] = ResolvedPath(path, kind)
 
@@ -3643,7 +3863,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # and DATA_DIR is read-only.
         result = await _run_tool_call(functools.partial(tool.invoke, args))
     except ToolArgumentError as exc:
-        _discard(work_dir, scratch_dirs)
+        await _off_loop(_discard, work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc))
     except dispatch.ToolFailure as exc:
         # The tool raised and named its exception class. There is no shared
@@ -3663,7 +3883,7 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
             # broke and why survive that; the name does not.
             logger.error("endpoint=/run/%s failure: %s", tool_name,
                          _described(_diagnosis(exc, tool_name)))
-        _discard(work_dir, scratch_dirs)
+        await _off_loop(_discard, work_dir, scratch_dirs)
         raise HTTPException(
             status_code=code,
             detail=exc.message if code != 500 else "Tool execution failed.",
@@ -3673,14 +3893,14 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         # image does not carry). 501 rather than 500: nothing the caller changes
         # will help, and the reason names a missing package, never a path.
         logger.warning("endpoint=/run/%s status=501", tool_name)
-        _discard(work_dir, scratch_dirs)
+        await _off_loop(_discard, work_dir, scratch_dirs)
         raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail=str(exc))
     except dispatch.RunCancelled:
         # The client withdrew this run. Cleaned up exactly like a failure --
         # nothing will be streamed and the inputs are confidential -- but
         # re-raised unchanged, because only the caller of this function knows
         # the run id and so only it can record how the run ended.
-        _discard(work_dir, scratch_dirs)
+        await _off_loop(_discard, work_dir, scratch_dirs)
         raise
     except Exception as exc:
         # Not logger.exception: a ToolExecutionError's message is the tool's
@@ -3690,19 +3910,11 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         logger.error("endpoint=/run/%s status=500 failure: %s\n%s", tool_name,
                      _described(_diagnosis(exc, tool_name)),
                      "".join(traceback.format_tb(exc.__traceback__)).rstrip())
-        _discard(work_dir, scratch_dirs)
+        await _off_loop(_discard, work_dir, scratch_dirs)
         raise HTTPException(status_code=500, detail="Tool execution failed.")
     finally:
         # Uploaded inputs are never needed again past this point.
-        for input_path in input_paths:
-            if os.path.exists(input_path):
-                os.remove(input_path)
-        # Server-side data (DATA_DIR) is persistent and must never be
-        # deleted; only backend-materialized temp copies are (see
-        # ResolvedFile.is_temporary in data_store.py).
-        for resolved in resolved_files:
-            if resolved.is_temporary and os.path.exists(resolved.path):
-                os.remove(resolved.path)
+        await _off_loop(_remove_staged, input_paths, resolved_files)
 
     return await _finish_run(
         tool, tool_name, start_time, background_tasks, detached, work_dir,
@@ -3872,7 +4084,7 @@ async def _finish_run(tool, tool_name: str, start_time: float,
             logger.exception("endpoint=/run/%s status=500 (packing output)", tool_name)
             # Never the roots of what the tool NAMED: those are exactly what a
             # rejected output pointed at -- another run's directory, say.
-            _discard(work_dir, list(scratch_dirs) + list(confine_to))
+            await _off_loop(_discard, work_dir, list(scratch_dirs) + list(confine_to))
             raise HTTPException(status_code=500, detail="Tool execution failed.")
 
         media_type = _media_type_of(str(result))

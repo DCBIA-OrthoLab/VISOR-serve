@@ -204,8 +204,8 @@ width_from = "structures"
 # AMASSS has one model and resolves it itself when `model` is empty, from
 # DATA/AMASSS/models/AMASSS_Models. The convention would fill the argument with
 # the models FOLDER, which is not a bundle, and would put a picker with a
-# single answer in front of a clinician. So it is neither filled nor asked;
-# a caller that names a bundle is still obeyed.
+# single answer in front of a clinician. So it is neither filled nor asked --
+# nor uploaded: a model never is (main.py `_reject_upload_for_model`).
 server_selectable = { model = "none" }
 hidden = ["model"]
 
@@ -229,8 +229,8 @@ dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "IOS to CBCT" = "AREG_IOS
 # convention that reads `*_model` as "pick one from DATA/ASO/models/" would fill
 # it with ASO's own model folder and pass that on as ALI's bundle. Measured in a
 # real run on 2026-09-11: ALI received `DATA/ASO/models` and predicted with the
-# wrong weights, silently. "none" opts it out; a caller may still name a bundle
-# to pin which weights ran.
+# wrong weights, silently. "none" opts it out, and the panel no longer asks for
+# it: a model is never uploaded (main.py `_reject_upload_for_model`).
 server_selectable = { landmark_model = "none" }
 
 [tools.ALI]

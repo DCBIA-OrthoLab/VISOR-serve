@@ -341,6 +341,21 @@ class Settings(BaseSettings):
     # fill TEMP_DIR; past the cap one "not reported" event is delivered and the
     # rest are dropped, terminal events always excepted.
     MAX_RUN_EVENTS: int = 2000
+    # Runs one workstation may have in flight at once -- registered and not yet
+    # ended, waiting for the card included -- past which POST /run answers 429
+    # before it reads a byte. Every workstation holds the same API token, so
+    # without this one client sending sixty runs filled the queue every other
+    # one waits in. A PAUSED run does not count: it waits for a person and
+    # holds no machine. 0 means no cap.
+    #
+    # 10 is well above what the Slicer client sends: one run per panel at a
+    # time (CONCURRENT_RUNS = 1), and on a workstation an operator set to
+    # parallel batches as many as the budget runs side by side (`max_parallel`
+    # of GET /clients/me, CPUs / CPUs per job). Counted per address as the
+    # server sees it: behind a proxy that is not in FORWARDED_ALLOW_IPS every
+    # workstation IS the proxy, and they share one cap. A benchmark battery an
+    # operator starts is not counted.
+    MAX_RUNS_PER_CLIENT: int = 10
 
 
     @field_validator("SADT_DISPATCH_MODE")

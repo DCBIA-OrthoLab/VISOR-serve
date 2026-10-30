@@ -157,6 +157,40 @@ def test_a_failing_detached_run_says_so_without_naming_a_path(detached_client):
     runs.discard(run_id)
 
 
+def test_a_result_that_cannot_be_parked_fails_the_run_as_such(detached_client, monkeypatch):
+    """Nothing answers a detached run, so a result that cannot be stored for
+    collection is a failed run -- with the error written for it, not the
+    NameError an unimported exception class turned it into."""
+    import file_utils
+    import registry
+    import telemetry
+    from base import Tool
+
+    class _Producing(Tool):
+        name = "Unparkable_Probe"
+        arguments = {}
+        output_kind = "file"
+
+        def run(self):
+            path = os.path.join(file_utils.make_scratch_dir(), "result.nii.gz")
+            with open(path, "wb") as handle:
+                handle.write(b"volume")
+            return path
+
+    def full(*_args, **_kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setitem(registry.TOOLS, _Producing.name, _Producing())
+    monkeypatch.setattr(main.transfer, "store_result", full)
+    run_id = _new_id()
+    response = detached_client.post(
+        f"/run/{_Producing.name}", headers=dict(AUTH, **DETACHED, **{"X-Run-Id": run_id}))
+    assert response.status_code == 202
+    assert _terminal(run_id)["state"] == "failed"
+    assert telemetry.ledger_record(run_id)["failure"]["error_type"] == "ToolExecutionError"
+    runs.discard(run_id)
+
+
 def test_an_unknown_tool_is_refused_before_any_run_is_recorded(detached_client):
     """The name comes from the URL. Recorded, it reached the status page as
     whatever string the client sent -- markup included."""

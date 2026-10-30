@@ -55,6 +55,11 @@ import urllib.request
 from typing import Optional
 
 RUN_ID_HEADER = "X-Run-Id"
+# This battery's key, which the server minted for it and checks on every
+# POST /run so a battery is not refused as one workstation sending too many
+# runs (benchmark_jobs.KEY_HEADER, which this script cannot import).
+BENCHMARK_KEY_HEADER = "X-Benchmark-Key"
+BENCHMARK_KEY_ENV = "SADT_BENCHMARK_KEY"
 # Long: a cohort segmentation legitimately takes an hour, and a benchmark that
 # times out before the tool does would record a failure that did not happen.
 REQUEST_TIMEOUT = 3 * 3600
@@ -136,6 +141,14 @@ def _request(url: str, token: str, data=None, method=None, timeout=POLL_TIMEOUT,
     # HTTPS URL of the server under benchmark.
     with urllib.request.urlopen(request, timeout=timeout, context=_tls_context()) as response:  # nosec B310
         return response.status, response.read(), dict(response.headers)
+
+
+def _run_headers(run_id: str) -> dict:
+    headers = {RUN_ID_HEADER: run_id}
+    key = os.environ.get(BENCHMARK_KEY_ENV)
+    if key:
+        headers[BENCHMARK_KEY_HEADER] = key
+    return headers
 
 
 def _send(url: str, token: str, body: bytes, method: str, content_type: str,
@@ -332,7 +345,7 @@ def _one_run(base: str, token: str, item: dict, client: int, origin: float,
         status, body, headers = _request(
             f"{base}/run/{urllib.parse.quote(item['tool'])}",
             token, data=form, method="POST",
-            timeout=REQUEST_TIMEOUT, headers={RUN_ID_HEADER: run_id})
+            timeout=REQUEST_TIMEOUT, headers=_run_headers(run_id))
         _record(LEDGER_END, run_id)
         record["seconds"] = round(time.time() - posted, 2)
         record["invocation"]["produced"] = {"bytes": len(body)}

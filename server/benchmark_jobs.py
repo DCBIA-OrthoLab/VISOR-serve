@@ -35,9 +35,11 @@ SIGKILLed from outside leaves nothing running either.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
+import secrets
 import shutil
 import signal
 import subprocess
@@ -62,6 +64,15 @@ _KILL_GRACE_SECONDS = 10.0
 # way in, and registers within milliseconds of arriving.
 LATE_SWEEP_SECONDS = 10.0
 _LATE_SWEEP_POLL = 0.25
+
+# How a battery's runs say they are the battery's: a key minted per battery,
+# handed to its process alone and sent beside each POST /run, so the cap on
+# runs per workstation (settings.MAX_RUNS_PER_CLIENT) does not refuse the very
+# concurrency a battery exists to measure. Never in this process's own
+# environment, so no tool inherits it, and never in `current()`. Repeated in
+# benchmark_client.py, which runs as a script and imports nothing from here.
+KEY_HEADER = "X-Benchmark-Key"
+KEY_ENV = "SADT_BENCHMARK_KEY"
 
 _lock = threading.Lock()
 _current: Optional[dict] = None
@@ -102,6 +113,17 @@ def _finished(job: dict) -> bool:
     return process is None or process.poll() is not None
 
 
+def is_battery(presented) -> bool:
+    """Whether `presented` is the key of the battery running now."""
+    if not presented:
+        return False
+    with _lock:
+        job = _current
+    if job is None or not job.get("_key") or _finished(job):
+        return False
+    return hmac.compare_digest(str(presented), job["_key"])
+
+
 def start(plan: dict, summary_dir: str, base_url: str, token: str,
           scratch_dir: str) -> dict:
     """Spawn the battery. Raises `BatteryError` if one is already running."""
@@ -131,8 +153,10 @@ def start(plan: dict, summary_dir: str, base_url: str, token: str,
         with open(plan_path, "w", encoding="utf-8") as handle:
             json.dump(plan, handle)
 
+        key = secrets.token_urlsafe(32)
         environment = dict(os.environ)
         environment["API_TOKEN"] = token
+        environment[KEY_ENV] = key
         environment["SADT_TLS_CAFILE"] = tls.certificate_paths()[0]
         client = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "benchmark_client.py")
@@ -155,6 +179,7 @@ def start(plan: dict, summary_dir: str, base_url: str, token: str,
             "exit_code": None,
             "cancelled_runs": None,
             "_process": process,
+            "_key": key,
             "_plan_path": plan_path,
             "_runs_path": runs_path,
         }

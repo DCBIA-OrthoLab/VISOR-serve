@@ -209,9 +209,13 @@ STATUS_PAGE = """<!doctype html>
     el("when").textContent = "updated " + new Date().toLocaleTimeString();
   }
 
+  // Hands back its fetch, so the timer below can wait for the answer.
   function poll() {
-    if (!token) { show("gate", true); el("when").textContent = "waiting for a token"; return; }
-    fetch("status", { headers: { Authorization: "Bearer " + token } })
+    if (!token) {
+      show("gate", true); el("when").textContent = "waiting for a token";
+      return Promise.resolve();
+    }
+    return fetch("status", { headers: { Authorization: "Bearer " + token } })
       .then(function (r) {
         if (r.status === 401) { throw new Error("That token was refused."); }
         if (!r.ok) { throw new Error("The server answered " + r.status + "."); }
@@ -235,8 +239,14 @@ STATUS_PAGE = """<!doctype html>
     if (e.key === "Enter") { el("save").click(); }
   });
 
-  poll();
-  window.setInterval(poll, 2000);
+  // The next poll is armed once this one has SETTLED, never on a clock of its
+  // own: against a server slow to answer -- exactly when somebody opens this
+  // page to see why -- a fixed interval stacked one more request every two
+  // seconds behind those still waiting, and made it slower still.
+  function loop() {
+    poll().finally(function () { window.setTimeout(loop, 2000); });
+  }
+  loop();
 }());
 </script>
 </body>
