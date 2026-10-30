@@ -3949,4 +3949,5 @@ def dashboard() -> HTMLResponse:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Direct-run fallback; serve.py is the entry point and chooses the address.
+    uvicorn.run(app, host="0.0.0.0", port=8000)  # nosec B104

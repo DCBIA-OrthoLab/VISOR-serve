@@ -26,7 +26,8 @@ class Settings(BaseSettings):
     # --- core ---------------------------------------------------------
     API_TOKEN: str  # required on /run; no default
     DEVICE: str = "cpu"  # "cuda" on the GPU server
-    TEMP_DIR: str = "/tmp/inference_server"  # emptied once a request is served
+    # The default only; production sets TEMP_DIR to its own volume.
+    TEMP_DIR: str = "/tmp/inference_server"  # emptied once a request is served  # nosec B108
     DATA_DIR: str = "/data"  # DATA_DIR/<tool>/{models,testfiles}, read-only
     DATA_BACKEND: str = "local"  # see data_store.py to plug in another
 

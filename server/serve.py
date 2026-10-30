@@ -162,7 +162,8 @@ def check(port: int) -> int:
 
     try:
         cert, _key = tls.certificate_paths()
-        with urllib.request.urlopen(f"https://127.0.0.1:{port}/health", timeout=5,
+        # Fixed loopback https URL.
+        with urllib.request.urlopen(f"https://127.0.0.1:{port}/health", timeout=5,  # nosec B310
                                     context=tls.loopback_context(cert)) as response:
             return 0 if response.status == 200 else 1
     except Exception:  # noqa: BLE001 - a probe answers 1, it never raises

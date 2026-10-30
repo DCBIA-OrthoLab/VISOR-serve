@@ -140,7 +140,8 @@ def _load_release_diff():
     panel and this agent can never disagree about a commit."""
     module = types.ModuleType("release_diff_for_agent")
     module.__file__ = "<HEAD:server/wire/release_diff.py>"
-    exec(compile(_release_diff_source(), module.__file__, "exec"), module.__dict__)
+    # Compiles the repository's own release_diff.py at HEAD, not input.
+    exec(compile(_release_diff_source(), module.__file__, "exec"), module.__dict__)  # nosec B102
     return module
 
 
@@ -762,7 +763,8 @@ class Agent:
             self.wait_idle("Before restarting", unreachable_grace=UNREACHABLE_GRACE_SECONDS)
             self.phase("Restarting the server." if restart == RESTART else "Recreating the server's container.")
             if self.args.restart_cmd:
-                done = subprocess.run(self.args.restart_cmd, shell=True, capture_output=True, text=True, timeout=600)
+                # --restart-cmd is the operator's own command line, passed on the agent's argv.
+                done = subprocess.run(self.args.restart_cmd, shell=True, capture_output=True, text=True, timeout=600)  # nosec B602
             else:
                 service = self.args.service or server_ctl.pick_service()
                 verb = ["restart", service] if restart == RESTART else ["up", "-d", "--force-recreate", service]

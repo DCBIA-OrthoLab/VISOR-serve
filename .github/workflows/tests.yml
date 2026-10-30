@@ -23,7 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
 
       # The server image is BUILT here, from this commit's
       # docker/server.Dockerfile, under the name docker-compose.yml runs. It
@@ -89,8 +91,9 @@ jobs:
       github.event_name == 'pull_request' ||
       github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          persist-credentials: false
           # Full history, not a shallow clone: the step below diffs against the
           # PR's merge base, which on a long-lived branch is far more than a
           # couple of commits back. `fetch-depth: 2` makes that `git diff` fail
@@ -125,7 +128,7 @@ jobs:
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         if: steps.changed.outputs.run == 'true'
 
       # Built against docker/fixtures/, not the real tools: three tools with
@@ -134,7 +137,7 @@ jobs:
       # still resolves without pulling a CUDA stack or the other repository.
       - name: Build with the fixture tools
         if: steps.changed.outputs.run == 'true'
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           file: docker/Dockerfile

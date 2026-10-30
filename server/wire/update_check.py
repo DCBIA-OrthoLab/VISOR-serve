@@ -56,7 +56,8 @@ def _compare(url: str, base: str, head: str) -> dict:
     request = urllib.request.Request(
         f"https://api.github.com/repos/{owner}/{name}/compare/{base}...{head}",
         headers={"Accept": "application/vnd.github+json", "User-Agent": "visor-serve-update-check"})
-    with urllib.request.urlopen(request, timeout=15) as response:
+    # Fixed https://api.github.com URL.
+    with urllib.request.urlopen(request, timeout=15) as response:  # nosec B310
         return json.loads(response.read().decode("utf-8"))
 
 

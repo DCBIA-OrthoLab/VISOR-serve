@@ -417,7 +417,8 @@ def tls_context(url: str) -> ssl.SSLContext:
 def server_urlopen(target, timeout: float):
     """`urllib.request.urlopen` for this server: HTTPS, verified (tls_context)."""
     url = target.full_url if isinstance(target, urllib.request.Request) else target
-    return urllib.request.urlopen(target, timeout=timeout, context=tls_context(url))
+    # The URL is this server's own https address.
+    return urllib.request.urlopen(target, timeout=timeout, context=tls_context(url))  # nosec B310
 
 
 def ensure_env(service: str, bind_addr=None, token=None, port=None) -> str:
