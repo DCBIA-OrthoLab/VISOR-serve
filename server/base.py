@@ -450,6 +450,11 @@ class Tool(ABC):
     # A tool whose inputs are paired publishes this instead: see
     # registry/conventions.paired_batch_plan.
     paired_batch: Optional[dict] = None
+    # `[tool.sadt] cost_epoch`, set by the registry: moving it drops what this
+    # deployment learned about the tool's memory (execution/costs.py). None
+    # when the pyproject declares one that is not an integer, which leaves the
+    # learned figures alone. An in-process tool declares nothing, and is 0.
+    cost_epoch: Optional[int] = 0
 
     def check_schema(self) -> None:
         """Reject an invalid `arguments` declaration. Called by registry.py at

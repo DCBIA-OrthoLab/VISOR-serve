@@ -705,8 +705,10 @@ re-enters the server at all.
 
 What a run reserves is what it was **measured** to need. `runner.py` has written
 a peak per run since the subprocess path landed; `execution/costs.py` keeps it
-as a high-water mark per tool under `SCHEMA_CACHE_DIR`, and nothing is declared
-by hand anywhere. Three rules keep that safe:
+as a high-water mark per tool in `COST_TABLE_PATH` (beside `SCHEMA_CACHE_DIR`
+when unset; the compose `inference` services keep it in the checkout's
+`server/.costs/`, which outlives the container), and nothing is declared by
+hand anywhere. Three rules keep that safe:
 
 - a tool nothing has measured reserves the whole budget and **runs alone**, so
   an empty table behaves exactly like the counter it replaced, and one run of
@@ -715,6 +717,12 @@ by hand anywhere. Three rules keep that safe:
   idle - a cap is a fairness target, never a refusal;
 - the card's **actually free** memory is checked too, because history cannot
   know what another process on the host is holding.
+
+The table survives restarts, recreated containers and updates of the server or
+the tools. Only a release resets it, and only by saying so: a tool's
+`[tool.sadt] cost_epoch` moving drops that tool's entry (`ADDING_A_TOOL.md`),
+and `costs.TABLE_EPOCH` moving drops the whole table. Either is done once at
+startup and logged as `Learned costs  RESET ...` with both epochs.
 
 There is no job COUNTER above the budget any more. `MAX_CONCURRENT_GPU_JOBS`
 was the last one and it is gone: despite its name it capped every running job,

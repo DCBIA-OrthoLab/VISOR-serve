@@ -98,6 +98,7 @@ def _record_failure(folder: str, exc: Exception) -> None:
 #     [tool.sadt]
 #     tool = true
 #     name = "Crown_Seg"
+#     cost_epoch = 1        # optional; see SADT_COST_EPOCH_KEY
 #
 # Keyed on the SECTION rather than on the presence of a pyproject.toml, because
 # a shared path dependency has one too and must not be served: tools/ALI/common/
@@ -106,6 +107,13 @@ def _record_failure(folder: str, exc: Exception) -> None:
 # tool.
 SADT_SECTION = "sadt"
 SADT_NAME_KEY = "name"
+# An integer a tool's release bumps when it changes what the tool COSTS -- a
+# new model, a different handling of the input's size -- so that the memory
+# this deployment learned from the old release is dropped and relearned
+# (execution/costs.py, `reconcile`). Absent is 0. Not bumped for an ordinary
+# release: learned figures are worth keeping, and a dropped tool runs alone
+# until it is measured again.
+SADT_COST_EPOCH_KEY = "cost_epoch"
 PYPROJECT = "pyproject.toml"
 
 # How deep discovery walks below TOOLS_DIR. 2 covers a grouping folder
@@ -115,7 +123,10 @@ MAX_TOOL_DEPTH = 2
 
 
 def _declares_tool(folder: str):
-    """`(True, declared name or None)` when this folder's pyproject says so.
+    """`(True, declared name or None, declared cost_epoch)` when this folder's
+    pyproject says so; `(False, None, 0)` otherwise. The epoch is returned as
+    written and checked once per tool, by `_cost_epoch` at load: this walk runs
+    more than once per startup, and a warning per walk would say it twice.
 
     A pyproject that cannot be parsed is reported and skipped rather than
     raising: it costs one tool, like every other discovery failure, and taking
@@ -124,22 +135,44 @@ def _declares_tool(folder: str):
     """
     path = os.path.join(folder, PYPROJECT)
     if not os.path.isfile(path):
-        return False, None
+        return False, None, 0
     try:
         with open(path, "rb") as handle:
             data = tomllib.load(handle)
     except (OSError, ValueError) as exc:
         _record_failure(os.path.basename(folder), exc)
-        return False, None
+        return False, None, 0
     section = (data.get("tool") or {}).get(SADT_SECTION)
     if not isinstance(section, dict) or not section.get("tool"):
-        return False, None
+        return False, None, 0
     declared = section.get(SADT_NAME_KEY)
-    return True, declared if isinstance(declared, str) and declared.strip() else None
+    return (True, declared if isinstance(declared, str) and declared.strip() else None,
+            section.get(SADT_COST_EPOCH_KEY, 0))
+
+
+def _cost_epoch(name: str, value):
+    """The declared `cost_epoch` itself, or None when it is not an integer.
+
+    **Not a discovery failure.** The tool runs exactly as well with a malformed
+    cost knob, and taking it away from a clinic over one is out of proportion.
+    Nor is it read as 0: that would be a reset nobody asked for, of a tool whose
+    entry was learned under epoch 2. None means "no statement", which `costs`
+    answers by leaving the tool's entry exactly as it is -- and it is said, so
+    the release that meant to reset it finds out why it did not.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value
+    logger.warning(
+        "Tool '%s': [tool.sadt] %s = %r is not an integer; ignored, and what this "
+        "server learned about the tool's memory is kept as it is.",
+        name, SADT_COST_EPOCH_KEY, value)
+    return None
 
 
 def _tool_folders(root: str) -> list:
-    """`(api name, folder path)` for every tool under `root`, in a stable order.
+    """`(api name, folder path, declared cost_epoch)` for every tool under
+    `root`, in a stable order. The epoch is 0 for a folder with no pyproject,
+    which is every in-process tool.
 
     Walked to MAX_TOOL_DEPTH rather than listed one level deep: ALI_CBCT and
     ALI_IOS are two tools inside tools/ALI/, which holds no tool of its own.
@@ -171,10 +204,10 @@ def _tool_folders(root: str) -> list:
             path = os.path.join(directory, entry)
             if not os.path.isdir(path):
                 continue
-            is_tool, declared = _declares_tool(path)
+            is_tool, declared, epoch = _declares_tool(path)
             if is_tool:
                 # Not descended into: a tool is never nested inside another.
-                found.append((declared or entry, path))
+                found.append((declared or entry, path, epoch))
                 continue
             if depth == 1:
                 # A folder directly under TOOLS_DIR with no `[tool.sadt]` is
@@ -182,7 +215,7 @@ def _tool_folders(root: str) -> list:
                 # `<name>.py` defining a Tool subclass, which has no pyproject at
                 # all. `[tool.sadt]` is what a PACKAGED tool declares, and the
                 # two kinds are told apart further down by is_packaged().
-                found.append((entry, path))
+                found.append((entry, path, 0))
             if depth < MAX_TOOL_DEPTH:
                 walk(path, depth + 1)
 
@@ -219,13 +252,17 @@ def _discover_schema_tools(root: str) -> list:
     re-raised -- it is the one failure that takes the server with it.
     """
     discovered = []
-    for name, folder in _tool_folders(root):
+    for name, folder, epoch in _tool_folders(root):
         if not is_packaged(folder):
             continue
         try:
-            discovered.append((name, load_tool(folder, deployment_config, name=name)))
+            tool = load_tool(folder, deployment_config, name=name)
         except Exception as exc:
             _record_failure(name, exc)
+            continue
+        # Carried on the tool, where startup hands it to the cost table.
+        tool.cost_epoch = _cost_epoch(name, epoch)
+        discovered.append((name, tool))
     return discovered
 
 
@@ -240,7 +277,7 @@ def _discover_tool_classes(root: str) -> list:
     if tools_package is None:
         return discovered
 
-    for entry, folder_path in _tool_folders(root):
+    for entry, folder_path, _epoch in _tool_folders(root):
         # A tool that declares a schema is served from it and never imported.
         if is_packaged(folder_path):
             continue
@@ -499,7 +536,7 @@ def _refuse_if_nothing_packaged_loaded(registry: dict) -> None:
     packaged = [
         name
         for root in settings.tool_roots()
-        for name, folder in _tool_folders(root)
+        for name, folder, _epoch in _tool_folders(root)
         if is_packaged(folder)
     ]
     loaded_packaged = [name for name in packaged if name in registry]

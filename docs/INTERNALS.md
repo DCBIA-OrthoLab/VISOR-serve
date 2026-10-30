@@ -28,10 +28,10 @@ server/
 
 ## Discovery
 
-`_tool_folders` walks `TOOLS_DIR` to depth 2 and returns `(api name, path)` for
-every directory whose `pyproject.toml` declares `[tool.sadt] tool = true`. It
-does not descend into a folder that is already a tool, and a leading underscore
-or dot excludes one.
+`_tool_folders` walks `TOOLS_DIR` to depth 2 and returns
+`(api name, path, cost_epoch)` for every directory whose `pyproject.toml`
+declares `[tool.sadt] tool = true`. It does not descend into a folder that is
+already a tool, and a leading underscore or dot excludes one.
 
 Depth 2 exists so a grouping folder can hold several tools: `tools/ALI/` is not
 a tool, `tools/ALI/ALI_CBCT/` is. A shared package like `tools/ALI/common/` has
@@ -41,6 +41,12 @@ The name comes from `[tool.sadt] name`, falling back to the directory. The
 directory must still be NAMED after the tool, because the interpreter is looked
 up by name; what declaring it buys is that the tool's DEPTH may change without
 the name a client sends moving with it.
+
+`[tool.sadt] cost_epoch` (an integer, absent = 0) is carried on the tool and
+handed to `costs.reconcile` at startup: an entry of the learned cost table
+recorded under another epoch is dropped, logged with both numbers, and
+relearned. A value that is not an integer is logged and ignored -- the tool
+loads, and its learned entry is left as it is.
 
 ### Failures that are fatal, and why
 

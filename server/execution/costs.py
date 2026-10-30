@@ -44,6 +44,16 @@ every channel after it pays only for its own working set -- so the cost of a
 run is an affine function of its width with an intercept, and the intercept is
 most of it. `_fit` is where that is measured rather than declared, and the two
 measured tables that say so are in its docstring.
+
+**The table outlives the server, and only a release can end it.** It is the
+one piece of state nothing can regenerate, so it lives at COST_TABLE_PATH (see
+config.py) rather than wherever a cache happens to be, and it survives a
+restart, a recreated container, a server update and a tools update. Exactly two
+things drop learned figures, and both are written down by whoever released the
+change: a tool's `[tool.sadt] cost_epoch` moving drops that tool's entry, and
+TABLE_EPOCH below moving drops the whole table. `reconcile` applies both, once,
+at startup. A new schema, a new image, a rebuilt venv are not statements about
+what a tool costs, and reset nothing.
 """
 
 from __future__ import annotations
@@ -105,7 +115,37 @@ OUTLIER_FACTOR = 2.0
 OUTLIER_PEERS = 3
 QUARANTINE_KEY = "quarantine"
 
+# The server's epoch for the whole table. **Bump it in a server release that
+# changes what the recorded figures MEAN** -- what a peak includes, how runner.py
+# measures it, the unit a window entry is stored in -- so that every entry
+# learned under the old meaning would mislead admission. Never for an ordinary
+# release, and never for one tool: that is `[tool.sadt] cost_epoch`, in the
+# tool's own pyproject. A table whose epoch differs is dropped whole, once, at
+# the next startup (`reconcile`), and the drop is logged with both numbers.
+#
+# 0 because a table written before the epoch existed carries no marker and is
+# read as 0: the release that introduced it kept every deployment's table.
+TABLE_EPOCH = 0
+# Where the table's epoch is stored: in the table itself, so it moves with the
+# file and is replaced by the same atomic write. A key no discovered tool can
+# have (discovery skips a folder starting with "_"), and an INTEGER rather than
+# a dict, so every reader that looks a tool up by name -- runner.py's
+# `_measured_cost`, and a rolled-back server's `cost_of` -- reads it as "no
+# measurement" rather than as a tool costing nothing. Here it is skipped by
+# `_load`, so `known()`, `banner()` and every page built on them never list it.
+TABLE_EPOCH_KEY = "__table_epoch__"
+# Per entry: the `[tool.sadt] cost_epoch` the tool declared when the entry was
+# learned. Absent -- every entry written before the key existed -- reads as 0,
+# which is also what a tool declaring nothing declares, so both are kept.
+COST_EPOCH_KEY = "cost_epoch"
+
 _lock = threading.Lock()
+# `{tool: declared cost_epoch}` for the tools this server serves, handed over by
+# `reconcile` at startup. A tool missing from it is never judged: one that
+# failed to load this time, or whose epoch could not be read, keeps its entry.
+_declared: dict = {}
+# A table that cannot be written is said ONCE: it fails every run's record.
+_unwritable_said = False
 
 
 @dataclass(frozen=True)
@@ -286,10 +326,18 @@ class Cost:
 
 
 def table_path() -> str:
-    return os.path.join(settings.SCHEMA_CACHE_DIR, "tool_costs.json")
+    """COST_TABLE_PATH, or beside the schema cache when it is not set."""
+    return settings.COST_TABLE_PATH or os.path.join(settings.SCHEMA_CACHE_DIR, "tool_costs.json")
 
 
-def _load() -> dict:
+def _epoch_of(value) -> int:
+    """An epoch as stored. Absent, or anything but an integer, is 0: the epoch
+    every table and entry written before epochs existed belongs to."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _read() -> dict:
+    """The file as written, the epoch marker included."""
     try:
         with open(table_path(), encoding="utf-8") as handle:
             loaded = json.load(handle)
@@ -298,22 +346,105 @@ def _load() -> dict:
     return loaded if isinstance(loaded, dict) else {}
 
 
+def _current(name: str, entry: dict) -> bool:
+    """Was this entry learned under the cost_epoch its tool declares now?"""
+    if name not in _declared:
+        return True
+    return _epoch_of(entry.get(COST_EPOCH_KEY)) == _declared[name]
+
+
+def _load() -> dict:
+    """Every tool's entry admission may believe, and nothing that is not a tool.
+
+    The epochs are checked here as well as in `reconcile`, so that nothing an
+    epoch has retired is admitted on even before -- or without -- the startup
+    pass that drops it from the file.
+    """
+    raw = _read()
+    if _epoch_of(raw.get(TABLE_EPOCH_KEY)) != TABLE_EPOCH:
+        return {}
+    return {name: entry for name, entry in raw.items()
+            if name != TABLE_EPOCH_KEY and isinstance(entry, dict) and _current(name, entry)}
+
+
 def _store(table: dict) -> None:
-    """Replace the table atomically, or give up quietly.
+    """Replace the table atomically, stamped with TABLE_EPOCH, or give up.
 
     A cost table that cannot be written costs one thing: every tool looks
     unknown and runs alone, which is exactly today's behaviour. It must never
-    cost a run.
+    cost a run -- but it is said once, at WARNING: a table that silently stops
+    persisting is the very defect COST_TABLE_PATH exists to end, and its only
+    symptom is a server that has gone serial for no visible reason.
     """
-    directory = settings.SCHEMA_CACHE_DIR
+    global _unwritable_said
+    path = table_path()
+    directory = os.path.dirname(os.path.abspath(path))
     try:
         os.makedirs(directory, exist_ok=True)
         handle, temporary = tempfile.mkstemp(dir=directory, suffix=".tmp")
         with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(table, stream, indent=2, sort_keys=True)
-        os.replace(temporary, table_path())
+            json.dump(dict(table, **{TABLE_EPOCH_KEY: TABLE_EPOCH}), stream,
+                      indent=2, sort_keys=True)
+        os.replace(temporary, path)
     except OSError as exc:
-        logger.debug("could not write the tool cost table: %s", exc)
+        if _unwritable_said:
+            logger.debug("could not write the tool cost table: %s", exc)
+            return
+        _unwritable_said = True
+        logger.warning(
+            "Learned costs  cannot write %s (%s): nothing measured from now on is "
+            "learned, so an unmeasured tool keeps running alone. COST_TABLE_PATH "
+            "must name a writable place that outlives the container.", path, exc)
+
+
+def reconcile(declared: dict) -> None:
+    """Drop what a release SAID is out of date, once, at startup -- nothing else.
+
+    `declared` is `{tool: [tool.sadt] cost_epoch}` for the tools this server
+    serves. Two checks, both explicit decisions of whoever released the change:
+
+    - the table's epoch against TABLE_EPOCH -- a server release that changed
+      what the figures mean drops all of them;
+    - each entry's epoch against its tool's -- a tool release that changed
+      what the tool costs (a new model, different input handling) drops that
+      tool's entry and no other.
+
+    A tool missing from `declared` keeps its entry: one that failed to load
+    this time, or whose epoch could not be read, has not asked for anything.
+
+    Written back at once rather than left to the next `record`, because
+    runner.py reads the FILE: a nested level would otherwise go on sizing
+    itself from figures admission has just stopped believing. Each drop is
+    logged at WARNING with both epochs, which is the line an operator finds
+    when a tool that ran in parallel yesterday runs alone today.
+    """
+    global _declared
+    with _lock:
+        _declared = {name: epoch for name, epoch in (declared or {}).items()
+                     if isinstance(epoch, int) and not isinstance(epoch, bool)}
+        raw = _read()
+        stored = _epoch_of(raw.get(TABLE_EPOCH_KEY))
+        tools = {name: entry for name, entry in raw.items()
+                 if name != TABLE_EPOCH_KEY and isinstance(entry, dict)}
+        changed = False
+        if stored != TABLE_EPOCH:
+            if tools:
+                logger.warning(
+                    "Learned costs  RESET the whole table, %d tool(s): TABLE_EPOCH "
+                    "%d -> %d set by this server's release; every tool runs alone "
+                    "until it is measured again", len(tools), stored, TABLE_EPOCH)
+            tools, changed = {}, bool(raw)
+        for name in sorted(tools):
+            if _current(name, tools[name]):
+                continue
+            logger.warning(
+                "Learned costs  RESET %s: cost_epoch %d -> %d declared by the "
+                "tool's release; it runs alone until it is measured again",
+                name, _epoch_of(tools[name].get(COST_EPOCH_KEY)), _declared[name])
+            del tools[name]
+            changed = True
+        if changed:
+            _store(tools)
 
 
 def _window(entry: dict) -> list:
@@ -674,6 +805,10 @@ def record(tool_name: str, vram_bytes: Optional[int], ram_bytes: Optional[int],
             window = []
         if own_only:
             entry[OWN_ONLY_KEY] = True
+        # The epoch this is learned under, so a later release of the tool can
+        # say it no longer holds. Left as it was for a tool nothing declared.
+        if tool_name in _declared:
+            entry[COST_EPOCH_KEY] = _declared[tool_name]
         # Stored PER CHANNEL, beside the width it was measured at, which is
         # what makes the two recoverable from each other: `_fit` multiplies
         # them straight back into the run's total, and the intercept can only
@@ -783,16 +918,19 @@ def banner() -> str:
     ones costing the parallelism -- and which tools' memory moves with the
     request, because for those the single reserved figure is the worst seen
     rather than a property of the tool.
+
+    And WHERE the table is: the count read after an update, next to the path it
+    was read from, is how an operator sees that the update kept it.
     """
     table = {name: cost_of(name) for name in sorted(_load())}
     if not table:
-        return ("Learned costs  none yet; every tool runs alone until it has "
-                "been measured once")
+        return ("Learned costs  none yet in {}; every tool runs alone until it "
+                "has been measured once".format(table_path()))
     varying = [(name, cost) for name, cost in table.items()
                if cost and cost.input_dependent]
     lines = [
-        "Learned costs  {} tool(s) measured; heaviest {}".format(
-            len(table),
+        "Learned costs  {} tool(s) measured in {}; heaviest {}".format(
+            len(table), table_path(),
             max(table.items(), key=lambda item: item[1].vram_bytes if item[1] else 0)[0],
         )
     ]

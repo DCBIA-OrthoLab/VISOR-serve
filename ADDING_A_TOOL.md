@@ -143,6 +143,29 @@ Raise `ValueError` or `FileNotFoundError` for something the caller can fix -
 the message reaches them as a `422`. Anything else is a `500` with a fixed
 message, and the traceback stays in the server log.
 
+## When a release changes what the tool costs
+
+The server learns each tool's RAM and VRAM from its own runs and keeps them
+across restarts and updates (`server/execution/costs.py`). An ordinary release
+keeps them too, which is what you want: a tool nobody has measured runs alone.
+
+When a release changes what the tool **costs** -- a new or larger model, a
+different handling of the input's size, a new engine -- the old figures would
+mislead admission. Say so in `pyproject.toml`:
+
+```toml
+[tool.sadt]
+tool = true
+name = "MyTool"
+cost_epoch = 1      # absent is 0; bump by one for such a release
+```
+
+At its next start the server drops that tool's learned figures, and no other
+tool's, logs `Learned costs  RESET MyTool: cost_epoch 0 -> 1`, and relearns
+from the next run. Do not bump it for a bug fix, a new argument or a UI change.
+A value that is not an integer is logged and ignored: the tool still loads and
+its figures are kept.
+
 ## The exceptions
 
 Only if a convention is wrong for you, add a section to

@@ -146,6 +146,15 @@ services:
       # The tools mount is read-only, so regenerated schemas need somewhere of
       # their own to land.
       - SCHEMA_CACHE_DIR=/tmp/schema-cache
+      # The learned cost table, which is NOT a cache and must not share the
+      # schema cache's /tmp: that goes with the container, and the update agent
+      # recreates the container on every update touching this file, the API's
+      # requirements or the image -- each of which silently put every tool back
+      # to "unmeasured", reserving the whole budget and running alone. In the
+      # bind-mounted checkout instead, beside server/.history and
+      # server/.update, which outlive the container the same way; gitignored,
+      # so the clone stays clean. See COST_TABLE_PATH in server/config.py.
+      - COST_TABLE_PATH=/workspace/server/.costs/tool_costs.json
       # Which peers uvicorn believes about `X-Forwarded-For`. Its default is
       # 127.0.0.1, and behind the TLS terminator the README documents the peer
       # is never that: nginx reaches 127.0.0.1:8000, Docker's proxy forwards it
@@ -201,6 +210,8 @@ services:
       # The tools mount is read-only, so regenerated schemas need somewhere of
       # their own to land.
       - SCHEMA_CACHE_DIR=/tmp/schema-cache
+      # Outside the container's /tmp; see the `inference` service.
+      - COST_TABLE_PATH=/workspace/server/.costs/tool_costs.json
       # Trusted proxies for `X-Forwarded-For`; see the `inference` service.
       - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
       # How clients reach it (see `ports` and server/serve.py). The

@@ -139,6 +139,20 @@ async def _trace_loop() -> None:
         await anyio.sleep(telemetry.TRACE_SECONDS)
 
 
+def _declared_cost_epochs(tools: dict) -> dict:
+    """`{tool: cost_epoch}` for every served tool whose epoch could be read.
+
+    One whose `[tool.sadt] cost_epoch` is not an integer is left out, which is
+    what makes `costs.reconcile` leave its learned figures exactly as they are.
+    """
+    declared = {}
+    for name, tool in tools.items():
+        epoch = getattr(tool, "cost_epoch", 0)
+        if isinstance(epoch, int) and not isinstance(epoch, bool):
+            declared[name] = epoch
+    return declared
+
+
 @contextlib.asynccontextmanager
 async def _lifespan(_app: FastAPI):
     # Before anything else: a server started without TLS does not start at all.
@@ -151,6 +165,11 @@ async def _lifespan(_app: FastAPI):
     # part of starting the server, not of importing it.
     for line in resources.banner(resources.allocation()).splitlines():
         logger.info("%s", line)
+    # Before the banner and before any run is admitted: an entry a tool's
+    # release declared out of date (`[tool.sadt] cost_epoch`), or a whole table
+    # from another server epoch, is dropped here, once, and said. Nothing else
+    # ever resets the table -- a restart, a new image or a new venv included.
+    costs.reconcile(_declared_cost_epochs(TOOLS))
     # Said beside the budget, because the budget is only as good as these: a
     # tool nobody has measured reserves everything, and a tool whose memory
     # moves with the request is reserving the worst run anyone has seen rather
