@@ -12,7 +12,6 @@ seconds. Skipped when node is not installed: nothing else here needs it.
 """
 
 import json
-import re
 import shutil
 import subprocess
 
@@ -99,7 +98,9 @@ vm.runInContext("with (scope) {\n" + source + "\n}", context);
 
 
 def _scripts(page: str) -> str:
-    return "\n;\n".join(re.findall(r"<script>(.*?)</script>", page, flags=re.S))
+    """The page's own inline scripts, in order. The page is a constant of this
+    repository, not input: a plain split is all it needs."""
+    return "\n;\n".join(chunk.split("</script>", 1)[0] for chunk in page.split("<script>")[1:])
 
 
 def _fetches_started(tmp_path, page: str, watched: str, answer: str = "never",
