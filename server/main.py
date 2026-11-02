@@ -1527,7 +1527,8 @@ def server_debug_run(run_id: str) -> dict:
             "timeline": runs.timeline(events)}
 
 
-_LOG_CONSOLE_LEVEL = {"debug": "info", "info": "info", "warning": "warn", "error": "error"}
+_LOG_CONSOLE_LEVEL = {"debug": "info", "info": "info", "warning": "warn", "error": "error",
+                      "metric": "info"}
 
 
 def _log_line(event: dict) -> dict:
