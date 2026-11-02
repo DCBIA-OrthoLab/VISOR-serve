@@ -205,6 +205,29 @@ def test_a_log_line_cannot_claim_a_phase_or_end_a_stream(run_id):
     assert "fraction" not in event
 
 
+def test_a_metric_reaches_the_user_as_a_metric(run_id):
+    """A number the clinician may want -- a registration's residual -- shown
+    apart from ordinary lines by a client that knows the level."""
+    _write(run_id, _log("arch U: landmark fit 1.28 mm", "metric", "user"))
+
+    (line,) = runs.read_events(run_id, logs=("user",))
+    assert line["level"] == "metric"
+
+
+def test_the_admin_console_shows_a_metric_as_info(run_id):
+    _write(run_id, _log("arch U: landmark fit 1.28 mm", "metric", "user"))
+
+    lines = client.get(f"/admin-panel/runs/{run_id}.json", headers=_panel()).json()["lines"]
+    (logged,) = [line for line in lines if line.get("kind") == "log"]
+    assert logged["level"] == "info"
+
+
+def test_a_level_nobody_knows_is_still_info(run_id):
+    _write(run_id, _log("something", "shouting", "user"))
+
+    assert runs.read_events(run_id, logs=("user",))[0]["level"] == "info"
+
+
 def test_a_line_with_no_audience_is_the_operators(run_id):
     _write(run_id, {"kind": "log", "level": "error", "message": "unmarked"})
 

@@ -199,7 +199,10 @@ LOG_KIND = "log"
 LOG_AUDIENCE_USER = "user"
 LOG_AUDIENCE_ADMIN = "admin"
 LOG_AUDIENCES = (LOG_AUDIENCE_USER, LOG_AUDIENCE_ADMIN)
-LOG_LEVELS = ("debug", "info", "warning", "error")
+# "metric": a number the user may want and can skip -- a residual, a volume --
+# which a client shows apart from ordinary lines. A client that predates it
+# reads it as "info", so nothing has to be deployed in any particular order.
+LOG_LEVELS = ("debug", "info", "warning", "error", "metric")
 # Per reader, apart from MAX_RUN_EVENTS: a chatty log must not be able to use
 # up the progress budget and leave a client's bar frozen.
 MAX_RUN_LOGS = 500

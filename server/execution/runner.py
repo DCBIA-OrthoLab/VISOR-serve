@@ -271,7 +271,8 @@ SPAN_ARGUMENT = "_progress"
 # What `sup.log` accepts, and what the rest are read as. The names are the
 # standard library's, so a level means here what it means in every log the
 # tool already writes.
-LOG_LEVELS = ("debug", "info", "warning", "error")
+# "metric" is `wire.runs`' own: a number for the user, read as info elsewhere.
+LOG_LEVELS = ("debug", "info", "warning", "error", "metric")
 _LOG_LEVEL_ALIASES = {"warn": "warning", "critical": "error", "fatal": "error"}
 
 # How much of a failure the runner hands the server. The message is a tool's
