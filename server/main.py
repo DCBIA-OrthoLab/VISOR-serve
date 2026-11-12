@@ -3933,8 +3933,11 @@ async def _run_tool(tool_name: str, request: Request, background_tasks: Backgrou
         await _off_loop(_discard, work_dir, scratch_dirs)
         raise HTTPException(status_code=500, detail="Tool execution failed.")
     finally:
-        # Uploaded inputs are never needed again past this point.
-        await _off_loop(_remove_staged, input_paths, resolved_files)
+        # Uploaded inputs are never needed again past this point -- unless the
+        # run stopped at a checkpoint: its resume runs the tool again on these
+        # very paths. They stay with the pause record and go with the run.
+        if runs.paused_at(runs.CURRENT_RUN.get(None) or "") is None:
+            await _off_loop(_remove_staged, input_paths, resolved_files)
 
     return await _finish_run(
         tool, tool_name, start_time, background_tasks, detached, work_dir,
