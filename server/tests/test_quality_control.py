@@ -9,6 +9,7 @@ must not stop, on a server other people are queueing on.
 
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import os
@@ -1765,3 +1766,74 @@ def test_a_stopped_run_s_outputs_are_accepted_from_the_job_directory_it_holds(tm
     finally:
         runs.finish(run_id, runs.PHASE_DONE)
         shutil.rmtree(job, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# An uploaded input outlives the request that paused on it
+# ---------------------------------------------------------------------------
+
+def test_an_uploaded_input_is_still_there_when_the_run_is_resumed(monkeypatch):
+    """The request's `finally` deleted every uploaded input once the tool
+    returned. For a run that PAUSED that is the one moment it must not: the
+    resume runs the tool again on the same paths and answered
+    `FileNotFoundError: Input path not found`, minutes after a clinician had
+    been shown the checkpoint. `keep_while_paused` protected the work
+    directory, but the upload sits inside it and had already been unlinked.
+    """
+    import registry
+    from base import ArgSpec, PATH_TYPE, Tool
+    from fastapi.testclient import TestClient
+    import main
+    from wire import runs
+
+    seen = {}
+
+    class UploadProbe(Tool):
+        name = "Pausing_Upload_Probe"
+        arguments = {"scan": ArgSpec(type=PATH_TYPE, required=True)}
+        output_kind = "text"
+
+        def run(self, scan=None):
+            return "unused"
+
+    async def stops(call):
+        # The path the tool was handed is the staged upload; the stop is
+        # recorded the way dispatch records it.
+        run_id = runs.CURRENT_RUN.get()
+        job = tempfile.mkdtemp(dir=main.settings.TEMP_DIR)
+        runs.pause(run_id, job, "ALI_CBCT")
+        seen["job"] = job
+        seen["run_id"] = run_id
+        return {"quality_control": True, "stopped_after": "ALI_CBCT",
+                "produced": [], "outputs": {}}
+
+    staged = []
+    original = main._staged_input_path
+
+    def spy(work_dir, field_name, filename, extension):
+        path = original(work_dir, field_name, filename, extension)
+        staged.append(path)
+        return path
+
+    monkeypatch.setitem(registry.TOOLS, UploadProbe.name, UploadProbe())
+    monkeypatch.setattr(main, "_run_tool_call", stops)
+    monkeypatch.setattr(main, "_staged_input_path", spy)
+
+    run_id = uuid.uuid4().hex
+    client = TestClient(main.app)
+    try:
+        response = client.post(
+            "/run/" + UploadProbe.name,
+            headers={"Authorization": "Bearer " + main.settings.API_TOKEN,
+                     "X-Run-Id": run_id},
+            files={"scan": ("patient.nii.gz", io.BytesIO(gzip.compress(b"a scan")))},
+        )
+        assert response.status_code == 200, response.text
+        assert runs.paused_at(run_id) is not None, "the run did not pause"
+        assert staged and os.path.isfile(staged[0]), (
+            "the uploaded input was deleted while the run waited at its checkpoint")
+    finally:
+        runs.finish(run_id, runs.PHASE_DONE)
+        for path in staged:
+            shutil.rmtree(os.path.dirname(os.path.dirname(path)), ignore_errors=True)
+        shutil.rmtree(seen.get("job", ""), ignore_errors=True)
