@@ -64,8 +64,8 @@ the difference is entirely the children.
 
 **Only orchestrators are light.** AREG_IOSCBCT holds ~12 MB because it imports
 no torch at all; a leaf holds ~500 MB. A chain is sequential, so one heavy
-process lives at a time whatever the depth. What multiplies memory is
-`MAX_CONCURRENT_TOOLS`, not nesting.
+process lives at a time whatever the depth. What multiplies memory is how many
+runs admission lets in at once, not nesting.
 
 ## Consequences for configuration
 

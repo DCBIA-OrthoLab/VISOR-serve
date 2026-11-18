@@ -152,6 +152,19 @@ def is_model(argument_name: str) -> bool:
     return any(argument_name == name or argument_name.endswith("_" + name) for name in MODEL_NAMES)
 
 
+# Of MODEL_NAMES, the one that means WEIGHTS: `model` and `*_model`. Never
+# uploaded, whatever a deployment opted them out of (main.py
+# `_reject_upload_for_model`): a model loader unpickles what it is handed, so an
+# uploaded "model" is uploaded code. `*_reference` is not in it -- a reference
+# is a scan or a mesh, FlexReg's other timepoint or AutoMatrix's output grid,
+# and is the clinician's own to send.
+WEIGHTS_NAME = "model"
+
+
+def names_weights(argument_name: str) -> bool:
+    return argument_name == WEIGHTS_NAME or argument_name.endswith("_" + WEIGHTS_NAME)
+
+
 # --- splitting a cohort ----------------------------------------------------
 
 
@@ -216,7 +229,42 @@ def batch_plan(arguments: dict, declared: ToolDeployment, defaults: tuple) -> Op
     return {"axis": axis, "max_mb": max_mb, "max_files": max_files}
 
 
-def derive(arguments: dict, declared: ToolDeployment, batch_defaults: tuple) -> ToolDeployment:
+def paired_batch_plan(paired, arguments: dict, declared: ToolDeployment,
+                      defaults: tuple) -> Optional[dict]:
+    """How a client may split a cohort for a tool whose inputs are PAIRED, or
+    None.
+
+    Only what the tool itself declares (`"paired": {"axes": [...]}` in its
+    schema): which arguments hold the same subjects. HOW they pair is the
+    tool's and stays there -- a client asks `POST /tools/{tool}/pairs`, which
+    runs the tool's own answer. The caps are this server's, as for any batch,
+    and `batch = false` in deployment.toml turns it off the same way.
+    """
+    if not isinstance(paired, dict) or declared.batch_enabled is False:
+        return None
+    axes = paired.get("axes")
+    if not isinstance(axes, list) or len(axes) < 2:
+        return None
+    for axis in axes:
+        declaration = arguments.get(axis)
+        # A path, not necessarily a required one: AREG's `t1`/`t2` are optional
+        # since a cohort may arrive as one folder per patient instead, and a
+        # request in that layout fills neither. A client splits the axes a
+        # request fills.
+        if not isinstance(declaration, dict) or declaration.get("type") != "path":
+            return None
+    max_mb, max_files = defaults
+    if declared.batch_max_mb is not None:
+        max_mb = declared.batch_max_mb
+    if declared.batch_max_files is not None:
+        max_files = declared.batch_max_files
+    if max_mb <= 0 and max_files <= 0:
+        return None
+    return {"axes": list(axes), "max_mb": max_mb, "max_files": max_files}
+
+
+def derive(arguments: dict, declared: ToolDeployment, batch_defaults: tuple,
+           paired=None) -> ToolDeployment:
     """`declared` (from deployment.toml) merged over these conventions.
 
     Anything stated explicitly wins, per argument, so an exception costs one
@@ -241,16 +289,24 @@ def derive(arguments: dict, declared: ToolDeployment, batch_defaults: tuple) -> 
     selectable.update(declared.server_selectable)
     # "none" is a removal, not a kind: it is how a deployment opts an argument
     # out of a convention its NAME would otherwise put it in.
+    opted_out = []
     for name, kind in list(selectable.items()):
         if kind == deployment_module.SERVER_SELECTABLE_NONE:
             del selectable[name]
+            opted_out.append(name)
 
     hidden = {name for name in arguments if name in TECHNICAL}
     hidden.update(declared.hidden)
+    # A model opted out is one the tool finds for itself, and left a plain
+    # `path` it would otherwise be an upload row on every panel -- for a file
+    # the server refuses (see WEIGHTS_NAME). Nobody is asked; the tool's own
+    # default applies, which is what opting it out was for.
+    hidden.update(name for name in opted_out if names_weights(name))
 
     return replace(
         declared,
         server_selectable=selectable,
         hidden=tuple(sorted(hidden)),
         batch=batch_plan(arguments, declared, batch_defaults),
+        paired_batch=paired_batch_plan(paired, arguments, declared, batch_defaults),
     )

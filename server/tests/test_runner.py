@@ -83,9 +83,15 @@ def test_a_raising_tool_records_which_failure_it_was(probe_python, probe_name, t
 
     with open(os.path.join(os.path.dirname(job_path), "result.json")) as handle:
         recorded = json.load(handle)
-    assert recorded["error"] == {
-        "type": "RuntimeError", "message": "_dispatch_probe was asked to fail"
-    }
+    error = recorded["error"]
+    assert error["type"] == "RuntimeError"
+    assert error["message"] == "_dispatch_probe was asked to fail"
+    # Where it broke, for the operator: the tool, its chain, and the line in
+    # the tool's OWN source -- relative to src/, so it names code, never data.
+    origin = error["origin"]
+    assert origin["tool"] == probe_name and origin["chain"] == [probe_name]
+    assert origin["error_type"] == "RuntimeError"
+    assert origin["where"].endswith(" in run") and not origin["where"].startswith("/")
     # And never a result: the two are mutually exclusive.
     assert "result" not in recorded
     # The measurements travel with a failure too. An out-of-memory is the most

@@ -43,7 +43,7 @@ def door_open_again():
 
 def test_a_server_starts_accepting_work():
     assert maintenance.accepting() is True
-    assert maintenance.snapshot() == {"accepting": True, "closed_for": None, "reason": ""}
+    assert maintenance.snapshot() == {"accepting": True, "closed_for": None, "reason": "", "by_operator": False}
 
 
 def test_the_door_reopens_on_its_own_when_nobody_comes_back():
@@ -156,7 +156,16 @@ def test_every_endpoint_that_starts_work_is_gated():
     # Endpoints that legitimately answer while the door is shut. Each one is
     # something a client needs to FINISH work it already started, or the
     # control that opens the door again.
-    ALLOWED_OPEN = {"/maintenance"}
+    # The operator's controls start nothing: they reorder or mark runs, or
+    # set how a workstation's batches run, which is exactly what an operator
+    # may need to do while an update is draining the server.
+    ALLOWED_OPEN = {"/maintenance", "/admin/queue/{run_id}/move", "/admin/runs/{run_id}/priority",
+                    "/admin/clients/{address}/policy", "/admin/door", "/admin/update", "/admin/data",
+                    "/admin/updates/check",
+                    # Gives a paused run longer before it is dropped; starts nothing.
+                    "/admin/runs/{run_id}/hold",
+                    # Answers which file NAMES go together; starts no run.
+                    "/tools/{tool_name}/pairs"}
     # This is also what catches a route that does not exist yet. A benchmark
     # battery is a run too, and the day `POST /benchmark/run` lands it arrives
     # here ungated and fails this test until somebody decides.
@@ -182,14 +191,38 @@ def test_an_open_door_changes_nothing():
 # The endpoint the updater uses
 # ---------------------------------------------------------------------------
 
+ADMIN = {"X-Admin-Token": "operator-secret-for-the-maintenance-tests"}
+
+
+@pytest.fixture(autouse=True)
+def _admin_token(monkeypatch):
+    monkeypatch.setattr(settings, "ADMIN_TOKEN", ADMIN["X-Admin-Token"])
+
+
 def test_shutting_the_door_needs_the_token():
     """It is a control over whether this deployment serves anyone."""
     assert client.post("/maintenance", json={"accepting": False}).status_code == 401
 
 
+def test_a_workstation_token_cannot_shut_or_reopen_the_door():
+    """Every workstation holds the API token; the door is the operator's."""
+    assert client.post("/maintenance", headers=AUTH, json={"accepting": False}).status_code == 401
+    maintenance.close_by_operator(600, "operator")
+    assert client.post("/maintenance", headers=AUTH, json={"accepting": True}).status_code == 401
+    assert maintenance.accepting() is False
+    maintenance.reopen()
+
+
+def test_a_closure_that_never_ends_is_refused():
+    response = client.post("/maintenance", headers={**ADMIN, "Content-Type": "application/json"},
+                           content='{"accepting": false, "seconds": "nan"}')
+    assert response.status_code == 422
+    assert maintenance.accepting() is True
+
+
 def test_the_updater_closes_and_reopens_over_http():
     closed = client.post(
-        "/maintenance", headers=AUTH,
+        "/maintenance", headers=ADMIN,
         json={"accepting": False, "seconds": 30, "reason": "applying an update"},
     )
     assert closed.status_code == 200
@@ -197,7 +230,7 @@ def test_the_updater_closes_and_reopens_over_http():
     assert closed.json()["reason"] == "applying an update"
     assert client.post("/run/Test_Tool", headers=AUTH, data=RUN_ARGS).status_code == 503
 
-    reopened = client.post("/maintenance", headers=AUTH, json={"accepting": True})
+    reopened = client.post("/maintenance", headers=ADMIN, json={"accepting": True})
     assert reopened.status_code == 200
     assert reopened.json()["accepting"] is True
     assert client.post("/run/Test_Tool", headers=AUTH, data=RUN_ARGS).status_code == 200
@@ -205,7 +238,7 @@ def test_the_updater_closes_and_reopens_over_http():
 
 def test_the_endpoint_answers_with_what_it_granted_not_what_was_asked():
     response = client.post(
-        "/maintenance", headers=AUTH, json={"accepting": False, "seconds": 86400}
+        "/maintenance", headers=ADMIN, json={"accepting": False, "seconds": 86400}
     )
     assert response.json()["closed_for"] <= maintenance.MAX_CLOSE_SECONDS
 

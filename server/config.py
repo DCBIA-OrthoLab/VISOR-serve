@@ -26,9 +26,30 @@ class Settings(BaseSettings):
     # --- core ---------------------------------------------------------
     API_TOKEN: str  # required on /run; no default
     DEVICE: str = "cpu"  # "cuda" on the GPU server
-    TEMP_DIR: str = "/tmp/inference_server"  # emptied once a request is served
+    # The default only; production sets TEMP_DIR to its own volume.
+    TEMP_DIR: str = "/tmp/inference_server"  # emptied once a request is served  # nosec B108
     DATA_DIR: str = "/data"  # DATA_DIR/<tool>/{models,testfiles}, read-only
     DATA_BACKEND: str = "local"  # see data_store.py to plug in another
+
+    # --- TLS (tls.py) ---------------------------------------------------
+    # The server only ever listens over HTTPS; nothing here can turn that off.
+    # An operator's certificate, both files or neither. Neither: a self-signed
+    # pair is generated into TLS_DIR once and kept, so a pinned client keeps
+    # trusting it across restarts -- which is why TLS_DIR must be persistent
+    # and writable (the image points it into its cache volume).
+    TLS_CERT_FILE: str = ""
+    TLS_KEY_FILE: str = ""
+    TLS_DIR: str = os.path.join(_SERVER_DIR, ".tls")
+    # Where the port is published (docker-compose.yml passes the same value it
+    # publishes on). Loopback by default: the self-signed certificate is for a
+    # front end on this machine -- `tailscale serve`, a reverse proxy -- and
+    # never for a client. Anywhere else, serve.py refuses to start unless the
+    # certificate it listens with is publicly signed (tls.public_certificate_problem).
+    PUBLISH_ADDR: str = "127.0.0.1"
+    # The address clients are given, whatever presents its public certificate:
+    # `tailscale serve`, a reverse proxy, or this server itself. Empty: the
+    # URL `tailscale serve` publishes, if any (scripts/server_ctl.py).
+    PUBLIC_URL: str = ""
 
     # --- running a tool -----------------------------------------------
     # "subprocess" runs a tool in its own virtualenv through runner.py, so the
@@ -71,9 +92,48 @@ class Settings(BaseSettings):
     # A .schema.json is a cache, and the tool folders are read-only to the
     # process serving them, so a regenerated one cannot live beside its tool.
     SCHEMA_CACHE_DIR: str = os.path.join(_SERVER_DIR, ".schema-cache")
+    # The learned cost table (execution/costs.py): what every run this
+    # deployment ever did measured itself to need. Empty keeps it beside the
+    # schema cache, where every existing deployment already has it -- the
+    # venvs image's cache volume, a checkout's .schema-cache.
+    #
+    # **A setting of its own because the two are not the same kind of thing.**
+    # A schema is a cache: losing it costs minutes of regeneration. The table is
+    # not regenerable at all: losing it puts every tool back to "unmeasured",
+    # which reserves the whole budget and runs it ALONE until it is measured
+    # again -- silently, since nothing fails. The compose `inference` services
+    # keep their schema cache in the container's /tmp, and the table went with
+    # it on every update that recreated the container; they point this at the
+    # bind-mounted checkout instead (server/.costs, gitignored), beside
+    # HISTORY_DIR and UPDATE_DIR, which outlive the container the same way.
+    #
+    # What does reset it is said explicitly by a release, and nothing else
+    # does: see `costs.TABLE_EPOCH` and `[tool.sadt] cost_epoch`.
+    COST_TABLE_PATH: str = ""
+    # Where finished runs are kept for the operator page, so its history and
+    # per-tool graphs survive an update. Beside the code by default, which in
+    # the `inference` service is the bind-mounted checkout and therefore
+    # outlives the container; empty keeps the history in memory only.
+    HISTORY_DIR: str = os.path.join(_SERVER_DIR, ".history")
+    # Where this server and the host's update agent (scripts/update_agent.py)
+    # leave each other notes: what can be updated, and an operator's request
+    # to do it. In the bind-mounted checkout, so both sides see the same files.
+    UPDATE_DIR: str = os.path.join(_SERVER_DIR, ".update")
+    # The server's own checkout, for "Check for updates": its `.git` is what
+    # says which commit is deployed. The parent of `server/`, which in the
+    # container is /workspace, where docker-compose.yml mounts `.git` read-only.
+    SERVER_REPO: str = os.path.dirname(_SERVER_DIR)
     DEPLOYMENT_CONFIG: str = os.path.join(_SERVER_DIR, "deployment.toml")
-    SADT_API: str = "http://127.0.0.1:8000"  # reaches this server from a tool
-    MAX_CONCURRENT_TOOLS: int = 4
+    SADT_API: str = "https://127.0.0.1:8000"  # reaches this server from a tool
+    # The operator dashboard's controls -- reordering the queue, giving a run
+    # priority -- answer only to this token, never to API_TOKEN: every
+    # workstation holds that one, and a control any of them can use is one any
+    # of them will use to put itself first. Empty disables the controls.
+    ADMIN_TOKEN: str = ""
+    # Whether a workstation's cohort batches run one at a time ("serial") or
+    # side by side ("parallel") until an operator says otherwise for that
+    # workstation (wire/clients.py). Serial is what every client did before.
+    DEFAULT_BATCH_POLICY: str = "serial"
     TOOL_TIMEOUT_SECONDS: float = 0  # 0 = none; a cohort legitimately takes hours
     # How many times a run that died for want of memory is started again, with
     # more room reserved each time. A clinician who asked for a segmentation
@@ -170,6 +230,14 @@ class Settings(BaseSettings):
     # same call that writes the document, so the page and the report cannot
     # disagree with each other.
     SADT_BENCHMARK_DIR: str = "/benchmarks"
+    # Where a battery launched from /benchmark writes its summary. Empty means
+    # "decide": SADT_BENCHMARK_DIR when this process may write there (the dev
+    # compose mounts it read-write), otherwise `batteries/` under
+    # SCHEMA_CACHE_DIR -- the one directory the image already gives the server
+    # to write, on a volume that survives a recreated container. The released
+    # compose mounts nothing at /benchmarks, so a battery that insisted on it
+    # failed to start at all. GET /benchmarks reads both.
+    SADT_BATTERY_DIR: str = ""
 
     # --- splitting a cohort -------------------------------------------
     #
@@ -227,18 +295,25 @@ class Settings(BaseSettings):
     # no client identity anywhere, so the server cannot tell ten workstations
     # from one clicking ten times.
     #
-    # Defaulted to MAX_CONCURRENT_TOOLS rather than to 1 so an untouched
-    # deployment keeps the concurrency it already had: at 1 a single job would
-    # reserve the whole budget and every run on the machine would serialise
-    # behind it, which is stricter than the four tool slots that exist today.
+    # Defaulted to 4 rather than to 1 so an untouched deployment keeps the
+    # concurrency it already had: at 1 a single job would reserve the whole
+    # budget and every run on the machine would serialise behind it. It stays
+    # at 4 because it sets each run's share of the cores, which the thread measurements in
+    # CLAUDE.md were taken against, and raising it would narrow every run.
     SADT_EXPECTED_CLIENTS: int = 4
     SADT_CPU_PER_JOB: str = ""
     SADT_RAM_PER_JOB: str = ""
     SADT_VRAM_PER_JOB: str = ""
 
     # --- uploads and results ------------------------------------------
-    MAX_UPLOAD_MB: int = 500  # over this, 413
-    MAX_EXTRACTED_MB: int = 2000  # zip-bomb cap on an extracted archive, 400
+    # Per file, not per request: AREG's two folders are two uploads, each
+    # checked on its own. 2 GB so a whole CBCT cohort sent as one archive --
+    # a tool that cannot be split into batches -- is not refused.
+    MAX_UPLOAD_MB: int = 2048  # over this, 413
+    # The uncompressed size an archive may expand to. Kept well above the
+    # upload cap: a 2 GB archive of compressed volumes legitimately unpacks
+    # to several times that, and this is a zip-bomb guard, not a quota.
+    MAX_EXTRACTED_MB: int = 8192  # zip-bomb cap on an extracted archive, 400
     UPLOAD_CHUNK_MB: int = 8  # default part size, clamped to [1, 64]
     # Idle timeout, not an age limit: every part written and every range read
     # stamps its directory. Bounds how long an uncollected result stays on disk.
@@ -269,6 +344,10 @@ class Settings(BaseSettings):
     # never comes back must still cost this machine nothing by the end of the
     # day, the run holding a staged cohort of patient data the whole time.
     PAUSED_RUN_TTL_SECONDS: int = 14400
+    # How far ahead an operator may push one paused run's deadline from the
+    # admin panel: a review that runs over is given more time, a reader who
+    # never comes back still costs this machine nothing after three days.
+    PAUSED_RUN_MAX_HOLD_SECONDS: int = 259200
     # How often GET /runs/{id}/events tails the file. Small because it is the
     # latency a clinician sees on a progress bar, and cheap because it is one
     # read of the bytes appended since the last poll.
@@ -280,6 +359,21 @@ class Settings(BaseSettings):
     # fill TEMP_DIR; past the cap one "not reported" event is delivered and the
     # rest are dropped, terminal events always excepted.
     MAX_RUN_EVENTS: int = 2000
+    # Runs one workstation may have in flight at once -- registered and not yet
+    # ended, waiting for the card included -- past which POST /run answers 429
+    # before it reads a byte. Every workstation holds the same API token, so
+    # without this one client sending sixty runs filled the queue every other
+    # one waits in. A PAUSED run does not count: it waits for a person and
+    # holds no machine. 0 means no cap.
+    #
+    # 10 is well above what the Slicer client sends: one run per panel at a
+    # time (CONCURRENT_RUNS = 1), and on a workstation an operator set to
+    # parallel batches as many as the budget runs side by side (`max_parallel`
+    # of GET /clients/me, CPUs / CPUs per job). Counted per address as the
+    # server sees it: behind a proxy that is not in FORWARDED_ALLOW_IPS every
+    # workstation IS the proxy, and they share one cap. A benchmark battery an
+    # operator starts is not counted.
+    MAX_RUNS_PER_CLIENT: int = 10
 
 
     @field_validator("SADT_DISPATCH_MODE")

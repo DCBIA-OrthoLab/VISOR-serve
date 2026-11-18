@@ -5,6 +5,17 @@
 # Pinned, the stack keeps one identity wherever it is cloned.
 name: visor-serve
 
+# The log every server service keeps: five files of 20 MB, the oldest dropped.
+# Docker's default json-file driver keeps everything a container ever wrote for
+# as long as it exists, and a server up for months -- an access line per panel
+# poll, every two seconds -- fills the disk TEMP_DIR lives on, where a run then
+# fails to stage its upload for a reason nobody looks for in a log.
+x-bounded-log: &bounded-log
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
 # Shared by the two server services below, which differ only in whether they
 # get the GPU. Two services rather than one, because a compose device
 # reservation is ALL-OR-NOTHING: a service asking for an nvidia device cannot
@@ -13,32 +24,67 @@ name: visor-serve
 # leaves the reservation in place). `inference` stays the default;
 # `inference-cpu` is what scripts/server_ctl.py starts on a machine with no card.
 x-inference-base: &inference-base
-  image: ghcr.io/jules-gp/lab-ai:2026.08
+  # The server image (docker/server.Dockerfile): Python, the API's four
+  # dependencies and the system libraries tool virtualenvs load -- no tool.
+  # Built and published by .github/workflows/server-image.yml. VISOR_SERVER_IMAGE
+  # pins another build, e.g. a local `docker build` or a dated tag.
+  image: ${VISOR_SERVER_IMAGE:-ghcr.io/dcbia-ortholab/visor-serve:main}
   shm_size: 8gb
   working_dir: /workspace/server
+  logging: *bounded-log
   volumes:
+    # See `inference-venvs`: a public certificate, when TLS_CERT_FILE names one.
+    - ./tls:/etc/visor-tls:ro
     - ./server:/workspace/server
     - ./DATA:/data:ro
-  ports:
-    # Unset BIND_ADDR publishes on every interface, which is what a lab GPU
-    # server behind a TLS terminator wants. server_ctl.py writes
-    # BIND_ADDR=127.0.0.1 for a local install instead: that one speaks plain
-    # HTTP, and plain HTTP carrying medical images must not leave the machine.
+    - ./scripts:/workspace/scripts:ro
+    # The checkout's history, read-only, for the admin panel's "Check for
+    # updates": it says which commit is deployed. Nothing in the container can
+    # change it -- pulling is the host's (scripts/update_agent.py).
+    - ./.git:/workspace/.git:ro
+    # The tools, when a deployment has them. Mounted at THEIR OWN PATH, not at
+    # a tidy /tools: each tool is a virtualenv, and a virtualenv's
+    # `pyvenv.cfg` and script shebangs hold absolute paths -- moved anywhere
+    # else, `<venv>/bin/python` no longer finds its own interpreter. Same path
+    # in and out is what makes a host-built venv runnable in here, and it is
+    # the pattern `test-gpu` below has used since the real-data suite landed.
     #
-    # The `:+` form keeps "unset" meaning NO host address rather than the
-    # literal 0.0.0.0: with no address docker publishes on both stacks, while
-    # an explicit 0.0.0.0 is IPv4 only and would silently drop IPv6 clients.
-    # The inner `:-` is not redundant -- without it compose warns "The
-    # BIND_ADDR variable is not set" on every command.
+    # Unset, both of these resolve to the fixtures directory and this is a
+    # no-op: `TOOLS_DIR` falls back to the demos exactly as before, so a
+    # deployment that never passes SADT_TOOLS sees no change at all.
+    - ${SADT_TOOLS:-./docker/fixtures}:${SADT_TOOLS:-/workspace/docker/fixtures}:ro
+    # And the interpreters those virtualenvs point AT. uv installs its own
+    # CPython outside the checkout and symlinks `.venv/bin/python` to it, so
+    # without this every tool's venv is a dangling link and every schema fails
+    # to generate.
+    - ${UV_PYTHON_STORE:-./docker/fixtures}:${UV_PYTHON_STORE:-/workspace/docker/fixtures}:ro
+  ports:
+    # Loopback by default: clients reach the server through a front end on
+    # this machine that presents a publicly signed certificate -- `tailscale
+    # serve`, or a reverse proxy -- and the server's own self-signed one never
+    # leaves it. PUBLISH_ADDR puts the port on a network address instead, for a
+    # server that presents a public certificate ITSELF (TLS_CERT_FILE); the
+    # same value reaches serve.py, which refuses to start published anywhere
+    # but loopback without one (server/serve.py, _exposure_problem).
     #
     # HOST_PORT moves the HOST side only; the container always serves 8000.
-    - "${BIND_ADDR:+${BIND_ADDR:-}:}${HOST_PORT:-8000}:8000"
-  # The install must NOT gate uvicorn. `pip install -r requirements.txt` cannot
-  # succeed offline even when everything is already installed: nnunetv2 ->
-  # batchgenerators -> unittest2 -> argparse, and pip never treats `argparse` as
-  # satisfied because the stdlib module shadows the distribution -- so it
-  # re-downloads that 23 kB wheel on every start. With `&&`, a machine off the
-  # network had a server that started once and never again.
+    - "${PUBLISH_ADDR:-127.0.0.1}:${HOST_PORT:-8000}:8000"
+  # The container's own probe (serve.py --check): it verifies the server
+  # against the certificate file it listens with, from inside, and is what
+  # server_ctl.py waits on before a public URL exists.
+  healthcheck:
+    test: ["CMD-SHELL", "cd /opt/sadt/server 2>/dev/null || cd /workspace/server; for p in /opt/sadt/.venv/bin/python python3 python; do command -v $$p >/dev/null 2>&1 && exec $$p serve.py --check --port 8000; done; exit 1"]
+    interval: 15s
+    timeout: 10s
+    retries: 3
+    start_period: 30m
+  # The image already carries requirements-api.txt, so this install is a
+  # no-op that needs no network -- it only acts when a pull changed the API's
+  # requirements ahead of the image. It must still NOT gate uvicorn: the
+  # previous image installed the whole tool stack here, and that could not
+  # succeed offline (nnunetv2 -> batchgenerators -> unittest2 -> argparse, a
+  # wheel pip never treats as satisfied), so a machine off the network had a
+  # server that started once and never again.
   #
   # A genuinely missing dependency still fails loudly: the `import fastapi,
   # uvicorn` probe separates "pip could not run but everything is here" (warn,
@@ -50,11 +96,11 @@ x-inference-base: &inference-base
   # keeps the newlines of its continuation lines, so a line STARTING with `||`
   # reaches sh as its own command and is a syntax error.
   command: >
-    sh -c "pip install --no-cache-dir --user --retries 1 --timeout 20 -r requirements.txt ||
+    sh -c "pip install --no-cache-dir --user --retries 1 --timeout 20 -r requirements-api.txt ||
            echo 'DEPENDENCY-INSTALL-SKIPPED: pip failed (offline?); continuing with what is already installed' >&2;
            python -c 'import fastapi, uvicorn' ||
            { echo 'DEPENDENCY-INSTALL-FATAL: fastapi is not importable and pip could not install it. This container needs network access once.' >&2; exit 1; };
-           uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
+           python serve.py --host 0.0.0.0 --port 8000 --reload"
   restart: unless-stopped
 
 # Shared by the two test services, which differ only in whether they get the
@@ -62,7 +108,7 @@ x-inference-base: &inference-base
 # command cannot drift between the suite the hook runs and the one a maintainer
 # runs.
 x-test-base: &test-base
-  image: ghcr.io/jules-gp/lab-ai:2026.08
+  image: ${VISOR_SERVER_IMAGE:-ghcr.io/dcbia-ortholab/visor-serve:main}
   profiles: ["test"]
   working_dir: /workspace/server
   volumes:
@@ -75,17 +121,57 @@ x-test-base: &test-base
     # Likewise: the tests check that the image's build fixtures still describe
     # their own source, and that the API requirements stay slim.
     - ./docker:/workspace/docker:ro
+    # And the dev override, which `test_dev_mounts.py` reads to check that no
+    # tool is left frozen in the image. Without it that guard raised
+    # FileNotFoundError here while passing from a checkout -- so the one test
+    # written to catch a silent staleness was itself silently not running.
+    - ./docker-compose.dev.yml:/workspace/docker-compose.dev.yml:ro
   command: >
-    sh -c "pip install --no-cache-dir --user -r requirements.txt -r requirements-dev.txt &&
+    sh -c "pip install --no-cache-dir --user -r requirements-dev.txt &&
            python -m pytest"
 
 services:
   inference:
     <<: *inference-base
     environment:
-      - API_TOKEN=${API_TOKEN:-dev-token}
+      - API_TOKEN=${API_TOKEN:-}
+      # The admin panel and its controls answer only to this. Unset, the panel stays closed.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DATA_DIR=/data
       - DEVICE=${DEVICE:-cuda}
+      # Resolve to the fixtures when SADT_TOOLS is unset, which is the same
+      # deployment this service has always been.
+      - TOOLS_DIR=${SADT_TOOLS:-/workspace/docker/fixtures}/tools
+      - DESCRIBE_PATH=${SADT_TOOLS:-/workspace/docker/fixtures}/scripts/describe.py
+      # The tools mount is read-only, so regenerated schemas need somewhere of
+      # their own to land.
+      - SCHEMA_CACHE_DIR=/tmp/schema-cache
+      # The learned cost table, which is NOT a cache and must not share the
+      # schema cache's /tmp: that goes with the container, and the update agent
+      # recreates the container on every update touching this file, the API's
+      # requirements or the image -- each of which silently put every tool back
+      # to "unmeasured", reserving the whole budget and running alone. In the
+      # bind-mounted checkout instead, beside server/.history and
+      # server/.update, which outlive the container the same way; gitignored,
+      # so the clone stays clean. See COST_TABLE_PATH in server/config.py.
+      - COST_TABLE_PATH=/workspace/server/.costs/tool_costs.json
+      # Which peers uvicorn believes about `X-Forwarded-For`. Its default is
+      # 127.0.0.1, and behind the TLS terminator the README documents the peer
+      # is never that: nginx reaches 127.0.0.1:8000, Docker's proxy forwards it
+      # from the bridge gateway (172.18.0.1 on one deployment), and every run
+      # on the dashboard read as that one address whatever machine sent it.
+      # Docker's default bridge pools are inside 172.16.0.0/12. Trusting them
+      # lets only what reaches the published port speak for a client, and
+      # uvicorn takes the right-most untrusted hop, which nginx appends, so a
+      # client cannot name another machine by sending the header itself.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
+      # How clients reach it (see `ports` and server/serve.py). The
+      # certificate files, when it presents a public one itself, are read
+      # from ./tls, mounted read-only below.
+      - PUBLISH_ADDR=${PUBLISH_ADDR:-127.0.0.1}
+      - PUBLIC_URL=${PUBLIC_URL:-}
+      - TLS_CERT_FILE=${TLS_CERT_FILE:-}
+      - TLS_KEY_FILE=${TLS_KEY_FILE:-}
 
     deploy:
       resources:
@@ -112,9 +198,29 @@ services:
     <<: *inference-base
     profiles: ["cpu"]
     environment:
-      - API_TOKEN=${API_TOKEN:-dev-token}
+      - API_TOKEN=${API_TOKEN:-}
+      # The admin panel and its controls answer only to this. Unset, the panel stays closed.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DATA_DIR=/data
       - DEVICE=cpu
+      # Resolve to the fixtures when SADT_TOOLS is unset, which is the same
+      # deployment this service has always been.
+      - TOOLS_DIR=${SADT_TOOLS:-/workspace/docker/fixtures}/tools
+      - DESCRIBE_PATH=${SADT_TOOLS:-/workspace/docker/fixtures}/scripts/describe.py
+      # The tools mount is read-only, so regenerated schemas need somewhere of
+      # their own to land.
+      - SCHEMA_CACHE_DIR=/tmp/schema-cache
+      # Outside the container's /tmp; see the `inference` service.
+      - COST_TABLE_PATH=/workspace/server/.costs/tool_costs.json
+      # Trusted proxies for `X-Forwarded-For`; see the `inference` service.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
+      # How clients reach it (see `ports` and server/serve.py). The
+      # certificate files, when it presents a public one itself, are read
+      # from ./tls, mounted read-only below.
+      - PUBLISH_ADDR=${PUBLISH_ADDR:-127.0.0.1}
+      - PUBLIC_URL=${PUBLIC_URL:-}
+      - TLS_CERT_FILE=${TLS_CERT_FILE:-}
+      - TLS_KEY_FILE=${TLS_KEY_FILE:-}
 
   # The pytest suite in the same environment as `inference`, without the GPU
   # reservation: asking for a GPU here would make the pre-push hook fail on any
@@ -199,16 +305,36 @@ services:
   # block as `inference`.
   inference-venvs:
     profiles: ["venvs"]
+    logging: *bounded-log
     build:
       context: .
       dockerfile: docker/Dockerfile
       additional_contexts:
         tools: ${TOOLS_CONTEXT:-docker/fixtures}
     environment:
-      - API_TOKEN=${API_TOKEN:-dev-token}
+      - API_TOKEN=${API_TOKEN:-}
+      # The admin panel and its controls answer only to this. Unset, the panel stays closed.
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - DEVICE=${DEVICE:-cuda}
+      # The server's self-signed certificate (server/tls.py), in the cache
+      # volume so it survives a recreate and a pinned client keeps trusting it.
+      # Repeated from the Dockerfile for images built before it said so.
+      - TLS_DIR=/var/cache/sadt/tls
+      # Trusted proxies for `X-Forwarded-For`; see the `inference` service.
+      - FORWARDED_ALLOW_IPS=${FORWARDED_ALLOW_IPS:-172.16.0.0/12}
+      # How clients reach it (see `ports` and server/serve.py). The
+      # certificate files, when it presents a public one itself, are read
+      # from ./tls, mounted read-only below.
+      - PUBLISH_ADDR=${PUBLISH_ADDR:-127.0.0.1}
+      - PUBLIC_URL=${PUBLIC_URL:-}
+      - TLS_CERT_FILE=${TLS_CERT_FILE:-}
+      - TLS_KEY_FILE=${TLS_KEY_FILE:-}
     volumes:
       - sadt-cache:/var/cache/sadt
+      # A publicly signed certificate, when this server presents one itself
+      # (TLS_CERT_FILE=/etc/visor-tls/fullchain.pem in .env). Read-only; the
+      # key must be readable by the container's user (uid 999).
+      - ./tls:/etc/visor-tls:ro
       # Read-only, and outside the image: an image gets copied around, a mount
       # does not.
       - ./DATA:/DATA:ro
@@ -218,10 +344,20 @@ services:
       # could not be configured at all. Mounted over the image's own copy, which
       # stays the default for a deployment that mounts nothing here.
       - ./server/deployment.toml:/opt/sadt/server/deployment.toml:ro
+    # HTTPS only (server/tls.py). Repeated from the Dockerfile's CMD for
+    # images built before it said so, which still start `uvicorn` in the clear.
+    command: ["/opt/sadt/.venv/bin/python", "serve.py", "--host", "0.0.0.0", "--port", "8000"]
     # Port 8001 by default, so it can run beside the in-process server while
-    # the tools are moved over one at a time.
+    # the tools are moved over one at a time. Loopback only, for the same
+    # reason as `inference`: tailscale serve is the only way in.
     ports:
-      - "${BIND_ADDR:+${BIND_ADDR:-}:}${VENVS_HOST_PORT:-8001}:8000"
+      - "${PUBLISH_ADDR:-127.0.0.1}:${VENVS_HOST_PORT:-8001}:8000"
+    healthcheck:
+      test: ["CMD", "/opt/sadt/.venv/bin/python", "serve.py", "--check", "--port", "8000"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 10m
     # Docker gives a container 64 MB, and nnUNet passes data between its
     # export workers through shared memory. Without this AMASSS and
     # Batch_Dental_Seg die with "Background workers died ... your RAM was

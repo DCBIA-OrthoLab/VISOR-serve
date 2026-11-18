@@ -100,6 +100,21 @@ class DataStore(ABC):
                 for name in (self.list_models(tool_name, scope) if kind == "models"
                              else self.list_testfiles(tool_name, scope))]
 
+    # Benchmark inputs, `DATA/<tool>/bench/`: the cases an operator stages to
+    # measure a tool on something harder than its test file. Deliberately NOT
+    # testfiles: a test file can be downloaded by any API token holder
+    # (`GET /tools/{tool}/testfiles/{name}`), and `/run` resolves it by name for
+    # anyone. A bench entry is reachable by neither -- only the benchmark
+    # launcher, behind the admin token, lists it, and only the battery process
+    # on this machine reads it. Defaults rather than abstract, so a backend
+    # with no such folder simply offers none.
+    def describe_bench(self, tool_name: str) -> list:
+        """`[{"name", "kind", "size"}]` for the tool's bench folder."""
+        return []
+
+    def resolve_bench(self, tool_name: str, filename: str) -> ResolvedFile:
+        raise DataNotFoundError(f"No bench input '{filename}' for tool '{tool_name}'")
+
     @abstractmethod
     def resolve_model(self, tool_name: str, filename: str, scope: str = "") -> ResolvedFile:
         ...
@@ -135,6 +150,15 @@ class LocalDataStore(DataStore):
     def resolve_testfile(self, tool_name: str, filename: str, scope: str = "") -> ResolvedFile:
         return ResolvedFile(path=self._resolve(tool_name, "testfiles", filename, scope))
 
+    def describe_bench(self, tool_name: str) -> list:
+        return self.describe(tool_name, "bench")
+
+    def resolve_bench(self, tool_name: str, filename: str) -> ResolvedFile:
+        try:
+            return ResolvedFile(path=self._resolve(tool_name, "bench", filename))
+        except DataNotFoundError:
+            raise DataNotFoundError(f"No bench input '{filename}' for tool '{tool_name}'")
+
     def describe(self, tool_name: str, kind: str, scope: str = "") -> list:
         directory = self._directory(tool_name, kind, scope)
         described = []
@@ -150,10 +174,9 @@ class LocalDataStore(DataStore):
     def _directory(self, tool_name: str, kind: str, scope: str = "") -> str:
         """`DATA/<tool>/<kind>/[<scope>]`.
 
-        The scope comes from deployment.toml, never from a request, so it is
-        not attacker-controlled -- but it is still joined and not interpolated,
-        and `_resolve` below re-checks containment of the final path either
-        way.
+        A scope may come from a request (the test-file download route), so it
+        is untrusted: `_resolve` refuses anything but a bare folder name and
+        checks containment against DATA/<tool>/<kind> itself.
         """
         parts = [self._root, tool_name, kind]
         if scope:
@@ -173,16 +196,30 @@ class LocalDataStore(DataStore):
     def _resolve(self, tool_name: str, kind: str, filename: str, scope: str = "") -> str:
         # First line of defense: filename must be a bare name, not a path
         # (rejects "../../etc/passwd" style traversal before touching disk).
-        if not filename or os.path.basename(filename) != filename:
+        # A leading dot covers "." and ".." -- "." named the whole folder,
+        # handing out every scope zipped -- and the hidden entries `_list`
+        # never offers anyway.
+        if not filename or os.path.basename(filename) != filename or filename.startswith("."):
             raise DataNotFoundError(f"Invalid file name: '{filename}'")
 
+        # The scope is one bare folder name too. It was assumed to come only
+        # from deployment.toml; the test-file download route took it from the
+        # query string, and `scope=../../..` moved the containment anchor below
+        # along with the directory -- reading any file the server can open.
+        if scope and (os.path.basename(scope) != scope or scope in (".", "..")):
+            raise DataNotFoundError(f"Invalid scope: '{scope}'")
+
+        # Anchored on DATA/<tool>/<kind>, never on anything a scope moved.
+        boundary = os.path.realpath(self._directory(tool_name, kind))
         directory = os.path.realpath(self._directory(tool_name, kind, scope))
         candidate = os.path.realpath(os.path.join(directory, filename))
 
         # Second line of defense: a bare name could still resolve outside
-        # `directory` via a symlink planted under DATA_DIR. Confirm the
-        # resolved path stays contained in the expected directory.
-        if os.path.commonpath([directory, candidate]) != directory or not os.path.exists(candidate):
+        # the tool's folder via a symlink planted under DATA_DIR. Confirm the
+        # resolved path stays contained in it.
+        if (os.path.commonpath([boundary, directory]) != boundary
+                or os.path.commonpath([directory, candidate]) != directory
+                or not os.path.exists(candidate)):
             raise DataNotFoundError(f"No such {kind[:-1]} '{filename}' for tool '{tool_name}'")
         return candidate
 

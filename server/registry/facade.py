@@ -57,13 +57,14 @@ class FacadeTool(Tool):
 
     def __init__(self, name: str, targets: dict, arguments: dict,
                  output_kind: str, description: str = "",
-                 batch: Optional[dict] = None):
+                 batch: Optional[dict] = None, paired_batch: Optional[dict] = None):
         self.name = name
         self.targets = dict(targets)
         self.arguments = arguments
         self.output_kind = output_kind
         self.description = description
         self.batch = batch
+        self.paired_batch = paired_batch
         # A facade runs nothing itself, so it has no folder and no interpreter.
         self.folder = None
 
@@ -254,13 +255,22 @@ def compose(name: str, targets: dict, registry: dict) -> FacadeTool:
     # none either. Nothing to declare in deployment.toml for either case.
     plans = [registry[target].batch for target in targets.values()]
     batch = plans[0] if plans and all(plan == plans[0] for plan in plans) else None
+    # A paired plan is per MODE instead: the client knows the mode before it
+    # splits, and asks the pairing of the engine that mode runs. A mode whose
+    # engine declares none is simply absent and travels whole.
+    paired_modes = {
+        mode: getattr(registry[target], "paired_batch", None)
+        for mode, target in targets.items()
+    }
+    paired_modes = {mode: plan for mode, plan in paired_modes.items() if plan}
+    paired_batch = {"by": MODE_ARGUMENT, "modes": paired_modes} if paired_modes else None
 
     logger.info(
         "Facade '%s' composed over %s: %d argument(s)",
         name, ", ".join(f"{mode}={target}" for mode, target in targets.items()),
         len(arguments),
     )
-    return FacadeTool(name, targets, composed, output_kind, batch=batch)
+    return FacadeTool(name, targets, composed, output_kind, batch=batch, paired_batch=paired_batch)
 
 
 def build_facades(registry: dict, configured, for_tool, on_failure=None) -> dict:

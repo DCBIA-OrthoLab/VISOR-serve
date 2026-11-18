@@ -337,6 +337,55 @@ def test_a_broken_schema_is_skipped_and_reported(make_tool_folder):
         registry.FAILED_TOOLS.pop("broken", None)
 
 
+def _declare(folder: str, **keys) -> None:
+    """Give a fixture folder the `[tool.sadt]` section a packaged tool carries."""
+    lines = ["[tool.sadt]", "tool = true", 'name = "{}"'.format(os.path.basename(folder))]
+    lines += ["{} = {}".format(key, value) for key, value in keys.items()]
+    with open(os.path.join(folder, registry.PYPROJECT), "w", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def test_a_tool_declares_its_cost_epoch_in_tool_sadt(make_tool_folder):
+    """What lets a tool's release say "what you learned about my memory no
+    longer holds" -- and the absence of the key, which is every tool today,
+    says the opposite."""
+    _declare(make_tool_folder("alpha"), cost_epoch="3")
+    _declare(make_tool_folder("beta"))
+    make_tool_folder("gamma")  # no pyproject at all
+
+    discovered = dict(registry._discover_schema_tools(make_tool_folder.root))
+
+    assert discovered["alpha"].cost_epoch == 3
+    assert discovered["beta"].cost_epoch == 0
+    assert discovered["gamma"].cost_epoch == 0
+
+
+def test_a_cost_epoch_that_is_not_an_integer_costs_nothing_but_is_said(
+    make_tool_folder, monkeypatch, caplog
+):
+    """The tool still loads, and its learned figures are left exactly as they
+    are: a typo in a cost knob is neither a reason to take a tool away from a
+    clinic nor a statement that its memory changed. Said once per startup,
+    though discovery walks the folders more than once."""
+    _declare(make_tool_folder("alpha"), cost_epoch='"2"')
+    _declare(make_tool_folder("beta"), cost_epoch="true")
+    _declare(make_tool_folder("delta"), cost_epoch="1.5")
+    monkeypatch.setattr(settings, "TOOLS_DIR", make_tool_folder.root)
+
+    try:
+        with caplog.at_level("WARNING", logger="inference_server"):
+            built = registry._build_registry()
+        for name in ("alpha", "beta", "delta"):
+            assert built[name].cost_epoch is None
+            assert name not in registry.FAILED_TOOLS
+            said = [r for r in caplog.records
+                    if "'{}'".format(name) in r.getMessage() and "cost_epoch" in r.getMessage()]
+            assert len(said) == 1
+    finally:
+        for name in ("alpha", "beta", "delta"):
+            registry.FAILED_TOOLS.pop(name, None)
+
+
 def test_a_folder_with_a_schema_is_never_imported(make_tool_folder, monkeypatch):
     """Dropping a .schema.json is what moves a tool off the in-process path."""
     import tools as tools_package

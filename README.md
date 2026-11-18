@@ -35,7 +35,82 @@ supervisor starts the callee in its own interpreter and passes a directory of
 files. The declared call graph is verified at every boot: the server refuses to
 start when a declared callee is not served.
 
-## Running it
+## Installing a server
+
+One command takes a bare Ubuntu machine to a running server: the server image,
+the whole SADT-VISOR tool library as its prebuilt image, every model and test
+file, and Tailscale in front of it. Run it from the directory that should hold
+the deployment (it needs about 60 GB):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-server.sh \
+  | sh -s -- --full --tailscale --auto-update apply \
+      --tools-image ghcr.io/dcbia-ortholab/sadt-visor-tools:latest
+```
+
+What it does on its way, asking before each step that needs sudo:
+
+- **NVIDIA driver.** A card whose driver is missing or too old (below 525, or
+  below 570 for an RTX 50xx) gets the driver Ubuntu recommends; reboot, then
+  run the same command again. A card older than Turing (RTX 20xx) runs on CPU.
+- **Docker** and the **NVIDIA Container Toolkit**, when missing.
+- **Tailscale.** Before running the command, open the Tailscale admin console,
+  Settings > Keys, and generate an auth key. Paste it when asked: the prompt
+  hides it, and it never appears on a command line. The server is then
+  reachable at `https://<name>.<tailnet>.ts.net`, from the tailnet only.
+
+Run again, the same command updates the deployment and keeps its tokens. The
+two tokens a deployment needs are printed by:
+
+```bash
+python3 VISOR-serve/scripts/server_ctl.py token            # for the Slicer client
+python3 VISOR-serve/scripts/server_ctl.py token --admin    # for /server-debug
+```
+
+## Connecting a workstation
+
+A workstation reaches the server through the same tailnet, and membership is
+what decides who can reach the server at all. With an **auth key** — the same
+kind the install above asks for — joining is one command on every platform:
+
+| | Install | Join |
+|---|---|---|
+| Ubuntu | `curl -fsSL https://tailscale.com/install.sh \| sh` | `sudo tailscale up --auth-key <key>` |
+| Windows | the installer from <https://tailscale.com/download> | `tailscale up --auth-key <key> --unattended` |
+| macOS | the **standalone package** from <https://tailscale.com/download> | `tailscale up --auth-key <key>` |
+
+Generate the key in the Tailscale admin console under *Settings > Keys*; it
+looks like `tskey-auth-…`. A reusable key covers a whole set of workstations, so
+one key rolls out a lab. Treat it as a credential — anything holding a valid key
+can join the tailnet — and revoke it there once the rollout is done.
+
+Without a key, `tailscale up` with no argument prints a link instead: open it
+and sign in with the lab's Tailscale account. That is the shorter path for a
+single machine with someone sitting at it, and the only one on a Mac installed
+from the App Store.
+
+Two platform details, because the Ubuntu line does not carry over:
+
+- **macOS** — the App Store build is sandboxed and puts no `tailscale` on
+  `PATH`, so the command above needs the **standalone package**; the App Store
+  build signs in from the menu bar instead, and its command, if you want it,
+  sits inside the bundle at
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale`.
+- **Windows** — `--unattended` is what keeps a workstation on the tailnet while
+  nobody is logged in, which is what a machine left running overnight needs.
+  The flag is Windows-only and does not exist in the Linux build, so it cannot
+  be copied the other way either.
+
+Either way the machine then appears in the admin console, and removing it there
+is how access is withdrawn — nothing changes on the server or in Slicer.
+
+Then, in 3D Slicer, open the Slicer Cloud module and set:
+
+- **URL**: `https://<name>.<tailnet>.ts.net`, as printed at the end of the
+  server install (`tailscale serve status` on the server shows it again);
+- **token**: the API token above, never the admin one.
+
+## Running it by hand
 
 ```bash
 cp .env.example .env          # API_TOKEN, TOOLS_DIR, DATA_DIR, DEVICE

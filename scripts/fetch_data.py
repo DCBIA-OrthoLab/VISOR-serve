@@ -18,13 +18,16 @@ actually uses (see _parse_manifest), not YAML at large.
 """
 
 import argparse
+import contextlib
 import hashlib
+import json
 import os
 import shutil
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 
@@ -171,6 +174,13 @@ def _entries(manifest: dict, kind: str, only_tools) -> list:
             where = f"tool '{tool}', {kind} entry #{index + 1}"
             if "name" not in entry or "url" not in entry:
                 raise ManifestError(f"{where}: both 'name' and 'url' are required")
+            if not _is_https(entry["url"]):
+                raise ManifestError(f"{where}: 'url' must be https://, got {entry['url']!r}")
+            if not entry.get("sha256") and entry.get("unpinned") is not True:
+                # Without a checksum the bytes installed are whatever the URL
+                # serves that day. An entry may only go without one when the
+                # manifest says so, out loud, beside the reason.
+                raise ManifestError(f"{where}: 'sha256' is required (or 'unpinned: true', stated on purpose)")
             if os.path.basename(entry["name"]) != entry["name"] or entry["name"] in ("", ".", ".."):
                 # The name becomes a path under DATA/: a bare file name is the
                 # only thing that cannot escape it.
@@ -181,6 +191,12 @@ def _entries(manifest: dict, kind: str, only_tools) -> list:
                     raise ManifestError(
                         f"{where}: 'dest' must be a relative path inside the tool's folder"
                     )
+            split = entry.get("split")
+            if split is not None:
+                if not isinstance(split, str) or os.path.basename(split) != split or split in ("", ".", ".."):
+                    raise ManifestError(f"{where}: 'split' must be a bare folder-name prefix")
+                if not entry.get("extract"):
+                    raise ManifestError(f"{where}: 'split' needs 'extract: true', a file has no subfolders")
             selected.append({**entry, "tool": tool, "kind": kind})
     return selected
 
@@ -227,12 +243,33 @@ def _target_path(data_dir: str, entry: dict) -> str:
 _LINE_PROGRESS_SECONDS = 3
 
 
+def _is_https(url) -> bool:
+    return isinstance(url, str) and urllib.parse.urlsplit(url).scheme.lower() == "https"
+
+
+class _HttpsOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """Follow a redirect only to another https:// URL: urllib's default also
+    follows one to http:// or ftp://, which would undo the check below."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_https(newurl):
+            raise urllib.error.HTTPError(newurl, code, "refused a redirect to a non-https URL", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_HttpsOnlyRedirects)
+
+
 def _download(url: str, destination: str, progress) -> str:
     """Stream `url` to `destination`, returning the content's sha256."""
+    if not _is_https(url):
+        # Checked here as well as in the manifest: this is the one function
+        # that opens a URL, and file://, ftp:// or http:// have no business in it.
+        raise ManifestError(f"Refusing to download a non-https URL: {url!r}")
     digest = hashlib.sha256()
     request = urllib.request.Request(url, headers=_HEADERS)
     last_report = 0.0
-    with urllib.request.urlopen(request) as response:  # noqa: S310 - https URLs from the manifest
+    with _OPENER.open(request) as response:  # noqa: S310 - https only, redirects included
         total = int(response.headers.get("Content-Length") or 0)
         done = 0
         with open(destination, "wb") as out:
@@ -285,17 +322,145 @@ def _safe_extract(archive: str, destination: str) -> None:
         os.rename(staging, root)
 
 
+def _link_tree(source: str, destination: str) -> None:
+    """Mirror `source` at `destination` with hardlinks, copying where it cannot.
+
+    Built beside the destination and renamed into place, so an interrupted run
+    leaves no half view the next run would report as present.
+    """
+    staging = destination + ".partial"
+    shutil.rmtree(staging, ignore_errors=True)
+
+    def link(src, dst):
+        try:
+            os.link(src, dst)
+        except OSError:
+            # Another filesystem, or one without hardlinks: a copy is correct,
+            # only bigger.
+            shutil.copy2(src, dst)
+
+    try:
+        shutil.copytree(source, staging, copy_function=link)
+        os.rename(staging, destination)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def _split(entry: dict, data_dir: str, force: bool) -> None:
+    """Publish each top-level subfolder of an entry as a view (see `split`).
+
+    Run whether the entry was just fetched or already present: a DATA/ staged
+    before the manifest declared the split is repaired by re-running the fetch,
+    with nothing downloaded.
+    """
+    prefix = entry.get("split")
+    target = _target_path(data_dir, entry)
+    if not prefix or not os.path.isdir(target):
+        return
+    kind_dir = os.path.join(data_dir, entry["tool"], entry["kind"])
+    for sub in sorted(os.listdir(target)):
+        source = os.path.join(target, sub)
+        if sub.startswith(".") or sub == "__MACOSX" or not os.path.isdir(source):
+            continue
+        view = os.path.join(kind_dir, f"{prefix}_{sub}", os.path.basename(target))
+        if os.path.exists(view):
+            if not force:
+                continue
+            shutil.rmtree(view)
+        os.makedirs(os.path.dirname(view), exist_ok=True)
+        _link_tree(source, view)
+        print(f"    -> {os.path.relpath(view, data_dir)}")
+
+
+# What each path under DATA/ was installed from: the sha256 of the downloaded
+# file (of the archive, for an extracted entry). Without it "present" was the
+# only test, so a file replaced upstream under the same name never reached a
+# deployment that already had the old one. Kept at the root of DATA/, which
+# data_store never lists: it only reads DATA/<tool>/<kind>/.
+_STAMPS = ".fetched.json"
+
+
+def _load_stamps(data_dir: str) -> dict:
+    try:
+        with open(os.path.join(data_dir, _STAMPS), encoding="utf-8") as handle:
+            stamps = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return stamps if isinstance(stamps, dict) else {}
+
+
+def _save_stamp(data_dir: str, label: str, sha256: str) -> None:
+    """Record one entry, written beside and renamed over the old file."""
+    stamps = _load_stamps(data_dir)
+    stamps[label] = sha256
+    os.makedirs(data_dir, exist_ok=True)
+    temporary = os.path.join(data_dir, _STAMPS + ".partial")
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(stamps, handle, indent=1, sort_keys=True)
+    os.replace(temporary, os.path.join(data_dir, _STAMPS))
+
+
+def _is_current(entry: dict, target: str, data_dir: str, label: str) -> bool:
+    """Whether what is at `target` is the version the manifest pins.
+
+    An entry with no sha256 pins nothing, so being present is enough. A target
+    installed before the stamps existed has none: a plain file is hashed once
+    and stamped; an extracted folder cannot be hashed back into its archive,
+    so it is taken to be the pinned version and stamped as such -- otherwise
+    every existing deployment would download its whole DATA/ again.
+    """
+    expected = entry.get("sha256")
+    if not expected:
+        return True
+    installed = _load_stamps(data_dir).get(label)
+    if installed is None:
+        installed = expected if entry.get("extract") or os.path.isdir(target) else _sha256_of(target)
+        _save_stamp(data_dir, label, installed)
+    return installed == expected
+
+
+MISSING, OUTDATED, CURRENT = "missing", "outdated", "current"
+
+
+def entry_state(entry: dict, data_dir: str) -> str:
+    """MISSING, OUTDATED or CURRENT, from the stamps alone.
+
+    Cheap enough for a survey every minute: nothing is hashed. A target with no
+    stamp yet reads as CURRENT; the next fetch hashes and stamps it
+    (`_is_current`), and replaces it if it turns out to differ.
+    """
+    target = _target_path(data_dir, entry)
+    if not os.path.exists(target):
+        return MISSING
+    expected = entry.get("sha256")
+    installed = _load_stamps(data_dir).get(os.path.relpath(target, data_dir))
+    if expected and installed is not None and installed != expected:
+        return OUTDATED
+    return CURRENT
+
+
 def _fetch(entry: dict, data_dir: str, force: bool, progress) -> str:
+    """Fetch one entry, then its views. Returns "skipped", "fetched", or raises."""
+    status = _fetch_entry(entry, data_dir, force, progress)
+    # A replaced entry's views still hold the old content: rebuild them.
+    _split(entry, data_dir, force or status == "fetched")
+    return status
+
+
+def _fetch_entry(entry: dict, data_dir: str, force: bool, progress) -> str:
     """Fetch one entry. Returns "skipped", "fetched", or raises."""
     target = _target_path(data_dir, entry)
     label = os.path.relpath(target, data_dir)
 
     if os.path.exists(target) and not force:
-        print(f"  = {label} (already present)")
-        return "skipped"
+        if _is_current(entry, target, data_dir, label):
+            print(f"  = {label} (already present)")
+            return "skipped"
+        print(f"  ~ {label} (changed in the manifest)")
+    else:
+        print(f"  + {label}")
 
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    print(f"  + {label}")
 
     # Downloaded into a scratch folder beside the target and only moved into
     # place once complete and verified. An interrupted run therefore leaves
@@ -329,9 +494,103 @@ def _fetch(entry: dict, data_dir: str, force: bool, progress) -> str:
         if os.path.exists(target):
             shutil.rmtree(target) if os.path.isdir(target) else os.remove(target)
         os.rename(ready, target)
+        _save_stamp(data_dir, label, actual)
         return "fetched"
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# One copy of each file, however many tools list it
+# ---------------------------------------------------------------------------
+
+# Below this a duplicate is not worth hashing: the bytes it would save are
+# fewer than the ones the walk reads to find it.
+_DEDUPE_MIN_BYTES = 1 << 20
+# The link `dedupe` makes beside a file before renaming it over that file:
+# hidden, and named so that nothing else in DATA/ could be mistaken for one.
+_DEDUPE_STAGING = ".dedupe-partial"
+
+
+def _dedupe_staging(path: str) -> str:
+    folder, name = os.path.split(path)
+    return os.path.join(folder, f".{name}{_DEDUPE_STAGING}")
+
+
+def _sha256_of(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(_CHUNK), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dedupe(data_dir: str) -> tuple:
+    """Hardlink every file under `data_dir` to the first identical one.
+
+    Several tools publish the same scans and models in their own releases --
+    the same CBCT pair as five tools' test files, AMASSS's nine structure
+    models under AREG as well -- and each lands in its own `<tool>/<kind>/`
+    tree, because that is where `data_store` looks. Measured on one
+    deployment: 6.5 GB of a 32 GB DATA/ was second copies. A hardlink keeps
+    every tool's path exactly where it was and stores the bytes once.
+
+    Identical means the same size AND the same sha256, never the same name.
+    Safe to share because nothing writes into DATA/ in place: a re-download
+    removes the old file and renames a new one over it (`_fetch_entry`),
+    which leaves the other names on the old bytes. Files on another
+    filesystem are left as they are. Returns `(files relinked, bytes freed)`.
+    """
+    by_size = {}
+    for root, dirs, names in os.walk(data_dir):
+        # Staging folders are another run's work in progress.
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".fetch_") and not d.endswith(".partial"))
+        for name in sorted(names):
+            path = os.path.join(root, name)
+            if name.startswith(".") and name.endswith(_DEDUPE_STAGING):
+                # Left by a run stopped between its link and its rename: a
+                # second name for a kept file, never data. Counted as data it
+                # was hashed after the run below had removed it, and crashed.
+                with contextlib.suppress(OSError):
+                    os.remove(path)
+                continue
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue  # gone since the listing
+            if size >= _DEDUPE_MIN_BYTES:
+                by_size.setdefault(size, []).append(path)
+
+    relinked = freed = 0
+    for size, paths in sorted(by_size.items()):
+        if len(paths) < 2:
+            continue
+        keepers = {}  # sha256 -> the path every identical file is linked to
+        for path in paths:
+            try:
+                keeper = keepers.setdefault(_sha256_of(path), path)
+                if keeper == path:
+                    continue
+                kept, this = os.stat(keeper), os.stat(path)
+            except OSError:
+                continue  # removed or replaced while the walk was running
+            if (kept.st_dev, kept.st_ino) == (this.st_dev, this.st_ino) or kept.st_dev != this.st_dev:
+                continue  # already one file, or another filesystem
+            # Linked beside it and renamed over it: never a moment without
+            # the file, and an interrupted run leaves the original in place.
+            temporary = _dedupe_staging(path)
+            try:
+                os.link(keeper, temporary)
+                os.replace(temporary, path)
+            except OSError:
+                with contextlib.suppress(OSError):
+                    os.remove(temporary)
+                continue
+            relinked += 1
+            freed += size
+    return relinked, freed
 
 
 # ---------------------------------------------------------------------------
@@ -409,7 +668,8 @@ def _list_manifest(manifest: dict, wanted=None) -> None:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Download the server's models / test files into DATA/.",
-        epilog="Files already present are skipped, so re-running is cheap and resumable.",
+        epilog="Files already present are skipped unless the manifest pins another sha256, "
+               "so re-running is cheap, resumable, and picks up a replaced file.",
     )
     parser.add_argument(
         "--kind", choices=KINDS, action="append",
@@ -432,7 +692,17 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--list", action="store_true", help="Show the manifest and exit.")
     parser.add_argument("--force", action="store_true", help="Re-download even if present.")
+    parser.add_argument(
+        "--dedupe", action="store_true",
+        help="Only hardlink identical files already under the data dir, and exit. "
+             "Every fetch does this at its end anyway.",
+    )
     args = parser.parse_args(argv)
+
+    if args.dedupe:
+        relinked, freed = dedupe(os.path.abspath(args.data_dir))
+        print(f"{relinked} duplicate file(s) now share one copy; {_human(freed)} freed.")
+        return 0
 
     try:
         manifest = _parse_manifest(args.manifest)
@@ -495,7 +765,12 @@ def main(argv=None) -> int:
             print(f"  ! FAILED {entry['tool']}/{entry['kind']}/{entry['name']}: {exc}")
             failures.append(entry)
 
-    print(f"\n{counts['fetched']} fetched, {counts['skipped']} already present, {len(failures)} failed.")
+    if counts["fetched"]:
+        relinked, freed = dedupe(data_dir)
+        if relinked:
+            print(f"\n{relinked} duplicate file(s) now share one copy; {_human(freed)} freed.")
+    print(f"\n{counts['fetched']} fetched, {counts['skipped']} already present and current, "
+          f"{len(failures)} failed.")
     if failures:
         print("\nFailed items (re-run to retry just those):")
         for entry in failures:

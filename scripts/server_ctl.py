@@ -36,10 +36,12 @@ import secrets
 import shutil
 import socket
 import ssl
+import signal
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -279,7 +281,7 @@ def compose_base(service: str):
 ENV_PATH = os.path.join(REPO_ROOT, ".env")
 
 # Keys docker-compose.yml interpolates. Anything else in the file is left alone.
-_ENV_KEYS = ("API_TOKEN", "DEVICE", "BIND_ADDR", "HOST_PORT")
+_ENV_KEYS = ("API_TOKEN", "ADMIN_TOKEN", "DEVICE", "BIND_ADDR", "HOST_PORT")
 _ENV_BANNER = "# Written by scripts/server_ctl.py. This file is gitignored - keep it that way."
 
 
@@ -328,18 +330,10 @@ def write_env(updates: dict, path=ENV_PATH) -> None:
         for key, value in remaining.items():
             output.append(f"{key}={value}")
 
-    # The API token is in here. The file is created owner-only (mode 0600 passed
-    # to open(2), so there is no moment at the umask's 0644); an existing file is
-    # tightened before the token is written into it. A filesystem without POSIX
-    # modes (a Windows bind mount) simply ignores the mode.
-    text = "\n".join(output).rstrip("\n") + "\n"
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        try:
-            os.fchmod(handle.fileno(), 0o600)
-        except (OSError, AttributeError):
-            pass
-        handle.write(text)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("\n".join(output).rstrip("\n") + "\n")
+    # The API token is in here. Owner-only, best effort: a filesystem without
+    # POSIX modes (a Windows bind mount) simply ignores it.
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -361,26 +355,84 @@ def effective_port() -> int:
 
 
 def url_for(port=None, bind_addr=None) -> str:
-    """Where this deployment answers, seen from the machine running it.
+    """Where this deployment answers: its public `https://<name>.ts.net` URL.
 
-    `localhost` is right when the port is published on loopback or on EVERY
-    interface. It is wrong when it is published on one specific address, which
-    is exactly what `--bind <vpn address>` is for: the port is then simply not
-    on 127.0.0.1, so a health check against localhost polls an address nothing
-    listens on and reports a perfectly healthy server as dead.
+    The ONLY address anything outside the container talks to, this script
+    included: it presents a publicly signed certificate, and that is the only
+    kind any client here verifies against. The port uvicorn listens on is
+    published on 127.0.0.1 alone, for `tailscale serve`, with a self-signed
+    certificate nobody else trusts. "" when this machine publishes no such URL
+    yet -- a first start, before setup-tailscale.sh -- which callers read as
+    "cannot reach it through the front door" (see wait_for_health).
 
-    Read from `.env` rather than passed around, so every caller agrees without
-    having to thread the value through. `cmd_up` calls `ensure_env` first, so
-    what is read here is already the binding the container is about to get.
+    `port` and `bind_addr` are accepted and ignored: callers still pass them.
     """
-    if bind_addr is None:
-        bind_addr = read_env().get("BIND_ADDR", "127.0.0.1")
-    host = "localhost"
-    # "" and 0.0.0.0/:: all mean "every interface", and loopback is included in
-    # that -- so localhost stays the right thing to talk to.
-    if bind_addr and bind_addr not in ("127.0.0.1", "localhost", "0.0.0.0", "::"):
-        host = f"[{bind_addr}]" if ":" in bind_addr else bind_addr
-    return f"http://{host}:{port or effective_port()}"
+    return public_url()
+
+
+def public_url() -> str:
+    """The https URL clients are given: PUBLIC_URL from .env, else Tailscale's.
+
+    PUBLIC_URL names whatever presents the public certificate -- a reverse
+    proxy, or the server itself with TLS_CERT_FILE -- and Tailscale is the
+    fallback, not the requirement. An http:// value is not an address any
+    client accepts, so it is not returned.
+    """
+    configured = read_env().get("PUBLIC_URL", "").strip().rstrip("/")
+    if configured:
+        return configured if configured.startswith("https://") else ""
+    return tailnet_url()
+
+
+def tailnet_url() -> str:
+    """The https URL `tailscale serve` publishes on this machine, or ""."""
+    if not shutil.which("tailscale"):
+        return ""
+    try:
+        listing = subprocess.run(["tailscale", "serve", "status"], capture_output=True,
+                                 text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for word in listing.split():
+        if word.startswith("https://"):
+            return word.rstrip("/").split(" ")[0]
+    return ""
+
+
+def tls_context(url: str) -> ssl.SSLContext:
+    """How to verify the server at `url`: against the PUBLIC authorities, always.
+
+    No certificate is trusted on sight, none is pinned, and no custom
+    authority is accepted, whatever the address: the server is reached through
+    `tailscale serve`, whose certificate a public authority signed, and nothing
+    else is something a client may trust. An `http://` URL is refused
+    outright, whatever its host, so nothing here can send a token in the clear.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https":
+        raise ValueError(f"The server only speaks HTTPS; refusing {parsed.scheme or 'a schemeless'} URL.")
+    return ssl.create_default_context()
+
+
+def pinned_context(cafile: str) -> ssl.SSLContext:
+    """Native backend: trust `cafile` alone, the certificate the server really serves.
+
+    The same context as `tls.loopback_context` in server/tls.py (pinned file, no
+    host name check, partial chains), repeated here because that module imports
+    the server's settings (pydantic) and this script is standard library only.
+    test_server_ctl_native.py asserts the two stay equal.
+    """
+    context = ssl.create_default_context(cafile=cafile)
+    context.check_hostname = False
+    context.verify_flags |= getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    return context
+
+
+def server_urlopen(target, timeout: float):
+    """`urllib.request.urlopen` for this server: HTTPS, verified (tls_context)."""
+    url = target.full_url if isinstance(target, urllib.request.Request) else target
+    # The URL is this server's own https address.
+    return urllib.request.urlopen(target, timeout=timeout, context=tls_context(url))  # nosec B310
 
 
 def ensure_env(service: str, bind_addr=None, token=None, port=None) -> str:
@@ -406,6 +458,12 @@ def ensure_env(service: str, bind_addr=None, token=None, port=None) -> str:
     if bind_addr is None:
         bind_addr = existing.get("BIND_ADDR", "127.0.0.1")
     updates = {"API_TOKEN": api_token, "BIND_ADDR": bind_addr, "HOST_PORT": str(port or effective_port())}
+    # The admin panel's own token, distinct from the one every workstation
+    # holds. Left empty, the panel is DISABLED, and a fresh install used to be
+    # left exactly so, with nothing saying how to turn it on. Generated once
+    # and kept, like the API token; `token --admin` prints it.
+    if not existing.get("ADMIN_TOKEN"):
+        updates["ADMIN_TOKEN"] = secrets.token_urlsafe(32)
     if service == GPU_SERVICE:
         updates["DEVICE"] = existing.get("DEVICE") or "cuda"
     write_env(updates)
@@ -605,10 +663,18 @@ def container_status(service: str) -> dict:
         return info
 
     info["exists"] = True
-    rc, state, err = _capture(["docker", "inspect", "--format", "{{.State.Status}}", container], timeout=30)
+    rc, state, err = _capture(
+        ["docker", "inspect", "--format",
+         "{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", container],
+        timeout=30)
     if rc == 0:
-        info["state"] = state
-        info["running"] = state == "running"
+        status, _sep, healthcheck = state.strip().partition(" ")
+        info["state"] = status
+        info["running"] = status == "running"
+        # The container's own healthcheck (`serve.py --check`): it verifies
+        # the server against the certificate file it listens with, from inside
+        # the container. What says "up" before a public URL exists.
+        info["healthy"] = healthcheck.strip() == "healthy"
     else:
         info["error"] = err or "docker inspect failed"
     return info
@@ -636,9 +702,17 @@ def health(url=None, timeout: float = 5.0, cafile=None) -> bool:
     `verify=False`). Without it the call is what it always was.
     """
     url = url or url_for()
+    if not url:
+        return False
     try:
-        context = ssl.create_default_context(cafile=cafile) if cafile else None
-        with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=timeout, context=context) as response:
+        target = f"{url.rstrip('/')}/health"
+        if cafile:
+            # Native backend: the pinned local certificate, nothing else.
+            opened = urllib.request.urlopen(  # nosec B310 - this server's own loopback URL
+                target, timeout=timeout, context=pinned_context(cafile))
+        else:
+            opened = server_urlopen(target, timeout=timeout)
+        with opened as response:
             if response.status != 200:
                 return False
             return json.loads(response.read().decode("utf-8")).get("status") == "ok"
@@ -658,12 +732,18 @@ def wait_for_health(url: str, timeout: int, service: str) -> bool:
     killed just before it would have worked.
     """
     deadline = time.monotonic() + timeout
-    log(f"Waiting for {url}/health (up to {timeout // 60} min)...")
+    # With no public URL yet there is nothing a client may verify, so the
+    # container's own healthcheck is what is waited on instead.
+    where = f"{url}/health" if url else f"the '{service}' container's healthcheck"
+    log(f"Waiting for {where} (up to {timeout // 60} min)...")
     while time.monotonic() < deadline:
-        if health(url):
-            log("The server is up.")
-            return True
         state = container_status(service)
+        if health(url) if url else state.get("healthy"):
+            log("The server is up.")
+            if not url:
+                log("It has no public URL yet: run scripts/setup-tailscale.sh, the only way "
+                    "a client can reach it.")
+            return True
         # "restarting" belongs here with the dead states: `restart:
         # unless-stopped` turns a container that fails at boot into a loop, and
         # a loop never becomes healthy - without this the caller waited out the
@@ -695,7 +775,7 @@ def wait_for_health(url: str, timeout: int, service: str) -> bool:
             cmd_logs_tail(service, 40)
             return False
         time.sleep(HEALTH_POLL_SECONDS)
-    log(f"Still no answer from {url}/health after {timeout}s. Last log lines:")
+    log(f"Still no answer from {where} after {timeout}s. Last log lines:")
     cmd_logs_tail(service, 40)
     return False
 
@@ -712,7 +792,7 @@ def warn_if_deps_skipped(service: str) -> bool:
     """Say so when the container started without re-running its dependency install.
 
     Harmless in the offline case it exists for - everything was already
-    installed - but it is the one state where a change to requirements.txt has
+    installed - but it is the one state where a change to requirements-api.txt has
     NOT taken effect while the server looks perfectly healthy. That has to be
     visible rather than buried in `docker compose logs`.
     """
@@ -723,7 +803,7 @@ def warn_if_deps_skipped(service: str) -> bool:
         return False
     log(
         "NOTE: the dependency install did not run this start (no network?). The server is up "
-        "on the packages already in its container. If you just changed requirements.txt, it "
+        "on the packages already in its container. If you just changed requirements-api.txt, it "
         "has NOT taken effect - re-run 'update' with the network available."
     )
     return True
@@ -751,6 +831,20 @@ def _load_fetch_data():
 
 def data_dir() -> str:
     return os.path.join(REPO_ROOT, "DATA")
+
+
+def ensure_tls_dir() -> str:
+    """Create ./tls before docker can, for the same reason as DATA/.
+
+    It is mounted read-only as /etc/visor-tls and holds a publicly signed
+    certificate only when the operator puts one there (TLS_CERT_FILE).
+    """
+    root = os.path.join(REPO_ROOT, "tls")
+    try:
+        os.makedirs(root, mode=0o755, exist_ok=True)
+    except OSError as exc:
+        raise ServerCtlError(f"Could not create {root}: {exc}") from None
+    return root
 
 
 def ensure_data_dir() -> str:
@@ -892,22 +986,25 @@ GHOST_AFTER_SECONDS = 900
 BUSY_STATES = ("pending", "running")
 
 
-def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0):
+def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0, admin: bool = False):
     """One JSON request to the server, or None if it could not be made.
 
     None is deliberately not distinguished from an error: every caller below
     treats "I could not ask" and "the answer was no" the same way, which is to
     not proceed with an update. Raising here would only move that decision.
+
+    `admin` sends `token` as the operator's admin token (X-Admin-Token)
+    instead of a Bearer API token: the two never travel together.
     """
     request = urllib.request.Request(
         f"{url.rstrip('/')}{path}",
-        headers={"Authorization": f"Bearer {token}"},
+        headers={ADMIN_HEADER: token} if admin else {"Authorization": f"Bearer {token}"},
     )
     if payload is not None:
         request.data = json.dumps(payload).encode("utf-8")
         request.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with server_urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
@@ -920,11 +1017,20 @@ def _api(url: str, token: str, path: str, payload=None, timeout: float = 10.0):
         return None
 
 
-def set_accepting(url: str, token: str, accepting: bool,
+# POST /maintenance is an operator's act: authenticated by ADMIN_TOKEN, which
+# no workstation holds (server/wire/security.py).
+ADMIN_HEADER = "X-Admin-Token"
+
+
+def set_accepting(url: str, admin_token: str, accepting: bool,
                   seconds: int = GATE_LEASE_SECONDS, reason: str = ""):
-    """Open or close the server's door. Returns its answer, or None."""
-    return _api(url, token, "/maintenance",
-                {"accepting": accepting, "seconds": seconds, "reason": reason})
+    """Open or close the server's door. Returns its answer, or None -- which
+    is also the answer when no admin token is known, or the server has none
+    (403) or refuses this one (401)."""
+    if not admin_token:
+        return None
+    return _api(url, admin_token, "/maintenance",
+                {"accepting": accepting, "seconds": seconds, "reason": reason}, admin=True)
 
 
 def server_load(url: str, token: str):
@@ -1031,7 +1137,9 @@ def cmd_status(args) -> dict:
         "service": service,
         "clone": clone,
         "container": container_status(service),
-        "server": {"url": url, "healthy": health(url)},
+        # `public_url`: the only address a client may be given (url_for).
+        # "" until PUBLIC_URL is set or setup-tailscale.sh has run.
+        "server": {"url": url, "public_url": public_url(), "healthy": health(url)},
         # Deliberately no token here: a status dump lands in log panes and bug
         # reports. `server_ctl.py token` is the one way to read it.
         "env": {
@@ -1045,11 +1153,12 @@ def cmd_status(args) -> dict:
     }
 
 
-def cmd_token(_args) -> dict:
-    token = read_env().get("API_TOKEN")
+def cmd_token(args) -> dict:
+    key = "ADMIN_TOKEN" if getattr(args, "admin", False) else "API_TOKEN"
+    token = read_env().get(key)
     if not token:
         raise ServerCtlError(
-            f"No API_TOKEN in {ENV_PATH}. Run 'server_ctl.py up' - it generates one."
+            f"No {key} in {ENV_PATH}. Run 'server_ctl.py up' - it generates one."
         )
     return {"token": token}
 
@@ -1108,11 +1217,36 @@ def _preflight(service: str, port=None) -> None:
         )
 
 
+def warn_if_tailscale_serves_http(port: int) -> bool:
+    """Say so when `tailscale serve` still forwards to plain http:// here.
+
+    An older setup-tailscale.sh published `http://127.0.0.1:PORT`. The server
+    has no plain-HTTP listener any more (server/tls.py), so every remote client
+    of such a machine gets a 502 while the local health check passes. Fixing it
+    needs root, so this only says how.
+    """
+    if not shutil.which("tailscale"):
+        return False
+    try:
+        listing = subprocess.run(["tailscale", "serve", "status"], capture_output=True,
+                                 text=True, timeout=10, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    stale = any(f"http://127.0.0.1:{port}" in line or f"http://localhost:{port}" in line
+                for line in listing.splitlines())
+    if stale:
+        log(f"WARNING: `tailscale serve` forwards to http://127.0.0.1:{port}, which this server "
+            "no longer answers: remote clients get an error. Re-run, as root: "
+            f"sh {os.path.join(_SCRIPT_DIR, 'setup-tailscale.sh')} --port {port}")
+    return stale
+
+
 def cmd_up(args) -> dict:
     service = pick_service(args.device)
     port = args.port or effective_port()
     _preflight(service, port)
     ensure_data_dir()
+    ensure_tls_dir()
     token = ensure_env(service, args.bind, token=args.token, port=port)
     # After ensure_env, so a --port lands in .env before the URL is derived
     # from it -- compose and the health check must not read different ports.
@@ -1135,7 +1269,7 @@ def cmd_up(args) -> dict:
 
     command = compose_base(service) + ["up", "-d"]
     if args.force_recreate:
-        # Not cosmetic: the container installs requirements.txt as part of its
+        # Not cosmetic: the container installs requirements-api.txt as part of its
         # *command*, into a writable layer that survives `restart`. Only a
         # fresh container re-resolves them. See CLAUDE.md, 2026-07-31.
         command.append("--force-recreate")
@@ -1145,10 +1279,12 @@ def cmd_up(args) -> dict:
 
     healthy = wait_for_health(url, args.timeout, service) if args.wait else False
     deps_skipped = warn_if_deps_skipped(service) if healthy else False
+    warn_if_tailscale_serves_http(port)
     return {
         "deps_install_skipped": deps_skipped,
         "service": service,
         "url": url,
+        "public_url": public_url(),
         "healthy": healthy,
         "token": token,
         "data_dir": data_dir(),
@@ -1159,8 +1295,8 @@ def cmd_update(args) -> dict:
     """Fetch, fast-forward if there is something to fast-forward to, relaunch.
 
     "Relaunch" is `up -d --force-recreate` rather than `restart` for the reason
-    in CLAUDE.md: the container pip-installs requirements.txt in its command,
-    into a layer `restart` keeps. A new requirements.txt that is never
+    in CLAUDE.md: the container pip-installs requirements-api.txt in its command,
+    into a layer `restart` keeps. A new requirements-api.txt that is never
     re-resolved is a silent no-op update, which is worse than a failed one.
     """
     service = pick_service(args.device)
@@ -1204,8 +1340,10 @@ def cmd_update(args) -> dict:
     # --- the container half -----------------------------------------------
     _preflight(service, port)
     up_to_date = not result["pulled"] and not result["switched_branch"]
-    running = container_status(service)["running"]
-    if up_to_date and running and health(url) and not args.force:
+    current = container_status(service)
+    running = current["running"]
+    answering = health(url) if url else current.get("healthy")
+    if up_to_date and running and answering and not args.force:
         log("Nothing to update and the server is answering. Leaving it alone.")
         result["healthy"] = True
         return result
@@ -1216,6 +1354,7 @@ def cmd_update(args) -> dict:
     result["pulled_image"] = True
 
     ensure_data_dir()
+    ensure_tls_dir()
     ensure_env(service, args.bind)
     if _stream(compose_base(service) + ["up", "-d", "--force-recreate", service], cwd=REPO_ROOT) != 0:
         raise ServerCtlError(f"'docker compose up --force-recreate' failed for service '{service}'.")
@@ -1281,6 +1420,16 @@ def cmd_watch(args) -> dict:
             "No API_TOKEN in the .env, so this cannot ask the server to stop taking "
             "work before it restarts it. Run 'up' first, or set one."
         )
+    # The door is closed with the operator's token, not the API one. Without
+    # it an update would restart the server under runs it never stopped
+    # admitting, so applying is refused here rather than at the first update.
+    args.admin_token = (getattr(args, "admin_token", None) or os.environ.get("ADMIN_TOKEN")
+                        or read_env().get("ADMIN_TOKEN") or "")
+    if mode == AUTO_UPDATE_APPLY and not args.admin_token:
+        raise ServerCtlError(
+            "No ADMIN_TOKEN in the .env, so this cannot close the server to new runs "
+            "before it restarts it. Run 'up' once to generate one, or pass --admin-token."
+        )
 
     log(f"Watching {branch} every {args.poll}s in '{mode}' mode. "
         f"The server is at {url}.")
@@ -1343,9 +1492,11 @@ def _watch_once(branch: str, url: str, service: str, token: str, args,
         return {"head": local}
 
     # Shut the door only now. Everything above happened with it open.
-    gate = set_accepting(url, token, False, GATE_LEASE_SECONDS, f"updating to {remote[:9]}")
+    admin_token = getattr(args, "admin_token", "") or ""
+    gate = set_accepting(url, admin_token, False, GATE_LEASE_SECONDS, f"updating to {remote[:9]}")
     if gate is None:
-        log("The server would not take the maintenance request; not updating.")
+        log("The server would not take the maintenance request; not updating." + (
+            "" if admin_token else " No ADMIN_TOKEN in the .env: the door cannot be closed without it."))
         return {"head": local}
     if gate.get("unsupported"):
         log("This server has no maintenance endpoint (it predates it). Updating "
@@ -1371,7 +1522,85 @@ def _watch_once(branch: str, url: str, service: str, token: str, args,
         # On every path out, including the ones above that return early. The
         # lease is the backstop for this process being killed, not for it
         # taking a branch it forgot to clean up after.
-        set_accepting(url, token, True)
+        set_accepting(url, admin_token, True)
+
+
+# ---------------------------------------------------------------------------
+# The update agent
+# ---------------------------------------------------------------------------
+#
+# scripts/update_agent.py, kept running beside the server so the admin panel
+# can apply updates and download data in one click. Started by `up` and
+# `update` themselves, so nobody has to remember it; detached from this shell,
+# so it outlives the ssh session that started it. Not a system service: a
+# reboot stops it until the next `up` or `update`, and the panel says so --
+# its own "Check for updates" needs no agent at all.
+
+AGENT_SCRIPT = os.path.join(_SCRIPT_DIR, "update_agent.py")
+AGENT_PID = os.path.join(REPO_ROOT, "server", ".update", "agent.pid")
+AGENT_LOG = os.path.join(REPO_ROOT, "update_agent.log")
+
+
+def agent_pid():
+    """The running agent's pid, or None."""
+    try:
+        with open(AGENT_PID, encoding="utf-8") as handle:
+            pid = int(handle.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            if b"update_agent.py" not in handle.read():
+                return None
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def ensure_agent() -> dict:
+    """Start the agent unless it is already running. Never raises."""
+    pid = agent_pid()
+    if pid:
+        return {"running": True, "pid": pid, "started": False}
+    if not os.path.isfile(AGENT_SCRIPT):
+        return {"running": False, "error": "scripts/update_agent.py is missing"}
+    env = dict(os.environ)
+    # uv, which the agent runs to rebuild a tool's environment, is usually in
+    # ~/.local/bin -- on PATH in a login shell, not always in this one.
+    env["PATH"] = os.pathsep.join([os.path.expanduser("~/.local/bin"), env.get("PATH", "")])
+    try:
+        with open(AGENT_LOG, "a", encoding="utf-8") as log_file:
+            process = subprocess.Popen([sys.executable, AGENT_SCRIPT], cwd=REPO_ROOT, env=env,
+                                       stdin=subprocess.DEVNULL, stdout=log_file,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+    except OSError as exc:
+        return {"running": False, "error": str(exc)}
+    log(f"Update agent started (pid {process.pid}); its log is {AGENT_LOG}.")
+    return {"running": True, "pid": process.pid, "started": True}
+
+
+def stop_agent() -> dict:
+    pid = agent_pid()
+    if not pid:
+        return {"running": False, "stopped": False}
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        return {"running": True, "stopped": False, "error": str(exc)}
+    return {"running": False, "stopped": True, "pid": pid}
+
+
+def cmd_agent(args) -> dict:
+    if args.stop:
+        return stop_agent()
+    return ensure_agent()
+
+
+def _with_agent(command):
+    """`up` and `update`, followed by making sure the agent runs."""
+    def wrapped(args):
+        result = command(args)
+        if not getattr(args, "no_agent", False):
+            result["agent"] = ensure_agent()
+        return result
+    return wrapped
 
 
 def cmd_down(args) -> dict:
@@ -1384,6 +1613,224 @@ def cmd_down(args) -> dict:
     # panel's button means.
     rc = _stream(compose_base(service) + ["stop", service], cwd=REPO_ROOT)
     return {"service": service, "stopped": rc == 0}
+
+
+# ---------------------------------------------------------------------------
+# uninstall - take this deployment down to nothing but what it should keep
+# ---------------------------------------------------------------------------
+
+# What `uninstall` keeps lands beside the clone, at <clone>.kept/, and
+# setup-server.sh looks there when it clones into the same place again: the
+# API token comes back (every Slicer pointed at this server keeps working) and
+# so does DATA/ (tens of GB that need not travel twice).
+KEPT_SUFFIX = ".kept"
+# The compose file's own default, for a deployment whose .env never set one.
+DEFAULT_SERVER_IMAGE = "ghcr.io/dcbia-ortholab/visor-serve:main"
+# The entries of a .env that are a deployment's identity rather than its
+# shape: the next install generates the rest, and must not inherit a stale
+# COMPOSE_FILE or a tools path that no longer exists.
+_KEPT_ENV_KEYS = ("API_TOKEN", "ADMIN_TOKEN")
+
+
+def kept_dir(repo_root: str = None) -> str:
+    return os.path.normpath(repo_root or REPO_ROOT) + KEPT_SUFFIX
+
+
+def _tree_size(path: str) -> int:
+    """Bytes on disk, each hardlinked file once: fetch_data links identical
+    files across tools, and counting every name overstated DATA/ twofold."""
+    total, seen = 0, set()
+    for root, _dirs, names in os.walk(path, onerror=lambda _error: None):
+        for name in names:
+            try:
+                info = os.lstat(os.path.join(root, name))
+            except OSError:
+                continue
+            if (info.st_dev, info.st_ino) not in seen:
+                seen.add((info.st_dev, info.st_ino))
+                total += info.st_size
+    return total
+
+
+def _is_this_clone(repo_root: str) -> bool:
+    """True only for a directory that is unmistakably a server clone.
+
+    The one check between `uninstall` and an `rmtree` of the wrong place: a
+    clone has its history, this script, and the compose file it drives -- and
+    is neither the filesystem root nor a home directory.
+    """
+    root = os.path.realpath(repo_root)
+    if root in ("/", os.path.realpath(os.path.expanduser("~"))):
+        return False
+    return all(os.path.exists(os.path.join(root, part))
+               for part in (".git", os.path.join("scripts", "server_ctl.py"), "docker-compose.yml"))
+
+
+def uninstall_plan(repo_root: str = None, remove_data: bool = False,
+                   remove_tools_clone: bool = False) -> dict:
+    """Everything `uninstall` would do, decided without touching anything.
+
+    Images are only the ones THIS deployment names -- its server image and its
+    tools image -- never a prune: the machine may run other containers whose
+    images are not ours to remove. The tools clone is only listed for removal
+    when asked: SADT_TOOLS may be a developer's own working checkout.
+    """
+    repo_root = os.path.normpath(repo_root or REPO_ROOT)
+    env = read_env(os.path.join(repo_root, ".env"))
+    data = os.path.join(repo_root, "DATA")
+    plan = {
+        "clone": repo_root,
+        "kept": kept_dir(repo_root),
+        "images": [image for image in (env.get("VISOR_SERVER_IMAGE") or DEFAULT_SERVER_IMAGE,
+                                       env.get("SADT_TOOLS_IMAGE")) if image],
+        "keep_env": [key for key in _KEPT_ENV_KEYS if env.get(key)],
+        "data": None,
+        "tools_clone": None,
+        "tools_clone_kept": None,
+    }
+    if os.path.isdir(data) and os.listdir(data):
+        plan["data"] = {"path": data, "bytes": _tree_size(data),
+                        "action": "remove" if remove_data else "keep"}
+    tools = env.get("SADT_TOOLS")
+    if tools and os.path.isdir(os.path.join(tools, ".git")) \
+            and not os.path.realpath(tools).startswith(os.path.realpath(repo_root) + os.sep):
+        if remove_tools_clone:
+            plan["tools_clone"] = tools
+        else:
+            plan["tools_clone_kept"] = tools
+    return plan
+
+
+def _print_uninstall_plan(plan: dict) -> None:
+    log(f"Server clone to remove:     {plan['clone']}")
+    for image in plan["images"]:
+        log(f"Image to remove:            {image}")
+    if plan["data"]:
+        size = plan["data"]["bytes"] / 1e9
+        if plan["data"]["action"] == "remove":
+            log(f"Data to remove:             {plan['data']['path']} ({size:.1f} GB)")
+        else:
+            log(f"Data to keep:               {plan['data']['path']} ({size:.1f} GB) -> {plan['kept']}/DATA")
+    if plan["keep_env"]:
+        log(f"Kept for the next install:  {', '.join(plan['keep_env'])} -> {plan['kept']}/.env")
+    if plan["tools_clone"]:
+        log(f"Tools clone to remove:      {plan['tools_clone']}")
+    if plan["tools_clone_kept"]:
+        log(f"Tools clone left alone:     {plan['tools_clone_kept']} (pass --tools-clone to remove it)")
+
+
+def _remove_tree(path: str, failures: list) -> None:
+    """rmtree that reports what it could not remove instead of stopping.
+
+    A deployment's tree holds files the docker daemon created as root (a
+    DATA/ the bind mount made, a job folder); the user cannot delete those,
+    and a half-removed clone is worse than one that names what is left.
+    """
+    def record(_function, failed_path, _exc_info):
+        failures.append(failed_path)
+
+    shutil.rmtree(path, onerror=record)
+
+
+def cmd_uninstall(args) -> dict:
+    repo_root = os.path.normpath(getattr(args, "repo_root", None) or REPO_ROOT)
+    if not _is_this_clone(repo_root):
+        raise ServerCtlError(f"{repo_root} does not look like a server clone; refusing to remove it.")
+    kept = kept_dir(repo_root)
+    if os.path.exists(os.path.join(kept, "DATA")) and not args.data:
+        # A second uninstall would otherwise stop half-way, with the clone's
+        # DATA/ unable to move onto the one already kept.
+        raise ServerCtlError(
+            f"{kept}/DATA already holds data from an earlier uninstall. Reinstall first (it moves that "
+            f"data back), or move it aside, or pass --data to remove this clone's data instead."
+        )
+    plan = uninstall_plan(repo_root, remove_data=args.data, remove_tools_clone=args.tools_clone)
+    _print_uninstall_plan(plan)
+    if args.dry_run:
+        return {"dry_run": True, **plan}
+    if not args.yes:
+        if not sys.stdin.isatty():
+            raise ServerCtlError("Nothing removed: confirm with --yes when not at a terminal.")
+        answer = input("Remove all of the above? Type 'yes' to go on: ").strip().lower()
+        if answer != "yes":
+            raise ServerCtlError("Nothing removed.")
+
+    warnings = []
+    # 1. What must survive goes first, before anything is deleted.
+    os.makedirs(kept, exist_ok=True)
+    os.chmod(kept, 0o700)
+    env = read_env(os.path.join(repo_root, ".env"))
+    if plan["keep_env"]:
+        kept_env = os.path.join(kept, ".env")
+        with open(kept_env, "w", encoding="utf-8") as handle:
+            handle.write("# Kept by `server_ctl.py uninstall`; setup-server.sh restores it.\n")
+            for key in plan["keep_env"]:
+                handle.write(f"{key}={env[key]}\n")
+        os.chmod(kept_env, 0o600)
+    server_env = os.path.join(repo_root, "server", ".env")
+    if os.path.isfile(server_env):
+        shutil.copy2(server_env, os.path.join(kept, "server.env"))
+        os.chmod(os.path.join(kept, "server.env"), 0o600)
+    # The deployment's own post-update checks (update_agent.py's smoke.json).
+    smoke = os.path.join(repo_root, "server", ".update", "smoke.json")
+    if os.path.isfile(smoke):
+        shutil.copy2(smoke, os.path.join(kept, "smoke.json"))
+    if plan["data"] and plan["data"]["action"] == "keep":
+        try:
+            os.rename(plan["data"]["path"], os.path.join(kept, "DATA"))  # same filesystem: instant
+        except OSError as exc:
+            # Still nothing removed: stopping here leaves a working deployment.
+            raise ServerCtlError(
+                f"Could not move {plan['data']['path']} aside ({exc.strerror}); nothing was removed. "
+                f"If docker created it as root: sudo chown -R $(id -u):$(id -g) {plan['data']['path']}"
+            ) from None
+
+    # 2. This deployment's containers -- found by the directory compose
+    # started them from, NOT by project name. Every clone called VISOR-serve
+    # is compose project "visor-serve", so `compose down --remove-orphans`
+    # from here would also take down another checkout's containers on the same
+    # machine; the working-directory label names this clone and nothing else.
+    removed_containers = []
+    if _which("docker"):
+        rc, out, err = _capture(["docker", "ps", "-a", "-q", "--filter",
+                                 f"label=com.docker.compose.project.working_dir={repo_root}"])
+        for container in out.split() if rc == 0 else []:
+            rc, _out, err = _capture(["docker", "rm", "-f", container], timeout=120)
+            if rc == 0:
+                removed_containers.append(container)
+            else:
+                warnings.append(f"container {container} kept: {err.splitlines()[-1] if err else rc}")
+    # The updater would otherwise wake in a directory that is gone.
+    if _which("systemctl"):
+        _capture(["systemctl", "--user", "stop", "visor-update.service"], timeout=30)
+
+    # 3. The images this deployment named. One still used elsewhere is left.
+    removed_images = []
+    if _which("docker"):
+        for image in plan["images"]:
+            rc, _out, err = _capture(["docker", "image", "rm", image], timeout=300)
+            if rc == 0:
+                removed_images.append(image)
+            elif "No such image" not in err:
+                warnings.append(f"image {image} kept: {err.splitlines()[-1] if err else rc}")
+
+    # 4. The trees.
+    failures = []
+    if plan["tools_clone"]:
+        _remove_tree(plan["tools_clone"], failures)
+    _remove_tree(repo_root, failures)
+    if failures:
+        top = sorted({path for path in failures})[:5]
+        warnings.append(
+            f"{len(failures)} path(s) could not be removed (created by docker as root?), e.g. "
+            f"{', '.join(top)}. Remove the rest with: sudo rm -rf {repo_root}"
+        )
+    for warning in warnings:
+        log(f"warning: {warning}")
+    log(f"Uninstalled. Kept for the next install: {kept}")
+    return {"removed_clone": not os.path.exists(repo_root), "removed_containers": removed_containers,
+            "removed_images": removed_images,
+            "kept": kept, "warnings": warnings, **plan}
 
 
 def cmd_logs(args) -> dict:
@@ -1509,15 +1956,12 @@ def _print_catalog(data: dict) -> None:
 def _add_tls_arguments(sub) -> None:
     sub.add_argument(
         "--tls-cert", default=None,
-        help="Native backend: serve https with this PEM certificate (with --tls-key; loopback only). "
-             "Remembered in .env.")
+        help="Native backend: serve this PEM certificate (with --tls-key; loopback only) instead of "
+             "the one the server generates. Remembered in .env as TLS_CERT_FILE.")
     sub.add_argument(
         "--tls-key", default=None,
         help="Native backend: the private key for --tls-cert. Must be owner-only (0600). "
-             "Remembered in .env as a path; its content is never read into a log.")
-    sub.add_argument(
-        "--no-tls", action="store_true",
-        help="Native backend: forget the remembered certificate and serve plain http again.")
+             "Remembered in .env as TLS_KEY_FILE, a path; its content is never read into a log.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1552,7 +1996,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
         if with_url:
             sub.add_argument("--url", default=None,
-                             help="Where to health-check. Default: http://localhost:<HOST_PORT>.")
+                             help="Where to health-check. Default: https://localhost:<HOST_PORT>.")
 
     status = subparsers.add_parser("status", help="Report every prerequisite, the clone, and the container.")
     add_common(status)
@@ -1562,7 +2006,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     status.set_defaults(func=cmd_status, printer=_print_status)
 
-    token = subparsers.add_parser("token", help="Print this deployment's API token.")
+    token = subparsers.add_parser(
+        "token", help="Print this deployment's API token, the one every workstation is configured with.")
+    token.add_argument("--admin", action="store_true",
+                       help="Print the admin panel's token instead. It controls the whole server "
+                            "(updates, shutdown, benchmarks): keep it out of shared logs.")
     token.set_defaults(func=cmd_token, printer=lambda result: print(result["token"]))
 
     up = subparsers.add_parser("up", help="Generate .env if needed and start the server.")
@@ -1586,7 +2034,8 @@ def build_parser() -> argparse.ArgumentParser:
     up.add_argument("--no-wait", dest="wait", action="store_false", help="Return without waiting for /health.")
     _add_tls_arguments(up)
     up.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
-    up.set_defaults(func=cmd_up, printer=None)
+    up.add_argument("--no-agent", action="store_true", help="Do not start the update agent.")
+    up.set_defaults(func=_with_agent(cmd_up), printer=None)
 
     update = subparsers.add_parser("update", help="Pull new commits and relaunch if anything changed.")
     add_common(update)
@@ -1598,7 +2047,12 @@ def build_parser() -> argparse.ArgumentParser:
     _add_tls_arguments(update)
     update.add_argument("--tool", action="append", help="Native backend: only rebuild this tool's venv.")
     update.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
-    update.set_defaults(func=cmd_update, printer=None)
+    update.add_argument("--no-agent", action="store_true", help="Do not start the update agent.")
+    update.set_defaults(func=_with_agent(cmd_update), printer=None)
+
+    agent = subparsers.add_parser("agent", help="Start the update agent the admin panel uses (or --stop it).")
+    agent.add_argument("--stop", action="store_true", help="Stop it instead.")
+    agent.set_defaults(func=cmd_agent, printer=None)
 
     watch = subparsers.add_parser(
         "watch",
@@ -1623,6 +2077,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Override SADT_AUTO_UPDATE for this invocation. "
                             "Default: whatever the environment or the .env says, "
                             "and 'off' when neither says anything.")
+    watch.add_argument("--admin-token", default=None,
+                       help="What closes the server to new runs during an update. "
+                            "Default: ADMIN_TOKEN from the environment, else the .env. "
+                            "Never printed.")
     watch.add_argument("--once", action="store_true",
                        help="Check once and exit, instead of looping. What a timer "
                             "or a cron entry calls, and what the tests drive.")
@@ -1631,6 +2089,18 @@ def build_parser() -> argparse.ArgumentParser:
     down = subparsers.add_parser("down", help="Stop the server container.")
     add_common(down, with_url=False)
     down.set_defaults(func=cmd_down, printer=None)
+
+    uninstall = subparsers.add_parser(
+        "uninstall",
+        help="Remove this deployment: its container, its images and this clone. The API token and "
+             "DATA/ are kept beside the clone, at <clone>.kept/, for setup-server.sh to restore.")
+    uninstall.add_argument("--data", action="store_true",
+                           help="Remove DATA/ too instead of keeping it.")
+    uninstall.add_argument("--tools-clone", action="store_true",
+                           help="Remove the tools clone SADT_TOOLS points at too.")
+    uninstall.add_argument("--dry-run", action="store_true", help="Say what would go, remove nothing.")
+    uninstall.add_argument("--yes", action="store_true", help="Do not ask for confirmation.")
+    uninstall.set_defaults(func=cmd_uninstall, printer=None)
 
     logs = subparsers.add_parser("logs", help="Show the last lines of the server log.")
     add_common(logs, with_url=False)
@@ -1700,9 +2170,9 @@ def main(argv=None) -> int:
         handler = server_ctl_native.HANDLERS[args.command]
         args.func = lambda a, _fn=handler[0]: _fn(sys.modules[__name__], a)
         args.printer = handler[1]
-    elif getattr(args, "tls_cert", None) or getattr(args, "tls_key", None) or getattr(args, "no_tls", False):
-        log("error: --tls-cert/--tls-key/--no-tls belong to the native backend (add --native). "
-            "The Docker deployment serves plain http.")
+    elif getattr(args, "tls_cert", None) or getattr(args, "tls_key", None):
+        log("error: --tls-cert/--tls-key belong to the native backend (add --native). "
+            "The Docker deployment takes TLS_CERT_FILE/TLS_KEY_FILE from .env.")
         return 1
 
     try:

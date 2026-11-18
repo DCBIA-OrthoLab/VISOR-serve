@@ -201,6 +201,11 @@ def create_upload(filename: str, size: int, chunk_size: Optional[int] = None) ->
     return session
 
 
+# The largest part the server ever hands out, and so the most a part request
+# may carry once inflated.
+MAX_CHUNK_BYTES = 64 * 1024 * 1024
+
+
 def _clamped_chunk_size(requested: Optional[int]) -> int:
     """The client may ask for a part size; the server decides.
 
@@ -208,10 +213,10 @@ def _clamped_chunk_size(requested: Optional[int]) -> int:
     too-large one gives the parallelism nothing to work with -- one 2 GB part
     is the single-stream transfer this module exists to replace.
     """
-    default = settings.UPLOAD_CHUNK_MB * 1024 * 1024
+    default = min(settings.UPLOAD_CHUNK_MB * 1024 * 1024, MAX_CHUNK_BYTES)
     if not requested:
         return default
-    return max(1024 * 1024, min(int(requested), 64 * 1024 * 1024))
+    return max(1024 * 1024, min(int(requested), MAX_CHUNK_BYTES))
 
 
 def get_upload(upload_id: str) -> UploadSession:
@@ -258,9 +263,13 @@ def write_part(session: UploadSession, index: int, data: bytes, sha256: Optional
 
     file_descriptor = os.open(session.blob_path, os.O_WRONLY)
     try:
+        # Through a memoryview: slicing a bytearray copies it, so a short
+        # write's retry -- and the first write, for `data[0:]` -- would hold
+        # the part twice.
+        view = memoryview(data)
         written = 0
-        while written < len(data):
-            written += os.pwrite(file_descriptor, data[written:], offset + written)
+        while written < len(view):
+            written += os.pwrite(file_descriptor, view[written:], offset + written)
     finally:
         os.close(file_descriptor)
 

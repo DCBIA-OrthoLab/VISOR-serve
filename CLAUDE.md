@@ -240,6 +240,8 @@ re-enters the same file with the sibling's interpreter, so chaining and nesting
 │   ├── setup-server.sh      #   curl-pipeable: clone, check docker, start
 │   ├── install-docker.sh    #   Docker Engine + compose plugin (Linux, root)
 │   ├── install-docker-gpu.sh#   ... plus the NVIDIA container toolkit
+│   ├── install-nvidia-driver.sh # the recommended NVIDIA driver (Ubuntu, root)
+│   ├── check-gpu.sh         #   can the tools use this GPU (driver, compute capability)
 │   ├── server_ctl.py        #   the deployment engine: status/up/update/down/catalog/models
 │   ├── setup-models.sh      #   curl-pipeable entry points
 │   ├── setup-testfiles.sh
@@ -464,7 +466,7 @@ dependency on when the next request arrives.
   - **core** - `API_TOKEN`, `DEVICE`, `TEMP_DIR`, `DATA_DIR`, `DATA_BACKEND`.
   - **running a tool** - `SADT_DISPATCH_MODE`, `TOOLS_DIR`, `RUNNER_PATH`,
     `DESCRIBE_PATH`, `SCHEMA_CACHE_DIR`, `DEPLOYMENT_CONFIG`, `SADT_API`,
-    `MAX_CONCURRENT_TOOLS`, `MAX_CONCURRENT_GPU_JOBS`, `TOOL_TIMEOUT_SECONDS`.
+    `MAX_CONCURRENT_GPU_JOBS`, `TOOL_TIMEOUT_SECONDS`.
   - **uploads and results** - `MAX_UPLOAD_MB`, `MAX_EXTRACTED_MB`,
     `UPLOAD_CHUNK_MB`, `TRANSFER_TTL_SECONDS`, `TRANSFER_SWEEP_SECONDS`,
     `RESULT_REFERENCE_MIN_MB`, `ZIP_COMPRESSLEVEL`, `ALLOWED_EXTENSIONS`.
@@ -568,9 +570,189 @@ Provide a small, generic client mirroring the server:
 
 Already implemented, despite earlier versions of this list: real GPU inference,
 out-of-process execution, and in-process parallelism (tool runs execute
-concurrently in worker threads, capped by `MAX_CONCURRENT_TOOLS`).
+concurrently in worker threads, gated by admission alone).
 
 ## Changelog
+
+### 2026-10-07 - MAX_CONCURRENT_TOOLS is gone; admission alone decides
+
+Eight workstations each sending one AREG CBCT run at the same second left a
+production server with 103 GB of RAM free and a load of 5 on 56 cores, while
+the seventh and eighth runs sat in `staging` for minutes. They were not
+staging: they were waiting for one of the six `MAX_CONCURRENT_TOOLS` slots,
+a wait that emitted no phase of its own. A count of jobs cannot describe a
+machine, which is why admission budgets bytes and cores; the slot was a
+second, coarser queue in front of it.
+
+The setting is removed. Tool runs still go to worker threads of their own,
+`_get_tool_threads()`, now an unbounded `CapacityLimiter`: a run waits for
+admission INSIDE its thread, so on anyio's default pool a deep queue would
+starve staging, uploads and `/status`. A waiting run costs one idle thread.
+`_tool_slot` became `_batch_turn`, which keeps the serial-cohort gate and its
+priority bypass; the priority race against the slot went with the slot.
+`GET /clients/me` answers `max_parallel` from the CPU budget
+(`cpus // cpus_per_job`). A `MAX_CONCURRENT_TOOLS` left in an `.env` is
+ignored (`extra="ignore"`).
+
+### 2026-10-06 - A tool can log, a chain has one bar, and a failure says where
+
+Three gaps, all on the path between a tool and the people watching it.
+
+**A tool had no way to address anyone.** `sup.log(message)` went to stderr at
+INFO, which nobody reads, and no tool called it. It is now
+`sup.log(message, level="info", user=False)`: one record in the run's events
+file, `{"kind": "log", "level", "audience"}`. `admin` lines (the default) reach
+the operator console redacted; `user` lines reach the client's stream ONLY when
+it asks with `?logs=user`, because the Slicer client released before this
+treats every event as progress and would blank its bar on one and show an
+operator's line to the clinician. Log lines are counted apart from
+`MAX_RUN_EVENTS` and can claim no phase. The supervisor's own narration moved
+to `_say`, stderr only, so the tool's voice is not buried under its mechanics.
+One-argument `sup.log` keeps working, which is what a dozen fakes in
+SADT-VISOR's tests rely on.
+
+**A chain's bar restarted at every level.** ASO's bar ran 0..0.2, then
+ALI_CBCT's own 0..1, then 0.6..1. `sup.run(tool, ..., _progress=(start, end))`
+gives a call its span of the caller's bar; the runner takes it out of the
+params like `output_dir` and puts it on the call's markers, which also carry a
+per-call id (`SADT_PROGRESS_CALL`, `"1"`, `"1.2"`) that every record of that
+process is stamped with. `wire/runs._ProgressTree` folds the records as it
+reads them, so `fraction` on the wire is the outermost weighted level's
+position and only moves forward; `own_fraction` keeps the record's own. A chain
+nobody weighted reads byte for byte as it did, which is what kept every
+existing test green. A tool's untagged `progress.py` line is attributed to the
+one open call, and left alone when two are open.
+
+**An operator could not tell why a run failed.** The page showed `failed` and
+nothing else; the 500 path logged the tool's raw message, file names included.
+The runner now records an `origin` with the error -- tool, chain, error type,
+the line in the tool's own `src/`, the last stage it reported -- relayed
+unchanged by every level above, so a failure three calls down names the leaf.
+`main._diagnosis` turns it into a redacted record kept in the run ledger,
+shown at the top of the run dialog and as the console's last line, and logged
+as one redacted line in place of the raw message. `redact.scrub` replaces
+paths, data file names, addresses and letter-digit identifiers by their kind;
+it over-redacts on purpose.
+
+The other two repositories follow on branches of the same name: SADT-VISOR's
+`progress.py` stamps `call` and gains `progress.log`, every orchestrator gives
+its nested calls a `_progress` span, and every tool's failures name the item,
+the step and the cause; the Slicer client asks for `?logs=user` and shows the
+lines in a Messages pane.
+
+### 2026-10-06 - A channel may bring its own cores
+
+`cores_per_channel` in `deployment.toml`: each channel of the tool reserves a
+whole per-job share of cores and opens that many threads, where every other
+tool's channels split one share. Off by default, because a channel of ALI_CBCT
+or AMASSS costs card memory and its CPU work is a slice of the run's threads.
+
+AREG_CBCT is the first to declare it, with `width_from = "regions"`. Its
+channel is one elastix registration, and elastix scales with the threads it is
+given -- one region of the test pair: 97 s on ten threads, 43 s on fifty-six,
+while elastix's own `NumberOfThreads` changes nothing (1, 8 and 10 give the
+same time and the same transform on eight validated cases). Dividing ten
+threads between two registrations gained nothing (182-203 s each); giving each
+its own ten does: two regions 210 s -> 130 s. The regions bound the
+reservation, since the subjects of two paired folders cannot be counted before
+the tool pairs them.
+
+### 2026-10-05 - A nested call is admitted like a run of its own
+
+A tool calling another through `sup.run` used to run the callee inside its own
+reservation. Two costs followed. The root reserved its whole chain's worst case
+for the whole run -- AREG held its segmentation step's card through an hour of
+CPU registration -- and a callee could never be wider than the share it
+inherited, however empty the machine was.
+
+**`execution/nested.py`: one admission desk per root run.** A Unix socket in
+the job directory, with a key only the run's processes hold. Before starting a
+child, the supervisor names the child's `job.json` and blocks; the desk prices
+the child with the same `_shapes`/`_demand_for` an HTTP run of that tool gets,
+queues it in the same `Budget`, and answers with the environment the child is
+started with (width, threads, room). **The connection is the reservation**:
+closed when the child returns, or by the kernel when a process dies, so nothing
+can leak past the process that held it. Children stay in the root's process
+group, so one `killpg` still stops a whole chain. Without a desk -- a tool run
+outside a server, or one the server does not serve -- a child runs inside its
+parent's room exactly as before.
+
+**Admission rules for nested calls**, each one pinned by a reproduction:
+
+- It is judged against everything OUTSIDE its own chain: the idle escape,
+  "an unmeasured job is running" and `solo` ignore its ancestors. An unmeasured
+  child holds the whole machine minus its parents.
+- It queues ahead of everything, the deepest first, then HIGH, then normal.
+  HIGH now means "the next run to START": a HIGH run that does not fit,
+  queued ahead of a running chain's child, froze that chain for good.
+- Any nested call that fits goes, not only the head: a shallower call can be
+  waiting for the very chain a deeper one would finish.
+- **The breaker.** When every run holding room outside a chain is itself a
+  parent waiting for a queued child, nothing can ever free room, and the head
+  nested call is admitted anyway. Two 4 GiB chains on 10 GiB each calling a
+  3 GiB child deadlocked without it; parents blocked in `sup.run` are idle, so
+  the overcommit is in the budget, not on the machine.
+
+**Each tool is measured for itself.** The parent's sampler leaves the admitted
+child's process subtree out, an admitted child samples only its own subtree,
+`RUSAGE_CHILDREN` and the card fallback are dropped once a child was admitted,
+and nothing is folded. The desk records the child under its OWN name; the
+parent reports `nested_admitted` and `costs.record(own_only=True)` clears its
+window once, the old figures holding its worst child too. Tool progress records
+carry no depth and the whole chain writes one file, so a level now tells its
+own records from its callees' by byte offset: read by depth alone the root
+took its callee's width (AREG was recorded at AMASSS's two channels) and the
+callee found none.
+
+**Measured on a real AREG -> ASO -> ALI_CBCT chain, occlusal orientation,
+alone, three runs each, old and new code alternated:** 354.6 +/- 1.0 s ->
+337.1 +/- 3.2 s (-5 %). Nearly all of it is AMASSS, 77.2 -> 57.8 s at two
+channels; ALI_CBCT at six channels is 2.5 s SLOWER than at one (27.5 -> 30.0
+s), and AREG's own registration does not move. A single earlier run at 547 s
+had been taken as the baseline and overstated the gain sevenfold. The gain
+that matters is under load: a chain no longer reserves its worst step for its
+whole life, and three AREG launched 20 s apart went from the third waiting
+~115 s to 34 s once loans landed (one demo each, not a controlled measure).
+Two chains at once: 390 s and 422 s, nested calls queueing behind each other
+and none stuck. Learned per tool: AREG alone 14.5 GiB of host and no card (its
+card was its children's), ASO 2.2 GiB, ALI_CBCT 0.83 GiB of card per channel
+over 6.
+
+**A waiting parent LENDS what it does not use.** AREG reserves 17.5 GiB and
+10 cores for its own registration and, blocked in `sup.run`, occupies a few
+hundred MB and one core. The supervisor sends what its level occupies with each
+request (`holding`); the parent's reservation minus that, minus what it has
+already lent, covers the call first, and only the rest is asked of the machine.
+Nothing is taken back: the parent keeps its whole reservation, the loan returns
+when the call ends, so there is no re-admission to wait for. A parent that says
+nothing lends nothing; an unmeasured call borrows nothing.
+
+**A second adversarial review**, of the loans, found five more, all fixed:
+
+- a loan skipped the card's REAL free memory: `_card_has_room` was asked about
+  the net demand, so a call whose VRAM the loan covered was admitted onto a
+  card another process had filled. It is asked about the gross demand now;
+- a stream of small calls from other chains kept a big one at the head for as
+  long as they ran, and everything behind it. A call may pass the head only
+  with what the head does not need: nothing at all on a resource the head is
+  short of;
+- a level killed by the out-of-memory killer closed its socket and released
+  its child's reservation while the child, in the root's group, ran on.
+  Nothing in a run's group outlives the run now, and a nested call that times
+  out or raises is killed with its whole subtree;
+- a call NOT admitted had its width records excluded from its parent's, while
+  its peak was still folded in: the parent was recorded too wide;
+- a parent's reported holding left out the CUDA context (about 0.5 GiB), and a
+  level with another call already in flight still lent as if idle. It lends
+  nothing then.
+
+**Not done:** an out-of-memory in a child is not retried on its own. Width
+records are attributed by where they sit in the shared progress file, which
+assumes one writer at a time per chain; per-level ids in a tool's own progress
+records would remove that, and are a change to the tools.
+
+**Tests:** 1182 server (+31), including the four deadlocks an adversarial
+review reproduced; the two between chains hang without the breaker.
 
 ### 2026-09-21 - Three tools faster, a model with an intercept, and three regressions of my own
 
@@ -1667,7 +1849,7 @@ table, a RAM watchdog, killing nnUNet processes a crashed scan left behind, a
 "free memory" button, a cool-down between scans, restoring the queue from disk.
 All of it exists because the widget runs inside Slicer on a clinician's laptop
 and has to survive being out of memory. Here the queue is a folder argument,
-concurrency is `MAX_CONCURRENT_TOOLS` plus a GPU semaphore, and a failure is an
+concurrency is admission plus a GPU semaphore, and a failure is an
 exception. None of it is ported.
 
 **Four models, and they do not label the same things.** DentalSegmentator and
@@ -2089,9 +2271,8 @@ argument is `required=False`, with cross-argument rules raised as
 `ToolArgumentError` **before** any file is read.
 
 The call into the landmark tool is **in-process, not HTTP to our own /run/ALI**:
-a tool run holds one of `MAX_CONCURRENT_TOOLS` slots for its whole duration, so
-four concurrent ASO runs each waiting on a fifth slot would deadlock the
-server, `/health` included. `Tool.invoke` is the same entry point `main.py`
+a tool run holds its admission for its whole duration, so concurrent ASO runs
+each waiting on room for an inner run would deadlock the server. `Tool.invoke` is the same entry point `main.py`
 uses, validation included.
 
 **Fully-Automated IOS takes already-segmented meshes only** (crown segmentation

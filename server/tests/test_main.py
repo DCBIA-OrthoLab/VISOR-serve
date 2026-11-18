@@ -8,6 +8,9 @@ import gzip
 import io
 import json
 import os
+import secrets
+import shutil
+import threading
 import zipfile
 
 # Set before importing main, so config.Settings() picks up a known token
@@ -1055,6 +1058,16 @@ def test_presentation_hints_are_validated_at_startup():
         "an empty label": {"opt": base.ArgSpec(type=str, label="   ")},
         "a non-string label": {"opt": base.ArgSpec(type=str, label=3)},
         "ui on a non-multichoice": {"opt": base.ArgSpec(type=str, ui="tabs")},
+        "required_when expecting a value outside the choices": {
+            "mode": mode,
+            "opt": base.ArgSpec(type=str, required_when={"mode": "MRI"}),
+        },
+        "required_when on an argument the tool does not declare": {
+            "opt": base.ArgSpec(type=str, required_when={"absent": "CBCT"})
+        },
+        "a check-box layout on a single choice": {
+            "opt": base.ArgSpec(type="choice", choices={"a": True, "b": False}, ui="tabs")
+        },
         "unknown layout": {"opt": base.ArgSpec(ui="carousel", **picks)},
         "grouped layout without groups": {"opt": base.ArgSpec(ui="tabs", **picks)},
         "groups without a grouped layout": {
@@ -1093,6 +1106,34 @@ def test_presentation_hints_are_validated_at_startup():
             ),
         }
     ).check_schema()
+
+
+def test_a_single_choice_may_be_drawn_as_segments():
+    """AREG's data organisation: two layouts of equal standing, both on screen."""
+    import base
+
+    tool = type("T", (base.Tool,), {
+        "name": "t",
+        "arguments": {"layout": base.ArgSpec(
+            type="choice", choices={"per type": True, "per patient": False}, ui="segmented")},
+        "run": lambda self: None,
+    })()
+    tool.check_schema()
+
+
+def test_an_input_may_be_required_in_one_layout_only():
+    """AREG's T1: required with one folder per type, unused with one per patient."""
+    import base
+
+    tool = type("T", (base.Tool,), {
+        "name": "t",
+        "arguments": {
+            "layout": base.ArgSpec(type="choice", choices={"type": True, "patient": False}),
+            "t1": base.ArgSpec(type=str, required=False, required_when={"layout": "type"}),
+        },
+        "run": lambda self: None,
+    })()
+    tool.check_schema()
 
 
 def test_tools_exposes_presentation_hints():
@@ -1438,17 +1479,18 @@ def test_a_single_file_tool_returning_several_paths_is_a_failure(monkeypatch, tm
 
 
 def test_a_single_named_output_is_streamed(monkeypatch, tmp_path):
-    scratch = file_utils.make_scratch_dir(prefix="named_output_")
-    produced = os.path.join(scratch, "result.nii.gz")
-    with open(produced, "wb") as handle:
-        handle.write(b"segmentation")
-
     class OneFile(Tool):
         name = "one_file_probe"
         arguments = {}
         output_kind = "file"
 
         def run(self):
+            # Inside the run, as a tool does: a directory made before the
+            # request is not one of its own, and is refused (test below).
+            scratch = file_utils.make_scratch_dir(prefix="named_output_")
+            produced = os.path.join(scratch, "result.nii.gz")
+            with open(produced, "wb") as handle:
+                handle.write(b"segmentation")
             return {"outputs": {"mandible": produced}}
 
     monkeypatch.setitem(registry.TOOLS, "one_file_probe", OneFile())
@@ -1457,6 +1499,50 @@ def test_a_single_named_output_is_streamed(monkeypatch, tmp_path):
 
     assert response.status_code == 200
     assert response.content == b"segmentation"
+
+
+def test_an_output_outside_the_runs_own_directories_is_refused_and_left_alone(monkeypatch):
+    """A tool naming another run's file used to get it streamed back -- and its
+    directory deleted afterwards."""
+    elsewhere = file_utils.make_scratch_dir(prefix="another_run_")
+    victim = os.path.join(elsewhere, "their_scan.nii.gz")
+    with open(victim, "wb") as handle:
+        handle.write(b"someone else")
+
+    class Thief(Tool):
+        name = "thief_probe"
+        arguments = {}
+        output_kind = "file"
+
+        def run(self):
+            return victim
+
+    monkeypatch.setitem(registry.TOOLS, "thief_probe", Thief())
+    response = client.post("/run/thief_probe", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert response.status_code == 500
+    assert b"someone else" not in response.content
+    assert os.path.exists(victim), "another run's directory must survive"
+    shutil.rmtree(elsewhere, ignore_errors=True)
+
+
+def test_a_symbolic_link_in_an_output_folder_is_not_followed(monkeypatch, tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("server secret")
+
+    class Linker(Tool):
+        name = "linker_probe"
+        arguments = {}
+        output_kind = "files"
+
+        def run(self):
+            folder = file_utils.make_scratch_dir(prefix="linker_")
+            os.symlink(str(secret), os.path.join(folder, "innocent.txt"))
+            return folder
+
+    monkeypatch.setitem(registry.TOOLS, "linker_probe", Linker())
+    response = client.post("/run/linker_probe", headers={"Authorization": f"Bearer {TOKEN}"})
+    assert response.status_code == 500
+    assert b"server secret" not in response.content
 
 
 # ---------------------------------------------------------------------------
@@ -1662,6 +1748,126 @@ def test_the_data_listing_says_what_each_entry_is_and_costs(monkeypatch, tmp_pat
     assert described["cohort"] == {"name": "cohort", "kind": "folder", "size": 300}
     assert described["scan.nii.gz"] == {"name": "scan.nii.gz", "kind": "file", "size": 42}
     assert body["entries"]["models"] == []
+
+
+def test_the_gzip_check_runs_off_the_event_loop(monkeypatch, tmp_path):
+    """It gunzips the whole input -- 5 s for a clinical CBCT -- and on the
+    event loop that froze every other request for as long: eight runs arriving
+    together staged one after another and stalled each other's uploads."""
+    import asyncio
+    import main
+
+    seen = []
+    real = main._reject_a_truncated_gzip
+
+    def checked(*args):
+        try:
+            asyncio.get_running_loop()
+            seen.append("event loop")
+        except RuntimeError:
+            seen.append("worker thread")
+        return real(*args)
+
+    class _Probe(Tool):
+        name = "Gzip_Thread_Probe"
+        arguments = {"scan": ArgSpec(type="path")}
+        output_kind = "text"
+
+        def run(self, scan):
+            return "ok"
+
+    monkeypatch.setitem(registry.TOOLS, "Gzip_Thread_Probe", _Probe())
+    monkeypatch.setattr(main, "_reject_a_truncated_gzip", checked)
+    response = client.post(
+        "/run/Gzip_Thread_Probe",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+        files={"scan": ("scan.nii.gz", io.BytesIO(gzip.compress(b"volume" * 100)),
+                        "application/gzip")},
+    )
+    assert response.status_code == 200, response.text
+    assert seen == ["worker thread"]
+
+
+def _calls_on_the_loop(monkeypatch, *targets):
+    """Record every call to `targets` -- (owner, attribute) pairs -- made on
+    the event loop that serves this test's request, the thread `_run_tool`
+    runs on, and on no other thread."""
+    import main
+    loop_thread, seen = [], []
+    real_run_tool = main._run_tool
+
+    async def run_tool(*args, **kwargs):
+        loop_thread.append(threading.get_ident())
+        return await real_run_tool(*args, **kwargs)
+
+    def spy(name, real):
+        def recorded(*args, **kwargs):
+            if threading.get_ident() in loop_thread:
+                seen.append(name)
+            return real(*args, **kwargs)
+        return recorded
+
+    monkeypatch.setattr(main, "_run_tool", run_tool)
+    for owner, attribute in targets:
+        monkeypatch.setattr(owner, attribute, spy(attribute, getattr(owner, attribute)))
+    return seen
+
+
+def _deletions_on_the_loop(monkeypatch):
+    return _calls_on_the_loop(monkeypatch, (shutil, "rmtree"), (os, "remove"))
+
+
+@pytest.mark.parametrize("watched", [False, True], ids=["no run id", "with a run id"])
+def test_a_refused_runs_inputs_are_deleted_off_the_event_loop(monkeypatch, watched):
+    """Deleting a staged CBCT costs ~105 ms a gigabyte; on the event loop that
+    froze every other request -- uploads, /status, the panel -- for as long.
+    A watched run's directory goes the same way, and so does its ending."""
+
+    class _Probe(Tool):
+        name = "Delete_Thread_Probe"
+        arguments = {"fixed_image": ArgSpec(type="file", required=True),
+                     "moving_image": ArgSpec(type="file", required=True)}
+        output_kind = "text"
+
+        def run(self, fixed_image, moving_image):
+            return "unused"
+
+    monkeypatch.setitem(registry.TOOLS, _Probe.name, _Probe())
+    seen = _deletions_on_the_loop(monkeypatch)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    if watched:
+        headers["X-Run-Id"] = secrets.token_urlsafe(24)
+    response = client.post(
+        f"/run/{_Probe.name}",
+        headers=headers,
+        files={"fixed_image": ("a.nii.gz", gzip.compress(b"a" * 100), "application/gzip")},
+    )
+    assert response.status_code == 422, response.text
+    assert seen == []
+
+
+@pytest.mark.parametrize("arguments, delivery, code", [
+    ({"text_1": "hello", "text_2": "world"}, {}, 200),
+    ({"text_1": "hello"}, {}, 422),
+    ({"text_1": "hello", "text_2": "world"}, {"X-Run-Delivery": "detached"}, 202),
+    ({"text_1": "hello"}, {"X-Run-Delivery": "detached"}, 202),
+], ids=["done", "failed", "detached done", "detached failed"])
+def test_a_watched_runs_ending_is_read_back_off_the_event_loop(monkeypatch, arguments,
+                                                               delivery, code):
+    """`runs.finish` reads the run's whole event file back for the ledger: a
+    chatty tool's 100k lines are half a second, and on the event loop every
+    other request waited for it. The diagnosis of a failure reads it too."""
+    from wire import runs
+    seen = _calls_on_the_loop(monkeypatch, (runs.EventReader, "read"))
+    run_id = secrets.token_urlsafe(24)
+    response = client.post(
+        "/run/Test_Tool",
+        headers={"Authorization": f"Bearer {TOKEN}", "X-Run-Id": run_id, **delivery},
+        data=arguments,
+    )
+    assert response.status_code == code, response.text
+    assert seen == []
+    runs.discard(run_id)
 
 
 def test_a_truncated_gzip_is_refused_rather_than_segmented(monkeypatch, tmp_path):

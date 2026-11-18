@@ -533,3 +533,50 @@ def test_a_cpu_run_is_not_held_back_by_an_unknown_vram():
                                   uses_gpu=False)
     assert demand.measured is True
     assert demand.vram_bytes == 0
+
+
+# ---------------------------------------------------------------------------
+# A shared machine bounds every shape but the narrowest by one job's share
+# ---------------------------------------------------------------------------
+
+_G = 1024 ** 3
+
+
+def _shapes(*rams):
+    """`[(channels, Demand)]` widest first, one GiB of card each."""
+    count = len(rams)
+    return [(count - index, admission.Demand(cpus=2, ram_bytes=int(ram * _G),
+                                             vram_bytes=_G, measured=True))
+            for index, ram in enumerate(rams)]
+
+
+def test_alone_a_run_takes_its_widest_shape():
+    budget = _budget()  # 16 GiB of host, a 4 GiB share
+    with budget.reserve(_shapes(8, 4, 3)) as (_cores, channels):
+        assert channels == 3
+
+
+def test_with_another_run_in_flight_a_shape_over_the_share_is_not_offered():
+    """Eight AREG runs reached AMASSS one after another: the first found an
+    empty queue, took four channels and most of the host, and the seven after
+    it waited in line. Beside another run, a shape stays within one share."""
+    budget = _budget()
+    other = _Holder(budget, _small()).start()
+    assert other.wait_admitted()
+    try:
+        with budget.reserve(_shapes(8, 4, 3)) as (_cores, channels):
+            assert channels == 2, "the 8 GiB shape is twice a 4 GiB share"
+    finally:
+        other.finish()
+
+
+def test_the_narrowest_shape_is_always_offered_however_large():
+    """A fairness target, not a refusal, as the setting is documented."""
+    budget = _budget()
+    other = _Holder(budget, _small()).start()
+    assert other.wait_admitted()
+    try:
+        with budget.reserve(_shapes(9, 6)) as (_cores, channels):
+            assert channels == 1
+    finally:
+        other.finish()

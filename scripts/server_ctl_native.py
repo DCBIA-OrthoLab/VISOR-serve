@@ -275,7 +275,9 @@ def venv_report(root: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Local TLS: a certificate the client pins, served on loopback only
+# TLS: always, on loopback only. serve.py (the upstream server's one entry point)
+# serves https; the certificate is the operator's (TLS_CERT_FILE/TLS_KEY_FILE) or
+# the one serve.py generates into TLS_DIR. The client pins whichever is served.
 # ---------------------------------------------------------------------------
 
 LOOPBACK = "127.0.0.1"
@@ -318,86 +320,87 @@ def validate_tls(cert: str, key: str):
     return cert, key
 
 
-def tls_settings(ctl, args):
-    """`(cert, key)` to serve with, or None. Arguments win; `.env` remembers; `--no-tls` forgets.
+def generated_cert_path() -> str:
+    """Where serve.py puts the certificate it generates (run-native.sh sets TLS_DIR to this folder)."""
+    return os.path.join(state_dir(), "tls", "cert.pem")
 
-    Validated every time it is used, so a key that became world-readable since
-    the last `up` stops the next start instead of being served from.
+
+def tls_settings(ctl, args):
+    """`(cert, key)` of the pair the operator supplied, or None for serve.py's own certificate.
+
+    Arguments win, `.env` remembers (TLS_CERT_FILE/TLS_KEY_FILE, the upstream
+    server's own names). Validated every time it is used, so a key that became
+    world-readable since the last `up` stops the next start instead of being
+    served from.
     """
-    if getattr(args, "no_tls", False):
-        if getattr(args, "tls_cert", None) or getattr(args, "tls_key", None):
-            raise ctl.ServerCtlError("--no-tls cannot be combined with --tls-cert/--tls-key.")
-        return None
     cert, key = getattr(args, "tls_cert", None), getattr(args, "tls_key", None)
     if bool(cert) != bool(key):
         raise ctl.ServerCtlError("--tls-cert and --tls-key go together.")
     if not cert:
         env = ctl.read_env()
-        cert, key = env.get("TLS_CERT"), env.get("TLS_KEY")
+        cert, key = env.get("TLS_CERT_FILE"), env.get("TLS_KEY_FILE")
         if not cert or not key:
             return None
     try:
-        pair = validate_tls(cert, key)
+        return validate_tls(cert, key)
     except _Error as exc:
         raise ctl.ServerCtlError(str(exc))
-    bind = getattr(args, "bind", None)
-    if bind is None:
-        bind = ctl.read_env().get("BIND_ADDR", LOOPBACK)
-    if bind != LOOPBACK:
-        raise ctl.ServerCtlError(
-            f"TLS is only served on {LOOPBACK} (the bind address is {bind!r}). The certificate the "
-            "client pins names loopback and nothing routable.")
-    return pair
+
+
+def served_cert(tls) -> str:
+    """The certificate path the server serves: the supplied one, else the generated one."""
+    return tls[0] if tls else generated_cert_path()
 
 
 def refuse_non_loopback(ctl, args) -> str:
-    """The native server listens on loopback only, with or without TLS.
+    """The native server listens on loopback only, with or without a supplied certificate.
 
-    Plain HTTP on a routable address would hand the token and the scans to the
-    LAN, and the certificate the client pins names loopback only. A BIND_ADDR
-    left in .env by a Docker deployment counts as much as --bind.
+    The certificate the client pins names loopback only, and the upstream
+    server will not publish a self-signed one elsewhere. A BIND_ADDR left in
+    .env by a Docker deployment counts as much as --bind.
     """
     bind = getattr(args, "bind", None)
     if bind is None:
         bind = ctl.read_env().get("BIND_ADDR") or LOOPBACK
     if bind != LOOPBACK:
         raise ctl.ServerCtlError(
-            f"The native server listens on {LOOPBACK} only (asked: {bind!r}), with or without TLS. "
+            f"The native server listens on {LOOPBACK} only (asked: {bind!r}), with or without a certificate. "
             "Use the Docker backend to serve another address.")
     return bind
 
 
 def remember_tls(ctl, args, tls) -> None:
-    """Write the pair into .env when the arguments gave one or took it away. Paths only."""
+    """Write the pair into .env when the arguments gave one. Paths only."""
     if tls and getattr(args, "tls_cert", None):
-        ctl.write_env({"TLS_CERT": tls[0], "TLS_KEY": tls[1]})
-    elif getattr(args, "no_tls", False):
-        ctl.write_env({"TLS_CERT": "", "TLS_KEY": ""})
+        ctl.write_env({"TLS_CERT_FILE": tls[0], "TLS_KEY_FILE": tls[1]})
 
 
 def tls_report(tls) -> dict:
-    """What the JSON says: enabled and the certificate. Never the key, not even its path."""
-    return {"enabled": bool(tls), "cert": tls[0] if tls else None}
+    """What the JSON says: always enabled, and the certificate served. Never the key, not even its path."""
+    return {"enabled": True, "cert": served_cert(tls)}
 
 
 def cert_digest(tls):
-    """sha256 of the certificate (a public file) the process was started with, or None."""
+    """sha256 of the SUPPLIED certificate (a public file) the process was started with, or None.
+
+    None for serve.py's generated certificate: it is made at start and kept, so
+    there is nothing to compare, and a relaunch would not change it.
+    """
     if not tls:
         return None
     with open(tls[0], "rb") as handle:
         return hashlib.sha256(handle.read()).hexdigest()
 
 
-def server_url(ctl, args, tls, port=None) -> str:
+def server_url(ctl, args, port=None) -> str:
+    """Always https on loopback, whatever the public URL is: the native server has no other front door."""
     if getattr(args, "url", None):
         return args.url
-    if tls:
-        return f"https://{LOOPBACK}:{port or ctl.effective_port()}"
-    return ctl.url_for()
+    return f"https://{LOOPBACK}:{port or ctl.effective_port()}"
 
 
 def _health(ctl, url, tls, **kwargs) -> bool:
-    return ctl.health(url, cafile=tls[0], **kwargs) if tls else ctl.health(url, **kwargs)
+    return ctl.health(url, cafile=served_cert(tls), **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +410,9 @@ def _health(ctl, url, tls, **kwargs) -> bool:
 def cmd_status(ctl, args) -> dict:
     env = ctl.read_env()
     # Status reports what is remembered; it does not judge the files (up does).
-    remembered = (env.get("TLS_CERT"), env.get("TLS_KEY"))
+    remembered = (env.get("TLS_CERT_FILE"), env.get("TLS_KEY_FILE"))
     tls = (os.path.abspath(remembered[0]), remembered[1]) if all(remembered) else None
-    url = server_url(ctl, args, tls)
+    url = server_url(ctl, args)
     clone = ctl.clone_status(check_remote=args.check_remote, want_branch=args.branch)
     root = sadt_root(ctl, args)
     info = read_pidfile()
@@ -520,7 +523,7 @@ def cmd_up(ctl, args) -> dict:
     ctl.write_env({"DEVICE": device, "SADT_TOOLS": root})
     remember_tls(ctl, args, tls)
     env_file = ctl.read_env()
-    url = server_url(ctl, args, tls, port)
+    url = server_url(ctl, args, port)
 
     venvs = venv_report(root)
     missing = sorted(name for name, present in venvs.items() if not present)
@@ -541,14 +544,15 @@ def cmd_up(ctl, args) -> dict:
         "VISOR_STATE_DIR": state_dir(),
     })
     # Only the paths travel, in the environment of the one process that needs them.
-    environment.pop("VISOR_TLS_CERT", None)
-    environment.pop("VISOR_TLS_KEY", None)
+    environment.pop("TLS_CERT_FILE", None)
+    environment.pop("TLS_KEY_FILE", None)
+    environment["TLS_DIR"] = os.path.dirname(generated_cert_path())
     if tls:
-        environment["VISOR_TLS_CERT"], environment["VISOR_TLS_KEY"] = tls
+        environment["TLS_CERT_FILE"], environment["TLS_KEY_FILE"] = tls
     log_file = open(log_path(), "ab")
     log_file.write(("\n--- %s starting (device %s) ---\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), device)).encode())
     log_file.flush()
-    ctl.log(f"Starting the native server (device {device}{', https' if tls else ''}); log: {log_path()}")
+    ctl.log(f"Starting the native server (device {device}, https); log: {log_path()}")
     process = subprocess.Popen(
         ["bash", script], cwd=ctl.REPO_ROOT, env=environment, stdin=subprocess.DEVNULL,
         stdout=log_file, stderr=subprocess.STDOUT,
@@ -559,7 +563,7 @@ def cmd_up(ctl, args) -> dict:
     with open(pidfile_path(), "w", encoding="utf-8") as handle:
         json.dump({"pid": process.pid, "port": port, "device": device, "tools": root,
                    "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "log": log_path(),
-                   "tls": bool(tls), "tls_sha": cert_digest(tls),
+                   "tls": True, "tls_sha": cert_digest(tls),
                    "proc_start": process_start_time(process.pid)}, handle)
 
     healthy = _wait_for_health(ctl, url, process.pid, args.timeout, tls) if args.wait else False
@@ -609,7 +613,7 @@ def cmd_update(ctl, args) -> dict:
     with nothing new costs two git calls.
     """
     tls = tls_settings(ctl, args)
-    url = server_url(ctl, args, tls)
+    url = server_url(ctl, args)
     result = {"service": SERVICE, "url": url, "tls": tls_report(tls), "pulled": False, "tools_pulled": False,
               "venvs": [], "restarted": False, "healthy": False, "switched_branch": False}
 

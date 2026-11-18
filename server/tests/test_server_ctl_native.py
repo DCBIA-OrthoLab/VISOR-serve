@@ -294,6 +294,7 @@ def test_run_native_sh_is_valid_bash_and_forces_the_subprocess_dispatch():
     text = open(script, encoding="utf-8").read()
     assert "SADT_DISPATCH_MODE=subprocess" in text
     assert "BIND_ADDR:-127.0.0.1" in text
+    assert 'serve.py --host "$BIND"' in text
     assert "DEVICE=mps" in text
 
 
@@ -339,7 +340,7 @@ def _run_script(tmp_path, **extra):
         _fake_api_venv(state)
     out = tmp_path / "out"
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith(("VISOR_", "TORCH_HOME", "TEMP_DIR", "BIND_ADDR"))}
+           if not k.startswith(("VISOR_", "TORCH_HOME", "TEMP_DIR", "BIND_ADDR", "TLS_", "PUBLISH_ADDR", "SADT_TLS_ACTIVE"))}
     env.update({"VISOR_STATE_DIR": str(state), "UV": "/bin/true", "API_TOKEN": "t",
                 "SADT_TOOLS": str(tools), "DATA_DIR": str(tmp_path / "DATA"),
                 "STUB_OUT": str(out), "HOME": str(tmp_path)})
@@ -361,8 +362,10 @@ def test_run_native_sh_gives_this_instance_its_own_temp_dir_and_torch_home(tmp_p
     assert seen["TEMP_DIR"] == str(state / "tmp")
     assert os.path.isdir(state / "tmp")
     assert seen["TORCH_HOME"] == str(state / "torch_home")
-    assert seen["SADT_API"].startswith("http://127.0.0.1:")
-    assert "--ssl-certfile" not in pathlib.Path(str(out) + ".args").read_text()
+    assert seen["SADT_API"].startswith("https://127.0.0.1:")
+    # No certificate supplied: serve.py generates its own, into this instance's state folder.
+    assert seen["TLS_DIR"] == str(state / "tls")
+    assert "TLS_CERT_FILE" not in seen and "TLS_KEY_FILE" not in seen
 
 
 def test_a_temp_dir_set_by_the_operator_is_kept(tmp_path):
@@ -371,29 +374,42 @@ def test_a_temp_dir_set_by_the_operator_is_kept(tmp_path):
     assert _environment_of(out)["TEMP_DIR"] == str(tmp_path / "mine")
 
 
-def test_run_native_sh_passes_the_tls_files_to_uvicorn_and_hides_them_from_the_tools(tmp_path):
-    done, out, _state = _run_script(tmp_path, VISOR_TLS_CERT=str(tmp_path / "c"), VISOR_TLS_KEY=str(tmp_path / "k"))
+def test_run_native_sh_starts_serve_py_and_never_uvicorn_directly(tmp_path):
+    """The trap conftest.py hides: it sets SADT_TLS_ACTIVE=1, so a server started through
+    `uvicorn main:app` passes every test while main.py's lifespan refuses it for real."""
+    done, out, _state = _run_script(tmp_path)
+    assert done.returncode == 0, done.stderr
+    args = pathlib.Path(str(out) + ".args").read_text().split("\n")[:-1]
+    assert args == ["serve.py", "--host", "127.0.0.1", "--port", "8000"]
+    seen = _environment_of(out)
+    # serve.py sets this itself once the listener has its certificate; the script must not.
+    assert "SADT_TLS_ACTIVE" not in seen
+    assert seen["PUBLISH_ADDR"] == "127.0.0.1"
+    text = open(os.path.join(_SCRIPTS, "run-native.sh"), encoding="utf-8").read()
+    assert "-m uvicorn" not in text
+
+
+def test_run_native_sh_hands_the_supplied_tls_files_to_serve_py(tmp_path):
+    done, out, _state = _run_script(tmp_path, TLS_CERT_FILE=str(tmp_path / "c"), TLS_KEY_FILE=str(tmp_path / "k"))
     assert done.returncode == 1 and "missing" in done.stderr  # files must exist
     (tmp_path / "c").write_text("x")
     (tmp_path / "k").write_text("x")
-    done, out, _state = _run_script(tmp_path, VISOR_TLS_CERT=str(tmp_path / "c"), VISOR_TLS_KEY=str(tmp_path / "k"))
+    done, out, _state = _run_script(tmp_path, TLS_CERT_FILE=str(tmp_path / "c"), TLS_KEY_FILE=str(tmp_path / "k"))
     assert done.returncode == 0, done.stderr
-    args = pathlib.Path(str(out) + ".args").read_text().split("\n")
-    assert args[args.index("--ssl-certfile") + 1] == str(tmp_path / "c")
-    assert args[args.index("--ssl-keyfile") + 1] == str(tmp_path / "k")
     seen = _environment_of(out)
-    assert "VISOR_TLS_KEY" not in seen and "VISOR_TLS_CERT" not in seen
+    assert seen["TLS_CERT_FILE"] == str(tmp_path / "c") and seen["TLS_KEY_FILE"] == str(tmp_path / "k")
     assert seen["SADT_API"].startswith("https://127.0.0.1:")
     assert "https://127.0.0.1" in done.stderr
+    assert "--ssl-keyfile" not in pathlib.Path(str(out) + ".args").read_text()
 
 
-def test_run_native_sh_refuses_tls_off_loopback_and_half_a_pair(tmp_path):
+def test_run_native_sh_refuses_a_certificate_off_loopback_and_half_a_pair(tmp_path):
     (tmp_path / "c").write_text("x")
     (tmp_path / "k").write_text("x")
-    both = {"VISOR_TLS_CERT": str(tmp_path / "c"), "VISOR_TLS_KEY": str(tmp_path / "k")}
+    both = {"TLS_CERT_FILE": str(tmp_path / "c"), "TLS_KEY_FILE": str(tmp_path / "k")}
     done, _out, _state = _run_script(tmp_path, BIND_ADDR="0.0.0.0", **both)
     assert done.returncode == 1 and "127.0.0.1 only" in done.stderr
-    done, _out, _state = _run_script(tmp_path, VISOR_TLS_CERT=str(tmp_path / "c"))
+    done, _out, _state = _run_script(tmp_path, TLS_CERT_FILE=str(tmp_path / "c"))
     assert done.returncode == 1 and "go together" in done.stderr
 
 
@@ -455,34 +471,25 @@ def test_missing_certificate_and_symlinked_or_absent_keys_are_refused(tmp_path):
         native.validate_tls(cert, str(tmp_path))  # a directory
 
 
-def test_tls_arguments_go_together_and_only_on_loopback(tmp_path, envfile):
+def test_tls_arguments_go_together_and_none_means_the_servers_own_certificate(tmp_path, envfile):
     cert, key = _make_cert(tmp_path)
     with pytest.raises(ctl.ServerCtlError, match="go together"):
-        native.tls_settings(ctl, _args(tls_cert=cert, tls_key=None, bind=None))
-    with pytest.raises(ctl.ServerCtlError, match="only served on 127.0.0.1"):
-        native.tls_settings(ctl, _args(tls_cert=cert, tls_key=key, bind="0.0.0.0"))
-    with pytest.raises(ctl.ServerCtlError, match="only served on 127.0.0.1"):
-        native.tls_settings(ctl, _args(tls_cert=cert, tls_key=key, bind=""))
-    ctl.write_env({"BIND_ADDR": "100.64.0.1"})  # a bind remembered from an earlier `up --bind`
-    with pytest.raises(ctl.ServerCtlError, match="only served on 127.0.0.1"):
-        native.tls_settings(ctl, _args(tls_cert=cert, tls_key=key, bind=None))
-    assert native.tls_settings(ctl, _args(tls_cert=cert, tls_key=key, bind="127.0.0.1")) == (cert, key)
+        native.tls_settings(ctl, _args(tls_cert=cert, tls_key=None))
+    with pytest.raises(ctl.ServerCtlError, match="go together"):
+        native.tls_settings(ctl, _args(tls_cert=None, tls_key=key))
+    assert native.tls_settings(ctl, _args(tls_cert=cert, tls_key=key)) == (cert, key)
+    assert native.tls_settings(ctl, _args()) is None
 
 
-def test_the_pair_is_remembered_in_env_and_forgotten_by_no_tls(tmp_path, envfile):
+def test_the_pair_is_remembered_in_env_under_the_upstream_names(tmp_path, envfile):
     cert, key = _make_cert(tmp_path)
     args = _args(tls_cert=cert, tls_key=key, bind=None)
     tls = native.tls_settings(ctl, args)
     native.remember_tls(ctl, args, tls)
-    assert ctl.read_env()["TLS_CERT"] == cert and ctl.read_env()["TLS_KEY"] == key
+    assert ctl.read_env()["TLS_CERT_FILE"] == cert and ctl.read_env()["TLS_KEY_FILE"] == key
     # no arguments: .env supplies the pair (what `update` relies on)
     assert native.tls_settings(ctl, _args(bind=None)) == (cert, key)
-    gone = _args(no_tls=True, bind=None)
-    assert native.tls_settings(ctl, gone) is None
-    native.remember_tls(ctl, gone, None)
-    assert native.tls_settings(ctl, _args(bind=None)) is None
     # a remembered key that became readable by others stops the next start
-    native.remember_tls(ctl, args, tls)
     os.chmod(key, 0o644)
     with pytest.raises(ctl.ServerCtlError, match="readable by other accounts"):
         native.tls_settings(ctl, _args(bind=None))
@@ -493,25 +500,37 @@ def test_the_report_names_the_certificate_and_never_the_key(tmp_path):
     report = native.tls_report((cert, key))
     assert report == {"enabled": True, "cert": cert}
     assert key not in json.dumps(report)
-    assert native.tls_report(None) == {"enabled": False, "cert": None}
+    # No supplied pair: the certificate serve.py generates, whose path is known before it exists.
+    assert native.tls_report(None) == {"enabled": True, "cert": native.generated_cert_path()}
 
 
-def test_status_says_https_and_tls_from_env_and_plain_http_without(tmp_path, monkeypatch, envfile):
+def test_status_says_https_with_the_served_certificate_whatever_the_public_url(tmp_path, monkeypatch, envfile):
     cert, key = _make_cert(tmp_path)
     monkeypatch.setenv("VISOR_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("VISOR_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setattr(ctl, "tailnet_url", lambda: "https://somewhere.ts.net")
     seen = []
     monkeypatch.setattr(ctl, "health", lambda url=None, timeout=5.0, cafile=None: seen.append((url, cafile)) or False)
     args = _args(url=None, check_remote=False, branch=None, tools_dir=str(tmp_path))
-    plain = native.cmd_status(ctl, args)
-    assert plain["tls"] == {"enabled": False, "cert": None}
-    assert plain["url"].startswith("http://") and seen[-1][1] is None
-    ctl.write_env({"HOST_PORT": "8123", "TLS_CERT": cert, "TLS_KEY": key})
+    generated = native.cmd_status(ctl, args)
+    assert generated["tls"] == {"enabled": True, "cert": native.generated_cert_path()}
+    assert generated["url"] == "https://127.0.0.1:%d" % ctl.effective_port()
+    assert seen[-1] == (generated["url"], native.generated_cert_path())
+    ctl.write_env({"HOST_PORT": "8123", "TLS_CERT_FILE": cert, "TLS_KEY_FILE": key})
     secure = native.cmd_status(ctl, args)
     assert secure["url"] == "https://127.0.0.1:8123"
     assert secure["tls"] == {"enabled": True, "cert": cert}
     assert seen[-1] == ("https://127.0.0.1:8123", cert)
     assert key not in json.dumps(secure)
+
+
+def test_the_pinned_probe_context_is_the_servers_loopback_context(tmp_path):
+    import tls as server_tls
+
+    cert, _key = _make_cert(tmp_path)
+    mine, theirs = ctl.pinned_context(cert), server_tls.loopback_context(cert)
+    assert (mine.check_hostname, mine.verify_mode, mine.verify_flags) == \
+           (theirs.check_hostname, theirs.verify_mode, theirs.verify_flags)
 
 
 def _free_port():
@@ -522,17 +541,21 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-def test_a_real_uvicorn_answers_https_to_its_own_certificate_only(tmp_path, monkeypatch, envfile):
-    """up --native with a real certificate, a real uvicorn, the real main:app.
+@pytest.mark.parametrize("supplied", [True, False], ids=["supplied-pair", "generated-certificate"])
+def test_a_real_serve_py_answers_https_to_its_own_certificate_only(tmp_path, monkeypatch, envfile, supplied):
+    """up --native through run-native.sh, a real serve.py, the real main:app.
 
     /health with verify=<cert> passes; with another certificate it fails; in
     plain http it fails; and the health check of server_ctl itself goes through
-    the same pinned file.
+    the same pinned file. The certificate is the supplied one, or the one
+    serve.py generated, and the report names the file really served.
     """
     pytest.importorskip("uvicorn")
     requests = pytest.importorskip("requests")
-    cert, key = _make_cert(tmp_path)
     other, _other_key = _make_cert(tmp_path, "other", san="IP:127.0.0.1")
+    cert = key = None
+    if supplied:
+        cert, key = _make_cert(tmp_path)
     state = tmp_path / "state"
     sadt = tmp_path / "sadt"
     (sadt / "tools").mkdir(parents=True)
@@ -546,25 +569,29 @@ def test_a_real_uvicorn_answers_https_to_its_own_certificate_only(tmp_path, monk
     monkeypatch.setattr(ctl, "ensure_data_dir", lambda: str(tmp_path / "DATA"))
     monkeypatch.setattr(ctl, "data_dir", lambda: str(tmp_path / "DATA"))
     port = _free_port()
-    args = _args(port=port, url=None, token="tok", bind=None, wait=True, timeout=90, device="cpu",
-                 tools_dir=str(sadt), tls_cert=cert, tls_key=key, no_tls=False)
+    args = _args(port=port, url=None, token="t" * 40, bind=None, wait=True, timeout=90, device="cpu",
+                 tools_dir=str(sadt), tls_cert=cert, tls_key=key)
     result = None
     try:
         result = native.cmd_up(ctl, args)
         assert result["healthy"] is True
         assert result["url"] == f"https://127.0.0.1:{port}"
-        assert result["tls"] == {"enabled": True, "cert": cert}
-        assert key not in json.dumps(result)
+        served = cert or str(state / "tls" / "cert.pem")
+        assert result["tls"] == {"enabled": True, "cert": served}
+        assert os.path.isfile(served)
+        if key:
+            assert key not in json.dumps(result)
         url = result["url"] + "/health"
-        assert requests.get(url, verify=cert, timeout=10).json() == {"status": "ok"}
+        assert requests.get(url, verify=served, timeout=10).json() == {"status": "ok"}
         with pytest.raises(requests.exceptions.SSLError):
             requests.get(url, verify=other, timeout=10)
         with pytest.raises(requests.exceptions.RequestException):
             requests.get(f"http://127.0.0.1:{port}/health", timeout=10)
-        assert ctl.health(result["url"], cafile=cert) is True
+        assert ctl.health(result["url"], cafile=served) is True
         assert ctl.health(result["url"], cafile=other) is False
         assert ctl.health(result["url"]) is False  # the system store does not know it
-        assert key not in pathlib.Path(native.log_path()).read_text(encoding="utf-8")
+        if key:
+            assert key not in pathlib.Path(native.log_path()).read_text(encoding="utf-8")
     finally:
         if result:
             native.cmd_down(ctl, _args())
@@ -586,7 +613,7 @@ def test_a_changed_certificate_makes_update_relaunch(tmp_path, monkeypatch, envf
     monkeypatch.setattr(ctl, "clone_status", lambda **k: {"is_git_repo": False, "checked_remote": False,
                                                          "error": None, "dirty": False, "behind": 0})
     base = {"url": None, "branch": None, "tools_dir": str(sadt), "force": False, "tool": None,
-            "bind": None, "no_tls": False}
+            "bind": None}
     native.cmd_update(ctl, _args(tls_cert=cert, tls_key=key, **base))
     assert calls == []  # same certificate: nothing to relaunch
     result = native.cmd_update(ctl, _args(tls_cert=new_cert, tls_key=new_key, **base))
@@ -642,10 +669,10 @@ def test_the_recipes_backbone_is_the_published_efficientnet_b0():
 
 
 # ----------------------------------------------------------------------
-# Audit fixes: loopback only, .env born 0600, down kills only its own server
+# Audit fixes: loopback only, down kills only its own server
 # ----------------------------------------------------------------------
 
-def test_run_native_sh_refuses_any_bind_but_loopback_even_without_tls(tmp_path):
+def test_run_native_sh_refuses_any_bind_but_loopback_even_without_a_certificate(tmp_path):
     for bind in ("0.0.0.0", "192.168.1.5", "::"):
         done, out, _state = _run_script(tmp_path, BIND_ADDR=bind)
         assert done.returncode == 1, bind
@@ -655,12 +682,12 @@ def test_run_native_sh_refuses_any_bind_but_loopback_even_without_tls(tmp_path):
     assert done.returncode == 0, done.stderr
 
 
-@pytest.mark.parametrize("argv", [["--bind", "0.0.0.0"], ["--bind", "0.0.0.0", "--no-tls"], ["--bind", "10.0.0.2"]])
+@pytest.mark.parametrize("argv", [["--bind", "0.0.0.0"], ["--bind", "10.0.0.2"], ["--bind", ""]])
 def test_up_native_refuses_a_non_loopback_bind_and_starts_nothing(tmp_path, monkeypatch, envfile, argv):
     monkeypatch.setenv("VISOR_STATE_DIR", str(tmp_path / "state"))
     started = []
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: started.append(a))
-    args = _args(bind=argv[1], no_tls="--no-tls" in argv, tls_cert=None, tls_key=None, port=None, token=None)
+    args = _args(bind=argv[1], tls_cert=None, tls_key=None, port=None, token=None)
     with pytest.raises(ctl.ServerCtlError, match="127.0.0.1 only"):
         native.cmd_up(ctl, args)
     assert started == []
@@ -670,46 +697,9 @@ def test_up_native_refuses_a_non_loopback_bind_and_starts_nothing(tmp_path, monk
 def test_up_native_refuses_a_bind_addr_left_in_env_by_a_docker_deployment(tmp_path, monkeypatch, envfile):
     monkeypatch.setenv("VISOR_STATE_DIR", str(tmp_path / "state"))
     pathlib.Path(envfile).write_text("BIND_ADDR=100.64.0.7\n")
-    args = _args(bind=None, no_tls=False, tls_cert=None, tls_key=None, port=None, token=None)
+    args = _args(bind=None, tls_cert=None, tls_key=None, port=None, token=None)
     with pytest.raises(ctl.ServerCtlError, match="127.0.0.1 only"):
         native.cmd_up(ctl, args)
-
-
-def test_env_is_never_readable_by_others_not_even_at_creation(tmp_path):
-    import sys as _sys
-
-    path = str(tmp_path / ".env")
-    seen = []
-
-    def hook(event, hook_args):
-        if event == "open" and hook_args[0] == path and hook_args[2] is not None:
-            seen.append(("open", hook_args[1], hook_args[2]))
-        if event == "os.chmod" and hook_args[0] == path:
-            seen.append(("chmod", os.stat(path).st_mode & 0o777))
-
-    old = os.umask(0o022)
-    try:
-        _sys.addaudithook(hook)
-        ctl.write_env({"API_TOKEN": "secret"}, path)
-        for entry in seen:
-            if entry[0] == "chmod":
-                assert entry[1] == 0o600, f"the token sat in a file of mode {entry[1]:o}"
-    finally:
-        os.umask(old)
-    assert os.stat(path).st_mode & 0o777 == 0o600
-    # The file is created with 0600 passed to open(2), not fixed afterwards.
-    with pytest.MonkeyPatch.context() as mp:
-        modes = []
-        real_open = os.open
-        mp.setattr(os, "open", lambda p, f, m=0o777, **k: (modes.append(m), real_open(p, f, m, **k))[1])
-        os.unlink(path)
-        ctl.write_env({"API_TOKEN": "secret"}, path)
-    assert modes and all(m == 0o600 for m in modes)
-    # An existing 0644 file is tightened and keeps the other lines.
-    os.chmod(path, 0o644)
-    ctl.write_env({"X": "1"}, path)
-    assert os.stat(path).st_mode & 0o777 == 0o600
-    assert "API_TOKEN=secret" in pathlib.Path(path).read_text()
 
 
 def _decoy(command_words, tmp_path):

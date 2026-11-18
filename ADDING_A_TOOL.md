@@ -52,7 +52,22 @@ def run(scans: Path, output_dir: Path, *, sup=None) -> Path:
 
 Six members, nothing more: `sup.run(tool, **params)` (blocking, returns what
 that tool's `run()` returned), `sup.out`, `sup.tmp`, `sup.channels(wanted)`,
-`sup.progress(fraction, message)`, `sup.log(message)`.
+`sup.progress(fraction, message)`, `sup.log(message, level="info", user=False)`.
+
+- **Give a call its share of your bar.** `sup.run("ALI_CBCT", ...,
+  _progress=(0.2, 0.6))` says the call fills 0.2..0.6 of THIS tool's bar; the
+  server folds the callee's own 0..1 into that span, at every depth, so the
+  clinician sees one bar that only moves forward. `_progress` is the
+  supervisor's and never reaches the callee. One span per call: two calls in a
+  loop each get their own slice, the way `progress.report(start=, end=)`
+  slices a loop. See `RUN_PROGRESS.md` §4d.
+- **`sup.log` is the tool's voice to the people around the run.** `level` is
+  `debug`, `info`, `warning` or `error`. `user=False` (default) reaches the
+  operator page, redacted, and a warning or error is kept with the run's
+  history; `user=True` reaches the clinician's panel. Neither may name a file
+  or a patient -- the operator copy is redacted anyway, the clinician's is not.
+  One positional argument still means what it always meant. See
+  `RUN_PROGRESS.md` §4e.
 
 - **`sup.channels(wanted)` is how a tool that parallelises asks how widely it
   may.** `wanted` is the tool's OWN count of the things it is about to loop
@@ -127,6 +142,29 @@ wiring will use, so give them meaning.
 Raise `ValueError` or `FileNotFoundError` for something the caller can fix - 
 the message reaches them as a `422`. Anything else is a `500` with a fixed
 message, and the traceback stays in the server log.
+
+## When a release changes what the tool costs
+
+The server learns each tool's RAM and VRAM from its own runs and keeps them
+across restarts and updates (`server/execution/costs.py`). An ordinary release
+keeps them too, which is what you want: a tool nobody has measured runs alone.
+
+When a release changes what the tool **costs** -- a new or larger model, a
+different handling of the input's size, a new engine -- the old figures would
+mislead admission. Say so in `pyproject.toml`:
+
+```toml
+[tool.sadt]
+tool = true
+name = "MyTool"
+cost_epoch = 1      # absent is 0; bump by one for such a release
+```
+
+At its next start the server drops that tool's learned figures, and no other
+tool's, logs `Learned costs  RESET MyTool: cost_epoch 0 -> 1`, and relearns
+from the next run. Do not bump it for a bug fix, a new argument or a UI change.
+A value that is not an integer is logged and ignored: the tool still loads and
+its figures are kept.
 
 ## The exceptions
 

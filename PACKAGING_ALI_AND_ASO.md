@@ -50,10 +50,9 @@ ALI       → ASO    ali_client.predict_landmarks()
 ```
 
 They are in-process calls rather than HTTP for a reason worth keeping in mind:
-a tool run holds one of `MAX_CONCURRENT_TOOLS` for its whole duration, so an
-ASO run calling the server's own `/run/ALI` would wait for a slot the outer
-run is holding. Four concurrent ASO requests would deadlock the server,
-`/health` included.
+a tool run holds its admission for its whole duration, so an ASO run calling
+the server's own `/run/ALI` would wait for room the outer run is holding.
+Concurrent ASO requests would deadlock the server.
 
 A packaged tool can do neither. Your document already states the target - the
 server chains them, the handoff is files - and that is the right answer. **The

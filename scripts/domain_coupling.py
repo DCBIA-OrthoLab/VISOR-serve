@@ -76,15 +76,37 @@ CORE = [
     "server/wire",
 ]
 
+# Pages whose CONTENT is a description of the tools, excluded with a reason
+# each. This is not a loophole for the core: coupling is the server *behaving*
+# differently because a tool is dental, and a page of prose does not behave.
+# The same reasoning already excludes docstrings "by construction" -- these
+# files are docstrings that happen to be served over HTTP.
+#
+# They are REPORTED below rather than hidden. An exclusion that does not
+# appear in the output is a hole nobody sees, which is the failure this whole
+# script exists to prevent.
+PROSE = {
+    "server/wire/doc_page.py":
+        "one French prose section per tool: what it does to a scan and what it "
+        "costs here. Naming the tools IS its content.",
+    "server/wire/debug_page.py":
+        "a dashboard whose example run names a real tool, so a reader "
+        "recognises the shape of what they are looking at.",
+    "server/wire/benchmark_page.py":
+        "draws a measured campaign, and a campaign is per tool.",
+}
+
 
 def modules(root):
-    """Every core .py file, tests excluded, in a stable order."""
+    """Every core .py file, tests and the prose pages excluded, in a stable order."""
+    excluded = {(root / name).resolve() for name in PROSE}
     for spec in CORE:
         path = root / spec
         if path.is_dir():
             yield from sorted(f for f in path.rglob("*.py")
-                              if "test" not in f.name)
-        elif path.is_file():
+                              if "test" not in f.name
+                              and f.resolve() not in excluded)
+        elif path.is_file() and path.resolve() not in excluded:
             yield path
 
 
@@ -160,7 +182,7 @@ def main(argv=None):
 
     if args.json:
         json.dump({"total": total, "word_list": WORDS,
-                   "modules": per_module}, sys.stdout, indent=2)
+                   "modules": per_module, "excluded": PROSE}, sys.stdout, indent=2)
         sys.stdout.write("\n")
     else:
         for entry in per_module:
@@ -169,6 +191,12 @@ def main(argv=None):
         print(f"\n{total} domain-word occurrence(s) in executable code, "
               f"across {len(per_module)} core modules.")
         print("Comments and docstrings are excluded; see this file's docstring.")
+        # Named, not hidden: the reader has to be able to see what was not
+        # measured, or the number above means less than it looks like.
+        print(f"\nNot measured -- {len(PROSE)} page(s) whose content IS a "
+              f"description of the tools:")
+        for name, reason in sorted(PROSE.items()):
+            print(f"  {name}\n      {reason}")
 
     if args.max is not None and total > args.max:
         # stderr, so --json still produces exactly one object on stdout.

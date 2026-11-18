@@ -16,10 +16,12 @@
 #   SADT_TOOLS    a SADT-VISOR checkout (default: ../SADT-VISOR next to this repo)
 #   DEVICE        mps on an Apple-silicon Mac, cuda if nvidia-smi exists, else cpu
 #   HOST_PORT     default 8000
-#   BIND_ADDR     default 127.0.0.1. Plain HTTP unless VISOR_TLS_* is set: keep it on loopback.
-#   VISOR_TLS_CERT, VISOR_TLS_KEY
-#                 PEM files (both or neither). Set: uvicorn serves https, and only
-#                 on 127.0.0.1. The key is passed by path, never read or printed here.
+#   BIND_ADDR     default 127.0.0.1, and nothing else is accepted.
+#   TLS_CERT_FILE, TLS_KEY_FILE
+#                 PEM files (both or neither), read by server/serve.py like the
+#                 Docker deployment. Neither: serve.py generates a self-signed
+#                 certificate into TLS_DIR (default <state>/tls) and keeps it.
+#                 There is no plain-HTTP mode. The key is never read or printed here.
 #   DATA_DIR      default <repo>/DATA
 #   VISOR_STATE_DIR  where the API venv and the schema cache live
 #                 (macOS: ~/Library/Application Support/VISOR/native,
@@ -85,35 +87,27 @@ fi
 PORT="${HOST_PORT:-8000}"
 BIND="${BIND_ADDR:-127.0.0.1}"
 
-# Loopback only, with or without TLS: plain HTTP on a routable address would
-# give the token and the scans to the LAN.
+# Loopback only: the certificate the client pins names loopback, and the
+# upstream server refuses to publish a self-signed one anywhere else.
 if [ "$BIND" != "127.0.0.1" ]; then
-    echo "The native server listens on 127.0.0.1 only (BIND_ADDR is '$BIND'), with or without TLS." >&2
+    echo "The native server listens on 127.0.0.1 only (BIND_ADDR is '$BIND'), with or without a certificate." >&2
     exit 1
 fi
 
-# Local TLS: both files or neither, and only on loopback (the certificate the
-# client pins names 127.0.0.1, ::1 and localhost, nothing routable).
-SCHEME=http
-TLS_ARGS=()
-if [ -n "${VISOR_TLS_CERT:-}${VISOR_TLS_KEY:-}" ]; then
-    if [ -z "${VISOR_TLS_CERT:-}" ] || [ -z "${VISOR_TLS_KEY:-}" ]; then
-        echo "VISOR_TLS_CERT and VISOR_TLS_KEY go together." >&2
+# TLS is not optional: server/serve.py is the only way to start the server
+# (main.py refuses `uvicorn main:app`), and it serves https always.
+if [ -n "${TLS_CERT_FILE:-}${TLS_KEY_FILE:-}" ]; then
+    if [ -z "${TLS_CERT_FILE:-}" ] || [ -z "${TLS_KEY_FILE:-}" ]; then
+        echo "TLS_CERT_FILE and TLS_KEY_FILE go together." >&2
         exit 1
     fi
-    if [ "$BIND" != "127.0.0.1" ]; then
-        echo "TLS is only served on 127.0.0.1 (BIND_ADDR is '$BIND')." >&2
-        exit 1
-    fi
-    if [ ! -f "$VISOR_TLS_CERT" ] || [ ! -f "$VISOR_TLS_KEY" ]; then
+    if [ ! -f "$TLS_CERT_FILE" ] || [ ! -f "$TLS_KEY_FILE" ]; then
         echo "The TLS certificate or key file is missing." >&2
         exit 1
     fi
-    SCHEME=https
-    TLS_ARGS=(--ssl-certfile "$VISOR_TLS_CERT" --ssl-keyfile "$VISOR_TLS_KEY")
 fi
-# The tools inherit this environment and have no use for the key's location.
-unset VISOR_TLS_CERT VISOR_TLS_KEY
+export TLS_DIR="${TLS_DIR:-$VISOR_STATE_DIR/tls}"
+export PUBLISH_ADDR=127.0.0.1
 
 if [ -z "${DEVICE:-}" ]; then
     if [ "$OS" = "Darwin" ]; then DEVICE=mps
@@ -133,7 +127,7 @@ export TEMP_DIR="${TEMP_DIR:-$VISOR_STATE_DIR/tmp}"
 # config.py defaults to `inprocess`, which imports every tool into the API
 # process: the Dockerfile forces `subprocess` and so does this.
 export SADT_DISPATCH_MODE=subprocess
-export SADT_API="$SCHEME://127.0.0.1:$PORT"
+export SADT_API="https://127.0.0.1:$PORT"
 # The tools' own downloads (torch hub: the EfficientNet backbone DOCShapeAXI
 # needs) are staged by `install-tools` under the state folder, not in ~/.cache.
 export TORCH_HOME="$VISOR_STATE_DIR/torch_home"
@@ -154,10 +148,9 @@ ulimit -S -n 10240 2>/dev/null || ulimit -S -n "$(ulimit -Hn)" 2>/dev/null || tr
 
 echo "tools   : $TOOLS_DIR" >&2
 echo "device  : $DEVICE" >&2
-echo "listen  : $SCHEME://$BIND:$PORT" >&2
+echo "listen  : https://$BIND:$PORT" >&2
 echo "open files limit: $(ulimit -n)" >&2
 
 cd "$REPO/server"
-# ${arr[@]+...}: an empty array is an unbound variable to bash 3.2 under `set -u`.
-exec "$API_VENV/bin/python" -m uvicorn main:app --host "$BIND" --port "$PORT" \
-    ${TLS_ARGS[@]+"${TLS_ARGS[@]}"}
+# serve.py, never `uvicorn main:app`: main.py refuses to start without it.
+exec "$API_VENV/bin/python" serve.py --host "$BIND" --port "$PORT"

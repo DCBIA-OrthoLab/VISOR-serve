@@ -43,9 +43,17 @@ MAX_CLOSE_SECONDS = 300.0
 # came back.
 RETRY_AFTER_SECONDS = 10
 
+# How long an OPERATOR may close the door for from the admin panel. Longer
+# than an updater's lease because the decision is a person's, made on purpose
+# -- "stop taking runs, I am about to update" -- and the drain it waits for can
+# be a multi-hour cohort. Still bounded: an operator who forgets is a clinic
+# refused for at most this long, and any restart opens it.
+OPERATOR_MAX_CLOSE_SECONDS = 12 * 3600.0
+
 _lock = threading.Lock()
 _closed_until: Optional[float] = None
 _reason: str = ""
+_by_operator: bool = False
 
 
 def close(seconds: float, reason: str = "") -> float:
@@ -56,8 +64,13 @@ def close(seconds: float, reason: str = "") -> float:
     told what it actually got rather than what it asked for, so an updater that
     wanted an hour learns it has five minutes and refreshes.
     """
-    global _closed_until, _reason
+    global _closed_until, _reason, _by_operator
 
+    with _lock:
+        if _by_operator and _closed_until is not None and time.monotonic() < _closed_until:
+            # An operator closed it for longer: an updater's lease must not
+            # shorten that, only an operator reopening it may.
+            return round(_closed_until - time.monotonic(), 1)
     granted = min(float(seconds), MAX_CLOSE_SECONDS)
     if granted <= 0:
         reopen()
@@ -65,16 +78,37 @@ def close(seconds: float, reason: str = "") -> float:
     with _lock:
         _closed_until = time.monotonic() + granted
         _reason = reason
+        _by_operator = False
+    return granted
+
+
+def close_by_operator(seconds: float, reason: str = "") -> float:
+    """Stop accepting new work for at most `OPERATOR_MAX_CLOSE_SECONDS`.
+
+    What the admin panel's "stop accepting new runs" does: the runs already in
+    are untouched and finish, new ones are refused with a 503 saying why.
+    """
+    global _closed_until, _reason, _by_operator
+
+    granted = min(float(seconds), OPERATOR_MAX_CLOSE_SECONDS)
+    if granted <= 0:
+        reopen()
+        return 0.0
+    with _lock:
+        _closed_until = time.monotonic() + granted
+        _reason = reason or "closed by an operator"
+        _by_operator = True
     return granted
 
 
 def reopen() -> None:
     """Accept work again, now."""
-    global _closed_until, _reason
+    global _closed_until, _reason, _by_operator
 
     with _lock:
         _closed_until = None
         _reason = ""
+        _by_operator = False
 
 
 def accepting() -> bool:
@@ -99,14 +133,15 @@ def snapshot() -> dict:
     """
     with _lock:
         if _closed_until is None:
-            return {"accepting": True, "closed_for": None, "reason": ""}
+            return {"accepting": True, "closed_for": None, "reason": "", "by_operator": False}
         remaining = _closed_until - time.monotonic()
         if remaining <= 0:
-            return {"accepting": True, "closed_for": None, "reason": ""}
+            return {"accepting": True, "closed_for": None, "reason": "", "by_operator": False}
         return {
             "accepting": False,
             "closed_for": round(remaining, 1),
             "reason": _reason,
+            "by_operator": _by_operator,
         }
 
 

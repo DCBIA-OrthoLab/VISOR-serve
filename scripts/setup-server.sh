@@ -3,11 +3,17 @@
 #
 # From a machine with nothing checked out:
 #
-#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-server.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-server.sh | sh
 #
 # Options reach this script through `sh -s --` when piping:
 #
 #   curl -fsSL .../setup-server.sh | sh -s -- --tool AMASSS --tool ALI
+#
+# A complete server -- every tool prebuilt, every model and test file, reached
+# over Tailscale -- in one command:
+#
+#   curl -fsSL .../setup-server.sh | sh -s -- --full --tailscale \
+#       --tools-image ghcr.io/dcbia-ortholab/sadt-visor-tools:latest
 #
 # Options:
 #   --dir DIR       where to clone (default: ./VISOR-serve, or $INSTALL_DIR)
@@ -15,16 +21,78 @@
 #                   Nothing is downloaded by default: the full set is ~29 GB, and
 #                   which tools a given site uses is not something to assume.
 #   --device gpu|cpu   force the compose service instead of detecting it
-#   --bind ADDR     host address the port is published on (default: 127.0.0.1)
+#   --bind ADDR     ignored: the port is published on 127.0.0.1 only
 #   --port N        host port to publish on (default: 8000). Only needed when
 #                   something else already holds it; it is remembered in .env.
 #   --no-start      clone and check prerequisites, but do not start anything
+#   --full          download EVERY tool's models and test files (~29 GB). The
+#                   same as naming every tool with --tool, and the honest
+#                   default for a site that does not yet know what it uses.
+#   --token VALUE   set the API token instead of keeping or generating one
+#   --auto-update MODE   off | notify | apply. Written to .env as
+#                   SADT_AUTO_UPDATE, and the update agent that acts on it is
+#                   installed as a systemd user service (visor-update). See
+#                   scripts/visor-update.service.
+#   --hints         print how to reach and run this deployment -- its URL,
+#                   tokens, update agent -- and stop. What an install prints
+#                   at its end, for whoever comes back to it later.
+#   --branch NAME   the branch this deployment follows (default: deploy). Both
+#                   what is cloned and what `watch` fast-forwards to. `deploy`
+#                   is a commit of `main` whose CI went green and which was
+#                   then promoted on purpose, so a deployment never picks up
+#                   whatever landed on `main` an hour ago. Pass `main` to
+#                   follow the tip instead. A fork carrying no such branch
+#                   falls back to its default one, saying so.
+#   --tools URL     also clone a TOOLS repository and point this deployment at
+#                   it, so the server serves real tools instead of the two
+#                   built-in demos. A git URL, and there is deliberately no
+#                   default: this server imports nothing from the tools and
+#                   knows no dental tool, so naming one repository in here
+#                   would be the one piece of that knowledge it holds. The
+#                   operator says which tools this deployment serves.
+#   --tools-dir DIR where to clone it (default: beside the server clone)
+#   --tools-ref REF which branch of the tools repository to clone (default:
+#                   the same name as --branch if that repository has it, its
+#                   own default branch otherwise). The counterpart of
+#                   --branch, and defaulted to the same name on purpose: the
+#                   two sides are promoted together, and a server following
+#                   `deploy` while the tools follow their tip is how a schema
+#                   and the server that reads it come apart.
+#   --tools-image IMAGE
+#                   serve a tool library from its PREBUILT image instead of a
+#                   clone: every tool's virtualenv and its Python, already
+#                   installed, pulled as one image and mounted read-only
+#                   (docker/compose.tools-image.yml). Minutes instead of an
+#                   hour of builds, and the same bytes on every server. E.g.
+#                   ghcr.io/dcbia-ortholab/sadt-visor-tools:latest, or a
+#                   release tag such as :tools-2026.10.12-1. Replaces --tools
+#                   and --build-tools; data is still downloaded per --tool or
+#                   --full. The updater follows the image's tag: a new tools
+#                   release is pulled and the container recreated, between
+#                   runs, like any other update. The server image then follows
+#                   the deployment's branch too (`:deploy` for deploy).
+#   --build-tools   build each tool's virtualenv after cloning, which is what
+#                   makes them actually RUN. ~25 GB and well over an hour, it
+#                   downloads two CUDA torch runtimes. Implied by --full.
+#                   Installs `uv` from astral.sh if it is not on PATH.
+#   --tailscale     also put the server on a Tailscale network, reachable as
+#                   https://<name>.<tailnet>.ts.net from the tailnet's machines
+#                   and from nowhere else (scripts/setup-tailscale.sh; needs
+#                   sudo). Forces --bind 127.0.0.1: Tailscale is then the only
+#                   way in, and it brings the TLS. Off unless asked for.
+#   --tailscale-key-file PATH
+#                   the Tailscale auth key, read from this file (a file holding
+#                   only the key). Without it the key is asked for at the
+#                   prompt, hidden, or taken from TS_AUTHKEY. Never accepted
+#                   on the command line, where `ps` and the history keep it.
+#   --yes           never ask anything; take the defaults and the options given
 #
 # Environment:
-#   REPO/REF        fork / branch to clone (default: this repo, main)
+#   REPO/REF        fork / branch to clone (default: this repo, deploy)
 #   REPO_URL        the clone URL outright, when REPO's github.com/<owner>/<name>
 #                   shape does not fit (a mirror, an ssh remote, a local path)
 #   INSTALL_DIR     same as --dir
+#   TS_AUTHKEY      the Tailscale auth key, for an unattended --tailscale
 #
 # Re-running is safe: an existing clone is updated rather than re-cloned, and
 # the API token already in .env is kept, so clients configured against this
@@ -32,8 +100,21 @@
 
 set -eu
 
+# One word, single-quoted for a shell to read back verbatim: every ' becomes
+# '\'' and nothing else inside single quotes is special, so $(...), ` and $
+# in an argument stay text.
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# The arguments as given, quoted, for the re-run under the docker group below.
+ORIGINAL_ARGS=""
+for _arg in "$@"; do
+    ORIGINAL_ARGS="$ORIGINAL_ARGS $(shell_quote "$_arg")"
+done
+
 REPO="${REPO:-DCBIA-OrthoLab/VISOR-serve}"
-REF="${REF:-main}"
+REF="${REF:-deploy}"
 REPO_URL="${REPO_URL:-https://github.com/${REPO}.git}"
 INSTALL_DIR="${INSTALL_DIR:-./VISOR-serve}"
 TOOLS=""
@@ -41,6 +122,18 @@ DEVICE="auto"
 BIND="127.0.0.1"
 PORT=""
 START=1
+FULL=0
+TOKEN=""
+AUTO_UPDATE=""
+ASK=1
+TOOLS_REPO=""
+TOOLS_DIR_OPT=""
+TOOLS_REF="${TOOLS_REF:-}"
+BUILD_TOOLS=0
+TOOLS_IMAGE=""
+TAILSCALE=0
+TS_KEY_FILE=""
+HINTS_ONLY=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -50,10 +143,169 @@ while [ $# -gt 0 ]; do
         --bind) BIND="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
         --no-start) START=0; shift ;;
-        -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --full) FULL=1; shift ;;
+        --token) TOKEN="$2"; shift 2 ;;
+        --auto-update) AUTO_UPDATE="$2"; shift 2 ;;
+        --branch) REF="$2"; shift 2 ;;
+        --tools) TOOLS_REPO="$2"; shift 2 ;;
+        --tools-dir) TOOLS_DIR_OPT="$2"; shift 2 ;;
+        --tools-ref) TOOLS_REF="$2"; shift 2 ;;
+        --build-tools) BUILD_TOOLS=1; shift ;;
+        --tools-image) TOOLS_IMAGE="$2"; shift 2 ;;
+        --tailscale) TAILSCALE=1; shift ;;
+        --tailscale-key-file) TAILSCALE=1; TS_KEY_FILE="$2"; shift 2 ;;
+        --yes|-y|--non-interactive) ASK=0; shift ;;
+        --hints) HINTS_ONLY=1; shift ;;
+        -h|--help) sed -n '2,94p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "setup-server: unknown option '$1'" >&2; exit 2 ;;
     esac
 done
+
+# --- what to do with it --------------------------------------------------
+# Printed last, after Tailscale, so it is what the screen shows when the
+# install ends, and again on demand with --hints.
+print_hints() {
+    _ctl="$INSTALL_DIR/scripts/server_ctl.py"
+    _port="$(sed -n 's/^HOST_PORT=//p' "$INSTALL_DIR/.env" 2>/dev/null | tail -n1)"
+    _port="${_port:-${PORT:-8000}}"
+    _url="https://localhost:${_port}"
+    if command -v tailscale >/dev/null 2>&1; then
+        _ts_url="$(tailscale serve status 2>/dev/null | grep -o 'https://[^ ]*' | head -n1)"
+        [ -n "$_ts_url" ] && _url="$_ts_url"
+    fi
+    _mode="$(sed -n 's/^SADT_AUTO_UPDATE=//p' "$INSTALL_DIR/.env" 2>/dev/null | tail -n1)"
+    _agent="not installed (the command below installs it)"
+    if [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/visor-update.service" ]; then
+        _agent="$(systemctl --user is-active visor-update.service 2>/dev/null)" || true
+    fi
+    echo
+    echo "=================================================================="
+    echo " VISOR server"
+    echo "=================================================================="
+    echo
+    echo "Slicer client"
+    echo "    URL    $_url"
+    echo "    token  python3 $_ctl token"
+    echo
+    echo "Admin panel and benchmarks, opened with the ADMIN token (it controls the"
+    echo "whole server, so it is not printed here):"
+    echo "    ${_url}/server-debug"
+    echo "    ${_url}/benchmark"
+    echo "    python3 $_ctl token --admin"
+    echo
+    echo "Updates: mode '${_mode:-off}', agent ${_agent}"
+    echo "    set the mode      sh $INSTALL_DIR/scripts/setup-server.sh --dir $INSTALL_DIR --auto-update apply"
+    echo "    agent log         journalctl --user -u visor-update -f"
+    echo
+    echo "Status    python3 $_ctl status"
+    echo "Logs      python3 $_ctl logs"
+    echo "Remove    python3 $_ctl uninstall   (keeps tokens, settings and DATA)"
+    echo "These again: sh $INSTALL_DIR/scripts/setup-server.sh --dir $INSTALL_DIR --hints"
+}
+
+if [ "$HINTS_ONLY" -eq 1 ]; then
+    # Run from inside a clone, the clone is where this script lives.
+    if [ ! -f "$INSTALL_DIR/scripts/server_ctl.py" ] && [ -f "$(dirname "$0")/server_ctl.py" ]; then
+        INSTALL_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+    fi
+    print_hints
+    exit 0
+fi
+
+# --- the questions -------------------------------------------------------
+# Only on a terminal, and read from /dev/tty rather than stdin: the documented
+# way to run this is `curl ... | sh`, where stdin IS the script and a `read`
+# would swallow the rest of it. A machine, a CI job or --yes takes the
+# defaults and never blocks.
+ask() {
+    # ask VARIABLE "question" "default"
+    eval "_current=\${$1}"
+    if [ -n "$_current" ] || [ "$ASK" -eq 0 ] || [ ! -r /dev/tty ] || [ ! -t 1 ]; then
+        [ -n "$_current" ] || eval "$1=\$3"
+        return 0
+    fi
+    printf '%s [%s]: ' "$2" "$3" > /dev/tty
+    read -r _answer < /dev/tty || _answer=""
+    [ -n "$_answer" ] || _answer="$3"
+    eval "$1=\$_answer"
+}
+
+if [ -n "$TOOLS_IMAGE" ]; then
+    if [ -n "$TOOLS_REPO" ] || [ "$BUILD_TOOLS" -eq 1 ]; then
+        echo "setup-server: --tools-image serves prebuilt tools; ignoring --tools / --build-tools." >&2
+    fi
+    TOOLS_REPO=""
+fi
+
+if [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    echo
+    echo "Answer, or press Enter to take the default in brackets."
+    echo
+fi
+
+ask PORT "Host port to publish the server on" "8000"
+
+# The port is published on 127.0.0.1 and nowhere else (docker-compose.yml):
+# Tailscale, with its publicly signed certificate, is the only way in.
+if [ "$BIND" != "127.0.0.1" ]; then
+    echo "setup-server: --bind is ignored; the server is published on 127.0.0.1 only and reached through Tailscale." >&2
+fi
+BIND="127.0.0.1"
+ask REF  "Branch this deployment follows" "$REF"
+ask AUTO_UPDATE "Follow that branch automatically? off | notify | apply" "off"
+
+# Without a tools repository the server starts with its two demo tools and
+# nothing else, which reads as a small deployment rather than an unfinished
+# one. Asked as a URL rather than offered as a default: see --tools.
+if [ -z "$TOOLS_REPO" ] && [ -z "$TOOLS_IMAGE" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    printf 'Git URL of the tools repository to serve (empty: the demos only): ' > /dev/tty
+    read -r TOOLS_REPO < /dev/tty || TOOLS_REPO=""
+fi
+
+case "$AUTO_UPDATE" in
+    off|notify|apply) ;;
+    *) echo "setup-server: --auto-update must be off, notify or apply (got '$AUTO_UPDATE')." >&2; exit 2 ;;
+esac
+
+# The token is what the Slicer client and the dashboard authenticate with.
+# Left empty, server_ctl.py generates one and a re-run keeps it, so configured
+# clients keep working -- which is why this does not default to a new value.
+if [ -z "$TOKEN" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    printf 'API token for Slicer and the dashboard [keep existing, else generate]: ' > /dev/tty
+    read -r TOKEN < /dev/tty || TOKEN=""
+fi
+
+# What to download. Asked as one question rather than per tool: the full set is
+# ~29 GB and naming eighteen tools at a prompt is not a thing anyone does.
+if [ "$FULL" -eq 0 ] && [ -z "$TOOLS" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    printf 'Download models and test files for every tool now? ~29 GB [y/N]: ' > /dev/tty
+    read -r _all < /dev/tty || _all=""
+    case "$_all" in y|Y|yes|YES) FULL=1 ;; esac
+fi
+
+# A server whose tools have no virtualenv reports every one of them as
+# unloadable, which reads as a broken deployment rather than an unbuilt one.
+[ "$FULL" -eq 1 ] && [ -z "$TOOLS_IMAGE" ] && BUILD_TOOLS=1
+if [ "$BUILD_TOOLS" -eq 0 ] && [ -n "$TOOLS_REPO" ] && [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    printf 'Build each tool virtualenv now? Needed to run them. ~25 GB, over an hour [y/N]: ' > /dev/tty
+    read -r _bt < /dev/tty || _bt=""
+    case "$_bt" in y|Y|yes|YES) BUILD_TOOLS=1 ;; esac
+fi
+
+# A branch name is a DEFAULT here, not a demand: this script is curl-piped at
+# forks and mirrors, and `git clone --branch deploy` against one that promotes
+# nothing exits 128 with the whole install undone. Asking the remote first
+# turns that into one printed line and the default branch.
+remote_branch_or_default() {
+    # $1 remote URL, $2 wanted branch. Echoes the branch to clone, or nothing
+    # for "let git pick", and explains itself on stderr when it gives up.
+    if [ -z "$2" ]; then return 0; fi
+    if git ls-remote --exit-code --heads "$1" "$2" >/dev/null 2>&1; then
+        echo "$2"
+    else
+        echo "setup-server: $1 has no '$2' branch; taking its default one." >&2
+    fi
+}
 
 for tool in git python3; do
     if ! command -v "$tool" >/dev/null 2>&1; then
@@ -80,8 +332,15 @@ elif [ -e "$INSTALL_DIR" ]; then
     echo "  or pass --dir with somewhere else." >&2
     exit 1
 else
-    echo "Cloning ${REPO_URL}@${REF} into $INSTALL_DIR ..."
-    git clone --branch "$REF" "$REPO_URL" "$INSTALL_DIR"
+    CLONE_REF="$(remote_branch_or_default "$REPO_URL" "$REF")"
+    if [ -n "$CLONE_REF" ]; then
+        echo "Cloning ${REPO_URL}@${CLONE_REF} into $INSTALL_DIR ..."
+        git clone --branch "$CLONE_REF" "$REPO_URL" "$INSTALL_DIR"
+    else
+        echo "Cloning ${REPO_URL} into $INSTALL_DIR ..."
+        git clone "$REPO_URL" "$INSTALL_DIR"
+        REF="$(git -C "$INSTALL_DIR" rev-parse --abbrev-ref HEAD)"
+    fi
 fi
 
 CTL="$INSTALL_DIR/scripts/server_ctl.py"
@@ -90,48 +349,437 @@ if [ ! -f "$CTL" ]; then
     exit 1
 fi
 
+# --- how far behind the tip this deployment is ---------------------------
+# A deployment branch is behind `main` on purpose; the failure mode is silence
+# about HOW far. A `deploy` nobody promoted for three months reads exactly
+# like one promoted this morning, and the operator who has to decide whether a
+# fix is in their deployment has no way to tell. Reported, never enforced:
+# whether to promote is the maintainer's call, not this script's.
+if [ "$REF" != "main" ]; then
+    git -C "$INSTALL_DIR" fetch --quiet origin main 2>/dev/null || true
+    BEHIND="$(git -C "$INSTALL_DIR" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || true)"
+    TIP_DATE="$(git -C "$INSTALL_DIR" log -1 --format=%cs FETCH_HEAD 2>/dev/null || true)"
+    case "$BEHIND" in
+        ''|*[!0-9]*) ;;
+        0) echo "Following '${REF}', which is level with main." ;;
+        *) echo "Following '${REF}', ${BEHIND} commit(s) behind main (tip ${TIP_DATE})." ;;
+    esac
+fi
+
 # --- docker --------------------------------------------------------------
+# Docker, with the GPU's container toolkit when this host has a working
+# NVIDIA driver -- installed here rather than left as a second command, so a
+# bare machine becomes a server in one go. Root is asked for through sudo, the
+# way the Tailscale step asks for it.
+GPU_STATE=0
+GPU_REPORT="$(sh "$INSTALL_DIR/scripts/check-gpu.sh")" || GPU_STATE=$?
+
+# A card the tools can use, held back by its driver: missing on a fresh
+# install, or older than the card or CUDA 12.8 needs. Installing the
+# recommended one takes a reboot, so the install stops there and the same
+# command finishes it -- before Docker and before the Tailscale key is asked
+# for, so nothing is half done across the reboot.
+if [ "$GPU_STATE" -eq 3 ]; then
+    echo
+    echo "GPU: $GPU_REPORT"
+    _driver=1
+    if [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+        printf 'Install the recommended NVIDIA driver now (needs sudo, then a reboot)? [Y/n]: ' > /dev/tty
+        read -r _answer < /dev/tty || _answer=""
+        case "$_answer" in n|N|no|NO) _driver=0 ;; esac
+    fi
+    if [ "$_driver" -eq 1 ]; then
+        if [ "$(id -u)" -eq 0 ]; then
+            sh "$INSTALL_DIR/scripts/install-nvidia-driver.sh" || _driver=0
+        else
+            echo "Installing it needs root; sudo may ask for your password."
+            sudo sh "$INSTALL_DIR/scripts/install-nvidia-driver.sh" || _driver=0
+        fi
+    fi
+    if [ "$_driver" -eq 1 ]; then
+        echo
+        echo "Reboot this machine, then run the same install command again:"
+        echo "it picks up where it left off, on the GPU."
+        exit 0
+    fi
+    GPU_STATE=2
+fi
+_needs_toolkit=0
+if [ "$GPU_STATE" -eq 0 ] && ! command -v nvidia-ctk >/dev/null 2>&1; then
+    _needs_toolkit=1
+fi
+if ! command -v docker >/dev/null 2>&1 || [ "$_needs_toolkit" -eq 1 ]; then
+    _what="Docker"
+    [ "$_needs_toolkit" -eq 1 ] && _what="Docker and the NVIDIA Container Toolkit"
+    command -v docker >/dev/null 2>&1 && [ "$_needs_toolkit" -eq 1 ] && _what="the NVIDIA Container Toolkit"
+    echo
+    echo "$_what is not installed on this machine."
+    if [ "$ASK" -eq 1 ] && [ -r /dev/tty ] && [ -t 1 ]; then
+        printf 'Install it now (needs sudo)? [Y/n]: ' > /dev/tty
+        read -r _install < /dev/tty || _install=""
+        case "$_install" in n|N|no|NO)
+            echo "Install it yourself with:"
+            echo "    sudo sh $INSTALL_DIR/scripts/install-docker.sh$( [ "$GPU_STATE" -eq 0 ] && echo ' --nvidia')"
+            echo "then re-run this script."
+            exit 1 ;;
+        esac
+    fi
+    _flags=""
+    [ "$GPU_STATE" -eq 0 ] && _flags="--nvidia"
+    if [ "$(id -u)" -eq 0 ]; then
+        sh "$INSTALL_DIR/scripts/install-docker.sh" $_flags
+    else
+        echo "Installing it needs root; sudo may ask for your password."
+        sudo sh "$INSTALL_DIR/scripts/install-docker.sh" $_flags
+    fi
+fi
+
 if ! docker info >/dev/null 2>&1; then
+    # Installed just now, or this user was only just added to the docker group:
+    # a group joined in this session does not apply to it until a new login.
+    # `sg` starts the rest of this install in that group instead, so nobody has
+    # to log out half-way through.
+    if [ -z "${VISOR_SETUP_REEXEC:-}" ] && command -v sg >/dev/null 2>&1 \
+            && getent group docker | grep -qw "$(id -un)" && sg docker -c "docker info" >/dev/null 2>&1; then
+        echo "Continuing in the docker group (no need to log out)..."
+        export VISOR_SETUP_REEXEC=1 REPO REF REPO_URL INSTALL_DIR
+        # No eval: the command string is read ONCE, by the shell sg starts, and
+        # every word in it is single-quoted. An eval here re-expanded the
+        # arguments, so a token holding $(...) was executed.
+        exec sg docker -c "sh $(shell_quote "$INSTALL_DIR/scripts/setup-server.sh")$ORIGINAL_ARGS"
+    fi
     echo
-    echo "Docker is not installed, or its daemon is not reachable by this user."
-    echo "Install it with:"
-    echo
-    echo "    sudo sh $INSTALL_DIR/scripts/install-docker.sh"
-    echo
-    echo "then log out and back in (group membership only applies to a new session)"
-    echo "and re-run this script. It will pick up where it left off."
+    echo "Docker is installed but this user cannot reach its daemon yet."
+    echo "Log out and back in (group membership applies to a new session),"
+    echo "then re-run this script. It will pick up where it left off."
     exit 1
 fi
 
-# --- models --------------------------------------------------------------
-# Before starting the server, not after: the tools that have no weights on
-# disk answer 422 rather than failing mysteriously, so it is better to know
-# what is missing while someone is still watching the terminal.
-if [ -n "$TOOLS" ]; then
-    # shellcheck disable=SC2086 -- $TOOLS is a deliberately word-split option list
-    python3 "$CTL" models $TOOLS
+# A GPU the tools cannot use -- a card older than Turing, or a driver that was
+# not updated -- would let the GPU service start and every run fail at its
+# first CUDA call. Saying so now and starting on CPU is the honest outcome;
+# updating the driver and re-running moves it to the GPU.
+case "$GPU_STATE" in
+    0) echo "GPU: $GPU_REPORT" ;;
+    2)
+        echo
+        echo "GPU: $GPU_REPORT"
+        echo "The server starts on CPU: every tool works, slowly."
+        [ "$DEVICE" = "auto" ] && DEVICE="cpu"
+        ;;
+    *) echo "GPU: $GPU_REPORT; the server runs on CPU." ;;
+esac
+
+# --- settings that outlive this run --------------------------------------
+# Merged line by line, never rewritten: an operator's own additions to .env
+# must survive, which is the same rule server_ctl.py's write_env follows.
+set_env() {
+    _file="$INSTALL_DIR/.env"
+    _tmp="$_file.tmp.$$"
+    # It holds the API and admin tokens: the new file is created 0600 from the
+    # start (umask in a subshell), never written under the default umask and
+    # narrowed afterwards. The old line is dropped by an exact key match and
+    # the new one appended with printf, so no character of the value (|, &,
+    # \) is ever read as a sed expression.
+    (
+        umask 077
+        if [ -f "$_file" ]; then
+            awk -v key="$1" 'index($0, key "=") != 1' "$_file" > "$_tmp"
+        else
+            printf '%s\n' "# Written by scripts/setup-server.sh." > "$_tmp"
+        fi
+        printf '%s=%s\n' "$1" "$2" >> "$_tmp"
+    ) && mv "$_tmp" "$_file"
+    chmod 600 "$_file"
+}
+
+# Drop KEY from .env, the same way set_env replaces it.
+unset_env() {
+    _file="$INSTALL_DIR/.env"
+    [ -f "$_file" ] || return 0
+    _tmp="$_file.tmp.$$"
+    (umask 077; awk -v key="$1" 'index($0, key "=") != 1' "$_file" > "$_tmp") && mv "$_tmp" "$_file"
+    chmod 600 "$_file"
+}
+
+# --- the tools -----------------------------------------------------------
+# A separate repository on purpose: this server imports nothing from it and
+# knows no dental tool. It is cloned, mounted at its own path, and served.
+# What `server_ctl.py uninstall` kept beside this clone: the tokens, so every
+# client keeps working, and DATA/, so tens of GB do not travel twice. Put back
+# before anything is downloaded, and only where nothing is already in place.
+KEPT="$(cd "$(dirname "$INSTALL_DIR")" && pwd)/$(basename "$INSTALL_DIR").kept"
+if [ -d "$KEPT" ]; then
+    echo "Restoring what the last uninstall kept, from $KEPT ..."
+    if [ -d "$KEPT/DATA" ]; then
+        if [ ! -e "$INSTALL_DIR/DATA" ] || [ -z "$(ls -A "$INSTALL_DIR/DATA" 2>/dev/null)" ]; then
+            rmdir "$INSTALL_DIR/DATA" 2>/dev/null || true
+            mv "$KEPT/DATA" "$INSTALL_DIR/DATA" && echo "  DATA/ moved back"
+        else
+            echo "  $INSTALL_DIR/DATA already has data; leaving $KEPT/DATA where it is." >&2
+        fi
+    fi
+    if [ -f "$KEPT/.env" ]; then
+        while IFS='=' read -r _key _value; do
+            case "$_key" in API_TOKEN|ADMIN_TOKEN) ;; *) continue ;; esac
+            if [ -f "$INSTALL_DIR/.env" ] && grep -q "^$_key=" "$INSTALL_DIR/.env"; then
+                continue
+            fi
+            set_env "$_key" "$_value" && echo "  $_key restored"
+        done < "$KEPT/.env"
+    fi
+    if [ -f "$KEPT/server.env" ] && [ ! -f "$INSTALL_DIR/server/.env" ]; then
+        cp -p "$KEPT/server.env" "$INSTALL_DIR/server/.env" && echo "  server/.env restored"
+    fi
+    if [ -f "$KEPT/smoke.json" ] && [ ! -f "$INSTALL_DIR/server/.update/smoke.json" ]; then
+        mkdir -p "$INSTALL_DIR/server/.update"
+        cp -p "$KEPT/smoke.json" "$INSTALL_DIR/server/.update/smoke.json" && echo "  smoke tests restored"
+    fi
+    # Kept until everything in it is back in place; then it goes.
+    [ -d "$KEPT/DATA" ] || rm -rf "$KEPT"
 fi
+
+TOOLS_ROOT=""
+if [ -n "$TOOLS_REPO" ]; then
+    if [ -n "$TOOLS_DIR_OPT" ]; then
+        TOOLS_ROOT="$TOOLS_DIR_OPT"
+    else
+        # Named after the repository, never after a repository this script
+        # knows: `--tools .../Foo.git` clones into ./Foo beside the server.
+        _tools_name="$(basename "$TOOLS_REPO")"
+        _tools_name="${_tools_name%.git}"
+        TOOLS_ROOT="$(dirname "$INSTALL_DIR")/${_tools_name}"
+    fi
+    if [ -d "$TOOLS_ROOT/.git" ]; then
+        echo "Updating the tools clone in $TOOLS_ROOT ..."
+        git -C "$TOOLS_ROOT" fetch --quiet origin || true
+        git -C "$TOOLS_ROOT" pull --ff-only || {
+            echo "setup-server: could not fast-forward $TOOLS_ROOT; leaving it as it is." >&2
+        }
+    elif [ -e "$TOOLS_ROOT" ]; then
+        echo "setup-server: $TOOLS_ROOT exists and is not a git clone." >&2
+        echo "  Move it aside or pass --tools-dir with somewhere else." >&2
+        exit 1
+    else
+        echo "Cloning the tools from $TOOLS_REPO into $TOOLS_ROOT ..."
+        # Unset means "follow the server", not "follow the tip".
+        TOOLS_CLONE_REF="$(remote_branch_or_default "$TOOLS_REPO" "${TOOLS_REF:-$REF}")"
+        if [ -n "$TOOLS_CLONE_REF" ]; then
+            git clone --branch "$TOOLS_CLONE_REF" "$TOOLS_REPO" "$TOOLS_ROOT"
+        else
+            git clone "$TOOLS_REPO" "$TOOLS_ROOT"
+        fi
+    fi
+    TOOLS_ROOT="$(cd "$TOOLS_ROOT" && pwd)"
+fi
+
+# --- models and test files -----------------------------------------------
+# Before starting the server, not after: a tool with no weights on disk
+# answers 422 rather than failing mysteriously, so it is better to know what
+# is missing while someone is still watching the terminal.
+#
+# Delegated to the TOOLS repository's own script: the manifest listing which
+# bundle belongs to which tool is dental knowledge and lives beside the tools.
+# Falls back to this repo's copy while both exist, so an older tools checkout
+# still works.
+fetch_data() {
+    if [ -n "$TOOLS_ROOT" ] && [ -f "$TOOLS_ROOT/scripts/setup-data.sh" ]; then
+        ( cd "$TOOLS_ROOT" && sh scripts/setup-data.sh --data-dir "$(cd "$INSTALL_DIR" && pwd)/DATA" "$@" )
+    else
+        # shellcheck disable=SC2086
+        python3 "$CTL" models "$@"
+    fi
+}
+
+if [ "$FULL" -eq 1 ]; then
+    echo
+    echo "Downloading every tool's models and test files (~31 GB)."
+    echo "Whatever is already on disk is skipped, so this is resumable."
+    fetch_data
+elif [ -n "$TOOLS" ]; then
+    # shellcheck disable=SC2086 -- $TOOLS is a deliberately word-split option list
+    fetch_data $TOOLS
+fi
+
+# --- the tool virtualenvs ------------------------------------------------
+# One per tool, built from its own committed lockfile. They are what makes a
+# tool runnable: TOOLS_DIR pointing at a tree with no `.venv` registers
+# nothing. A tool that fails to build is REPORTED and the others carry on --
+# the same rule the registry follows, because with eighteen tools one missing
+# dependency must not cost the other seventeen.
+if [ "$BUILD_TOOLS" -eq 1 ] && [ -n "$TOOLS_ROOT" ]; then
+    if ! command -v uv >/dev/null 2>&1; then
+        echo
+        echo "Installing uv (the tools' package manager) from astral.sh ..."
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+        # Its installer puts uv here and prints a line about restarting the
+        # shell, which a non-interactive run cannot do.
+        PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+        export PATH
+    fi
+    if ! command -v uv >/dev/null 2>&1; then
+        echo "setup-server: uv is still not on PATH; cannot build the tool virtualenvs." >&2
+        echo "  Install it yourself (https://docs.astral.sh/uv/) and re-run with --build-tools." >&2
+    else
+        echo
+        echo "Building each tool's virtualenv. This downloads two CUDA torch"
+        echo "runtimes and lands at roughly 25 GB; it is resumable, so a"
+        echo "re-run only does what is missing."
+        _failed=""
+        for _pyproject in "$TOOLS_ROOT"/tools/*/pyproject.toml "$TOOLS_ROOT"/tools/*/*/pyproject.toml; do
+            [ -f "$_pyproject" ] || continue
+            grep -q '^\[tool.sadt\]' "$_pyproject" || continue   # a tool, not a shared package
+            _tool_dir="$(dirname "$_pyproject")"
+            _tool_name="$(basename "$_tool_dir")"
+            printf '  %-20s ' "$_tool_name"
+            # --all-extras, as the image builds them: Crown_Seg's segmentation
+            # engine is an extra, and without it every mesh that is not already
+            # labelled is refused (AREG IOS included).
+            if ( cd "$_tool_dir" && uv sync --frozen --all-extras --quiet ) >/dev/null 2>&1; then
+                echo "built"
+            else
+                echo "FAILED"
+                _failed="$_failed $_tool_name"
+            fi
+        done
+        if [ -n "$_failed" ]; then
+            echo
+            echo "These tools did not build and will not be served:$_failed"
+            echo "  Re-run the one that matters from its own folder to see why:"
+            echo "      cd $TOOLS_ROOT/tools/<name> && uv sync --frozen --all-extras"
+        fi
+    fi
+fi
+
+# --- point the deployment at the tools -----------------------------------
+if [ -n "$TOOLS_IMAGE" ]; then
+    # Pulled here, with docker's own progress, rather than left to `up`: the
+    # library image is tens of GB, and a start that sits silent for twenty
+    # minutes looks like a hang.
+    echo
+    echo "Pulling the tools image $TOOLS_IMAGE ..."
+    if ! docker pull "$TOOLS_IMAGE"; then
+        # A tools image built on this machine was never in a registry.
+        docker image inspect "$TOOLS_IMAGE" >/dev/null 2>&1 || {
+            echo "setup-server: $TOOLS_IMAGE could not be pulled and is not on this machine." >&2
+            exit 1
+        }
+        echo "Using the copy of $TOOLS_IMAGE already on this machine."
+    fi
+    set_env COMPOSE_FILE "docker-compose.yml:docker/compose.tools-image.yml"
+    set_env SADT_TOOLS_IMAGE "$TOOLS_IMAGE"
+    # The server image of the branch this deployment follows: server-image.yml
+    # publishes `:main` from main and `:deploy` with every server release, so
+    # the code a pull lands and the image it runs in move together.
+    case "$REF" in
+        main|deploy)
+            _owner="$(echo "${REPO%%/*}" | tr '[:upper:]' '[:lower:]')"
+            set_env VISOR_SERVER_IMAGE "ghcr.io/${_owner}/visor-serve:${REF}"
+            ;;
+    esac
+    # A previous install from a clone left these; with an image they would
+    # mount a checkout nothing reads any more.
+    for _key in SADT_TOOLS UV_PYTHON_STORE; do
+        if [ -f "$INSTALL_DIR/.env" ] && grep -q "^$_key=" "$INSTALL_DIR/.env"; then
+            unset_env "$_key"
+        fi
+    done
+elif [ -n "$TOOLS_ROOT" ]; then
+    set_env SADT_TOOLS "$TOOLS_ROOT"
+    # The interpreters those virtualenvs symlink to. uv installs its own
+    # CPython outside the checkout, so without this every `.venv/bin/python`
+    # inside the container is a dangling link.
+    for candidate in "${UV_PYTHON_INSTALL_DIR:-}" "$HOME/.local/share/uv/python"; do
+        [ -n "$candidate" ] && [ -d "$candidate" ] && { set_env UV_PYTHON_STORE "$candidate"; break; }
+    done
+fi
+
+[ -n "$TOKEN" ] && set_env API_TOKEN "$TOKEN"
+[ -n "$AUTO_UPDATE" ] && set_env SADT_AUTO_UPDATE "$AUTO_UPDATE"
 
 # --- start ---------------------------------------------------------------
 if [ "$START" -eq 0 ]; then
-    python3 "$CTL" status --device "$DEVICE"
+    python3 "$CTL" status --device "$DEVICE" --branch "$REF"
     exit 0
 fi
 
 if [ -n "$PORT" ]; then
-    python3 "$CTL" up --device "$DEVICE" --bind "$BIND" --port "$PORT"
+    python3 "$CTL" up --device "$DEVICE" --bind "$BIND" --port "$PORT" --branch "$REF"
 else
-    python3 "$CTL" up --device "$DEVICE" --bind "$BIND"
+    python3 "$CTL" up --device "$DEVICE" --bind "$BIND" --branch "$REF"
 fi
 
-echo
-echo "Point the Slicer client at this server with:"
-echo "    URL    http://localhost:${PORT:-8000}"
-echo "    token  $(python3 "$CTL" token)"
-echo
-echo "Or open the 'Slicer Cloud' module in Slicer, which does all of the above"
-echo "(clone, start, update, model selection) from a panel."
-echo
-echo "This deployment listens on ${BIND} over plain HTTP. That is fine for"
-echo "localhost; putting it on a network address requires a TLS terminator in"
-echo "front -- see SECURITY.md."
+# --- the update agent ----------------------------------------------------
+# What acts on SADT_AUTO_UPDATE: scripts/update_agent.py, as a systemd user
+# service bound to THIS clone, lingering so it runs with nobody logged in.
+# Installed whatever the mode -- 'off' only keeps it from acting, and the
+# admin panel's update button talks to it either way.
+if [ -n "$AUTO_UPDATE" ] && [ "$(id -u)" -ne 0 ] && command -v systemctl >/dev/null 2>&1 \
+        && systemctl --user show-environment >/dev/null 2>&1; then
+    _unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    _abs_dir="$(cd "$INSTALL_DIR" && pwd)"
+    mkdir -p "$_unit_dir"
+    sed "s|^WorkingDirectory=.*|WorkingDirectory=$_abs_dir|" \
+        "$INSTALL_DIR/scripts/visor-update.service" > "$_unit_dir/visor-update.service"
+    systemctl --user daemon-reload
+    systemctl --user enable visor-update.service >/dev/null 2>&1
+    # restart, not start: a re-run must hand the agent the new code and mode.
+    if systemctl --user restart visor-update.service; then
+        echo "Update agent running (mode '${AUTO_UPDATE}')."
+    else
+        echo "The update agent did not start: journalctl --user -u visor-update" >&2
+    fi
+    if [ "$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null)" != "yes" ]; then
+        loginctl enable-linger "$(id -un)" 2>/dev/null \
+            || sudo loginctl enable-linger "$(id -un)" \
+            || echo "Without linger the agent stops at logout: sudo loginctl enable-linger $(id -un)" >&2
+    fi
+elif [ -n "$AUTO_UPDATE" ]; then
+    echo "The update agent is a systemd user service, which this session cannot reach;"
+    echo "see scripts/visor-update.service to install it by hand."
+fi
+
+if [ "$TAILSCALE" -eq 1 ]; then
+    echo
+    echo "--- Tailscale ---"
+    _ts_args="--port ${PORT:-8000} --dir $INSTALL_DIR"
+    [ "$ASK" -eq 0 ] && _ts_args="$_ts_args --yes"
+    [ -n "$TS_KEY_FILE" ] && _ts_args="$_ts_args --auth-key-file $TS_KEY_FILE"
+    # The server is installed and running by now. A Tailscale step that stops
+    # -- no key on an unattended run, certificates not enabled on the tailnet,
+    # a device waiting for approval -- must not turn that into a failed
+    # install: it says what is missing, and re-running the script finishes it.
+    _ts_ok=1
+    # A handler, not an ignore: the child still dies on Ctrl-C (a handler is
+    # reset across exec), and this script carries on to the summary.
+    trap ':' INT
+    if [ "$(id -u)" -eq 0 ]; then
+        # shellcheck disable=SC2086 -- a deliberately word-split option list
+        sh "$INSTALL_DIR/scripts/setup-tailscale.sh" $_ts_args || _ts_ok=0
+    else
+        echo "Installing Tailscale needs root; sudo may ask for your password."
+        # TS_AUTHKEY is kept by NAME, so an unattended install works under
+        # sudo, which would otherwise drop it -- and the key itself never
+        # becomes an argument `ps` could show.
+        # shellcheck disable=SC2086
+        sudo --preserve-env=TS_AUTHKEY sh "$INSTALL_DIR/scripts/setup-tailscale.sh" $_ts_args || _ts_ok=0
+    fi
+    trap - INT
+    stty echo < /dev/tty 2>/dev/null || true
+    if [ "$_ts_ok" -eq 0 ]; then
+        echo
+        echo "The server is installed and listens on 127.0.0.1:${PORT:-8000}, but Tailscale"
+        echo "is not finished (see above). Once that is fixed, finish it with:"
+        echo
+        echo "    sudo sh $INSTALL_DIR/scripts/setup-tailscale.sh --port ${PORT:-8000} --dir $INSTALL_DIR"
+    fi
+else
+    echo
+    echo "This deployment is NOT reachable by any client yet. It listens over HTTPS"
+    echo "on 127.0.0.1 only, with a self-signed certificate no client accepts:"
+    echo "clients verify a publicly signed certificate. Re-run with --tailscale, or"
+    echo "put a reverse proxy or the server's own certificate in front and set"
+    echo "PUBLIC_URL (server/README.md, \"HTTPS only\")."
+fi
+
+print_hints

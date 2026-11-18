@@ -38,6 +38,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import subprocess
 import threading
 import shutil
@@ -65,6 +66,19 @@ VRAM_SOURCE_KEY = "vram_source"
 VRAM_FROM_TORCH = "torch"   # this process's own allocator, exact
 VRAM_FROM_CARD = "card"     # the whole card's growth, contaminated by neighbours
 VRAM_FROM_NONE = "none"     # no figure at all
+
+# Nested admission (the server's `execution/nested.py`). The root run's process
+# is handed a socket and a key; every level passes both down, and a supervisor
+# about to start a child asks through them for the child to be admitted like a
+# run of its own. Absent -- a tool run outside a server, or an older server --
+# and a child runs inside its parent's room, as it always did.
+ADMISSION_SOCKET_ENV = "SADT_ADMISSION_SOCKET"
+ADMISSION_KEY_ENV = "SADT_ADMISSION_KEY"
+# Set on a child the server admitted, which then measures its own subtree only.
+ADMITTED_ENV = "SADT_ADMITTED"
+# In result.json: this level's nested calls were admitted and measured on their
+# own, so its figures are the tool alone.
+NESTED_ADMITTED_KEY = "nested_admitted"
 
 # The supervisor: how a tool calls ANOTHER tool. Keyword-only and unannotated,
 # which is what `describe.py` reads to keep it out of the published schema -- a
@@ -164,8 +178,23 @@ SUP_DIRNAME = "sup"
 _ALL_STEPS = frozenset({"*"})
 
 
-class QualityControlStop(Exception):
+class QualityControlStop(BaseException):
     """A run stopping where it was ASKED to stop, which is not a failure.
+
+    **BaseException, not Exception, and that is the whole point.** This class
+    lives here, in the file the server injects by path, so a tool CANNOT import
+    it -- and therefore cannot write `except QualityControlStop: raise`. Every
+    tool that wraps a `sup.run()` in `except Exception` to keep one bad case
+    from costing the cohort would otherwise catch this too, and turn "the
+    reader asked to stop here" into "that step failed". Measured on 2026-09-29:
+    `ALI_IOS` armed at `Crown_Seg` answered 500 with "Crown_Seg could not label
+    them. First reason: QualityControlStop", and no pause ever happened.
+    `ASO` and `AREG_IOSCBCT` have the same shape of catch.
+
+    Deriving from BaseException puts it beside `KeyboardInterrupt` and
+    `SystemExit`, which is exactly the company it keeps: control flow that
+    unwinds a program and must not be mistaken for an error. `except Exception`
+    no longer sees it, and nothing in any tool had to change.
 
     Raised inside the tool's own code -- by `sup.declareQualityControl` or by
     the supervisor on the way out of a `sup.run()` the caller armed -- and
@@ -191,7 +220,7 @@ class QualityControlStop(Exception):
 # Measured: an orchestrating tool holds ~12 MB (AREG_IOSCBCT imports no torch),
 # a leaf ~500 MB, and a chain is SEQUENTIAL -- each sup.run() waits for its
 # child -- so one heavy process lives at a time per chain whatever the depth.
-# What multiplies memory is MAX_CONCURRENT_TOOLS, not this.
+# What multiplies memory is how many runs admission lets in at once, not this.
 SUPERVISOR_DEPTH_ENV = "SADT_SUPERVISOR_DEPTH"
 MAX_SUPERVISOR_DEPTH = 10
 
@@ -222,6 +251,34 @@ MAX_PROGRESS_RECORD_BYTES = 4096
 # chain append to the same file -- so it bounds the BYTES it can add rather than
 # the count. The server applies the real MAX_RUN_EVENTS cap when it reads.
 MAX_PROGRESS_FILE_BYTES = 8 * 1024 * 1024
+
+# Which supervised call this process IS, as a dotted path of slot numbers:
+# unset (the root), "1" for the root's first `sup.run`, "1.2" for that child's
+# second. Set by the supervisor for each child, so every record a level writes
+# can say whose it is -- which is what lets the server fold a child's own 0..1
+# into the span its parent gave it, and tell two siblings running at once
+# apart, where `depth` alone cannot.
+PROGRESS_CALL_ENV = "SADT_PROGRESS_CALL"
+_CALL_ID = re.compile(r"[0-9]{1,4}(\.[0-9]{1,4}){0,9}")
+
+# The keyword a caller passes to `sup.run` to say how much of ITS OWN bar the
+# call occupies: `sup.run("ALI_CBCT", ..., _progress=(0.2, 0.6))`. Taken out
+# before the callee sees it, the way `output_dir` is, so no tool has to declare
+# it. Underscored because it is the supervisor's, and a tool argument can never
+# start with one.
+SPAN_ARGUMENT = "_progress"
+
+# What `sup.log` accepts, and what the rest are read as. The names are the
+# standard library's, so a level means here what it means in every log the
+# tool already writes.
+# "metric" is `wire.runs`' own: a number for the user, read as info elsewhere.
+LOG_LEVELS = ("debug", "info", "warning", "error", "metric")
+_LOG_LEVEL_ALIASES = {"warn": "warning", "critical": "error", "fatal": "error"}
+
+# How much of a failure the runner hands the server. The message is a tool's
+# own words and the server redacts it before an operator sees it; the bound is
+# here so a 40-patient list joined into one sentence cannot outgrow result.json.
+MAX_FAILURE_MESSAGE = 500
 
 # The tools already on the stack, innermost last, as one comma-separated value.
 # It travels in the environment rather than in job.json because it belongs to
@@ -470,21 +527,37 @@ class _TreeSampler:
         self._ps_snapshot = None
         self._stop = threading.Event()
         self._thread = None
+        # Nested calls admitted as runs of their own. Their processes share
+        # this group -- that is what lets one kill stop a whole chain -- but
+        # they are measured by their own runner and recorded under their own
+        # name, so their subtrees are left out of this one.
+        self._excluded = set()
+        # An admitted nested call measures its own subtree only: the group it
+        # sits in is the ROOT's, and holds its parents too.
+        self.subtree_only = False
+
+    def exclude(self, pid: int) -> None:
+        """Leave `pid` and everything it starts out of this run's figures."""
+        self._excluded.add(int(pid))
 
     # -- one sample ----------------------------------------------------
     def _group(self) -> set:
-        """Every pid in this run's process group."""
+        """Every pid this run is measured over.
+
+        Its process group, or -- for an admitted nested call -- its own subtree;
+        either way minus the subtrees of the nested calls it admitted.
+        """
         try:
             mine = os.getpgrp()
         except OSError:
             return set()
-        found = set()
         try:
             entries = os.listdir("/proc")
         except OSError:
             if sys.platform == "darwin":
                 return self._group_from_ps(mine)
-            return found  # not Linux, or /proc not mounted
+            return set()  # not Linux, or /proc not mounted
+        group, children = set(), {}
         for entry in entries:
             if not entry.isdigit():
                 continue
@@ -493,9 +566,14 @@ class _TreeSampler:
                     fields = handle.read().rsplit(b")", 1)[-1].split()
                 # After the comm field: state, ppid, pgrp, ...
                 if int(fields[2]) == mine:
-                    found.add(int(entry))
+                    pid = int(entry)
+                    group.add(pid)
+                    children.setdefault(int(fields[1]), []).append(pid)
             except (OSError, IndexError, ValueError):
                 continue  # it exited between the listing and the read
+        found = _subtree(os.getpid(), children) & group if self.subtree_only else group
+        for pid in tuple(self._excluded):
+            found -= _subtree(pid, children)
         return found
 
     def _group_from_ps(self, mine: int) -> set:
@@ -821,15 +899,147 @@ def _peak_rss_bytes():
     try:
         import resource as _resource
 
-        peak_kb = max(
-            _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss,
-            _resource.getrusage(_resource.RUSAGE_CHILDREN).ru_maxrss,
-        )
+        peak_kb = _resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss
+        # Not once a nested call has been admitted on its own: the children
+        # this process waited for then include that call, which is measured and
+        # recorded under its own name. The sampler still covers this level's
+        # own workers, its admitted children's subtrees left out.
+        if not _nested_admitted:
+            peak_kb = max(peak_kb, _resource.getrusage(_resource.RUSAGE_CHILDREN).ru_maxrss)
         # Linux reports kilobytes; macOS reports bytes. Only Linux runs here,
         # but a benchmark harness on a laptop should not record a 1000x figure.
         return int(peak_kb) if sys.platform == "darwin" else int(peak_kb) * 1024
     except Exception:  # noqa: BLE001 - instrumentation never fails a run
         return None
+
+
+def _admission_lease(job_path: str, caller_dir: str, log, lend: bool = True):
+    """Ask the server to admit the child whose job file is `job_path`.
+
+    Returns `(connection, environment)`: the connection to keep open while the
+    child runs -- closing it is the release -- and the variables to start the
+    child with. `(None, None)` when there is no server to ask, or it answers
+    that this call is not its to admit; the child then runs as it always did.
+    Blocks while the child waits for room, which the parent spends idle.
+    """
+    path = os.environ.get(ADMISSION_SOCKET_ENV)
+    key = os.environ.get(ADMISSION_KEY_ENV)
+    if not path or not key:
+        return None, None
+    import socket
+    try:
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.connect(path)
+        connection.sendall((json.dumps(
+            {"key": key, "job": os.path.abspath(job_path),
+             "caller": os.path.abspath(caller_dir),
+             "holding": _holding_now() if lend else {}}) + "\n").encode("utf-8"))
+        reader = connection.makefile("r", encoding="utf-8")
+        for line in reader:
+            message = json.loads(line)
+            if message.get("queued"):
+                log("waiting for room on this machine")
+                continue
+            if isinstance(message.get("granted"), dict):
+                return (connection, reader), dict(message["granted"].get("environment") or {})
+            break
+    except (OSError, ValueError):
+        pass
+    try:
+        connection.close()
+    except (OSError, UnboundLocalError):
+        pass
+    return None, None
+
+
+# What a process's CUDA context holds on the card, which torch's own counters
+# leave out: measured at 524 MiB for one process on the deployment card.
+_CUDA_CONTEXT_BYTES = 768 * 1024 * 1024
+
+
+def _holding_now() -> dict:
+    """What this level occupies right now, while it waits for a nested call.
+
+    The server LENDS the rest of this level's reservation to the call: an
+    orchestrator reserved for its own heaviest phase, and blocked in `sup.run`
+    it uses almost none of it. Resident memory of this level's own processes
+    (admitted calls' subtrees excluded), one core, and what torch holds on the
+    card if it was ever loaded here -- plus the CUDA context, which
+    `memory_reserved()` does not count and which is about half a GiB on a
+    current driver.
+
+    It assumes the level is IDLE while it waits, which is what `sup.run`
+    blocking means. A level with another call already in flight sends nothing,
+    and lends nothing (see `_Supervisor.run`).
+    """
+    try:
+        ram = _sampler._rss(_sampler._group())
+    except Exception:  # noqa: BLE001 - instrumentation never fails a run
+        ram = None
+    if not ram:
+        return {}
+    vram = 0
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            if torch.cuda.is_available() and torch.cuda.is_initialized():
+                vram = int(torch.cuda.memory_reserved()) + _CUDA_CONTEXT_BYTES
+        except Exception:  # noqa: BLE001
+            vram = 0
+    return {"cpus": 1, "ram_bytes": int(ram), "vram_bytes": vram}
+
+
+def _close_lease(lease) -> None:
+    if not lease:
+        return
+    for handle in reversed(lease):
+        try:
+            handle.close()
+        except OSError:
+            pass
+
+
+def _kill_tree(process) -> None:
+    """SIGKILL a child and every process descended from it, then reap it.
+
+    Not the group: nested levels share the root's, and killing it would take
+    this level down too. The tree is read from /proc's parent links.
+    """
+    import signal
+    children = {}
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open("/proc/%s/stat" % entry, "rb") as handle:
+                    fields = handle.read().rsplit(b")", 1)[-1].split()
+                children.setdefault(int(fields[1]), []).append(int(entry))
+            except (OSError, IndexError, ValueError):
+                continue
+    except OSError:
+        pass
+    for pid in _subtree(process.pid, children):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        process.wait()
+    except OSError:
+        pass
+
+
+def _subtree(root: int, children: dict) -> set:
+    """`root` and every process descended from it, from a ppid -> pids map."""
+    found, pending = set(), [root]
+    while pending:
+        pid = pending.pop()
+        if pid in found:
+            continue
+        found.add(pid)
+        pending.extend(children.get(pid, ()))
+    return found
 
 
 # The worst VRAM a supervised child was measured to hold, folded up as each
@@ -848,6 +1058,16 @@ _child_vram_bytes = 0
 # 32.43 GiB per channel in the table this guard exists to fix.
 _child_vram_source = VRAM_FROM_NONE
 
+# Whether any nested call of this process was admitted by the server as a run
+# of its own. From then on this process reports itself ALONE -- no child folded
+# in -- and says so, so the server records it that way.
+_nested_admitted = False
+
+
+def _mark_nested_admitted() -> None:
+    global _nested_admitted
+    _nested_admitted = True
+
 
 def _fold_child_measurement(payload: dict) -> None:
     """Keep the worst VRAM any child of this process reported, and its source."""
@@ -859,6 +1079,49 @@ def _fold_child_measurement(payload: dict) -> None:
     if reported > _child_vram_bytes:
         _child_vram_bytes = reported
         _child_vram_source = str(payload.get(VRAM_SOURCE_KEY) or VRAM_FROM_NONE)
+
+
+# Where this process's own records sit in the progress file the whole chain
+# shares. A tool's own progress module writes records with no depth on them, so
+# a level tells its own from everybody else's by WHERE they are: after this
+# process started, and outside the stretches written while one of its nested
+# calls ran -- during which this level is blocked in `sup.run`, so what was
+# written belongs to the callee.
+_PROGRESS_FROM = 0
+_FOREIGN_RANGES = []
+
+
+def _progress_size() -> int:
+    path = os.environ.get(PROGRESS_FILE_ENV)
+    try:
+        return os.path.getsize(path) if path else 0
+    except OSError:
+        return 0
+
+
+def _mark_progress_start() -> None:
+    global _PROGRESS_FROM
+    _PROGRESS_FROM = _progress_size()
+
+
+def _written_here(record: dict, at: int, depth: int) -> bool:
+    """Is this progress record this process's own?
+
+    One carrying a depth says whose it is. One without -- what a tool's own
+    progress module writes -- is this level's when it was written while this
+    level, and not one of its nested calls, was the one running. Reading such
+    records as depth 0 handed the root its children's widths: a chain whose
+    callee ran two channels wide was recorded as a two-channel orchestrator,
+    and the callee, finding no record at its own depth, as a one-channel tool.
+    """
+    if "depth" in record:
+        try:
+            return int(record.get("depth") or 0) == depth
+        except (TypeError, ValueError):
+            return False
+    if at < _PROGRESS_FROM:
+        return False
+    return not any(start <= at < end for start, end in _FOREIGN_RANGES)
 
 
 def _width_reached() -> int:
@@ -900,10 +1163,21 @@ def _width_reached() -> int:
     Falls back to ONE when nothing was reported at all -- never to what the
     server granted. Reading a grant as a measurement is the defect this exists
     to close.
+
+    **Unknown, None, when there is nowhere to read a width from and the run
+    could have been wider than one.** A run started without a run id has no
+    progress file, so the tool's `width` records went nowhere. One would be a
+    guess in the dangerous direction: an AMASSS run sent that way was granted
+    four structures, peaked at 38.65 GiB, and went into the table as one
+    channel's cost -- three times the 13.6 GiB one channel takes. Every AMASSS
+    after it reserved about 50 GiB and they ran one at a time. A process that
+    was never handed or answered more than one channel cannot have run wider,
+    so one is then exact rather than a guess. The dispatcher learns nothing
+    from a run whose width is None.
     """
     path = os.environ.get(PROGRESS_FILE_ENV)
     if not path:
-        return 1
+        return 1 if _width_running_at() == 1 else None
     mine = None
     try:
         depth = int(os.environ.get(SUPERVISOR_DEPTH_ENV, "0") or 0)
@@ -911,7 +1185,9 @@ def _width_reached() -> int:
         depth = 0
     try:
         with open(path, "rb") as handle:
+            offset = 0
             for line in handle:
+                at, offset = offset, offset + len(line)
                 try:
                     record = json.loads(line)
                 except ValueError:
@@ -920,7 +1196,7 @@ def _width_reached() -> int:
                     continue
                 if "width" not in record:
                     continue  # said nothing, rather than said one
-                if int(record.get("depth") or 0) != depth:
+                if not _written_here(record, at, depth):
                     continue
                 try:
                     width = int(record["width"])
@@ -987,7 +1263,11 @@ def _measurements() -> dict:
     # the server reserves card memory for something that never touches the
     # card. It also made the test that pins this FLAKY: passing on an idle
     # machine, failing whenever anything else was running.
-    chain_vram = own if own else (_sampler.peak_vram if _touched_torch() else 0)
+    # Not once a nested call was admitted on its own: the card's growth then
+    # holds that call's allocation too, which is recorded under its own name.
+    # What is left is this process's torch figure, or nothing.
+    card_fallback = _touched_torch() and not _nested_admitted
+    chain_vram = own if own else (_sampler.peak_vram if card_fallback else 0)
     if chain_vram:
         measured["peak_vram_bytes"] = chain_vram
     # WHICH of the two produced it, said out loud. A source, not a confidence
@@ -1023,6 +1303,8 @@ def _measurements() -> dict:
     rss = max(rss or 0, _sampler.peak_rss) or None
     if rss is not None:
         measured["peak_rss_bytes"] = rss
+    if _nested_admitted:
+        measured[NESTED_ADMITTED_KEY] = True
     return measured
 
 
@@ -1124,6 +1406,149 @@ def _write_result(job_dir: str, result) -> None:
     os.replace(temp_path, final_path)
 
 
+# Where a failure came from, attached to the exception a nested failure is
+# re-raised as, so the level above writes the CALLEE's origin rather than its
+# own. An attribute rather than a class: the re-raised type has to keep the
+# callee's name, which is what the server maps to a status code.
+ORIGIN_ATTRIBUTE = "_sadt_origin"
+# The class names a nested failure descends from, carried across the re-raise
+# for the same reason as its origin: the class re-raised here is built from a
+# NAME and inherits from nothing of the child's.
+BASES_ATTRIBUTE = "_sadt_bases"
+
+
+def _bases_of(exc: BaseException) -> list:
+    """The names `exc`'s class descends from, nearest first, its own excluded.
+
+    The server maps a failure to a status code by class NAME, there being no
+    shared package to isinstance against -- so a tool's `SupervisorRequired
+    (ToolInputError)` or `ModelNotFoundError(FileNotFoundError)` reached it as
+    an unknown name and answered 500. Recording the lineage lets the server
+    take the first name it knows, which is what the tool meant by subclassing.
+    """
+    carried = getattr(exc, BASES_ATTRIBUTE, None)
+    if isinstance(carried, list):
+        return [str(name) for name in carried]
+    # Only a class a TOOL defined (every tool package is `sadt_*`). A library's
+    # subclass of ValueError -- `JSONDecodeError` on a corrupt bundle, numpy's
+    # `AxisError` -- is not the tool saying "the caller sent the wrong thing",
+    # and reading its lineage would answer a server fault with a 422.
+    if not str(type(exc).__module__ or "").startswith("sadt_"):
+        return []
+    return [klass.__name__ for klass in type(exc).__mro__[1:]
+            if klass not in (BaseException, Exception, object)]
+
+
+def _origin_of(exc: BaseException) -> dict:
+    """Where this failure happened, for the operator: `{tool, chain, error_type,
+    message, where, stage, fraction}`.
+
+    Written once, by the level that raised, and passed up unchanged by every
+    level above (see `_nested_subprocess`), so the root's result names the
+    tool that actually broke. Facts, not prose:
+
+    - `chain` -- the tools on the stack, root first, ending at this one.
+    - `where` -- `package/module.py:line in function`, the innermost frame
+      inside the TOOL's own source. A location in code, never in data.
+    - `stage` / `fraction` -- the last thing this level said it was doing,
+      read back from the progress file. A message is the tool's own words, so
+      the server redacts it before an operator sees it.
+    """
+    inherited = getattr(exc, ORIGIN_ATTRIBUTE, None)
+    if isinstance(inherited, dict):
+        return inherited
+    chain = [name for name in os.environ.get(SUPERVISOR_CHAIN_ENV, "").split(",") if name]
+    tool = chain[-1] if chain else _JOB_TOOL
+    if not chain and tool:
+        chain = [tool]
+    origin = {
+        "tool": tool,
+        "chain": chain,
+        "error_type": type(exc).__name__,
+        "message": _condensed(str(exc), MAX_FAILURE_MESSAGE),
+    }
+    where = _source_location(exc)
+    if where:
+        origin["where"] = where
+    stage = _last_stage()
+    if stage:
+        origin.update(stage)
+    return origin
+
+
+# The tool this process was started for, set by `main` once job.json is read.
+_JOB_TOOL = None
+
+
+def _source_location(exc: BaseException):
+    """`sadt_x/module.py:123 in function` for the innermost frame in the tool's
+    src/, or None when the failure never reached the tool's code."""
+    try:
+        src = os.path.realpath(os.path.join(_tool_dir(), SRC_DIR_NAME)) + os.sep
+    except Exception:  # noqa: BLE001
+        return None
+    found = None
+    for frame in traceback.extract_tb(exc.__traceback__):
+        path = os.path.realpath(frame.filename)
+        if path.startswith(src):
+            found = "{}:{} in {}".format(path[len(src):], frame.lineno, frame.name)
+    return found
+
+
+def _last_stage():
+    """`{stage, fraction}`: the last progress THIS level reported, or None.
+
+    Read back from the shared file rather than remembered, because most tools
+    report through their own `progress.py`, which this process never sees.
+    Only the last megabyte is read: the stage that matters is the latest one.
+    """
+    path = os.environ.get(PROGRESS_FILE_ENV)
+    if not path:
+        return None
+    try:
+        depth = int(os.environ.get(SUPERVISOR_DEPTH_ENV, "0") or 0)
+    except ValueError:
+        depth = 0
+    own = _own_call()
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            start = max(0, size - (1 << 20))
+            handle.seek(start)
+            chunk = handle.read()
+    except OSError:
+        return None
+    found = None
+    offset = start
+    for line in chunk.split(b"\n"):
+        at = offset
+        offset += len(line) + 1
+        try:
+            record = json.loads(line.decode("utf-8", errors="replace"))
+        except ValueError:
+            continue
+        # A log line, a nested-call marker, or one of the SERVER's own records
+        # ("input 2 of 2" while staging) is not something this level said it
+        # was doing.
+        if (not isinstance(record, dict) or record.get("kind") or record.get("tool")
+                or record.get("src")):
+            continue
+        if "call" in record:
+            mine = record.get("call") == own
+        else:
+            mine = (own == "" or "depth" not in record) and _written_here(record, at, depth)
+        if mine and (record.get("message") or record.get("fraction") is not None):
+            found = record
+    if found is None:
+        return None
+    stage = {}
+    if found.get("message"):
+        stage["stage"] = _single_line(found["message"])
+    if isinstance(found.get("fraction"), (int, float)):
+        stage["fraction"] = found["fraction"]
+    return stage or None
+
+
 def _write_error(job_dir: str, exc: Exception) -> None:
     """Record WHICH failure happened, next to where a result would have gone.
 
@@ -1135,6 +1560,15 @@ def _write_error(job_dir: str, exc: Exception) -> None:
     failure.
     """
     payload = {"error": {"type": type(exc).__name__, "message": str(exc)}}
+    bases = _bases_of(exc)
+    if bases:
+        payload["error"]["bases"] = bases
+    try:
+        origin = _origin_of(exc)
+    except Exception:  # noqa: BLE001 - a diagnosis must never cost the error itself
+        origin = None
+    if origin:
+        payload["error"]["origin"] = origin
     # The measurements travel with the failure too. A run that died of an
     # out-of-memory is the most informative thing a budget can learn from, and
     # it used to be the one run that recorded nothing at all.
@@ -1164,11 +1598,174 @@ def _configure_logging() -> None:
 # Progress
 # ---------------------------------------------------------------------------
 
-def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
+def _own_call() -> str:
+    """This process's call id (see PROGRESS_CALL_ENV), or "" for the root."""
+    raw = os.environ.get(PROGRESS_CALL_ENV) or ""
+    return raw if _CALL_ID.fullmatch(raw) else ""
+
+
+def _clean_span(value):
+    """`(start, end)` within 0..1 with start <= end, or None.
+
+    A malformed span is dropped rather than refused: it only shapes a progress
+    bar, and a bar is never a reason to fail a run.
+    """
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        start, end = float(value[0]), float(value[1])
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= start <= end <= 1.0):
+        return None
+    return (round(start, 4), round(end, 4))
+
+
+def _clean_level(level) -> str:
+    text = str(level or "info").strip().lower()
+    text = _LOG_LEVEL_ALIASES.get(text, text)
+    return text if text in LOG_LEVELS else "info"
+
+
+def _write_record(record: dict) -> None:
+    """One record, one write, O_APPEND, no O_CREAT -- or nothing at all.
+
+    Shared by progress, nested markers and log lines, which all ride the same
+    file under the same three rules (see `_append_progress`).
+    """
+    path = os.environ.get(PROGRESS_FILE_ENV)
+    if not path:
+        return
+    try:
+        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+        if len(payload) > MAX_PROGRESS_RECORD_BYTES:
+            return
+        handle = os.open(path, os.O_WRONLY | os.O_APPEND)
+        try:
+            if os.fstat(handle).st_size + len(payload) > MAX_PROGRESS_FILE_BYTES:
+                return
+            os.write(handle, payload)
+        finally:
+            os.close(handle)
+    except Exception:  # noqa: BLE001 - progress must never break a run
+        pass
+
+
+def _condensed(text, limit: int) -> str:
+    """`text` on one line and within `limit`, keeping its END as well as its start.
+
+    A newline inside a record would be read as the end of it, so lines are
+    joined. And a long message is cut in the MIDDLE rather than at the end:
+    the one that does not fit is a third-party error -- a DataLoader worker's
+    "Original Traceback", greedy's stderr, an ITK exception -- whose first
+    line says where and whose LAST line says what actually went wrong.
+    """
+    raw = "" if text is None else str(text)
+    lines = [line.strip() for line in raw.replace("\r", "\n").split("\n") if line.strip()]
+    flat = " ".join(lines)
+    if len(flat) <= limit:
+        return flat
+    tail = lines[-1] if len(lines) > 1 else flat
+    keep_tail = min(len(tail), limit * 3 // 5)
+    head = flat[: max(0, limit - keep_tail - 3)]
+    return "{} … {}".format(head.rstrip(), tail[-keep_tail:].lstrip())[:limit]
+
+
+def _single_line(message) -> str:
+    return _condensed(message, MAX_PROGRESS_MESSAGE)
+
+
+def _append_log(message, level: str, user: bool, depth: int) -> None:
+    """Append one log line to the run's file, for the operator or the clinician.
+
+    `user=False` -- the default -- is for whoever runs the server: the server
+    never sends it to the client, and redacts it before the operator page shows
+    it. `user=True` is written for the person who started the run, and reaches
+    the panel of a client that asked for it. Neither is a progress record, so
+    neither can move a bar or end a stream.
+    """
+    record = {
+        "kind": "log",
+        "at": time.time(),
+        "level": _clean_level(level),
+        "audience": "user" if user else "admin",
+        "message": _single_line(message),
+        "depth": depth,
+    }
+    call = _own_call()
+    if call:
+        record["call"] = call
+    _write_record(record)
+
+
+class _RunLogHandler(logging.Handler):
+    """Every line the TOOL logs, copied into the run's events for the operator.
+
+    Tools log through a plain module logger (`logging.getLogger(__name__)`),
+    and that went to stderr -- a file kept for the life of the job directory
+    and read by nobody. Copied here, it reaches the operator console with no
+    change to any tool, redacted on the way like any `admin` line (the server
+    runs `redact.scrub` over every one), and the warnings and errors outlive
+    the run in its history.
+
+    Only the tool's OWN loggers: its package (`sadt_aso.dispatch`) or its
+    name. Third-party libraries -- nnUNet printing every case, torch's
+    warnings -- would drown the tool's lines and name more files than they
+    would explain. INFO and above; `debug` stays on stderr.
+    """
+
+    def __init__(self, prefixes):
+        super().__init__(logging.INFO)
+        self._prefixes = tuple(prefix for prefix in prefixes if prefix)
+
+    def _ours(self, name: str) -> bool:
+        return any(name == prefix or name.startswith(prefix + ".") for prefix in self._prefixes)
+
+    def emit(self, record):
+        if not self._ours(record.name):
+            return
+        try:
+            text = record.getMessage()
+            if record.exc_info and record.exc_info[1] is not None:
+                # The class and the message, never the traceback: the server
+                # records where a FAILURE happened by itself, and a traceback
+                # is a page of paths.
+                error = record.exc_info[1]
+                text = "{} ({}: {})".format(text, type(error).__name__, error)
+            if record.levelno >= logging.ERROR:
+                level = "error"
+            elif record.levelno >= logging.WARNING:
+                level = "warning"
+            else:
+                level = "info"
+            try:
+                depth = int(os.environ.get(SUPERVISOR_DEPTH_ENV, "0") or 0)
+            except ValueError:
+                depth = 0
+            _append_log(text, level, False, depth)
+        except Exception:  # noqa: BLE001 - a log line must never break a run
+            pass
+
+
+def _forward_tool_logs(module, tool_name) -> None:
+    """Attach `_RunLogHandler` for this tool, when a run is listening."""
+    if not os.environ.get(PROGRESS_FILE_ENV):
+        return
+    package = (getattr(module, "__name__", "") or "").split(".")[0]
+    logging.getLogger().addHandler(_RunLogHandler((package, tool_name)))
+
+
+def _append_progress(fraction, message, depth: int, tool: str = "",
+                     call=None, span=None, edge: str = "") -> None:
     """Append one progress record to SADT_PROGRESS_FILE, if there is one.
 
     `tool` is set only by the supervisor, to mark a nested call opening and
-    closing at the CHILD's depth -- see `Supervisor._run_nested`.
+    closing at the CHILD's depth -- see `Supervisor._run_nested`. With it come
+    the child's `call` id, which edge of the call this is, and the `span` of
+    the parent's bar the call was given, if it was given one.
+
+    Every other record carries THIS process's call id, when it is not the
+    root's, so the server can tell whose fraction it is reading.
 
     Best effort in the strictest sense: nothing here may reach the tool. A run
     that cannot report its progress is a run, and turning a failed `write` into
@@ -1189,8 +1786,7 @@ def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
     processes -- so the count is capped by the server when it reads, and the
     bytes are capped here, which is what actually protects the disk.
     """
-    path = os.environ.get(PROGRESS_FILE_ENV)
-    if not path:
+    if not os.environ.get(PROGRESS_FILE_ENV):
         return
     try:
         try:
@@ -1201,7 +1797,6 @@ def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
                 value = min(1.0, max(0.0, value))
         except (TypeError, ValueError):
             value = None
-        text = "" if message is None else str(message)
         # `at` and `depth`, and nothing else the server would only override:
         # a tool's line says how far along it is, never what phase the RUN is
         # in. These two are facts only this side knows -- the depth of a
@@ -1210,11 +1805,12 @@ def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
         record = {
             "at": time.time(),
             "fraction": value,
-            # A newline inside a record would be read as the end of it, and a
-            # message is free text written by a tool.
-            "message": text.replace("\r", " ").replace("\n", " ")[:MAX_PROGRESS_MESSAGE],
+            "message": _single_line(message),
             "depth": depth,
         }
+        call = _own_call() if call is None else call
+        if call:
+            record["call"] = call
         # Only on a supervisor's nested marker. It is a TOOL NAME, so it is
         # emitted as its own field rather than inside `message`: a message is
         # free text a tool wrote and may name a patient's file, which is why
@@ -1223,18 +1819,13 @@ def _append_progress(fraction, message, depth: int, tool: str = "") -> None:
         # one fact the drawing needs and cannot carry anything else.
         if tool:
             record["tool"] = str(tool)[:MAX_PROGRESS_MESSAGE]
-        payload = (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
-        if len(payload) > MAX_PROGRESS_RECORD_BYTES:
-            return
-        handle = os.open(path, os.O_WRONLY | os.O_APPEND)
-        try:
-            if os.fstat(handle).st_size + len(payload) > MAX_PROGRESS_FILE_BYTES:
-                return
-            os.write(handle, payload)
-        finally:
-            os.close(handle)
+            if edge:
+                record["edge"] = edge
+            if span is not None:
+                record["span"] = list(span)
     except Exception:  # noqa: BLE001 - progress must never break a run
-        pass
+        return
+    _write_record(record)
 
 
 # ---------------------------------------------------------------------------
@@ -1803,14 +2394,15 @@ class _Supervisor:
     gets its own venv, its own dependency set and its own supervisor. Nesting
     (`AREG -> ASO -> ALI`) is that same recursion and needs no special case.
 
-    **It does not go back through the server.** A nested call is a subprocess of
-    the parent, so it never queues for a slot the parent is already holding --
-    which is exactly the deadlock the in-process version had, where four
-    concurrent ASO runs each waited on a fifth slot. The cost is that nested
-    work is invisible to MAX_GPU_JOBS: a supervised chain can put two tools on
-    the card at once. Chains are serial today (ASO waits for ALI before it
-    registers), so the peak is one tool at a time per chain, but a deployment
-    running several supervised jobs concurrently has to size for that.
+    **It is admitted by the server, never through a slot.** A nested call is a
+    subprocess of the parent, so it never queues for one of the slots that cap
+    how many runs a server takes -- which is exactly the deadlock the
+    in-process version had, where four concurrent ASO runs each waited on a
+    fifth slot. It does queue for ROOM: before starting a child, `run` asks the
+    run's admission desk (the server's `execution/nested.py`) to admit it like
+    a run of its own, in a band ahead of runs not yet started, and judged
+    against everything outside its own chain so it can never wait for its own
+    parents. Without a desk the child runs inside its parent's room.
     """
 
     @staticmethod
@@ -1886,11 +2478,12 @@ class _Supervisor:
         # The job at the top of this tree. Carried so every record in a
         # supervised run can be attributed to the request that started it --
         # traceability, and what a VRAM budget would later be applied to. It is
-        # NOT what makes nesting deadlock-free: a nested call is a subprocess of
-        # its parent and never re-enters the server's admission queue at all,
-        # so there is no queue it could wait in.
+        # NOT what makes nesting deadlock-free: that is the admission desk,
+        # which judges a child against everything outside its own chain.
         self._root = root or job_id
         self._calls = 0
+        self._in_flight = 0
+        self._flight_lock = threading.Lock()
         self.out = Path(job_dir) / "output"
         # Removed with the job directory, by whoever owns it. The tool is held
         # to writing only under `output/`, so its scratch sits beside it rather
@@ -1941,8 +2534,23 @@ class _Supervisor:
         # the caller's scratch directory has its results deleted with it, before
         # anything could collect them.
         params.pop(OUTPUT_DIR_ARGUMENT, None)
-        self._calls += 1
-        slot = f"{self._calls:02d}_{tool}"
+        # How much of THIS level's bar the call fills. The supervisor's, never
+        # the callee's: taken out here so no tool has to declare it. A bad one
+        # costs the weighting and nothing else.
+        raw_span = params.pop(SPAN_ARGUMENT, None)
+        span = _clean_span(raw_span)
+        if raw_span is not None and span is None:
+            self._say(f"ignoring {SPAN_ARGUMENT}={raw_span!r} for '{tool}': "
+                      "expected (start, end) with 0 <= start <= end <= 1")
+        # Under the lock: a level running its items in threads may call
+        # `sup.run` from several at once, and two calls sharing a number would
+        # share a slot directory and a call id.
+        with self._flight_lock:
+            self._calls += 1
+            number = self._calls
+        slot = f"{number:02d}_{tool}"
+        own = _own_call()
+        call = f"{own}.{number}" if own else str(number)
         nested_dir = os.path.join(self._job_dir, "sup", slot)
 
         # A resumed run re-enters the tool from the top: nothing preserves a
@@ -1954,15 +2562,17 @@ class _Supervisor:
         remembered = self._memo(slot, tool)
         if remembered is not None:
             self._substitute(slot, nested_dir)
-            _append_progress(None, "", self._depth + 1, tool=tool)
-            _append_progress(None, "", self._depth + 1, tool=tool)
+            _append_progress(None, "", self._depth + 1, tool=tool, call=call,
+                             span=span, edge="open")
+            _append_progress(None, "", self._depth + 1, tool=tool, call=call,
+                             span=span, edge="close")
             if tool in self._stops:
                 raise QualityControlStop(tool)
             return remembered["result"]
 
         os.makedirs(os.path.join(nested_dir, "output"), exist_ok=True)
 
-        child_id = f"{os.path.basename(self._job_dir)}.{self._calls}"
+        child_id = f"{os.path.basename(self._job_dir)}.{number}"
         job_path = os.path.join(nested_dir, JOB_FILE)
         with open(job_path, "w", encoding="utf-8") as handle:
             json.dump(
@@ -1981,13 +2591,14 @@ class _Supervisor:
                 default=_jsonable,
             )
 
-        self.log(f"running '{tool}'")
+        self._say(f"running '{tool}'")
         environment = dict(os.environ)
         environment[SUPERVISOR_DEPTH_ENV] = str(self._depth + 1)
         environment[SUPERVISOR_CHAIN_ENV] = ",".join(self._chain + (tool,))
-        # What the child may SPEND -- not how wide it may run. A nested call
-        # never re-enters the server's admission queue (it is a subprocess of
-        # this one), so nothing between the two levels would divide anything,
+        environment[PROGRESS_CALL_ENV] = call
+        # What the child may SPEND when no server admits it (below) -- not how
+        # wide it may run. Such a call is a subprocess of this one and nothing
+        # between the two levels would divide anything,
         # and a parent running six channels whose child opens eight is
         # forty-eight on a machine that admitted one job. What is handed down
         # is therefore this level's room divided by this level's channels, and
@@ -2025,12 +2636,51 @@ class _Supervisor:
             environment[STOPS_ENV] = json.dumps(sorted(inside))
         else:
             environment.pop(STOPS_ENV, None)
-        # Raises when the budget is already spent, before starting anything.
-        remaining = self._remaining_seconds()
         # SADT_TOOL_DIR points at the PARENT's folder; the callee derives its
         # own from its interpreter, and inheriting ours would send it to the
         # wrong sources.
         environment.pop(TOOL_DIR_ENV, None)
+
+        # Admitted like a run of its own, when there is a server to ask: the
+        # same queue, the same price and the same width a run of this tool
+        # arriving over HTTP would get, held for exactly as long as the child
+        # runs. What is granted REPLACES the share worked out above. Without
+        # a server -- or for a tool it does not serve -- the child runs inside
+        # this level's room, as it always did.
+        # A previous attempt's result in this slot -- a memory retry, a resume
+        # whose memo diverged -- must not be what is read back, by this level
+        # or by the server learning the call's cost.
+        try:
+            os.remove(os.path.join(nested_dir, RESULT_FILE))
+        except OSError:
+            pass
+        # Lends only when no other call of this level is in flight: the loan
+        # assumes the level sits idle in `sup.run`, and a level already
+        # running a call from another thread is not.
+        with self._flight_lock:
+            alone = self._in_flight == 0
+            self._in_flight += 1
+        try:
+            lease, granted = _admission_lease(job_path, self._job_dir, self._say, lend=alone)
+        except BaseException:
+            with self._flight_lock:
+                self._in_flight -= 1
+            raise
+        admitted = granted is not None
+        if admitted:
+            environment.update({str(k): str(v) for k, v in granted.items()})
+            environment[ADMITTED_ENV] = "1"
+        else:
+            environment.pop(ADMITTED_ENV, None)
+        # Raises when the budget is already spent, before starting anything.
+        # After the admission, whose wait is part of the job's time.
+        try:
+            remaining = self._remaining_seconds()
+        except BaseException:
+            _close_lease(lease)
+            with self._flight_lock:
+                self._in_flight -= 1
+            raise
 
         # The nested call declares itself, at the CHILD's depth.
         #
@@ -2053,13 +2703,27 @@ class _Supervisor:
         # between them can raise -- `_remaining_seconds` does, when the job's
         # time is already spent -- and an open with no close is a span with no
         # end.
-        _append_progress(None, "", self._depth + 1, tool=tool)
+        _append_progress(None, "", self._depth + 1, tool=tool, call=call,
+                         span=span, edge="open")
+        foreign_from = _progress_size()
         try:
             produced = self._nested_subprocess(
-                tool, interpreter, job_path, nested_dir, environment, remaining
+                tool, interpreter, job_path, nested_dir, environment, remaining,
+                admitted
             )
         finally:
-            _append_progress(None, "", self._depth + 1, tool=tool)
+            # Everything an ADMITTED callee wrote is the callee's: see
+            # `_written_here`. One that ran inside this level is folded into
+            # it, and its width has to stay this level's too.
+            if admitted:
+                _FOREIGN_RANGES.append((foreign_from, _progress_size()))
+            # Hung up once the child has exited and written its result: that
+            # is what releases its reservation, and what the server reads.
+            _close_lease(lease)
+            with self._flight_lock:
+                self._in_flight -= 1
+            _append_progress(None, "", self._depth + 1, tool=tool, call=call,
+                             span=span, edge="close")
 
         self._remember(nested_dir, tool, produced)
 
@@ -2170,7 +2834,7 @@ class _Supervisor:
             )
 
     def _nested_subprocess(self, tool, interpreter, job_path, nested_dir,
-                           environment, remaining):
+                           environment, remaining, admitted=False):
         """Run one nested level and return its result, or raise its error.
 
         Split out of `_run_nested` so the nested markers around it are one
@@ -2186,17 +2850,25 @@ class _Supervisor:
         # The timeout below is therefore the polite path, not the only one: it
         # lets a level fail with a message naming the chain instead of being
         # killed silently, and the group kill remains the backstop.
+        # Popen rather than run(): an admitted child's pid is what this
+        # level's sampler leaves out of its own figures.
+        process = subprocess.Popen(
+            [interpreter, os.path.abspath(__file__), "--job", job_path],
+            # Not captured: a nested tool's log is the only sign of life
+            # during an hour-long run, and it is already on stderr where the
+            # server collects it. Its result never travels on stdout anyway.
+            cwd=nested_dir,
+            env=environment,
+        )
+        if admitted:
+            # Marked once the child exists, not when it was admitted: a call
+            # that never started must not make this level report itself alone.
+            _mark_nested_admitted()
+            _sampler.exclude(process.pid)
         try:
-            completed = subprocess.run(
-                [interpreter, os.path.abspath(__file__), "--job", job_path],
-                # Not captured: a nested tool's log is the only sign of life
-                # during an hour-long run, and it is already on stderr where the
-                # server collects it. Its result never travels on stdout anyway.
-                cwd=nested_dir,
-                env=environment,
-                timeout=remaining,
-            )
+            completed = subprocess.CompletedProcess(process.args, process.wait(timeout=remaining))
         except subprocess.TimeoutExpired:
+            _kill_tree(process)
             raise RunnerError(
                 "Supervised tool '{}' ran out of the job's remaining time after "
                 "{:.0f}s. The chain is {} -> {}; raise the ROOT tool's "
@@ -2204,12 +2876,18 @@ class _Supervisor:
                     tool, remaining or 0, " -> ".join(self._chain), tool
                 )
             )
+        except BaseException:
+            # What subprocess.run did on ANY exception -- and the whole
+            # subtree, not the one pid: a grandchild left running would go on
+            # holding memory after the lease covering it was closed.
+            _kill_tree(process)
+            raise
         if completed.returncode != 0:
             # Its own result file is where the useful half is. The child's
             # traceback goes to stderr, which whatever runs the PARENT may be
             # capturing and trimming -- so "see above" is a promise this cannot
             # keep, and the message has to carry the reason itself.
-            kind, message = self._failure_parts(tool, nested_dir)
+            kind, message, origin, bases = self._failure_parts(tool, nested_dir)
 
             # A child's answer to the CALLER is re-raised under the child's own
             # exception name, so the server maps it the way it would have if the
@@ -2220,25 +2898,37 @@ class _Supervisor:
             # execution failed", indistinguishable from a crash. The tool name is
             # prepended because in a chain the caller cannot otherwise tell which
             # step is talking.
-            if kind in CALLER_FACING_ERRORS:
-                raise type(kind, (Exception,), {})(f"{tool}: {message}")
-
-            raise RunnerError(
-                f"Supervised tool '{tool}' failed (exit {completed.returncode}). "
-                f"{kind}: {message}" if message else
-                f"Supervised tool '{tool}' failed (exit {completed.returncode}). {kind}."
-            )
-        return self._result(tool, nested_dir)
+            if kind in CALLER_FACING_ERRORS or set(bases) & set(CALLER_FACING_ERRORS):
+                failure = type(kind, (Exception,), {})(f"{tool}: {message}")
+                setattr(failure, BASES_ATTRIBUTE, bases)
+            else:
+                failure = RunnerError(
+                    f"Supervised tool '{tool}' failed (exit {completed.returncode}). "
+                    f"{kind}: {message}" if message else
+                    f"Supervised tool '{tool}' failed (exit {completed.returncode}). {kind}."
+                )
+            # Where it REALLY broke travels up untouched: every level above
+            # re-raises the failure under its own frame, and an operator asking
+            # "where" wants the innermost tool, not the root that relayed it.
+            if origin:
+                setattr(failure, ORIGIN_ATTRIBUTE, origin)
+            raise failure
+        return self._result(tool, nested_dir, admitted)
 
     def _failure_parts(self, tool: str, nested_dir: str):
-        """`(exception class name, message)` the callee recorded, read back."""
+        """`(class name, message, origin, base class names)` the callee recorded."""
         path = os.path.join(nested_dir, RESULT_FILE)
         try:
             with open(path, encoding="utf-8") as handle:
                 error = json.load(handle).get("error") or {}
         except (OSError, ValueError):
-            return ("Error", f"It wrote no readable result; see its output and {path}.")
-        return (error.get("type", "Error"), error.get("message", "").strip())
+            return ("Error", f"It wrote no readable result; see its output and {path}.",
+                    None, [])
+        origin = error.get("origin")
+        bases = error.get("bases")
+        return (error.get("type", "Error"), error.get("message", "").strip(),
+                origin if isinstance(origin, dict) else None,
+                [str(name) for name in bases] if isinstance(bases, list) else [])
 
     def channels(self, wanted: int = 0) -> int:
         """How many of `wanted` items this run may process at once. Never below 1.
@@ -2317,11 +3007,26 @@ class _Supervisor:
             except (TypeError, ValueError):
                 pass
         answer = _capped_here(answer)
-        self.log("{} channel(s) of {} asked for".format(answer, asked or "any"))
+        self._say("{} channel(s) of {} asked for".format(answer, asked or "any"))
         return _record_width(answer)
 
-    def declareQualityControl(self, name: str) -> bool:
+    def declareQualityControl(self, name: str, kind: str = "view") -> bool:
         """Offer the caller a place to stop, here, and stop if they asked.
+
+        `kind` is DECLARATIVE and is not read here. It says what a reader may
+        do at this point -- look, drag the points, drag the scan -- and its one
+        consumer is `describe.py`, which lifts it out of this call site by AST
+        so the server can publish it beside the option. The signature has to
+        accept it all the same, and did not: the keyword was parseable and not
+        callable, which nothing discovered because no tool had ever passed one.
+        `AREG_CBCT` declaring the first `kind="registration"` answered 500 with
+        "got an unexpected keyword argument 'kind'" after a full 143-second
+        registration -- at the finish line, the worst place to find it.
+
+        The default is the literal "view" rather than a shared constant: this
+        file is standard-library only and injected by path, so it imports
+        nothing from the server. The vocabulary itself is checked where it is
+        read, in `describe.REVIEW_KINDS`.
 
         Called by a tool in the MIDDLE of its own work, where no `sup.run()`
         boundary exists: AMASSS between its crop and its prediction, ALI once
@@ -2343,14 +3048,43 @@ class _Supervisor:
 
     def progress(self, fraction: float, message: str) -> None:
         try:
-            self.log(f"{float(fraction):.0%} {message}")
+            self._say(f"{float(fraction):.0%} {message}")
         except (TypeError, ValueError):
-            self.log(str(message))
+            self._say(str(message))
         _append_progress(fraction, message, self._depth)
 
-    def log(self, message: str) -> None:
+    def log(self, message: str, level: str = "info", user: bool = False) -> None:
+        """Say something about this run, to its operator or to its requester.
+
+            sup.log("ALI found 3 of 7 landmarks; orienting on those", level="warning")
+            sup.log("Scan 4 has no mandible; skipped", level="warning", user=True)
+
+        `level` is one of debug, info, warning, error. `user=False` (the
+        default) is for whoever runs the server: it reaches the operator page,
+        redacted, and is kept with the run's history when it is a warning or
+        an error. `user=True` is written to be read by the clinician, in the
+        panel of a client that asked for it -- the same rule as a progress
+        message, so never a file name or a patient's.
+
+        One positional argument is exactly what this method always accepted,
+        and still means an info line for the operator.
+        """
+        level = _clean_level(level)
         # Through logging, not print: the runner owns handlers and the server
         # reads stderr. The depth prefix is what makes a nested chain readable.
+        logging.getLogger("sadt.supervisor").log(
+            getattr(logging, level.upper(), logging.INFO),
+            "%s%s", "  " * self._depth, message)
+        _append_log(message, level, bool(user), self._depth)
+
+    def _say(self, message: str) -> None:
+        """The supervisor's OWN narration -- stderr only, never the run's log.
+
+        What it says about its own mechanics ("running 'ALI_CBCT'", a channel
+        grant) is a developer's trace, and the run's log channel is the TOOL's
+        voice; mixing them would bury the one line that matters under a dozen
+        that never do.
+        """
         logging.getLogger("sadt.supervisor").info("%s%s", "  " * self._depth, message)
 
     # -- internals ----------------------------------------------------------
@@ -2432,7 +3166,7 @@ class _Supervisor:
                 ordered.append(root)
         return ordered
 
-    def _result(self, tool: str, nested_dir: str):
+    def _result(self, tool: str, nested_dir: str, admitted: bool = False):
         path = os.path.join(nested_dir, RESULT_FILE)
         try:
             with open(path, encoding="utf-8") as handle:
@@ -2443,7 +3177,10 @@ class _Supervisor:
         # memory is the most useful measurement in the whole chain, and
         # discarding it because the chain then failed is how a budget goes on
         # admitting the thing that broke it.
-        _fold_child_measurement(payload)
+        # Not for a child the server admitted: it was measured, and recorded,
+        # as a run of its own.
+        if not admitted:
+            _fold_child_measurement(payload)
         if "error" in payload:
             error = payload["error"]
             raise RunnerError(
@@ -2521,21 +3258,43 @@ def _load_job(job_path: str) -> dict:
     return job
 
 
+# A job may ask a tool's `pairs()` instead of its `run()`: which listed file
+# names belong together, for splitting a paired cohort. See main().
+PAIRS_ENTRY = "pairs"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Run one SADT tool job.")
     parser.add_argument("--job", required=True, help="Path to the job.json written by the server")
     arguments = parser.parse_args(argv)
 
     _configure_logging()
+    # An admitted nested call is in the root's process group, beside its
+    # parents: it measures what descends from it, not the whole group.
+    _sampler.subtree_only = os.environ.get(ADMITTED_ENV) == "1"
+    _mark_progress_start()
     # Started before the tool is even imported: a heavy import is real resident
     # memory and belongs in the figure, and starting it later would miss a tool
     # whose peak is in its own loading.
     _sampler.start()
 
+    global _JOB_TOOL
     job = None
     try:
         job = _load_job(arguments.job)
+        _JOB_TOOL = job.get("tool")
         module = _import_tool(job["tool"], os.path.join(_tool_dir(), SRC_DIR_NAME))
+        _forward_tool_logs(module, job["tool"])
+        if job.get("entry") == PAIRS_ENTRY:
+            # Not a run: the tool is asked which of the listed file NAMES go
+            # together, so a client can split a paired cohort into batches.
+            # Nothing is supervised, measured for admission or written but the
+            # answer.
+            answer = getattr(module, PAIRS_ENTRY, None)
+            if not callable(answer):
+                raise RunnerError(f"Tool '{job['tool']}' defines no {PAIRS_ENTRY}().")
+            _write_result(job["job_dir"], answer(**dict(job["params"])))
+            return 0
         run = _run_function(module, job["tool"])
         params = dict(job["params"])
         # Taken back out before the tool ever sees it: no tool declares this
@@ -2608,6 +3367,30 @@ def main(argv=None) -> int:
             where = arguments.get(OUTPUT_DIR_ARGUMENT) if isinstance(arguments, dict) else None
             produced = _collect_supervised_outputs(
                 job["job_dir"], where, _ALL_STEPS, move=False)
+            # The tool's OWN output, which was missing from the ARCHIVE -- and
+            # no earlier checkpoint could reveal that: stopping after a
+            # `sup.run()` means the tool has barely started and its output
+            # directory holds nothing of its own, so the omission stayed
+            # invisible until a tool declared a checkpoint at the END of its
+            # work. `AREG_CBCT`'s `Registration` then handed back `01_AMASSS`
+            # -- 772 kB of masks -- for a pause whose entire purpose is to show
+            # the registered scans.
+            #
+            # It joins `outputs` and NOT `produced`, and the two are different
+            # things however alike they look. `produced` is a protocol field:
+            # the client parses each entry as a step slot, splitting `01_ASO`
+            # into a position and a tool name so it can walk the run backwards
+            # and offer a rewind (`base_widget._previousCorrectableStep`). A
+            # `"output"` in that list has no underscore, names no tool, and
+            # silently cost the reader every rewind offer. `outputs` is what
+            # the server PACKS, and the archive is where the scans belong.
+            packed = {os.path.basename(path): path for path in produced}
+            if where and os.path.isdir(where) and os.listdir(where):
+                # Under its own name, so a reader opening the archive can tell
+                # this run's results from the steps that fed them -- and so the
+                # steps, already copied to `<output>/intermediate/` by the
+                # collect above, are not also added at the root and sent twice.
+                packed = {os.path.basename(where): where}
             _write_result(job["job_dir"], {
                 STOPPED_AFTER_KEY: stop.name,
                 # Named so a client can tell this from a finished run without
@@ -2615,12 +3398,14 @@ def main(argv=None) -> int:
                 # the level above reads it back through `_stopped_after`,
                 # which is what makes a nested stop the whole chain's.
                 QUALITY_CONTROL_KEY: True,
+                # The STEPS, in the order they ran. See above: this is read as
+                # slots, not as archive members.
                 "produced": [os.path.basename(path) for path in produced],
                 # The canonical shape for "what this run produced", which is
                 # what the server packs. A stopped run still has an answer --
                 # everything the chain got through -- and it travels the same
                 # way a finished one's does.
-                "outputs": {os.path.basename(path): path for path in produced},
+                "outputs": packed,
             })
         return 0
     except RunnerError as exc:

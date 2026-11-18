@@ -1,0 +1,12 @@
+# Placeholders in server/README.md examples (`Bearer your-...-token`) and the
+# word "tokens" in prose: no credential. One fingerprint per finding, as gitleaks
+# prints it; a real secret stays reported.
+0d2ca921460692722561d2cfab21a0a2bfdfeafe:server/README.md:curl-auth-header:213
+0d2ca921460692722561d2cfab21a0a2bfdfeafe:server/README.md:curl-auth-header:219
+0d2ca921460692722561d2cfab21a0a2bfdfeafe:server/README.md:curl-auth-header:226
+327f665f56a4b141dafa75c1d2ac0178b2e18c04:server/README.md:generic-api-key:420
+34f6e4ca2589f3c3f7e6059fd79681d77fd7c298:server/README.md:curl-auth-header:98
+ddb07475e3dba207f0b48f672869fb5cfd0d8949:server/README.md:curl-auth-header:98
+d35a99467206d75f992884b4f737048bb855182d:server/README.md:curl-auth-header:71
+d35a99467206d75f992884b4f737048bb855182d:server/README.md:curl-auth-header:76
+fb990dcab7ffc18b6ddc75e6a126a101a0d0312d:server/README.md:curl-auth-header:40

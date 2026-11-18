@@ -29,24 +29,45 @@ data_dir = "AREG"
 # below about its own: the convention fills an unnamed model argument with
 # DATA/<tool>/models/ -- the FOLDER -- and AREG passed that straight to AMASSS,
 # which answered "No nnUNet model found in 'models'". The folder is not a
-# bundle. Left empty, the tool resolves the AMASSS bundle itself
-# (dispatch._own_segmentation), which is the one answer there was ever going
-# to be.
+# bundle. Left empty, AREG sends no model and AMASSS resolves its own bundle,
+# which is the one answer there was ever going to be.
 # One folder per ARGUMENT, not per modality. Scoped to the modality, the
 # picker still offered whole cohorts -- `<name>/{T1,T2}/` -- so the baseline
 # field listed entries holding the follow-up too, and the intraoral field
 # listed entries holding a CBCT. The per-argument folders are hardlinked views
-# of the same cohorts (`cp -al`), so they cost directory entries and no data.
+# of the same cohorts, built by the tools repository's fetch script (`split`
+# in its data manifest), so they cost directory entries and no data. Scoped to
+# a folder no script built, a fresh deployment had empty pickers.
+#
+# `patients` (one folder per patient) offers no hosted data: no cohort on this
+# server is laid out that way, and listing the per-type ones under it offered a
+# folder the tool would read as patients and find none in.
 #
 # `t1`/`t2` draw from DATA/AREG/testfiles/CBCT_T1|CBCT_T2 only. This tool registers
 # volumes; the intraoral cohorts staged beside them for the other two engines
 # cannot be a baseline, and offering them put a folder of `.vtk` one click away
 # from a CBCT picker.
-server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:CBCT_T1", t2 = "testfile:CBCT_T2" }
+server_selectable = { t1_masks = "none", segmentation_model = "none", landmark_model = "none", t1 = "testfile:CBCT_T1", t2 = "testfile:CBCT_T2", patients = "none" }
+# Its channels are REGISTRATIONS -- one region of one subject each, run side by
+# side and each on one elastix thread -- and it asks for its width at run time
+# (`sup.channels`), once it has paired the subjects. The subjects cannot be
+# counted from outside: `t1` and `t2` are two paired folders. The regions can,
+# so they bound the reservation: a two-region run reserves at most two
+# registrations' worth for its whole life, where an unbounded ladder would hold
+# every registration the machine could afford through hours of nested calls.
+# A cohort therefore runs no wider than its region count; that is the cost of
+# reserving before the tool can say how many subjects it paired.
+width_from = "regions"
+# And each registration brings its own share of cores: elastix scales with the
+# threads it is given (97 s on ten, 43 s on fifty-six), so two registrations
+# side by side on ten threads each finish in about the time of one (102 and
+# 115 s against 97), where dividing ten threads between them gained nothing.
+cores_per_channel = true
 
 [tools.AREG_IOS]
 data_dir = "AREG"
-# The intraoral cohorts, for the same reason AREG_CBCT takes only the CBCT ones.
+# The intraoral cohorts, IOS_T1|IOS_T2, for the same reason AREG_CBCT takes only
+# the CBCT ones.
 # `crown_model` opts out here too: a name has to mean ONE thing across the
 # engines the AREG facade composes, and IOSCBCT having opted its own out is
 # what made the facade refuse to publish at all.
@@ -65,7 +86,7 @@ data_dir = "AREG"
 # clinical choice -- Frankfurt or Occlusal -- and keeps its dropdown. Opting out
 # under the shared name would have changed what that name means between two
 # engines of one facade, which is what the note above is about.
-server_selectable = { t1 = "testfile:IOS_T1", t2 = "testfile:IOS_T2", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none" }
+server_selectable = { t1 = "testfile:IOS_T1", t2 = "testfile:IOS_T2", crown_model = "none", registration_model = "none", mgl_model = "none", ios_reference = "none", patients = "none" }
 
 # Orchestrates four tools and computes almost nothing itself; see the rule in
 # deployment.toml.example. Chain measured today: Crown_Seg ~52s + ALI_IOS ~45s +
@@ -74,15 +95,18 @@ server_selectable = { t1 = "testfile:IOS_T1", t2 = "testfile:IOS_T2", crown_mode
 [tools.AREG_IOSCBCT]
 data_dir = "AREG"
 # Its cohorts hold BOTH modalities -- a patient's intraoral scans and their
-# CBCT, which is the pairing this engine registers -- so all four inputs draw
-# from the one folder staged for it.
+# CBCT, which is the pairing this engine registers. Each input draws from the
+# view the manifest's `split: IOSCBCT` publishes for its own part of a cohort:
+# IOSCBCT_T1 the meshes, IOSCBCT_T2 the CBCT, and one per landmark side. Drawn
+# from the whole cohort, the intraoral picker and the CBCT picker offered the
+# same entry, and nothing on screen said which part each would take.
 # The four model arguments opt OUT of the hosted-model convention, which fills
 # an unnamed one with DATA/<tool>/models/ -- the FOLDER, which is not a bundle
 # and is what AMASSS refused with "No nnUNet model found in 'models'". Left
 # genuinely empty, each callee resolves its own weights (Crown_Seg, ALI_IOS and
 # ALI_CBCT all can), and the orientation reference is resolved by this engine,
 # there being one frame the rest of the chain expects.
-server_selectable = { ios = "testfile:IOSCBCT_IOS", cbct = "testfile:IOSCBCT_CBCT", ios_landmarks = "testfile:IOSCBCT_IOS_LM", cbct_landmarks = "testfile:IOSCBCT_CBCT_LM", crown_model = "none", ios_landmark_model = "none", landmark_model = "none", cbct_reference = "none" }
+server_selectable = { ios = "testfile:IOSCBCT_T1", cbct = "testfile:IOSCBCT_T2", ios_landmarks = "testfile:IOSCBCT_IOS Landmarks", cbct_landmarks = "testfile:IOSCBCT_CBCT Landmarks", crown_model = "none", ios_landmark_model = "none", landmark_model = "none", cbct_reference = "none", patients = "none" }
 
 # The two ALI engines share DATA/ALI/, one folder holding both bundles. Without
 # this each looks for DATA/<its own name>/ and falls back to the run-together
@@ -177,6 +201,13 @@ width_from = false
 # structures and was answered one, and the card stayed at 2.4 GiB while the
 # run took as long as it always had.
 width_from = "structures"
+# AMASSS has one model and resolves it itself when `model` is empty, from
+# DATA/AMASSS/models/AMASSS_Models. The convention would fill the argument with
+# the models FOLDER, which is not a bundle, and would put a picker with a
+# single answer in front of a clinician. So it is neither filled nor asked --
+# nor uploaded: a model never is (main.py `_reject_upload_for_model`).
+server_selectable = { model = "none" }
+hidden = ["model"]
 
 # AREG became three tools when it was split, one per modality, because the
 # engines cannot share a virtualenv. This publishes the name callers already
@@ -198,8 +229,8 @@ dispatch = { "CBCT" = "AREG_CBCT", "IOS" = "AREG_IOS", "IOS to CBCT" = "AREG_IOS
 # convention that reads `*_model` as "pick one from DATA/ASO/models/" would fill
 # it with ASO's own model folder and pass that on as ALI's bundle. Measured in a
 # real run on 2026-09-11: ALI received `DATA/ASO/models` and predicted with the
-# wrong weights, silently. "none" opts it out; a caller may still name a bundle
-# to pin which weights ran.
+# wrong weights, silently. "none" opts it out, and the panel no longer asks for
+# it: a model is never uploaded (main.py `_reject_upload_for_model`).
 server_selectable = { landmark_model = "none" }
 
 [tools.ALI]
@@ -253,3 +284,59 @@ batch = false
 # entirely.
 [tools.CLIC]
 width_from = false
+
+
+# VFACE orchestrates seven tools and computes the measurements itself. It is
+# declared here for its DATA folder and, above all, to opt ten arguments out of
+# the hosted-file convention -- for four different reasons, which is why they are
+# listed apart below rather than as one gesture.
+#
+# SEVEN are bundles this tool resolves itself (`dispatch._BUNDLES`):
+# `segmentation_model`, `classifier_model`, `cranial_base_reference`,
+# `maxilla_reference`, `mirror_reference`, `measurements`, `feature_template`.
+# The convention fills an unnamed model argument with DATA/<tool>/models/ -- the
+# FOLDER, which here holds six bundles at once -- so each callee would be handed
+# a directory that is not a bundle. AREG showed what that costs: the run dies
+# after the segmentation and the orientation have already been paid for. None of
+# them is a clinical choice either: one classifier, one mirror transform, one
+# reference per frame, one measurement list per region.
+#
+# `landmark_model` opts out for the reason [tools.ASO] gives about its own:
+# ALI_CBCT finds its own weights from the same data root, and a name held here
+# would be AREG holding a name for its neighbour's storage.
+#
+# `surface_model` is Batch_Dental_Seg's, and this deployment publishes none. Left
+# offering the models folder, the heat-map path would fail inside a child process
+# instead of saying which bundle is missing.
+#
+# `registration_transforms` is the clinician's OWN transforms, for the mode that
+# measures scans somebody else registered. Nothing this server hosts is a
+# plausible answer, and a dropdown of reference test files in front of that field
+# is an invitation to measure a patient against another patient's registration --
+# the same reason [tools.AREG_CBCT] opts `t1_masks` out.
+#
+# `t1` is scoped to the one hosted cohort that holds volumes. `Testing` holds
+# landmarks and a ground-truth spreadsheet, so offering the testfiles folder
+# whole puts a directory of .json one click away from a scan picker; and the
+# scope this carried first, `Scans`, named a folder nothing stages -- the
+# manifest's VFACE entries land in `Testing` and `CBCT_Or_FullyAuto`, so the
+# picker was empty on every fresh install. An empty dropdown reads as "this
+# deployment hosts no scans", which is the one thing it does host.
+#
+# `t2` is opted out rather than pointed at the same cohort. It is the FOLLOW-UP
+# of a longitudinal study, the hosted cohort holds a single timepoint
+# (`C_0001_T1.nii.gz`), and a picker offering it on both sides is an invitation
+# to register a patient against themselves -- which does not fail, it returns a
+# study reporting no change. The clinician's own second timepoint is an upload,
+# which `"none"` leaves in place: it removes the hosted kind, not the argument.
+[tools.VFACE]
+data_dir = "VFACE"
+server_selectable = { t1 = "testfile:CBCT_Or_FullyAuto", t2 = "none", segmentation_model = "none", landmark_model = "none", classifier_model = "none", surface_model = "none", cranial_base_reference = "none", maxilla_reference = "none", mirror_reference = "none", measurements = "none", feature_template = "none", registration_transforms = "none" }
+
+[tools.GreedyReg]
+# Each side of a registration is ONE timepoint, and the tool refuses a folder
+# holding both -- "the two will be paired timepoint against timepoint and the
+# run will look like it worked". The hosted cohort splits them into `T1/` and
+# `T2/`, so both pickers draw from inside it rather than offering the cohort
+# folder the tool cannot accept.
+server_selectable = { t1 = "testfile:CBCT_T1_T2_pair", t2 = "testfile:CBCT_T1_T2_pair" }

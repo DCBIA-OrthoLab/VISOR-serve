@@ -14,8 +14,7 @@ segfault inside a CUDA kernel takes the API down with the job.
 
 **Still synchronous.** The HTTP request blocks for exactly as long as it does
 today; `subprocess.run` is called from the same worker thread `tool.invoke`
-already ran in, so MAX_CONCURRENT_TOOLS keeps arbitrating how many run at
-once. No queue, no polling, no change to the contract with the client.
+already ran in, so admission keeps arbitrating how many run at once. No queue, no polling, no change to the contract with the client.
 
 The job directory is handed out by file_utils, which means the request handler
 already removes it once the response has been streamed -- outputs included,
@@ -38,7 +37,9 @@ from typing import Any, Optional
 
 import file_utils
 import resources
-from execution import admission, concurrency, costs, mps_slot
+import telemetry
+import tls
+from execution import admission, concurrency, costs, mps_slot, nested, reports
 from base import ToolUnavailableError
 from config import settings
 from registry.deployment import deployment_config
@@ -58,6 +59,9 @@ RESULT_FILE = "result.json"
 # imported, exactly as RESULT_FILE is: runner.py is executed by a tool's
 # interpreter and this module never imports it.
 VRAM_SOURCE_KEY = "vram_source"
+# Set by the runner when this run's nested calls were admitted and measured on
+# their own; mirrors `runner.NESTED_ADMITTED_KEY`.
+NESTED_ADMITTED_KEY = "nested_admitted"
 VRAM_FROM_CARD = "card"
 # How long a TERMed process group gets before SIGKILL.
 _KILL_GRACE_SECONDS = 10.0
@@ -124,10 +128,17 @@ class ToolFailure(RuntimeError):
     fault (422), this deployment's (503), or opaque (500).
     """
 
-    def __init__(self, error_type: str, message: str):
+    def __init__(self, error_type: str, message: str, origin: Optional[dict] = None,
+                 bases=None):
         super().__init__(f"{error_type}: {message}")
         self.error_type = error_type
         self.message = message
+        # The names the class descends from, nearest first: what lets main.py
+        # map a tool's subclass of ToolInputError the way the tool meant it.
+        self.kinds = (error_type,) + tuple(str(name) for name in (bases or ()))
+        # Where in the chain it broke, as the runner recorded it -- see
+        # `runner._origin_of`. Raw: main.py redacts it before anyone sees it.
+        self.origin = origin if isinstance(origin, dict) else None
 
 
 class ToolExecutionError(RuntimeError):
@@ -207,8 +218,11 @@ def _shapes(tool, params: dict) -> list:
     # ladder down to one first would put (1 channel, floor cores) ahead of
     # (1 channel, every core free) -- a run admitted on two cores while ten
     # were going spare, because the list stopped narrowing monotonically.
+    # A tool whose channels each bring their own cores (`cores_per_channel`)
+    # asks for a share per channel; every other tool's channels split one.
+    per_channel = bool(getattr(deployment_config.resolved(tool.name), "cores_per_channel", False))
     for channels in range(widest, 1, -1):
-        shapes.append((channels, share))
+        shapes.append((channels, share * channels if per_channel else share))
     # Then one channel, giving cores back one at a time. A tool that declares
     # no channel argument has `widest == 1` and this tail is the whole list --
     # which is right: it is the only axis it has.
@@ -241,6 +255,34 @@ def _demand_for(tool, params: dict, channels: int = 1, cores=None):
     )
 
 
+def _nested_candidates(tool_name: str, params: dict):
+    """What a nested call queues on: the same widths and the same prices a run
+    of that tool arriving over HTTP would get. None for a tool this server does
+    not serve, whose call then runs inside its parent's room as it always did."""
+    try:
+        import registry
+        tool = registry.get_tool(tool_name)
+    except Exception:  # noqa: BLE001 - unknown, failed or unimportable: not ours to price
+        return None
+    return [(channels, _demand_for(tool, params, channels, cores))
+            for channels, cores in _shapes(tool, params)]
+
+
+def _nested_environment(tool_name: str, grant) -> dict:
+    """The variables a nested call is started with: exactly what a run of the
+    same tool admitted at the same width over HTTP would be given."""
+    import registry
+    tool = registry.get_tool(tool_name)
+    granted = concurrency.granted(tool, grant.channels)
+    concurrency.log_grant(tool_name, granted)
+    return concurrency.child_budget(_thread_limits(grant.cores, granted.channels), granted)
+
+
+def _learn_nested(tool_name: str, payload: dict, solo: bool) -> None:
+    """A nested call's measurements, kept under the nested tool's own name."""
+    _keep_measurements(tool_name, payload, solo)
+
+
 def _log_grant(tool_name: str, cpus) -> None:
     """Say so when a run is given more than its declared share.
 
@@ -264,7 +306,10 @@ def _mps_exclusive(tool, params: dict, run_id: Optional[str]):
     if not mps_slot.runs_on_mps(tool, params):
         yield
         return
-    cancelled = (lambda: bool(run_id) and runs.is_cancelled(run_id))
+
+    def cancelled() -> bool:
+        return bool(run_id) and runs.is_cancelled(run_id)
+
     try:
         with mps_slot.slot().hold(
             is_cancelled=cancelled,
@@ -303,7 +348,7 @@ def _admitted(candidates, run_id: Optional[str]):
 
     try:
         with admission.budget().reserve(candidates, on_wait=announce,
-                                        is_cancelled=cancelled) as granted:
+                                        is_cancelled=cancelled, run_id=run_id) as granted:
             yield granted
     except admission.Cancelled as exc:
         raise RunCancelled(str(exc))
@@ -558,17 +603,32 @@ def _thread_limits(cpus=None, channels: int = 1) -> dict:
     return {name: threads for name in _THREAD_VARIABLES}
 
 
+# What a tool process never inherits. Every subprocess the server starts goes
+# through `child_environment_base()`, not only a run.
+SERVER_SECRETS = ("API_TOKEN", "ADMIN_TOKEN", "TLS_KEY_FILE",
+                  # So a tool cannot sign a run event as the server (wire/runs.py).
+                  "SADT_EVENT_SIGNING_KEY")
+
+
+def child_environment_base() -> dict:
+    """os.environ minus the server's secrets, for any process it starts."""
+    environment = dict(os.environ)
+    for secret in SERVER_SECRETS:
+        environment.pop(secret, None)
+    return environment
+
+
 def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = None,
                        progress_file: Optional[str] = None) -> dict:
     """The environment the tool process runs in.
 
     Inherited rather than rebuilt: tools legitimately need PATH, HOME,
     LD_LIBRARY_PATH, CUDA_VISIBLE_DEVICES and whatever else the deployment
-    sets. API_TOKEN is removed -- it is the server's credential, a tool has no
-    use for it, and the tool venvs hold third-party code.
+    sets. The server's credentials are removed -- API_TOKEN, ADMIN_TOKEN and
+    where its TLS key lives -- a tool has no use for them, and the tool venvs
+    hold third-party code.
     """
-    environment = dict(os.environ)
-    environment.pop("API_TOKEN", None)
+    environment = child_environment_base()
     environment.update(_thread_limits())
     if timeout:
         # An ABSOLUTE instant on the monotonic clock, not a duration: the clock's
@@ -594,6 +654,9 @@ def _child_environment(job_id: str, job_dir: str, timeout: Optional[float] = Non
     environment.update(
         {
             "SADT_API": settings.SADT_API,
+            # The server speaks only HTTPS (tls.py); a tool reading SADT_API
+            # verifies against this certificate, the one it is listening with.
+            "SADT_API_CAFILE": tls.certificate_paths()[0],
             "SADT_JOB_ID": job_id,
             "SADT_JOB_DIR": job_dir,
             # What a nested level needs to size ITSELF, since it cannot import
@@ -685,7 +748,16 @@ def _execute(command: list, job_dir: str, environment: dict, timeout: Optional[f
                 _kill_group(process)
                 raise RunCancelled("The client cancelled this run.")
 
-        return _wait(process, timeout, tool_name, run_id)
+        try:
+            return _wait(process, timeout, tool_name, run_id)
+        finally:
+            # Nothing in the run's group outlives the run, however it ended.
+            # A nested level killed out from under its child -- by the
+            # kernel's out-of-memory killer, say -- releases that child's
+            # reservation when its socket closes, while the child, in this
+            # group, goes on running: the budget would then believe memory is
+            # free that is not.
+            _kill_leftovers(process)
 
 
 def _wait(process: subprocess.Popen, timeout: Optional[float], tool_name: str,
@@ -763,6 +835,35 @@ def _kill_group(process: subprocess.Popen) -> None:
         logger.error("Tool process %s survived SIGKILL; it is now a zombie.", process.pid)
 
 
+def _kill_leftovers(process: subprocess.Popen) -> None:
+    """SIGKILL whatever is left in a finished run's process group.
+
+    By the group id, which is the leader's pid (`start_new_session`): once the
+    leader is reaped `os.getpgid` cannot find it, but the group goes on
+    existing for as long as anything is left in it.
+    """
+    if not process.pid or process.pid <= 1:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def cancel_run(run_id: str) -> Optional[int]:
+    """Cancel one run the way `DELETE /runs/{id}` does; the group signalled.
+
+    The marker first, then the signal, for the reasons the endpoint gives. One
+    function so that every path that stops a run -- the endpoint, and a
+    benchmark battery stopping the runs it started -- stops it the same way.
+    Raises `runs.RunError` for an id the registry does not hold.
+    """
+    pgid = runs.request_cancel(run_id)
+    if pgid is not None:
+        kill_process_group(pgid)
+    return pgid
+
+
 def kill_process_group(pgid: int) -> None:
     """SIGTERM a process group named only by its id. What `DELETE /runs/{id}`
     does with the pgid the run directory recorded.
@@ -827,7 +928,9 @@ def _read_result(job_dir: str, tool_name: str, solo: bool = False) -> Any:
     if isinstance(error, dict):
         # The tool raised and named its exception class. Which one it was is
         # the difference between "you sent the wrong thing" and "this broke".
-        raise ToolFailure(str(error.get("type", "")), str(error.get("message", "")))
+        bases = error.get("bases")
+        raise ToolFailure(str(error.get("type", "")), str(error.get("message", "")),
+                          error.get("origin"), bases if isinstance(bases, list) else None)
 
     if "result" not in payload:
         raise ToolExecutionError(
@@ -883,6 +986,18 @@ def _keep_measurements(tool_name: str, payload: dict, solo: bool = False) -> Non
     rss = rss if isinstance(rss, int) else None
     if vram is None and rss is None:
         return
+    # Present and None: the runner had no progress file to read the width from
+    # (a run started without a run id), so nobody knows how many channels this
+    # peak was spread over. Its figures are logged and not learned -- see
+    # `runner._width_reached`. Absent altogether is a runner from before widths
+    # were reported, and keeps meaning one.
+    if "channels" in payload and payload["channels"] is None:
+        logger.info(
+            "tool=%s peak_vram=%.2f GiB peak_rss=%.2f GiB not learned: the run "
+            "had no progress file, so its width is unknown",
+            tool_name, (vram or 0) / 1024 ** 3, (rss or 0) / 1024 ** 3,
+        )
+        return
     channels = payload.get("channels")
     channels = channels if isinstance(channels, int) and channels > 0 else 1
     cores = payload.get("peak_cpu_cores")
@@ -920,8 +1035,12 @@ def _keep_measurements(tool_name: str, payload: dict, solo: bool = False) -> Non
     # `vram_known=False` on a refusal, NOT a zero. Zero is "this tool costs the
     # card nothing" and lets it share with anything; absence is "nobody knows",
     # and a tool nobody knows runs alone until one solo run measures it.
+    # `own_only` when the run's nested calls were admitted as runs of their own:
+    # this figure is then the tool alone, and its children were each recorded
+    # under their own names by the desk that admitted them.
     costs.record(tool_name, vram, rss, channels=channels, cpu_cores=cores,
-                 vram_known=not refused)
+                 vram_known=not refused,
+                 own_only=bool(payload.get(NESTED_ADMITTED_KEY)))
     # And on the run's own event stream, not only in the table. `costs` keeps a
     # high-water mark per TOOL, which is what admission needs and what a reader
     # of ONE run cannot use: six runs sharing a card make the card's trace line
@@ -977,6 +1096,25 @@ REPLAY_DIRNAME = "replay"
 REPLAY_JOB_FILE = "job.replay.json"
 
 
+def _inside(folder: str, path: str) -> bool:
+    """Whether `path` really sits under `folder`, symlinks resolved.
+
+    `os.path.join` happily builds `<cohort>/../../etc/passwd`, and
+    `os.path.isfile` happily confirms it. Both halves matter: `realpath`
+    because a symlink inside the cohort points wherever it likes, and
+    `commonpath` rather than `startswith` because `/data/cohort2` starts with
+    `/data/cohort` and is a different cohort.
+    """
+    try:
+        folder = os.path.realpath(folder)
+        resolved = os.path.realpath(path)
+        return folder == resolved or os.path.commonpath([folder, resolved]) == folder
+    except (OSError, ValueError):
+        # A path so malformed that commonpath refuses it -- mixed drives on
+        # Windows, an empty string. Not inside anything.
+        return False
+
+
 def narrow_to_cases(job_dir: str, tool, keep) -> str:
     """A job file feeding `tool` only the inputs of `keep`, or "".
 
@@ -995,41 +1133,79 @@ def narrow_to_cases(job_dir: str, tool, keep) -> str:
     Hardlinked, not copied: a cohort is gigabytes and this is the same
     filesystem, so the narrowed folder costs directory entries.
     """
-    named = getattr(tool, "case_input", "") or ""
+    declared = getattr(tool, "case_input", "") or ""
+    arguments = [declared] if isinstance(declared, str) else list(declared)
     wanted = [name for name in (keep or ()) if name]
-    if not named or not wanted:
+    if not arguments or not wanted:
         return ""
     try:
         with open(os.path.join(job_dir, JOB_FILE), encoding="utf-8") as handle:
             job = json.load(handle)
     except (OSError, ValueError):
         return ""
-    source = (job.get("params") or {}).get(named)
-    if not isinstance(source, str) or not os.path.isdir(source):
+
+    # Which file a case has under each argument. A tool naming ONE argument
+    # may leave this unsaid and be narrowed by case name, which is what ASO
+    # does and what this did for everybody: the id IS the file. A tool naming
+    # SEVERAL cannot -- patient `C_0001` is `C_0001_T1.nii.gz` under `t1` and
+    # `C_0001_T2.nii.gz` under `t2` -- so it states the pairing in its report
+    # and this reads it back rather than guessing at names.
+    stated = reports.inputs_per_argument(
+        reports.read(os.path.join(job_dir, JOB_OUTPUT_DIRNAME)), wanted)
+    if len(arguments) > 1 and not stated:
+        logger.info("Not narrowing %s: it names %d inputs and its report "
+                    "pairs none of them", getattr(tool, "name", "?"),
+                    len(arguments))
         return ""
 
-    destination = os.path.join(job_dir, REPLAY_DIRNAME, named)
-    shutil.rmtree(destination, ignore_errors=True)
-    kept = 0
-    for relative in wanted:
-        origin = os.path.join(source, relative)
-        if not os.path.isfile(origin):
-            # A case named something that is not a file under this argument:
-            # the report and the request disagree, and narrowing on half an
-            # agreement would drop the rest.
-            logger.info("Not narrowing %s: %r is not under %s",
-                        getattr(tool, "name", "?"), relative, named)
-            shutil.rmtree(destination, ignore_errors=True)
+    narrowed = {}
+    for named in arguments:
+        source = (job.get("params") or {}).get(named)
+        if not isinstance(source, str) or not os.path.isdir(source):
             return ""
-        landing = os.path.join(destination, relative)
-        os.makedirs(os.path.dirname(landing), exist_ok=True)
-        try:
-            os.link(origin, landing)
-        except OSError:
-            shutil.copy2(origin, landing)
-        kept += 1
+        destination = os.path.join(job_dir, REPLAY_DIRNAME, named)
+        shutil.rmtree(destination, ignore_errors=True)
+        kept = 0
+        for case in wanted:
+            relative = (stated.get(case) or {}).get(named, case)
+            origin = os.path.join(source, relative)
+            if not _inside(source, origin):
+                # `wanted` reaches here from the REQUEST -- a reader names the
+                # cases they marked -- so a name is untrusted input and
+                # `../../etc/passwd` is a path that exists. Measured before
+                # this check: `case_0=../secret.txt` hardlinked a file from
+                # outside the cohort into the job directory, whose outputs are
+                # zipped and returned, AND left the tool an empty input folder
+                # to register nobody from. Confidential imaging, so the answer
+                # is to refuse the whole narrowing rather than skip the entry.
+                logger.warning("Not narrowing %s: %r leaves %s",
+                               getattr(tool, "name", "?"), relative, named)
+                for undo in list(narrowed) + [named]:
+                    shutil.rmtree(os.path.join(job_dir, REPLAY_DIRNAME, undo),
+                                  ignore_errors=True)
+                return ""
+            if not os.path.isfile(origin):
+                # A case named something that is not a file under this
+                # argument: the report and the request disagree, and narrowing
+                # on half an agreement would drop the rest. Every argument
+                # already narrowed is undone -- feeding a tool three baselines
+                # and forty follow-ups is worse than feeding it everything.
+                logger.info("Not narrowing %s: %r is not under %s",
+                            getattr(tool, "name", "?"), relative, named)
+                for undo in list(narrowed) + [named]:
+                    shutil.rmtree(os.path.join(job_dir, REPLAY_DIRNAME, undo),
+                                  ignore_errors=True)
+                return ""
+            landing = os.path.join(destination, relative)
+            os.makedirs(os.path.dirname(landing), exist_ok=True)
+            try:
+                os.link(origin, landing)
+            except OSError:
+                shutil.copy2(origin, landing)
+            kept += 1
+        narrowed[named] = destination
 
-    job["params"] = dict(job.get("params") or {}, **{named: destination})
+    job["params"] = dict(job.get("params") or {}, **narrowed)
     replay = os.path.join(job_dir, REPLAY_JOB_FILE)
     with open(replay, "w", encoding="utf-8") as handle:
         json.dump(job, handle)
@@ -1051,6 +1227,8 @@ def _reset_job(job_dir: str) -> None:
     os.makedirs(output, exist_ok=True)
 
 
+# Pinned equal to `execution.runner.RESUME_ENV` by a test; the runner is
+# executed by a TOOL's interpreter and the two cannot share a module.
 RESUME_ENV = "SADT_RESUME"
 
 # Where corrections are staged, one directory per slot. Pinned equal to
@@ -1190,9 +1368,29 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None,
             ]
             exit_code = None
             try:
+                asked_at = time.monotonic()
                 with _mps_exclusive(tool, params, run_id), \
                         _admitted(candidates, run_id) as grant:
                     cpu_grant, channels = grant
+                    # Recorded HERE, not inside `_admitted`: the wait is the
+                    # whole time between asking and being let in, and this is
+                    # the only scope holding both that interval and the name of
+                    # the tool that spent it. An observation, never a decision.
+                    waited = time.monotonic() - asked_at
+                    telemetry.record_admission(tool.name, waited, channels)
+                    # What this run actually holds, for the page's per-run
+                    # detail. Taken from the candidate that was granted rather
+                    # than from the widest one asked for: a run admitted at two
+                    # channels holds two channels' worth, and reporting the
+                    # eight it hoped for would overstate the machine.
+                    admitted = next(
+                        (demand for width, demand in candidates if width == channels),
+                        None)
+                    telemetry.record_run_grant(
+                        run_id, channels=channels, cpus=cpu_grant,
+                        ram_bytes=admitted.ram_bytes if admitted else None,
+                        vram_bytes=admitted.vram_bytes if admitted else None,
+                        waited=waited)
                     _raise_if_cancelled(run_id)
                     # Applied HERE rather than when the environment was built,
                     # because neither number is knowable until the run has been
@@ -1206,8 +1404,18 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None,
                          **_thread_limits(cpu_grant, granted.channels)},
                         granted,
                     )
-                    exit_code = _execute(command, job_dir, granted_environment,
-                                         timeout, tool.name, run_id)
+                    # The desk admits this run's nested calls for as long as
+                    # its process lives, and is closed with it.
+                    desk = nested.open_desk(run_id, job_dir, grant, _nested_candidates,
+                                            _nested_environment, _learn_nested)
+                    try:
+                        exit_code = _execute(
+                            command, job_dir,
+                            {**granted_environment, **(desk.environment() if desk else {})},
+                            timeout, tool.name, run_id)
+                    finally:
+                        if desk is not None:
+                            desk.close()
                 if exit_code != 0:
                     # A tool that recorded WHICH exception it was gets to say
                     # so; the tail of stderr is the fallback for one that died

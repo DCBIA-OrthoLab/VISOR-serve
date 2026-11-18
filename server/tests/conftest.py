@@ -23,6 +23,9 @@ import pytest
 
 # Set before anything builds config.Settings().
 os.environ.setdefault("API_TOKEN", "test-token")
+# What serve.py sets once the listener has its certificate; the in-process
+# TestClient has no listener, so main.py's lifespan check is told it has one.
+os.environ.setdefault("SADT_TLS_ACTIVE", "1")
 
 import config
 import file_utils
@@ -69,11 +72,42 @@ def _is_usable(interpreter: str) -> bool:
     return probe.returncode == 0
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _session_temp_dir(tmp_path_factory):
+    """No test writes into the TEMP_DIR a server on this machine serves from.
+
+    The default is that server's own, so a test that registered a run without
+    moving TEMP_DIR first put the run in the live registry, where its panel
+    listed it as running. A test that moves TEMP_DIR itself still does.
+    """
+    original = settings.TEMP_DIR
+    settings.TEMP_DIR = str(tmp_path_factory.mktemp("inference_server"))
+    yield
+    settings.TEMP_DIR = original
+
+
 @pytest.fixture(autouse=True)
 def schema_cache(tmp_path, monkeypatch):
     """A .schema.json is a cache the server may regenerate, so no test is
     allowed to write one into the repository."""
     monkeypatch.setattr(settings, "SCHEMA_CACHE_DIR", str(tmp_path / "schema-cache"))
+    # The run history is written on every finished run, and no test may write
+    # one into the repository either.
+    monkeypatch.setattr(settings, "HISTORY_DIR", str(tmp_path / "history"))
+    # Nor the learned cost table: empty puts it beside the schema cache above,
+    # whatever COST_TABLE_PATH the shell running the suite exports. And no
+    # test inherits the tool epochs another test's startup declared.
+    monkeypatch.setattr(settings, "COST_TABLE_PATH", "")
+    from execution import costs
+    monkeypatch.setattr(costs, "_declared", {})
+    # The operator panel answers only to the admin token, so every test has
+    # one; a test about its absence sets it back to "".
+    monkeypatch.setattr(settings, "ADMIN_TOKEN", "test-admin-token")
+    monkeypatch.setattr(settings, "UPDATE_DIR", str(tmp_path / "update"))
+    # Reading the admin panel's update report starts a background check that
+    # calls git and GitHub; never from a test.
+    from wire import update_check
+    monkeypatch.setattr(update_check, "_background", lambda: None)
 
 
 @pytest.fixture(scope="session")

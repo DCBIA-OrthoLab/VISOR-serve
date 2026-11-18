@@ -409,6 +409,11 @@ def _count(value) -> Optional[int]:
         return found or None
     if os.path.exists(text):
         return 1
+    # A multichoice sent as its comma-separated shorthand, which the schema
+    # accepts beside the array: "CBMASK,CB,MAND,MAX" is four structures, and
+    # read as nothing it left the width bounded by affordability alone.
+    if "," in text:
+        return sum(1 for part in text.split(",") if part.strip()) or None
     return None
 
 

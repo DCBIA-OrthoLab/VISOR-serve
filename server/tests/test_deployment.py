@@ -436,3 +436,20 @@ def test_the_shipped_file_counts_amasss_channels_from_its_structures():
         shipped = tomllib.load(handle)
 
     assert shipped["tools"]["AMASSS"]["width_from"] == "structures"
+
+
+def test_cores_per_channel_is_read_and_must_be_a_boolean(tmp_path):
+    path = _write(tmp_path, "[tools.areg]\ncores_per_channel = true\n")
+    assert deployment.load(path).for_tool("areg").cores_per_channel is True
+
+    path = _write(tmp_path, '[tools.areg]\ncores_per_channel = "yes"\n')
+    with pytest.raises(DeploymentConfigError, match="cores_per_channel"):
+        deployment.load(path)
+
+
+def test_the_shipped_file_gives_each_areg_registration_its_own_cores():
+    """The one tool that declares it, and the bound that keeps it honest."""
+    shipped = deployment.load(os.path.join(os.path.dirname(__file__), "..", "deployment.toml"))
+    entry = shipped.for_tool("AREG_CBCT")
+    assert entry.cores_per_channel is True
+    assert entry.width_from == "regions"

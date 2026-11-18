@@ -9,7 +9,10 @@ model bundles around.
 | File | Role |
 | --- | --- |
 | [`setup-server.sh`](setup-server.sh) | Clone, check docker, start. One command from nothing. Runnable straight from GitHub. |
+| [`setup-tailscale.sh`](setup-tailscale.sh) | Put the server on a Tailscale network, in HTTPS, and nowhere else. Linux, needs root. |
 | [`install-docker.sh`](install-docker.sh) | Docker Engine + compose plugin (+ the NVIDIA toolkit on request). Linux, needs root. |
+| [`install-nvidia-driver.sh`](install-nvidia-driver.sh) | The NVIDIA driver Ubuntu recommends for the card (an RTX 50xx gets 570+). Ubuntu, needs root, then a reboot. |
+| [`check-gpu.sh`](check-gpu.sh) | Can the tools use this GPU? Exit 0 yes, 1 no GPU, 2 card too old, 3 driver missing or too old. |
 | [`server_ctl.py`](server_ctl.py) | The deployment engine: `status` / `up` / `update` / `down` / `logs` / `catalog` / `models`. |
 | [`setup-models.sh`](setup-models.sh) | Fetch AI models. Runnable straight from GitHub. |
 | [`setup-testfiles.sh`](setup-testfiles.sh) | Fetch reference test files. Runnable straight from GitHub. |
@@ -26,7 +29,7 @@ Slicer's own interpreter, where nothing may be pip-installed on a user's behalf.
 From nothing, on the machine that will host it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-server.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-server.sh | sh
 ```
 
 That clones the repo, checks docker (telling you exactly what to run if it is
@@ -39,6 +42,14 @@ working.
 Add `--tool NAME` (repeatable) to also download that tool's data. Nothing is
 downloaded by default - the full set is ~29 GB and which tools a site uses is
 not something to assume.
+
+Both the URL above and what it clones are the `deploy` branch, not `main`:
+`deploy` is a commit of `main` whose CI went green and which was then moved
+there on purpose, so a clinic installing today gets the same code as the clinic
+that installed last week rather than whatever merged an hour ago. The install
+prints how far behind `main` that is. To follow the tip instead, pass
+`--branch main` -- or fetch this script from `main` too, which is what a
+developer testing an unreleased change wants.
 
 ### Afterwards, from the clone
 
@@ -69,15 +80,14 @@ container toolkit is installed. Force it with `--device gpu|cpu`.
 
 ### A word on where it listens
 
-`server_ctl.py up` publishes the port on **`127.0.0.1`** by default, because
-this deployment speaks plain HTTP. `docker compose up` by hand still binds
-every interface - IPv4 *and* IPv6 - unchanged, for the lab server that sits
-behind a TLS terminator. Putting a plain-HTTP deployment on a network address
-means medical images crossing the network in the clear - see `SECURITY.md`.
-
-`BIND_ADDR` unset is not the same as `BIND_ADDR=0.0.0.0`: with no host address
-docker publishes on both stacks, while an explicit `0.0.0.0` is IPv4 only.
-Leave it out unless you mean to restrict.
+The port is published on **`127.0.0.1`** unless `PUBLISH_ADDR` in `.env` says
+otherwise, and the server then refuses to start without a publicly signed
+certificate of its own (`server/README.md`, "HTTPS only"). `--bind` /
+`BIND_ADDR` no longer change anything. Clients - this script and the update
+agent included - are given `PUBLIC_URL`, or the URL `tailscale serve`
+publishes when it is unset, and verify its publicly signed certificate. Until
+one of them exists, `up` waits on the container's own healthcheck and says
+that no client can reach the server yet.
 
 `--port` moves the **host** side only (the container always serves 8000
 internally) and is remembered in `.env`, so it is passed once and not on every
@@ -102,6 +112,101 @@ looks perfectly healthy.
 A container that genuinely has nothing installed still fails, on purpose and
 in one line (`DEPENDENCY-INSTALL-FATAL`): it needs the network once.
 
+### Reaching it from other machines: Tailscale
+
+The simplest way to let other machines in without exposing plain HTTP is a
+Tailscale network. Add `--tailscale` to the install, or run it on its own
+against a deployment that is already up:
+
+```bash
+curl -fsSL .../setup-server.sh | sh -s -- --tailscale
+sudo sh scripts/setup-tailscale.sh          # an existing deployment
+```
+
+It installs Tailscale, joins the tailnet with an auth key asked for at a
+prompt that does not echo it, and publishes the server with `tailscale serve`
+as `https://<name>.<tailnet>.ts.net`. The server keeps listening on
+`127.0.0.1` in plain HTTP; `tailscale serve` is the TLS terminator in front of
+it, and fetches and renews the certificate itself. Nothing has to run at boot:
+`tailscaled` keeps the configuration.
+
+Before running it, in the tailnet's admin console:
+
+- **DNS**: MagicDNS on, and **HTTPS Certificates** enabled. Without them the
+  script stops and says so, rather than hanging on `tailscale serve`.
+- **Settings -> Keys**: an auth key for the server, **not reusable**, tagged
+  (`tag:server`), so the machine belongs to no person and its login never
+  expires. The tag has to be declared in the access policy's `tagOwners`
+  first.
+
+The key is never accepted as an argument, where the shell history and `ps`
+would keep it: the prompt (hidden; pasting works), `--auth-key-file`
+(`--tailscale-key-file` through `setup-server.sh`), or `TS_AUTHKEY` for an
+unattended install. If the Tailscale step stops -- no key on an unattended run,
+certificates not enabled, a device awaiting approval -- the server is still
+installed on `127.0.0.1`, and the script prints the one command that finishes
+the job once that is fixed.
+
+The machine's name ends up in its URL, and is **public**: every certificate is
+written to the Certificate Transparency logs. It defaults to `visor`; keep any
+`--hostname` neutral.
+
+Who may reach the server is the tailnet's access policy, not this script. A
+policy that gives the researchers' machines HTTPS and nothing else:
+
+```json
+"grants": [
+  {"src": ["tag:user"],         "dst": ["tag:server"], "ip": ["tcp:443"]},
+  {"src": ["<admin account>"],  "dst": ["tag:server"], "ip": ["tcp:22"]}
+]
+```
+
+#### Adding a workstation
+
+A shared lab workstation joins with an auth key, so it belongs to no person and
+its login never expires. Generate one in **Settings -> Keys**: **reusable** to
+set up several machines in one sitting, **tagged** (`tag:user`, so the policy
+above applies), with a **short expiry** (a day), and revoke it once the machines
+are in; those already joined stay joined. Then, on each workstation:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+printf 'Auth key: '; stty -echo; read -r TSKEY; stty echo; echo
+printf '%s' "$TSKEY" | sudo tee /root/.tskey >/dev/null && sudo chmod 600 /root/.tskey
+sudo tailscale up --auth-key=file:/root/.tskey; sudo rm -f /root/.tskey; unset TSKEY
+curl -s https://<name>.<tailnet>.ts.net/health; echo
+```
+
+The key is asked for without echo (pasting works) and reaches `tailscale up`
+through a root-only file removed right after, so it lands in neither the shell
+history nor `ps`. The last line answers `{"status":"ok"}` once the machine can
+reach the server.
+
+On a machine that already runs Tailscale, `tailscale up` refuses with
+"changing settings via 'tailscale up' requires mentioning all non-default
+flags". To keep the tailnet it is on and add this one beside it, replace the
+`tailscale up` line with `tailscale login`, restating the flags the error
+lists (often `--operator=<user>`):
+
+```bash
+sudo tailscale login --auth-key=file:/root/.tskey --operator="$USER"; sudo rm -f /root/.tskey; unset TSKEY
+```
+
+To put it on this tailnet only, use `tailscale up --reset --auth-key=file:/root/.tskey`
+instead, which drops its previous settings.
+
+In the Slicer client, set the server URL to `https://<name>.<tailnet>.ts.net`
+and keep TLS verification **on**: the certificate is publicly trusted, so no
+certificate file is needed. The API token does not change.
+
+A personal laptop is simpler: install the app from tailscale.com/download and
+sign in. For someone who is already on another tailnet, share the server's
+machine with their account (**Machines -> the server -> Share**) instead: it
+then appears in their own tailnet, with no switching, and nothing else of this
+one is reachable. A machine can be on one tailnet at a time; `tailscale login`
+adds an account without dropping the current one, and `tailscale switch`
+moves between them without signing in again.
+
 ### `DATA/` has to exist before docker starts
 
 `./DATA:/data:ro` is a bind mount, so a missing host path is created by the
@@ -124,8 +229,8 @@ On a machine with nothing checked out - run it from the directory that should
 end up holding `DATA/`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-models.sh | sh
-curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-testfiles.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-models.sh | sh
+curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-testfiles.sh | sh
 ```
 
 From a clone, the same thing without the network round trip (the wrappers

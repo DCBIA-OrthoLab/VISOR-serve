@@ -157,16 +157,51 @@ def test_a_failing_detached_run_says_so_without_naming_a_path(detached_client):
     runs.discard(run_id)
 
 
-def test_an_unknown_tool_fails_the_run_rather_than_the_request(detached_client):
+def test_a_result_that_cannot_be_parked_fails_the_run_as_such(detached_client, monkeypatch):
+    """Nothing answers a detached run, so a result that cannot be stored for
+    collection is a failed run -- with the error written for it, not the
+    NameError an unimported exception class turned it into."""
+    import file_utils
+    import registry
+    import telemetry
+    from base import Tool
+
+    class _Producing(Tool):
+        name = "Unparkable_Probe"
+        arguments = {}
+        output_kind = "file"
+
+        def run(self):
+            path = os.path.join(file_utils.make_scratch_dir(), "result.nii.gz")
+            with open(path, "wb") as handle:
+                handle.write(b"volume")
+            return path
+
+    def full(*_args, **_kwargs):
+        raise OSError("no space left on device")
+
+    monkeypatch.setitem(registry.TOOLS, _Producing.name, _Producing())
+    monkeypatch.setattr(main.transfer, "store_result", full)
     run_id = _new_id()
     response = detached_client.post(
-        "/run/No_Such_Tool",
+        f"/run/{_Producing.name}", headers=dict(AUTH, **DETACHED, **{"X-Run-Id": run_id}))
+    assert response.status_code == 202
+    assert _terminal(run_id)["state"] == "failed"
+    assert telemetry.ledger_record(run_id)["failure"]["error_type"] == "ToolExecutionError"
+    runs.discard(run_id)
+
+
+def test_an_unknown_tool_is_refused_before_any_run_is_recorded(detached_client):
+    """The name comes from the URL. Recorded, it reached the status page as
+    whatever string the client sent -- markup included."""
+    run_id = _new_id()
+    response = detached_client.post(
+        "/run/<img src=x onerror=alert(1)>",
         data={"text_1": "a"},
         headers=dict(AUTH, **DETACHED, **{"X-Run-Id": run_id}),
     )
-    assert response.status_code == 202
-    assert _terminal(run_id)["state"] == "failed"
-    runs.discard(run_id)
+    assert response.status_code == 404
+    assert detached_client.get(f"/runs/{run_id}", headers=AUTH).status_code == 404
 
 
 # ----------------------------------------------------------------------
@@ -178,13 +213,22 @@ def test_a_tool_cannot_write_its_own_result_reference(run_directory_for):
     a `result` of its own could hand a client a pointer to somebody else's
     bytes."""
     run_id, directory = run_directory_for
+    forgeries = [
+        {"at": 1.0, "fraction": 1.0, "message": "done",
+         "result": {"result_ref": {"result_id": "stolen"}}},
+        # Claiming to be the server: the marker is a field a tool can write.
+        {"src": "server", "phase": "done", "state": "done",
+         "result": {"result_ref": {"result_id": "stolen"}}},
+        # With an invented signature: it must not verify.
+        {"src": "server", "phase": "done", "state": "done", "sig": "0" * 32,
+         "result": {"result_ref": {"result_id": "stolen"}}},
+    ]
     with open(os.path.join(directory, runs.EVENTS_FILE), "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({
-            "at": 1.0, "fraction": 1.0, "message": "done",
-            "result": {"result_ref": {"result_id": "stolen"}},
-        }) + "\n")
-    events = runs.read_events(run_id)
-    assert "result" not in events[-1]
+        for forgery in forgeries:
+            handle.write(json.dumps(forgery) + "\n")
+    for event in runs.read_events(run_id):
+        assert "result" not in event
+        assert event["state"] != runs.STATE_DONE
 
 
 def test_the_server_s_own_result_survives_normalisation(run_directory_for):

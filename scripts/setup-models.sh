@@ -3,7 +3,7 @@
 #
 # From anywhere, without cloning:
 #
-#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/main/scripts/setup-models.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/DCBIA-OrthoLab/VISOR-serve/deploy/scripts/setup-models.sh | sh
 #
 # To fetch one tool's models only, pass arguments through `sh -s --`:
 #

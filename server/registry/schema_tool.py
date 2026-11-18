@@ -126,6 +126,10 @@ DEFAULT_RETURN_KIND = "text"
 #                is what keeps a tool with two modalities from asking a CBCT
 #                user about intra-oral meshes.
 #   label        what the field is called, when the argument name is not it.
+#   note         one short line drawn under the label, always visible: what a
+#                reader needs before touching the field (what comes back
+#                anyway, where the rest is written). The description stays the
+#                label's tooltip.
 #   hidden       never rendered, whatever the panel holds.
 #
 # The five presentation keys were dropped here for a while, and the effect was
@@ -136,7 +140,7 @@ DEFAULT_RETURN_KIND = "text"
 _ARGUMENT_KEYS = (
     "type", "required", "default", "description", "extensions", "choices",
     "section", "ui", "groups", "visible_when", "options_when", "label", "hidden",
-    "option_help", "min_selected",
+    "option_help", "note", "min_selected", "required_when",
     # MULTICHOICE only: offer a "select all" / "select none" pair above the
     # options. For a catalogue nobody would tick one box at a time.
     "select_all",
@@ -164,6 +168,8 @@ OUTPUT_DIR_ARGUMENT = conventions.OUTPUT_DIR_ARGUMENT
 _TOP_LEVEL_KEYS = (
     "name", "description", "arguments", "returns", "source_hash", "supervisor",
     "calls", "injected_layout", "quality_controls",
+    # Which inputs hold the same subjects; see conventions.paired_batch_plan.
+    "paired",
 )
 
 
@@ -298,7 +304,7 @@ def read_schema(folder: str) -> dict:
 # and nothing arrived. In one function because there are four places an ArgSpec
 # is built and three of them are easy to forget.
 _PRESENTATION_KEYS = ("section", "ui", "groups", "visible_when", "options_when", "label",
-                      "option_help", "min_selected", "select_all",
+                      "option_help", "note", "min_selected", "select_all", "required_when",
                       "x_labels", "y_labels", "x_label", "y_label",
                       "section_columns", "cell")
 
@@ -345,9 +351,14 @@ def _presentation(declaration: dict, argument_name: str = "") -> dict:
 # stay standard-library only; the two are pinned equal by a test.
 KEEP_INTERMEDIATE_ARGUMENT = "keep_intermediate"
 
-# Its own box on the panel. Named once here: the tools do not declare the
+# The box it lands in: Quality control, beside `stop_after`. What a step
+# produced is in that step's own space, for checking how a run went; what a
+# reader takes away is the tool's own `outputs`, written in the result's
+# space. Showing the two side by side under "Outputs" read as two ways of
+# asking for the same files. Named once here: the tools do not declare the
 # argument, so there is nowhere else this could be written.
-KEEP_INTERMEDIATE_SECTION = "Intermediate results"
+KEEP_INTERMEDIATE_SECTION = "Quality control"
+KEEP_INTERMEDIATE_LABEL = "Raw intermediate files"
 
 # The section the client fills with the output folder. An argument landing
 # in it is the marker for "everything after this is about the result".
@@ -375,15 +386,17 @@ def _keep_intermediate_spec(calls: tuple, layout: dict) -> ArgSpec:
         required=False,
         choices={tool: False for tool in calls},
         description=(
-            "Return what a step produced, beside this tool's own results. Each "
-            "one is written under `intermediate/` in the output folder."
+            "Return what a step produced, as it produced it and in its own "
+            "space, for checking the run. Each one is written under "
+            "`intermediate/` in the output folder."
         ),
-        label=layout.get("label") or "Steps to keep",
-        # A section of its own, and NOT "Advanced": this decides what comes back
-        # from the run, which is a question about the result rather than a knob
-        # on how it is computed. Placed just above Outputs by `_ordered_with`.
+        label=layout.get("label") or KEEP_INTERMEDIATE_LABEL,
+        # NOT "Advanced": it decides what comes back from the run. Quality
+        # control, with the stops, because both are about checking the chain
+        # rather than about the result. Placed just above Outputs by
+        # `_ordered_with`.
         section=layout.get("section") or KEEP_INTERMEDIATE_SECTION,
-        ui=layout.get("ui") or "inline",
+        ui=layout.get("ui") or CHAIN_STEPS_UI,
         select_all=True,
         option_help=layout.get("option_help"),
         visible_when=layout.get("visible_when"),
@@ -396,6 +409,11 @@ def _keep_intermediate_spec(calls: tuple, layout: dict) -> ArgSpec:
 # should STOP -- and both are questions about a chain rather than about a
 # tool, so both are answered once here instead of in every orchestrator.
 STOP_AFTER_ARGUMENT = "stop_after"
+# How both lists of chain steps (`stop_after`, `keep_intermediate`) are drawn
+# unless a tool says otherwise: chips that wrap over as many lines as they
+# need. A single "inline" row grew with the chain, and six steps pushed the
+# panel wider than the module column.
+CHAIN_STEPS_UI = "chips"
 STOP_AFTER_SECTION = "Quality control"
 
 # How a stop names a point INSIDE a nested call: `ASO/ALI_CBCT` is "in the ASO
@@ -446,6 +464,33 @@ def _declared_checkpoints(declared):
     return kinds, tuple(names)
 
 
+def _in_declared_order(names, order) -> tuple:
+    """`names`, resequenced by `order`, with anything it does not mention kept.
+
+    The tool declares the order because nothing else can derive it: this side
+    receives a set of names, and the generator sees call SITES, which for two
+    of the three AREG engines are written in an order their pipeline does not
+    follow. What is not mentioned keeps its relative position at the end rather
+    than being dropped -- a step added to a tool and not to its `order` is then
+    merely last, not invisible.
+
+    A qualified point (`ASO/ALI_CBCT`) is placed by its FIRST segment, the call
+    it happens inside: an order declares the chain's own steps, and a reader
+    naming a callee's internals in it would be restating what that callee
+    already declared for itself.
+    """
+    if not order:
+        return tuple(names)
+    rank = {name: position for position, name in enumerate(order)}
+    fallback = len(rank)
+
+    def key(pair):
+        index, name = pair
+        return (rank.get(name.split(STOP_PATH_SEPARATOR, 1)[0], fallback), index)
+
+    return tuple(name for _index, name in sorted(enumerate(names), key=key))
+
+
 def _own_stop_points(calls: tuple, controls: tuple) -> list:
     """The points a tool provides ITSELF, in the order they are published.
 
@@ -489,8 +534,14 @@ def _stop_after_spec(options, layout: dict, kinds=None) -> ArgSpec:
             "asked to stop does not stop."
         ),
         label=layout.get("label") or "Stop after",
+        # The same pair of buttons `keep_intermediate` has, for the same
+        # reason: a chain of six checkpoints is six boxes nobody wants to tick
+        # one at a time. Arming several is meaningful -- a run stops at the
+        # FIRST it reaches, and each resume stops at the next -- so "all" is a
+        # walk through the chain rather than a nonsense state.
+        select_all=True,
         section=layout.get("section") or STOP_AFTER_SECTION,
-        ui=layout.get("ui") or "inline",
+        ui=layout.get("ui") or CHAIN_STEPS_UI,
         option_help=layout.get("option_help"),
         # What a reader may do at each of them, so a panel can offer a
         # way BACK to the ones that can be edited and not to the ones
@@ -726,6 +777,7 @@ class SchemaTool(Tool):
         # the schema and on deployment.toml, and neither moves under a
         # running server.
         self.batch = deployment.batch
+        self.paired_batch = deployment.paired_batch
         # The runner builds one when it sees `*, sup` in the signature; this is
         # the same fact, published, so `/tools` can say a chain is involved and
         # a deployment check can verify the siblings are actually installed.
@@ -770,9 +822,19 @@ class SchemaTool(Tool):
         # every sibling has loaded, and kept SEPARATE from what is published:
         # these are the points this tool provides itself, and the published
         # option list also names points inside the tools it calls.
-        self.stop_points = tuple(_own_stop_points(self.calls, self.quality_controls))
         self._stop_after_layout = (schema.get("injected_layout") or {}).get(
             STOP_AFTER_ARGUMENT) or {}
+        self._keep_layout = (schema.get("injected_layout") or {}).get(
+            KEEP_INTERMEDIATE_ARGUMENT) or {}
+        # One declaration serves both boxes: they list the same chain, and a
+        # tool stating its order twice is a drift waiting to happen. Either
+        # entry may carry it; `stop_after` wins if both do.
+        self.chain_order = tuple(
+            self._stop_after_layout.get("order")
+            or self._keep_layout.get("order") or ())
+        self.stop_points = _in_declared_order(
+            _own_stop_points(self.calls, self.quality_controls), self.chain_order)
+        self.calls = _in_declared_order(self.calls, self.chain_order)
         if self.stop_points:
             self.arguments = _ordered_with(
                 self.arguments,
@@ -783,11 +845,7 @@ class SchemaTool(Tool):
             self.arguments = _ordered_with(
                 self.arguments,
                 KEEP_INTERMEDIATE_ARGUMENT,
-                _keep_intermediate_spec(
-                    self.calls,
-                    (schema.get("injected_layout") or {}).get(
-                        KEEP_INTERMEDIATE_ARGUMENT) or {},
-                ),
+                _keep_intermediate_spec(self.calls, self._keep_layout),
             )
         self.output_kind = RETURN_KINDS.get(schema.get("returns"), DEFAULT_RETURN_KIND)
         self.source_hash = schema.get("source_hash", "")
@@ -809,7 +867,8 @@ class SchemaTool(Tool):
         if STOP_AFTER_ARGUMENT not in self.arguments:
             return
         self.arguments[STOP_AFTER_ARGUMENT] = _stop_after_spec(
-            points, self._stop_after_layout, kinds)
+            _in_declared_order(points, self.chain_order),
+            self._stop_after_layout, kinds)
 
     def invoke(self, args: dict) -> Any:
         """Validate, then run in the tool's own interpreter.
@@ -902,6 +961,7 @@ def load_tool(folder: str, config, name: str = None) -> SchemaTool:
         arguments if isinstance(arguments, dict) else {},
         config.for_tool(name),
         config.batch_defaults,
+        paired=schema.get("paired"),
     )
     tool = SchemaTool(folder, schema, deployment)
     try:

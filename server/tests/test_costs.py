@@ -630,6 +630,26 @@ def test_a_torch_figure_is_learned_whether_the_run_was_alone_or_not(solo):
     assert costs.cost_of("Batch_Dental_Seg").vram_bytes == 16 * 1024 ** 3
 
 
+def test_a_run_whose_width_nobody_saw_teaches_nothing():
+    """A run with no progress file cannot say how many channels its peak was
+    spread over. Learned as one, a four-structure AMASSS priced ONE channel at
+    38.65 GiB, and every AMASSS after it ran alone."""
+    from execution import dispatch
+
+    unknown = dict(_measured("torch"), channels=None)
+    dispatch._keep_measurements("AMASSS", unknown, solo=True)
+    assert costs.cost_of("AMASSS") is None
+
+
+def test_a_payload_from_before_widths_were_reported_still_means_one():
+    from execution import dispatch
+
+    old = _measured("torch")
+    del old["channels"]
+    dispatch._keep_measurements("Batch_Dental_Seg", old, solo=True)
+    assert costs.cost_of("Batch_Dental_Seg").vram_bytes == 16 * 1024 ** 3
+
+
 def test_a_card_figure_is_learned_from_a_run_that_had_the_machine_to_itself():
     """On an idle machine the card's growth IS this run's allocation, and on
     this deployment it is the only reading the driver ever gives."""
@@ -715,3 +735,53 @@ def test_the_refusal_travels_from_admission_to_the_table(tmp_path):
     (job_dir / "result.json").write_text(json.dumps(_measured("card")))
     assert dispatch._read_result(str(job_dir), "ALI_CBCT", solo=False) == "ok"
     assert costs.cost_of("ALI_CBCT").vram_known is False
+
+
+# ---------------------------------------------------------------------------
+# One run far above the others is held aside until a second confirms it
+# ---------------------------------------------------------------------------
+
+_GIB = 1024 ** 3
+
+
+def _usual_runs(tool="AMASSS", runs=5, ram=13.6, vram=5.6, channels=1):
+    for _ in range(runs):
+        costs.record(tool, int(vram * channels * _GIB), int(ram * channels * _GIB),
+                     channels=channels)
+
+
+def test_a_one_off_far_above_its_width_is_held_not_learned():
+    """87.38 GiB at two channels where the others at two took 20: learned, it
+    priced one channel at 62.8 GiB and every AMASSS after it ran alone."""
+    _usual_runs(channels=2, ram=10.3, vram=2.7)
+    before = costs.cost_of("AMASSS").ram_bytes
+    costs.record("AMASSS", int(5.5 * _GIB), int(87.38 * _GIB), channels=2)
+    assert costs.cost_of("AMASSS").ram_bytes == before
+    held = costs._load()["AMASSS"][costs.QUARANTINE_KEY]
+    assert held[2] == 2
+
+
+def test_a_second_heavy_run_confirms_the_first_and_both_are_learned():
+    """A larger scan IS heavier: a cohort of them teaches the table on its
+    second scan, not never."""
+    _usual_runs()
+    costs.record("AMASSS", int(5.6 * _GIB), int(40 * _GIB))
+    assert costs.cost_of("AMASSS").ram_bytes < 20 * _GIB
+    costs.record("AMASSS", int(5.6 * _GIB), int(44 * _GIB))
+    assert costs.cost_of("AMASSS").ram_bytes >= 44 * _GIB
+    assert costs.QUARANTINE_KEY not in costs._load()["AMASSS"]
+    assert sum(1 for row in costs._load()["AMASSS"]["recent"] if row[1] >= 40 * _GIB) == 2
+
+
+def test_with_too_few_runs_to_compare_everything_is_learned():
+    _usual_runs(runs=costs.OUTLIER_PEERS - 1)
+    costs.record("AMASSS", int(5.6 * _GIB), int(40 * _GIB))
+    assert costs.cost_of("AMASSS").ram_bytes >= 40 * _GIB
+
+
+def test_a_run_is_only_compared_with_runs_at_its_own_width():
+    """Four channels cost more than one; that is not an outlier."""
+    _usual_runs(ram=13.6)
+    costs.record("AMASSS", int(10.8 * _GIB), int(39.3 * _GIB), channels=4)
+    assert costs.QUARANTINE_KEY not in costs._load()["AMASSS"]
+    assert costs.cost_of("AMASSS").at(4).ram_bytes >= int(39.3 * _GIB)

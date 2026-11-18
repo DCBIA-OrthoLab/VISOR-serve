@@ -12,10 +12,30 @@
 # Entry format
 # ---------------------------------------------------------------------------
 #   name      REQUIRED  the file name to download (a bare name, no path)
-#   url       REQUIRED  direct download URL
-#   sha256    optional  verified after download; the file is discarded on a
-#                       mismatch. Absent means "not pinned yet" -- fetch_data.py
-#                       prints the hash it got, which is what you paste here.
+#   url       REQUIRED  direct download URL, https:// only
+#   sha256    REQUIRED  verified after download; the file is discarded on a
+#                       mismatch. Also what makes an update reach a deployment:
+#                       a file on disk installed under another sha256 is
+#                       replaced.
+#   unpinned  optional  `true` lets an entry go without a sha256. Never a
+#                       default: fetch_data.py refuses an entry with neither,
+#                       and prints the hash it got, which is what to paste in
+#                       place of this line.
+#   release_name  the file's name in the data releases of this repository
+#                 (scripts/publish_data_release.py). Required for a file to be
+#                 republished; entries sharing a url share it. Two schemes:
+#                   model.<tool>.<name>   a model, under the tool that owns it
+#                   TestFile<NNN>[_<time>]_<modality>[_<arch>][_<content>...].<ext>
+#                       NNN       one number per published file, never reused,
+#                                 and never tied to a patient
+#                       time      T1, T2 or T1T2, when the data has timepoints
+#                       modality  CBCT, IOS, IOSCBCT, MRICBCT -- or lm, ROI,
+#                                 Measurements for what is not a scan
+#                       arch      U, L or UL, for IOS
+#                       content   in this order, only what is present: Or
+#                                 (oriented), Seg, lm (landmarks), Surface,
+#                                 Matrix, Reg (registered), DCM (DICOM)
+#                       ext       the real one: .nii.gz, .vtk, or .zip for a folder
 #   size      optional  bytes, for the size report before a run. Informational.
 #   extract   optional  true -> unpack the zip and keep the FOLDER, dropping
 #                       the archive. A single top-level folder inside the
@@ -28,6 +48,14 @@
 #                       archives into ONE bundle folder -- which matters
 #                       because `server_selectable="model"` shows one dropdown
 #                       entry per top-level name, and the tool receives one.
+#   split     optional  a prefix. Each top-level subfolder of the extracted
+#                       entry (a cohort's T1/, T2/) is also published as
+#                       DATA/<tool>/<kind>/<split>_<subfolder>/<entry>/,
+#                       hardlinked, so it costs directory entries and no data.
+#                       This is what a per-timepoint picker scope draws from
+#                       (`server_selectable = { t1 = "testfile:CBCT_T1" }`).
+#                       Rebuilt when missing, so re-running the fetch also
+#                       repairs a DATA/ staged before the key existed.
 #
 # ---------------------------------------------------------------------------
 # Sizes -- read this before running the whole thing
@@ -39,7 +67,11 @@
 #     python3 scripts/fetch_data.py --list        # sizes per tool, downloads nothing
 #
 # Anything already on disk is skipped, so re-running only fetches what is
-# missing and an interrupted run resumes by simply being restarted.
+# missing and an interrupted run resumes by simply being restarted. An entry
+# with a sha256 is the exception: when the pin changes, the file on disk is
+# replaced. Changing a file is therefore publishing the new one and updating
+# its `url` and `sha256` here; every deployment then downloads that file and
+# nothing else.
 #
 # ---------------------------------------------------------------------------
 # Status of each tool
@@ -53,11 +85,13 @@
 # Two consequences of `DATA/` being organized per tool, worth knowing before
 # the ports start:
 #
-#   * Shared assets get duplicated. AMASSS_Models.zip is wanted by AMASSS,
-#     AREG and VFACE; the ALIDDM IOS weights by ALI and ASO. A tool can only
-#     read DATA/<its own name>/, so the copy is listed once per tool that
-#     genuinely needs it -- and, for the unported ones, not listed at all yet
-#     rather than eagerly duplicating gigabytes.
+#   * Every tool owns its model. A tool that needs another tool's work --
+#     AREG and VFACE want AMASSS's masks and ASO's orientation -- calls that
+#     tool, which resolves its OWN bundle from DATA/<its own name>/. So
+#     AMASSS_Models is listed under AMASSS only and the CBCT/IOS reference
+#     planes under ASO only; a caller never holds a copy. What is still listed
+#     twice is a different publication that happens to share a name (ASO's
+#     landmark weights are not ALI's -- see the ASO block).
 #   * A few things the client downloads are deliberately absent: Slicer's
 #     boilerplate SampleData (the two SlicerTestingData SHA256 blobs every
 #     wizard-generated module carries), the Windows WSL2 installer, the
@@ -77,13 +111,17 @@ tools:
       # expects. lucanchling/AMASSS_CBCT's separate Masks_Models.zip is
       # therefore redundant and deliberately not listed.
       - name: AMASSS_Models.zip
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AMASSS_CBCT/AMASSS_Models.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.AMASSS.AMASSS_Models.zip
+        release_name: model.AMASSS.AMASSS_Models.zip
         size: 2078744372
         extract: true
+        sha256: 5efb7ad39ff2720f9f6e0eb35d623f47bf46eadc3246d085e83af7368562fa61
     testfiles:
       - name: MG_test_scan.nii.gz
-        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile001_CBCT.nii.gz
+        release_name: TestFile001_CBCT.nii.gz
         size: 98611496
+        sha256: c2a4f498e66355e0f6d3b63df1e75ffa96094847eefd24cca0ceb251107ab2fe
 
   # =========================================================================
   # SurgMovPred -- surgical movement prediction. LIVE on the server.
@@ -94,15 +132,18 @@ tools:
       # holding a stacking_package.pkl -- which is what LoadData.extract_model
       # globs for recursively.
       - name: all_models.zip
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/SurgMovPred/all_models.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Surg_Mov_Pred.all_models.zip
+        release_name: model.Surg_Mov_Pred.all_models.zip
         size: 740183656
         extract: true
+        sha256: 14bdabefa3e2c9f9cdb5a131e3434ac36a023f7a94edffdd00036df430be01eb
     testfiles:
       - name: TestFiles.zip
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/SurgMovPred/TestFiles.zip
-        sha256: 9d7e8dc9b419de34f4977e84faca2793c7723379cfcb914be604198fe56c0f11
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile023_Measurements.zip
+        release_name: TestFile023_Measurements.zip
         size: 3405824
         extract: true
+        sha256: 9d7e8dc9b419de34f4977e84faca2793c7723379cfcb914be604198fe56c0f11
 
   # =========================================================================
   # ALI -- landmark identification. LIVE on the server.
@@ -166,50 +207,68 @@ tools:
       # special case -- see ALI_IOS/engine.discover_weights.
       - name: Models.zip
         dest: ALI_IOS_Models
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/ALI_IOS_models/Models.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ALI.IOS_Models.zip
+        release_name: model.ALI.IOS_Models.zip
         size: 236630338
         extract: true
+        sha256: bf9ac0b739bdd49dca76070db5189d21b0dca7f8a3e9e36dab7d2c088e25ea06
       # --- CBCT: one archive per anatomical region -------------------------
       - name: Cranial_Base.zip
         dest: ALI_CBCT_Models/Cranial_Base
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Cranial_Base.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ALI.Cranial_Base.zip
+        release_name: model.ALI.Cranial_Base.zip
         size: 1081579451
         extract: true
+        sha256: bf10426493f5b34b24b833b7c0f267b263c0d820c4390152a36d704d47e9e177
       - name: Lower_Bones_1.zip
         dest: ALI_CBCT_Models/Lower_Bones_1
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Lower_Bones_1.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ALI.Lower_Bones_1.zip
+        release_name: model.ALI.Lower_Bones_1.zip
         size: 1946226141
         extract: true
+        sha256: 4fb1a0ec12db3732a2cfd86858b39c6ea64b9db82782cdc33f83c609171f2f40
       - name: Lower_Bones_2.zip
         dest: ALI_CBCT_Models/Lower_Bones_2
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Lower_Bones_2.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ALI.Lower_Bones_2.zip
+        release_name: model.ALI.Lower_Bones_2.zip
         size: 648751778
         extract: true
+        sha256: d1fb4ea2b0e5c72abdc02e8fb480c32411313d6891d03f4d802ec3b38c2806a5
       - name: Lower_Left_Teeth.zip
         dest: ALI_CBCT_Models/Lower_Left_Teeth
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Lower_Left_Teeth.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ALI.Lower_Left_Teeth.zip
+        release_name: model.ALI.Lower_Left_Teeth.zip
         size: 1838102298
         extract: true
+        sha256: 24438db96bc040199ec78d4c8ad90ca985c5affea4e0b2112a692824b5850134
       - name: Lower_Right_Teeth.zip
         dest: ALI_CBCT_Models/Lower_Right_Teeth
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Lower_Right_Teeth.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ALI.Lower_Right_Teeth.zip
+        release_name: model.ALI.Lower_Right_Teeth.zip
         size: 1729989986
         extract: true
+        sha256: e8b6ad763bae57115c6455b29be1d667b719a591fc0e235ba54812e175deeee8
       - name: Upper_Bones_v2.zip
         dest: ALI_CBCT_Models/Upper_Bones_v2
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Upper_Bones_v2.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ALI.Upper_Bones_v2.zip
+        release_name: model.ALI.Upper_Bones_v2.zip
         size: 1514275767
         extract: true
+        sha256: e045cd3456eb27c028ba0f356065f3f46adc8244857bb2622e426546f410df5a
       - name: Upper_Left_Teeth_v2.zip
         dest: ALI_CBCT_Models/Upper_Left_Teeth_v2
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Upper_Left_Teeth_v2.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ALI.Upper_Left_Teeth_v2.zip
+        release_name: model.ALI.Upper_Left_Teeth_v2.zip
         size: 2054620817
         extract: true
+        sha256: e2b69dcbd79d54851adb209fedc0d2db85b498eca5e67c02e239a84ef560d8ed
       - name: Upper_Right_Teeth_v2.zip
         dest: ALI_CBCT_Models/Upper_Right_Teeth_v2
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/v0.1-v2.0_models/Upper_Right_Teeth_v2.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ALI.Upper_Right_Teeth_v2.zip
+        release_name: model.ALI.Upper_Right_Teeth_v2.zip
         size: 2054773872
         extract: true
+        sha256: 0940653574eeef5de2d8da6664c8c420c93e67de34c0242c7f29dbf34aa6a72d
       # --- Crown segmentation: not ALI's weights, and ALI still needs them ---
       #
       # ALI_IOS places landmarks on TEETH, so a mesh that carries no tooth-label
@@ -233,15 +292,21 @@ tools:
       # inside is what Crown_Seg's discovery keys on, so it is kept exactly.
       - name: 07-21-22_val-loss0.169.pth
         dest: Crown_Seg_Model/07-21-22_val-loss0.169.pth
-        url: https://github.com/DCBIA-OrthoLab/Fly-by-CNN/releases/download/3.0/07-21-22_val-loss0.169.pth
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Crown_Seg.07-21-22_val-loss0.169.pth
+        release_name: model.Crown_Seg.07-21-22_val-loss0.169.pth
         size: 6612456
+        sha256: 9fa232d2eca9bf7bf6b6e7b03d48828d14f9369448e5ea7bfeb574474daabdbe
     testfiles:
       - name: T1_01_U_segmented.vtk
-        url: https://github.com/baptistebaquero/ALIDDM/releases/download/v1.0.4/T1_01_U_segmented.vtk
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile014_T1_IOS_U_Seg.vtk
+        release_name: TestFile014_T1_IOS_U_Seg.vtk
+        sha256: fd618be1684f4e696fd88fc4d6947391055ff8e6e47abd925b344685e1356f09
       # The CBCT counterpart, so both engines have a testfile to run against.
       - name: MG_test_scan.nii.gz
-        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile001_CBCT.nii.gz
+        release_name: TestFile001_CBCT.nii.gz
         size: 98611496
+        sha256: c2a4f498e66355e0f6d3b63df1e75ffa96094847eefd24cca0ceb251107ab2fe
 
   # =========================================================================
   # CrownSeg -- per-tooth labelling of intraoral scans. LIVE on the server.
@@ -259,30 +324,29 @@ tools:
   Crown_Seg:
     models:
       - name: 07-21-22_val-loss0.169.pth
-        url: https://github.com/DCBIA-OrthoLab/Fly-by-CNN/releases/download/3.0/07-21-22_val-loss0.169.pth
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Crown_Seg.07-21-22_val-loss0.169.pth
+        release_name: model.Crown_Seg.07-21-22_val-loss0.169.pth
         size: 6612456
+        sha256: 9fa232d2eca9bf7bf6b6e7b03d48828d14f9369448e5ea7bfeb574474daabdbe
     testfiles:
       - name: T1_01_U_segmented.vtk
-        url: https://github.com/baptistebaquero/ALIDDM/releases/download/v1.0.4/T1_01_U_segmented.vtk
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile014_T1_IOS_U_Seg.vtk
+        release_name: TestFile014_T1_IOS_U_Seg.vtk
+        sha256: fd618be1684f4e696fd88fc4d6947391055ff8e6e47abd925b344685e1356f09
 
   # =========================================================================
   # AREG -- automated registration. Ported: server/tools/AREG/.
   #
   # AREG's automated modes are mostly OTHER tools -- AMASSS produces the CBCT
-  # masks, ASO orients, CrownSeg labels the crowns -- and every one of those
-  # is driven through an argument that is `server_selectable` on AREG'S OWN
-  # schema. GET /tools/{tool}/data is per tool, so the bundles have to be
-  # under DATA/AREG/ even though byte-identical copies live under the other
-  # tools' folders.
+  # masks, ASO orients, CrownSeg labels the crowns -- and each of those
+  # resolves its own bundle from its own DATA folder. AREG calls them through
+  # the supervisor and names no bundle of theirs (ASO is asked for a frame by
+  # name), so only AREG's own registration checkpoint is listed here.
   #
-  # A deployment tight on disk should HARD-LINK them (`cp -al`), not symlink
-  # them: data_store._resolve requires the realpath to stay inside
-  # `DATA/<tool>/<kind>/` -- not merely inside DATA_DIR -- so a symlink
-  # pointing at another tool's folder is listed by GET /tools/AREG/data and
-  # then refused with "No such model 'AMASSS_Models' for tool 'AREG'", which
-  # is the traversal guard doing its job. A hard link resolves to its own
-  # path and costs no extra space. (Verified 2026-08-10; the same correction
-  # applies to the ASO block's note below, which this one used to copy.)
+  # Deployments staged before 2026-10 still hold AREG's former copies of
+  # AMASSS_Models, the two CBCT_Gold_* planes and IOS_Gold_files under
+  # DATA/AREG/models/. Nothing reads them any more; they are harmless and may
+  # be deleted.
   #
   # The IOSCBCT test files below are for the one mode that is NOT ported:
   # cross-modality IOS-to-CBCT registration. Kept rather than dropped because
@@ -293,78 +357,84 @@ tools:
     models:
       # The patch-prediction checkpoint for IOS registration ('registration_model').
       - name: AREG_model.zip
-        url: https://github.com/HUTIN1/AREG/releases/download/v1.0.0/AREG_model.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.AREG.AREG_model.zip
+        release_name: model.AREG.AREG_model.zip
         size: 18014117
         extract: true
-      # 'segmentation_model' -- the T1 masks of the Fully-Automated CBCT modes.
-      # Same archive AMASSS itself uses.
-      - name: AMASSS_Models.zip
-        dest: AMASSS_Models
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AMASSS_CBCT/AMASSS_Models.zip
-        size: 1163164147
-        extract: true
-      # 'cbct_reference' -- the frame the T1 scans are oriented into by the
-      # Oriented + Fully-Automated mode. Two published planes; the landmark
-      # sets they carry are DISJOINT, which is why ASO refuses a selection a
-      # reference cannot support rather than failing every patient separately.
-      - name: Frankfurt_Horizontal_Midsagittal_Plane.zip
-        dest: CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane
-        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Frankfurt_Horizontal_Midsagittal_Plane.zip
-        extract: true
-      - name: Occlusal_Midsagittal_Plane.zip
-        dest: CBCT_Gold_Occlusal_Midsagittal_Plane
-        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Occlusal_Midsagittal_Plane.zip
-        extract: true
-      # 'ios_reference' -- the reference arches the Fully-Automated IOS mode
-      # orients both timepoints onto before predicting the patch.
-      - name: Gold_file.zip
-        dest: IOS_Gold_files
-        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.0/Gold_file.zip
-        extract: true
-    # One folder per MODALITY, which is what `server_selectable = { t1 =
-    # "testfile:CBCT" }` draws from: AREG registers CBCT volumes, intraoral
+        sha256: bd9f2af80c1983e5bb66a300f90bd1248adc92ae846169ec3e6b5f49dc6e937f
+    # One folder per MODALITY: AREG registers CBCT volumes, intraoral
     # surfaces, and one onto the other, and flat, every argument was offered
     # every cohort -- the CBCT baseline picker listed the intraoral meshes.
     # The shape mirrors the one the Slicer extension downloads into
     # (AREG/<engine>/Test_Files/).
+    #
+    # Each CBCT and IOS cohort holds T1/ and T2/, and the pickers draw from one
+    # TIMEPOINT of one modality (`t1 = "testfile:CBCT_T1"`), so `split` also
+    # publishes CBCT_T1/, CBCT_T2/, IOS_T1/ and IOS_T2/ as hardlinked views.
+    # Without them a fresh deployment had no folder its AREG pickers could
+    # list. IOSCBCT is split the same way, `split: IOSCBCT`: its archives hold
+    # T1/ (the intraoral meshes), T2/ (the CBCT) and, for the registration-only
+    # set, `IOS Landmarks/` and `CBCT Landmarks/`. Each picker draws from its
+    # own view, so the intraoral one lists meshes and the CBCT one a scan.
     testfiles:
       - name: AREG_test_scans.zip
         dest: IOS/AREG_test_scans
-        url: https://github.com/HUTIN1/AREG/releases/download/v1.0.0/AREG_test_scans.zip
+        split: IOS
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile017_T1T2_IOS_U.zip
+        release_name: TestFile017_T1T2_IOS_U.zip
         size: 3700969
         extract: true
+        sha256: ab82fddf370433777eff981284a085658f222210ef78e22efe3f95e357491943
       - name: FullyAuto.zip
         dest: CBCT/CBCT_FullyAuto
-        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/FullyAuto.zip
+        split: CBCT
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile007_T1T2_CBCT_Or.zip
+        release_name: TestFile007_T1T2_CBCT_Or.zip
         size: 352211664
         extract: true
+        sha256: 4498fdf70e8017330849c6113748b4cc3b2e8797c0596d7c19cd8230323b36dc
       - name: SemiAuto.zip
         dest: CBCT/CBCT_SemiAuto
-        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/SemiAuto.zip
+        split: CBCT
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile008_T1T2_CBCT_Or_Seg.zip
+        release_name: TestFile008_T1T2_CBCT_Or_Seg.zip
         size: 353120642
         extract: true
+        sha256: b3dd09879e0ae9df0de2e0a2db611d019259234ef34984edd9916ec05320ae95
       - name: Or_FullyAuto.zip
         dest: CBCT/CBCT_Or_FullyAuto
-        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/Or_FullyAuto.zip
+        split: CBCT
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile006_T1T2_CBCT.zip
+        release_name: TestFile006_T1T2_CBCT.zip
         size: 278088796
         extract: true
+        sha256: 2c851b37cc7ea001f56e296ee0f1a1df066363034974361badee65e2cb3c82be
       - name: Or_FullyAuto_DCM.zip
         dest: CBCT/CBCT_Or_FullyAuto_DCM
-        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/Or_FullyAuto_DCM.zip
+        split: CBCT
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile009_T1T2_CBCT_DCM.zip
+        release_name: TestFile009_T1T2_CBCT_DCM.zip
         size: 233583082
         extract: true
+        sha256: daaca5682912b1e11e4142988f3daba6809c4f71ac4e7699bc0569cb023b6e45
       # IOSCBCT mode: RegTestFiles is the registration-only set, TestFile the
       # semi- and fully-automated ones. Near-identical sizes, distinct content.
       - name: RegTestFiles.zip
         dest: IOSCBCT/IOSCBCT_RegTestFiles
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AREG_IOSCBCT/RegTestFiles.zip
+        split: IOSCBCT
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile020_IOSCBCT_UL_lm.zip
+        release_name: TestFile020_IOSCBCT_UL_lm.zip
         size: 222374572
         extract: true
+        sha256: 7d31e904db0ad8d03ee4fa074a37437fd8f90af59f56da756b2dc12a2af27c3c
       - name: TestFile.zip
         dest: IOSCBCT/IOSCBCT_TestFile
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AREG_IOSCBCT/TestFile.zip
+        split: IOSCBCT
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile019_IOSCBCT_UL.zip
+        release_name: TestFile019_IOSCBCT_UL.zip
         size: 222369355
         extract: true
+        sha256: a0a7d3338d4b62eb0a045b321100c02742b42a49974380a56bafb7c836e77875
 
   # =========================================================================
   # ASO -- automated standardized orientation. Packaged in SADT-VISOR;
@@ -388,122 +458,88 @@ tools:
   # =========================================================================
   ASO:
     models:
-      # Landmark weights for Fully-Automated CBCT. ASO does not predict
-      # landmarks itself -- it asks the ALI tool for them, mid-run, through
-      # the supervisor the runner injects (`sup.run("ALI", ...)`).
+      # ASO holds no landmark weights. Fully-Automated CBCT asks the ALI_CBCT
+      # tool for the landmarks, mid-run, through the supervisor the runner
+      # injects (`sup.run("ALI_CBCT", ...)`), and that tool predicts with its own
+      # weights, the ones DATA/ALI/models/ holds. `landmark_model` is only an
+      # override naming one of THOSE bundles; the server no longer offers it
+      # from this folder (deployment.toml, [tools.ASO]).
       #
-      # They live under DATA/ASO/ because `landmark_model` is
-      # server_selectable on ASO's schema, and GET /tools/{tool}/data is
-      # per tool: the client's dropdown lists DATA/ASO/models/ and main.py
-      # resolves the name there before ASO ever runs.
+      # This block used to stage seven landmark bundles of its own
+      # (model.ASO.Ba, S, N, RPo, LPo, ROr and LOr, 758 MB, under
+      # CBCT_landmark_models/), a separate training published as
+      # lucanchling/ALI_CBCT models_v01. Nothing reads them since the landmarks
+      # come only from ALI, so they are no longer fetched. The archives stay
+      # attached to the data-2026.10.09-1 release; a server that already
+      # unpacked them can delete DATA/ASO/models/CBCT_landmark_models/.
       #
-      # These are NOT the weights DATA/ALI/models/ holds, and an earlier note
-      # here said they were -- inviting a `cp -al` that would have replaced them
-      # silently. Measured 2026-09-10: every checkpoint differs, at both scales,
-      # for every landmark compared (Ba, S, N, RPo). Two separate publications,
-      # two separate trainings of the same landmarks:
-      #
-      #     ASO   lucanchling/ALI_CBCT                models_v01
-      #     ALI   DCBIA-OrthoLab/SlicerAutomated...   v0.1-v2.0_models
-      #
-      # So DO NOT hard-link them, and do not deduplicate them. ASO's published
-      # reference planes were built with THESE weights; swapping in ALI's would
-      # move the landmarks a little, move the registration with them, and produce
-      # oriented scans nobody could tell were wrong -- every one of them
-      # plausible.
-      #
-      # Each tool keeps its own: ALI's predict for ALI, ASO's for ASO. That costs
-      # 782 MB and buys the only thing that matters here -- knowing which weights
-      # a result came from.
-      #
-      # Curated to the seven landmarks the published reference planes are
-      # built on (ASO's own defaults), not all 112: that is 758 MB instead of
-      # roughly 12 GB. Add a landmark here the day someone selects it.
-      # Verified 2026-07-31: each archive holds its scales at the root
-      # (0-3/<LM>_Net_0-3.pth, 1/<LM>_Net_1.pth), which is why `dest` nests
-      # them one level -- GetBrain keys on <LM>/<scale>/*.pth.
-      - name: Ba.zip
-        dest: CBCT_landmark_models/Ba
-        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/Ba.zip
-        size: 108211992
-        extract: true
-      - name: S.zip
-        dest: CBCT_landmark_models/S
-        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/S.zip
-        size: 108238247
-        extract: true
-      - name: N.zip
-        dest: CBCT_landmark_models/N
-        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/N.zip
-        size: 108237024
-        extract: true
-      - name: RPo.zip
-        dest: CBCT_landmark_models/RPo
-        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/RPo.zip
-        size: 108190441
-        extract: true
-      - name: LPo.zip
-        dest: CBCT_landmark_models/LPo
-        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LPo.zip
-        size: 108189434
-        extract: true
-      - name: ROr.zip
-        dest: CBCT_landmark_models/ROr
-        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/ROr.zip
-        size: 108230408
-        extract: true
-      - name: LOr.zip
-        dest: CBCT_landmark_models/LOr
-        url: https://github.com/lucanchling/ALI_CBCT/releases/download/models_v01/LOr.zip
-        size: 108211595
-        extract: true
+      # What is left is data, not weights: the reference bundles the oriented
+      # scans are registered to.
       - name: Gold_file.zip
         dest: IOS_Gold_file
-        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.0/Gold_file.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.IOS_Gold_file.zip
+        release_name: model.ASO.IOS_Gold_file.zip
         size: 5169472
         extract: true
+        sha256: 1f60f5be88de825aa2ea865d48af89cb593b53b6130c947be24e37b12e01beb1
       - name: Occlusal_Midsagittal_Plane.zip
         dest: CBCT_Gold_Occlusal_Midsagittal_Plane
-        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Occlusal_Midsagittal_Plane.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.Occlusal_Midsagittal_Plane.zip
+        release_name: model.ASO.Occlusal_Midsagittal_Plane.zip
         size: 55722763
         extract: true
+        sha256: 6e530a490d3ab57cbe3f335462b6dd3033c3a8ae41ab73c64bb9ab96697c3416
       - name: Frankfurt_Horizontal_Midsagittal_Plane.zip
         dest: CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane
-        url: https://github.com/lucanchling/ASO_CBCT/releases/download/v01_goldmodels/Frankfurt_Horizontal_Midsagittal_Plane.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.Frankfurt_Horizontal_Midsagittal_Plane.zip
+        release_name: model.ASO.Frankfurt_Horizontal_Midsagittal_Plane.zip
         size: 174378374
         extract: true
+        sha256: cd2c79fa5243892831ee00d6ac85785c8d4095c6fe28905a3f8035e895fcf065
     testfiles:
       - name: Test_file_Full-IOS.zip
         dest: IOS_FullyAuto
-        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.1/Test_file_Full-IOS.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile015_IOS_UL.zip
+        release_name: TestFile015_IOS_UL.zip
         size: 2583991
         extract: true
+        sha256: 9dbc3cd854d9bf9eab3ffa96994a44b73b3d194de4fadee60d1280c1ab4daa04
       - name: Test_file_Semi-IOS.zip
         dest: IOS_SemiAuto
-        url: https://github.com/HUTIN1/ASO/releases/download/v1.0.2/Test_file_Semi-IOS.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile016_IOS_UL_lm.zip
+        release_name: TestFile016_IOS_UL_lm.zip
         size: 5994773
         extract: true
+        sha256: b07ea260162d72aad7c03df0f89abf3965b1bdaa471cbb722e0fa4ffddf8ae0c
       - name: FullyAuto.zip
         dest: CBCT_FullyAuto
-        url: https://github.com/lucanchling/ASO_CBCT/releases/download/TestFiles/FullyAuto.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile002_CBCT.zip
+        release_name: TestFile002_CBCT.zip
         size: 98233200
         extract: true
+        sha256: 8c15a7752122f86e5bc82800be175d3c045801ff31ec47d6d8998c80e80e3fe2
       - name: SemiAuto.zip
         dest: CBCT_SemiAuto
-        url: https://github.com/lucanchling/ASO_CBCT/releases/download/TestFiles/SemiAuto.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile003_CBCT_lm.zip
+        release_name: TestFile003_CBCT_lm.zip
         size: 245337499
         extract: true
+        sha256: 16fca2dacacdd7859de66f0226c0e6f53937ec8b54d524203fda9fce036a177a
       # DICOM-input variants of the two above (getTestFileListDCM).
       - name: FullyAuto_DCM.zip
         dest: CBCT_FullyAuto_DCM
-        url: https://github.com/lucanchling/ASO_CBCT/releases/download/TestFiles/FullyAuto_DCM.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile004_CBCT_DCM.zip
+        release_name: TestFile004_CBCT_DCM.zip
         size: 99050795
         extract: true
+        sha256: d0ff4910495764dff05549df53f453325a4557b713be1aa567041dc96b4a2f11
       - name: SemiAuto_DCM.zip
         dest: CBCT_SemiAuto_DCM
-        url: https://github.com/lucanchling/ASO_CBCT/releases/download/TestFiles/SemiAuto_DCM.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile005_CBCT_lm_DCM.zip
+        release_name: TestFile005_CBCT_lm_DCM.zip
         size: 205570313
         extract: true
+        sha256: 68667da67a4ca26d9a676385b1f3824cd62e1fa17b6612ec23f2b30f64b384e0
 
   # =========================================================================
   # FlexReg -- surface registration. NOT PORTED YET.
@@ -513,19 +549,24 @@ tools:
       # Fly-by-CNN teeth segmentation checkpoint, fetched by FlexReg's own
       # downloadModel() button.
       - name: 07-21-22_val-loss0.169.pth
-        url: https://github.com/DCBIA-OrthoLab/Fly-by-CNN/releases/download/3.0/07-21-22_val-loss0.169.pth
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Crown_Seg.07-21-22_val-loss0.169.pth
+        release_name: model.Crown_Seg.07-21-22_val-loss0.169.pth
         size: 6612456
+        sha256: 9fa232d2eca9bf7bf6b6e7b03d48828d14f9369448e5ea7bfeb574474daabdbe
     testfiles:
       - name: RegTestFiles.zip
         dest: Arches
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/AREG_IOSCBCT/RegTestFiles.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile020_IOSCBCT_UL_lm.zip
+        release_name: TestFile020_IOSCBCT_UL_lm.zip
         size: 222374572
         extract: true
+        sha256: 7d31e904db0ad8d03ee4fa074a37437fd8f90af59f56da756b2dc12a2af27c3c
       - name: TestFiles.zip
-        url: https://github.com/GaelleLeroux/SlicerAutomatedDentalTools/releases/download/testfileFlexReg/TestFiles.zip
-        sha256: 494b58bc73ec2e1162ac9e483fe11afb8160905a6f679ffce6f3b7117e3d69a8
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile018_T1T2_IOS.zip
+        release_name: TestFile018_T1T2_IOS.zip
         size: 8892200
         extract: true
+        sha256: 494b58bc73ec2e1162ac9e483fe11afb8160905a6f679ffce6f3b7117e3d69a8
 
   # =========================================================================
   # BatchDentalSeg -- nnUNet dental segmentation, four models.
@@ -543,53 +584,73 @@ tools:
     models:
       - name: checkpoint_final.pth
         dest: UniversalLab/fold_0/checkpoint_final.pth
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/UNIVERSALLAB_MODEL/checkpoint_final.pth
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.UniversalLab.checkpoint_final.pth
+        release_name: model.Batch_Dental_Seg.UniversalLab.checkpoint_final.pth
         size: 819880677
+        sha256: c967bb566c60470c6a85c8dc4c674aeec895f2c20dbe451ec08f8b60ddfda81d
       - name: dataset.json
         dest: UniversalLab/dataset.json
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/UNIVERSALLAB_MODEL/dataset.json
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.UniversalLab.dataset.json
+        release_name: model.Batch_Dental_Seg.UniversalLab.dataset.json
         size: 2423
+        sha256: 8dbed7d097fc2ccca67ec1ff8a92a25b2f914a5b466c587486439990c4b4b3ac
       - name: plans.json
         dest: UniversalLab/plans.json
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/UNIVERSALLAB_MODEL/plans.json
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.UniversalLab.plans.json
+        release_name: model.Batch_Dental_Seg.UniversalLab.plans.json
         size: 16102
+        sha256: 46136ab5ac5a0418ba199ae19f3bc8b2316b76601715bbb9ee94c5deecaafa4c
       - name: checkpoint_final.pth
         dest: PediatricDentalSeg/fold_0/checkpoint_final.pth
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/PEDIATRICDENTALSEG_MODEL/checkpoint_final.pth
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.PediatricDentalSeg.checkpoint_final.pth
+        release_name: model.Batch_Dental_Seg.PediatricDentalSeg.checkpoint_final.pth
         size: 250280254
+        sha256: 554c53eadae22473ab616e003e75765105a909d6b740a60af5be00127984bff7
       - name: dataset.json
         dest: PediatricDentalSeg/dataset.json
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/PEDIATRICDENTALSEG_MODEL/dataset.json
-        sha256: fa1b5d5646454362d3a9245374028d7ded97746b2912a9bec1cbb53e90ce3b80
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.PediatricDentalSeg.dataset.json
+        release_name: model.Batch_Dental_Seg.PediatricDentalSeg.dataset.json
         size: 283
+        sha256: fa1b5d5646454362d3a9245374028d7ded97746b2912a9bec1cbb53e90ce3b80
       - name: plans.json
         dest: PediatricDentalSeg/plans.json
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/PEDIATRICDENTALSEG_MODEL/plans.json
-        sha256: 65c553cfc8da8108dfb73a9e289fe0de209822650ef8fde8c6c9e04766254238
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.PediatricDentalSeg.plans.json
+        release_name: model.Batch_Dental_Seg.PediatricDentalSeg.plans.json
         size: 16053
+        sha256: 65c553cfc8da8108dfb73a9e289fe0de209822650ef8fde8c6c9e04766254238
       - name: checkpoint_final.pth
         dest: NasoMaxillaDentSeg/fold_0/checkpoint_final.pth
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/NASOMAXILLADENTSEG_MODEL/checkpoint_final.pth
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.NasoMaxillaDentSeg.checkpoint_final.pth
+        release_name: model.Batch_Dental_Seg.NasoMaxillaDentSeg.checkpoint_final.pth
         size: 1132459189
+        sha256: 00b7579381ef04de0fa2d4a061d765649548deb98f2fafc30ddfe699e23bb90e
       - name: dataset.json
         dest: NasoMaxillaDentSeg/dataset.json
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/NASOMAXILLADENTSEG_MODEL/dataset.json
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.NasoMaxillaDentSeg.dataset.json
+        release_name: model.Batch_Dental_Seg.NasoMaxillaDentSeg.dataset.json
         size: 305
+        sha256: a7ffb06c6664d1c3b48760821bdf168d3c1de7471231e81aef246ec15870b4ed
       - name: plans.json
         dest: NasoMaxillaDentSeg/plans.json
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/NASOMAXILLADENTSEG_MODEL/plans.json
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.NasoMaxillaDentSeg.plans.json
+        release_name: model.Batch_Dental_Seg.NasoMaxillaDentSeg.plans.json
         size: 11245
+        sha256: 2473064dd805e98782fc3bec7e04e9044d85c45223f047b3c7f9139ed5d967c0
       - name: Dataset111_453CT_v100.zip
         dest: DentalSegmentator
-        url: https://github.com/gaudot/SlicerDentalSegmentator/releases/download/v1.0.0-alpha/Dataset111_453CT_v100.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.Batch_Dental_Seg.DentalSegmentator.zip
+        release_name: model.Batch_Dental_Seg.DentalSegmentator.zip
         size: 229698747
         extract: true
+        sha256: 779fc3fffb4ee3caa371f7602520c5a254ad8d8618aead98e79d69e9874b7d35
     testfiles:
       # The same public CBCT AMASSS ships: all four bundles here segment teeth
       # and jaw structures on a dental CT/CBCT, which is what this is.
       - name: MG_test_scan.nii.gz
-        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile001_CBCT.nii.gz
+        release_name: TestFile001_CBCT.nii.gz
         size: 98611496
+        sha256: c2a4f498e66355e0f6d3b63df1e75ffa96094847eefd24cca0ceb251107ab2fe
 
   # =========================================================================
   # DOCShapeAXI -- shape classification. NOT PORTED YET.
@@ -597,20 +658,30 @@ tools:
   DOCShapeAXI:
     models:
       - name: condyles_4_class.ckpt
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/condyles_4_class.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.DOCShapeAXI.condyles_4_class.ckpt
+        release_name: model.DOCShapeAXI.condyles_4_class.ckpt
         size: 71890130
+        sha256: d8a1b21062cf668a8f3115026b99b1ba422e465964e4f387d42e4fb1cccc0280
       - name: airways_2_class.ckpt
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/airways_2_class.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.DOCShapeAXI.airways_2_class.ckpt
+        release_name: model.DOCShapeAXI.airways_2_class.ckpt
         size: 71885763
+        sha256: 4af8decff5361698ee042ce9ba7be9dd77d04333a54aa48aec274c8951fdeff6
       - name: airways_4_class.ckpt
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/airways_4_class.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.DOCShapeAXI.airways_4_class.ckpt
+        release_name: model.DOCShapeAXI.airways_4_class.ckpt
         size: 71898579
+        sha256: 503fb6e979766f0c5b271294915c743ad20d78980223d1d0bacf3748ffb0ab1d
       - name: airways_4_regress.ckpt
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/airways_4_regress.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.DOCShapeAXI.airways_4_regress.ckpt
+        release_name: model.DOCShapeAXI.airways_4_regress.ckpt
         size: 71869063
+        sha256: 2a267cab6f5b67c6ebbadd1c65ba4d3e252599902791f3685383665debdf4c11
       - name: cleft_4_class.ckpt
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/shapeaxi-ckpt-v1/cleft_4_class.ckpt
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.DOCShapeAXI.cleft_4_class.ckpt
+        release_name: model.DOCShapeAXI.cleft_4_class.ckpt
         size: 71891882
+        sha256: eb662b7e1f6a064dbc1f930875e1be8dbf7baa577b53105487623d02799b6ba2
     # NO testfiles, deliberately. The five checkpoints grade an AIRWAY, a
     # CONDYLE or a CLEFT, and nothing public is a surface of any of those --
     # the only meshes anywhere in this manifest are dental arches. Handing one
@@ -630,15 +701,19 @@ tools:
   CLIC:
     models:
       - name: final_model.pth
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/CLIC_model/final_model.pth
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.CLIC.final_model.pth
+        release_name: model.CLIC.final_model.pth
         size: 176269352
+        sha256: 2de4d8ff308ac451495a86187f03d2de93c9fca84e42e394b279a920786a9338
     testfiles:
       # The same public CBCT AMASSS ships. CLIC looks for an impacted canine in
       # a maxillary scan, so a whole-head CBCT is the right shape of input --
       # and reusing one file across tools is what ALI already does.
       - name: MG_test_scan.nii.gz
-        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile001_CBCT.nii.gz
+        release_name: TestFile001_CBCT.nii.gz
         size: 98611496
+        sha256: c2a4f498e66355e0f6d3b63df1e75ffa96094847eefd24cca0ceb251107ab2fe
 
   # =========================================================================
   # MedX -- report analysis. NOT PORTED YET.
@@ -646,50 +721,114 @@ tools:
   MedX:
     models:
       - name: BART.zip
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/MedX/BART.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.MedX.BART.zip
+        release_name: model.MedX.BART.zip
         size: 1508192833
         extract: true
+        sha256: 011b972aca1f71fc45d10d85582cb0372ebb334dbca7b70a43f343fd65a7f559
 
   # =========================================================================
-  # VFACE -- NOT PORTED YET.
+  # VFACE -- facial asymmetry; drives six neighbours through the supervisor.
   # =========================================================================
   VFACE:
+    # Only VFACE's own bundles, under the names `dispatch._BUNDLES` resolves
+    # (a VFACE test reads this file and holds the two together). The bone
+    # masks and the two orientation frames are AMASSS's and ASO's, which
+    # resolve their own: nothing of theirs is copied here.
     models:
+      # 'classifier_model' -- the three asymmetry models. Unpacked under the
+      # name the tool asks for; it used to land as `V_FACE_Models`, which no
+      # code looked for. A deployment holding that older folder can delete it.
       - name: V_FACE_Models.zip
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/VFACE/V_FACE_Models.zip
-        sha256: da860a6267ade5d83f28de05c2e98870178a222035f8ecb1ef87713d3c8b8f83
+        dest: VFACE_classifier
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.VFACE.VFACE_classifier.zip
+        release_name: model.VFACE.VFACE_classifier.zip
         size: 201281
         extract: true
+        sha256: da860a6267ade5d83f28de05c2e98870178a222035f8ecb1ef87713d3c8b8f83
+      # 'mirror_reference' -- the one transform that reflects a scan across the
+      # mid-sagittal plane, what an asymmetry assessment compares against. The
+      # archive's lone root folder is stripped, giving
+      # Mirror_matrix/Matrix_mirror.tfm.
+      - name: Mirror.zip
+        dest: Mirror_matrix
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.VFACE.Mirror_matrix.zip
+        release_name: model.VFACE.Mirror_matrix.zip
+        size: 468
+        extract: true
+        sha256: 0cfb3871c3a34554ecd6579bdd59019a02b116a28ee752a1b6c1d0513c86df4b
       - name: DefaultList.zip
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/VFACE/DefaultList.zip
-        sha256: dfa63f809edb83e8672c189204cd53872e4b93816073a17da4e8b611e6a878a4
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.VFACE.DefaultList.zip
+        release_name: model.VFACE.DefaultList.zip
         size: 21515
         extract: true
+        sha256: dfa63f809edb83e8672c189204cd53872e4b93816073a17da4e8b611e6a878a4
     testfiles:
-      # Fetched by VFACE's Q3DC helper (functionaq3dc.py).
+      # Fetched by VFACE's Q3DC helper (functionaq3dc.py). Landmarks and a
+      # ground-truth workbook only -- no volume, so it cannot drive a run.
       - name: Testing.zip
-        url: https://github.com/HUTIN1/Q3DCExtension/releases/download/v1.0.0/Testing.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile022_T1T2_lm.zip
+        release_name: TestFile022_T1T2_lm.zip
         size: 19943
+        extract: true
+        sha256: a6d0212a413314f2e352883f2176b04724b9c4c3a4048806d3f542314b5ee12d
+      # A CBCT cohort, because the entry above holds none and VFACE's first
+      # stage resamples a volume. Upstream's own module registered two generic
+      # `SlicerTestingData` blobs for this and the port dropped them, so there
+      # is no VFACE-specific cohort published anywhere; this is the same
+      # anonymised pair AREG is tested on, from the same release, listed again
+      # here because a tool can only read `DATA/<its own name>/`.
+      - name: Or_FullyAuto.zip
+        dest: CBCT_Or_FullyAuto
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile006_T1T2_CBCT.zip
+        release_name: TestFile006_T1T2_CBCT.zip
+        size: 278088796
+        extract: true
+        sha256: 2c851b37cc7ea001f56e296ee0f1a1df066363034974361badee65e2cb3c82be
+      # The two modes that skip steps need scans already oriented and
+      # registered. Derived by the tools themselves from the T1 of the scan
+      # above, already public; data-2026.10.12-2's SOURCES.md says how.
+      # 'File already Oriented' takes it as t1, 'File already Registered' too.
+      - name: TestFile025_T1_CBCT_Or_Matrix.zip
+        dest: CBCT_Oriented
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.12-2/TestFile025_T1_CBCT_Or_Matrix.zip
+        release_name: TestFile025_T1_CBCT_Or_Matrix.zip
+        sha256: 1048b626ea377d3b8cf847c5a5756a05376fd8e1decb1368644186637de58ca6
+        size: 257642493
+        extract: true
+      # ... and its registration transforms, one subfolder per region.
+      - name: TestFile026_Matrix_Reg.zip
+        dest: Registration_Transforms
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.12-2/TestFile026_Matrix_Reg.zip
+        release_name: TestFile026_Matrix_Reg.zip
+        sha256: 9b4d0bf61a530b00225ec557b8410eb5188288edd1da5ad82e7c183afc270979
+        size: 1329
         extract: true
 
   # =========================================================================
   # CNE -- clinical note engine. NOT PORTED YET.
   #
   # The only tool whose weights are NOT on GitHub: two quantized GGUF LLMs on
-  # Hugging Face, pulled by CNE.getModelPath(). Its test files are bundled in
-  # the client repo (CNE/Resources/testfiles), so there is nothing to fetch.
+  # Hugging Face, in the DCBIA-OrthoLab organization, pulled by
+  # CNE.getModelPath(). Its test files are bundled in the client repo
+  # (CNE/Resources/testfiles), so there is nothing to fetch.
   #
-  # The second model the client declares,
-  # dcbia/Meta-Llama-3.1-8B-Instruct-Ortho/model-q4_0.gguf ("Ortho"), answers
-  # 404 today -- the repo is private, renamed, or gone. Left out rather than
-  # listed as a URL that cannot work; restore it once it resolves.
+  # Both are pinned to a commit revision and the sha256 of the file it holds.
+  # The Ortho repository only ever held model-q4_k_m.gguf; the
+  # model-q4_0.gguf the client used to ask for never existed.
   # =========================================================================
   CNE:
     models:
       - name: qwen-ft-q4_k_m.gguf
         dest: TMJ/qwen-ft-q4_k_m.gguf
-        url: https://huggingface.co/dcbia/Qwen-2.5-7B-Instruct-TMJ/resolve/main/qwen-ft-q4_k_m.gguf
+        url: https://huggingface.co/DCBIA-OrthoLab/Qwen-2.5-7B-Instruct-TMJ/resolve/eac9ce7d93af4b9b704eb958af8c0b3f4dccc876/qwen-ft-q4_k_m.gguf
         size: 4683073408
+        sha256: 66b7e2be8da810233953c7b8cb58f6935d2e9561ca70454778d1ff7419220410
+      - name: model-q4_k_m.gguf
+        dest: Ortho/model-q4_k_m.gguf
+        url: https://huggingface.co/DCBIA-OrthoLab/Llama-3.1-8B-Instruct-Ortho/resolve/34e4f976743f59bc5353b44208b8876122b2162f/model-q4_k_m.gguf
+        size: 4920738880
+        sha256: 6aad2eb367b169f600c5180a6199cebcb2418eae0230c1703ec2b315c7931ded
     testfiles:
       # One of the synthetic TMJ consult notes the module ships in its own
       # repository -- not patient data, and the only note anywhere public.
@@ -699,6 +838,10 @@ tools:
         dest: TMJ/TMJ_note1.txt
         url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/raw/main/CNE/Resources/testfiles/input_TMJ/TMJ_note1.txt
         size: 4731
+        # NOT PINNED: `raw/main` follows the branch and no sha256 is declared.
+        # TODO(maintainer): replace `main` by a commit sha and add the file's
+        # sha256, then drop this line.
+        unpinned: true
 
   # =========================================================================
   # MRI2CBCT -- MRI/CBCT registration. NOT PORTED YET.
@@ -710,21 +853,29 @@ tools:
       # release namespace as the dental-segmentation bundles.
       - name: checkpoint_final.pth
         dest: TMJCrop/checkpoint_final.pth
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/TMJ_CROP_MODEL/checkpoint_final.pth
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.MRI2CBCT.TMJCrop.checkpoint_final.pth
+        release_name: model.MRI2CBCT.TMJCrop.checkpoint_final.pth
         size: 1132326645
+        sha256: ceb84c6f396fb4b53c5a884741b24d3cb7a8a5d79bdbb6cd75aa6ee6e1b11d09
       - name: dataset.json
         dest: TMJCrop/dataset.json
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/TMJ_CROP_MODEL/dataset.json
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.MRI2CBCT.TMJCrop.dataset.json
+        release_name: model.MRI2CBCT.TMJCrop.dataset.json
         size: 199
+        sha256: 5d0882fe70f682284eb8f6965c6e3bbad8821837337dd3ff06c8244f29d09ca9
       - name: plans.json
         dest: TMJCrop/plans.json
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/TMJ_CROP_MODEL/plans.json
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.MRI2CBCT.TMJCrop.plans.json
+        release_name: model.MRI2CBCT.TMJCrop.plans.json
         size: 17167
+        sha256: 6ae2f89be4adda1c1dfa0fcde2753cf4050bf27ab359f02fff86d814e0caefe7
     testfiles:
       - name: TestFile.zip
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/releases/download/test_files/TestFile.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile021_MRICBCT_Reg.zip
+        release_name: TestFile021_MRICBCT_Reg.zip
         size: 258100460
         extract: true
+        sha256: 9aea20511317342e18ef7817a2a77fa6757ba0094ee2918951f2e639e3ad771d
 
   # =========================================================================
   # AutoMatrix -- matrix application. NOT PORTED YET (test data only).
@@ -732,25 +883,35 @@ tools:
   AutoMatrix:
     testfiles:
       - name: AutoMatrixRelease1.zip
-        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixTag/AutoMatrixRelease1.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile010_T1_CBCT_Matrix.zip
+        release_name: TestFile010_T1_CBCT_Matrix.zip
         size: 247961348
         extract: true
+        sha256: fe5d8ceb7afa08f91f398d0cce2b26694d0c9fe2838741fb18750f5d5de7aea7
       - name: AutoMatrixRelease2.zip
-        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixTag/AutoMatrixRelease2.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile011_T1_CBCT_Matrix.zip
+        release_name: TestFile011_T1_CBCT_Matrix.zip
         size: 247962104
         extract: true
+        sha256: 6dcbb11b2f09426d424dd576db10eab4a97543fd1d86d9319d84aa1b25cd6429
       - name: AutoMatrixRelease3.zip
-        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixTag/AutoMatrixRelease3.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile012_T1_CBCT_Surface_Matrix.zip
+        release_name: TestFile012_T1_CBCT_Surface_Matrix.zip
         size: 254256972
         extract: true
+        sha256: 8e1e2c4794387170ec46f41faf53a3039d5b9b816a5c307f19528f8fc50597db
       - name: AutoMatrixRelease4.zip
-        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixTag/AutoMatrixRelease4.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile013_T1_CBCT_Surface_Matrix.zip
+        release_name: TestFile013_T1_CBCT_Surface_Matrix.zip
         size: 787127578
         extract: true
+        sha256: 50e738189a22103a1f82030f32e0818286eac449c94b42dce8e7de6ad2f8cc97
       - name: Mirror.zip
-        url: https://github.com/GaelleLeroux/DCBIA_Apply_matrix/releases/download/AutoMatrixMirror/Mirror.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.VFACE.Mirror_matrix.zip
+        release_name: model.VFACE.Mirror_matrix.zip
         size: 468
         extract: true
+        sha256: 0cfb3871c3a34554ecd6579bdd59019a02b116a28ee752a1b6c1d0513c86df4b
 
   # =========================================================================
   # GreedyReg -- two-timepoint CBCT registration. LIVE on the server.
@@ -778,9 +939,11 @@ tools:
       # Delete DATA/GreedyReg/testfiles/CBCT_T1_T2_pair and fetch again.
       - name: FullyAuto.zip
         dest: CBCT_T1_T2_pair
-        url: https://github.com/lucanchling/Areg_CBCT/releases/download/TestFiles/FullyAuto.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile007_T1T2_CBCT_Or.zip
+        release_name: TestFile007_T1T2_CBCT_Or.zip
         size: 352211664
         extract: true
+        sha256: 4498fdf70e8017330849c6113748b4cc3b2e8797c0596d7c19cd8230323b36dc
 
   # =========================================================================
   # AutoCrop3D -- crop a cohort to a Slicer ROI box. LIVE on the server.
@@ -790,8 +953,10 @@ tools:
   AutoCrop3D:
     testfiles:
       - name: MG_test_scan.nii.gz
-        url: https://github.com/Maxlo24/AMASSS_CBCT/releases/download/v1.0.1/MG_test_scan.nii.gz
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile001_CBCT.nii.gz
+        release_name: TestFile001_CBCT.nii.gz
         size: 98611496
+        sha256: c2a4f498e66355e0f6d3b63df1e75ffa96094847eefd24cca0ceb251107ab2fe
       # The box itself, and the tool cannot be tried without one. It lives in
       # the upstream source tree rather than in a release, so it is fetched
       # from there -- the same file the upstream module's own test uses.
@@ -802,6 +967,8 @@ tools:
       # user which is the scan and which is the box.
       - name: ROI.mrk.zip
         dest: ROI_box
-        url: https://github.com/DCBIA-OrthoLab/SlicerAutomatedDentalTools/raw/main/AutoCrop3D/Crop_Volumes_UI/Testing/Test_data/ROI.mrk.zip
+        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/TestFile024_ROI.zip
+        release_name: TestFile024_ROI.zip
         size: 1121
         extract: true
+        sha256: eb5e90e2146f3be46e24d8879583781b5c8be89b506e0560b18bbb0fc4ab51a5

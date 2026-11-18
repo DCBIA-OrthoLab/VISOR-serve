@@ -7,8 +7,9 @@
 # undoes that: the API is pinned to whatever those packages agree on again.
 # There is a test on this file (tests/test_api_requirements.py).
 #
-# The in-process image keeps using requirements.txt, which still carries the
-# whole stack, until every tool has moved (see CLAUDE.md, phase 4).
+# It is also all the server image installs (docker/server.Dockerfile), and
+# what docker-compose.yml re-checks at every start. requirements.txt, the whole
+# tool stack the in-process image needed, is no longer installed anywhere.
 fastapi
 uvicorn[standard]
 python-multipart

@@ -1,0 +1,932 @@
+"""scripts/update_agent.py, against real git repositories in a temp folder.
+
+Each test builds a remote and a checkout that follows it, commits to the
+remote, and lets the agent look. What must hold:
+
+* it counts and lists what is waiting, and classifies it -- a restart, a
+  recreated container, or an image it must refuse; per tool, code or
+  environment;
+* it never touches a checkout without a request, and a request withdrawn while
+  it waits for runs changes nothing;
+* an update pulls, restarts, and ALWAYS ends with the door open.
+"""
+
+import importlib.util
+import json
+import os
+import ssl
+import subprocess
+import sys
+
+import pytest
+
+_SCRIPTS = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "scripts")
+
+
+@pytest.fixture(scope="module")
+def agent_module():
+    path = os.path.join(_SCRIPTS, "update_agent.py")
+    if not os.path.isfile(path):
+        pytest.skip("scripts/update_agent.py is not mounted here")
+    sys.path.insert(0, _SCRIPTS)
+    spec = importlib.util.spec_from_file_location("update_agent_under_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", "-C", str(cwd)] + list(args), check=True, capture_output=True,
+                   env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"})
+
+
+def _commit(repo, files, message):
+    for path, text in files.items():
+        full = repo / path
+        full.parent.mkdir(parents=True, exist_ok=True)
+        full.write_text(text)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", message)
+    _git(repo, "push", "-q", "origin", "HEAD:deploy")
+
+
+@pytest.fixture
+def repos(tmp_path):
+    """`(writer, checkout)`: commits made in `writer` reach `checkout` only
+    through its remote, as on a deployment."""
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", str(origin))
+    writer = tmp_path / "writer"
+    _git(tmp_path, "clone", "-q", str(origin), str(writer))
+    _git(writer, "checkout", "-q", "-b", "deploy")
+    _commit(writer, {"server/main.py": "v1", "tools/AMASSS/src/a.py": "v1",
+                     "tools/AREG/AREG_CBCT/uv.lock": "v1"}, "ADD: start")
+    checkout = tmp_path / "checkout"
+    _git(tmp_path, "clone", "-q", "-b", "deploy", str(origin), str(checkout))
+    return writer, checkout
+
+
+def test_an_up_to_date_checkout_has_nothing_waiting(agent_module, repos):
+    _writer, checkout = repos
+    info = agent_module.inspect(str(checkout), "server")
+    assert info["behind"] == 0 and info["commits"] == [] and info["error"] == ""
+    assert info["branch"] == "deploy"
+
+
+def test_server_commits_are_listed_and_classified(agent_module, repos):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: a server fix")
+    info = agent_module.inspect(str(checkout), "server")
+    assert info["behind"] == 1
+    assert info["commits"][0]["subject"] == "FIX: a server fix"
+    assert info["changes"]["action"] == agent_module.RESTART
+    _commit(writer, {"server/requirements.txt": "fastapi"}, "UPDATE: deps")
+    assert agent_module.inspect(str(checkout), "server")["changes"]["action"] == agent_module.RECREATE
+    _commit(writer, {"docker/Dockerfile": "FROM x"}, "UPDATE: image")
+    info = agent_module.inspect(str(checkout), "server")
+    assert info["changes"]["action"] == agent_module.IMAGE
+    assert any("image" in reason for reason in agent_module.blockers(info))
+
+
+def test_tools_commits_name_each_tool_and_whether_its_environment_changes(agent_module, repos):
+    writer, checkout = repos
+    _commit(writer, {"tools/AMASSS/src/a.py": "v2", "tools/AREG/AREG_CBCT/uv.lock": "v2",
+                     "scripts/data-manifest.yml": "x", "tools/_template/x": "y"}, "UPDATE: tools")
+    changes = agent_module.inspect(str(checkout), "tools")["changes"]
+    by_tool = {t["tool"]: t for t in changes["tools"]}
+    assert set(by_tool) == {"AMASSS", "AREG"}
+    assert by_tool["AMASSS"]["environment"] is False
+    assert by_tool["AREG"]["environment"] is True
+    assert changes["environments"] == ["tools/AREG/AREG_CBCT"]
+    assert "scripts/data-manifest.yml" in changes["other"]
+
+
+def test_local_changes_block_an_update(agent_module, repos):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    (checkout / "server" / "main.py").write_text("edited here")
+    assert any("uncommitted" in r for r in agent_module.blockers(agent_module.inspect(str(checkout), "server")))
+
+
+class _FakeServer:
+    def __init__(self, busy_polls=0):
+        self.door_calls = []
+        self.busy_polls = busy_polls
+
+    def install(self, agent):
+        agent.door = lambda accepting, reason="": self.door_calls.append(accepting)
+        agent.healthy = lambda: True
+
+        def in_flight():
+            if self.busy_polls > 0:
+                self.busy_polls -= 1
+                return [{"tool": "AMASSS", "state": "running"}]
+            return []
+        agent.in_flight = in_flight
+
+
+def _agent(agent_module, checkout, tmp_path, **extra):
+    args = agent_module.argparse.Namespace(
+        server_repo=str(checkout), tools_repo="", update_dir=str(tmp_path / "update"),
+        url="https://127.0.0.1:1", token="t", service=None, restart_cmd="true", poll=60,
+        data_dir=str(tmp_path / "DATA"),
+        health_timeout=5, no_sync=True, once=True)
+    for key, value in extra.items():
+        setattr(args, key, value)
+    return agent_module.Agent(args)
+
+
+def _request(agent, target="all"):
+    os.makedirs(agent.update_dir, exist_ok=True)
+    request = {"id": "r1", "target": target}
+    with open(os.path.join(agent.update_dir, "request.json"), "w") as handle:
+        json.dump(request, handle)
+    return request
+
+
+def test_an_update_drains_pulls_restarts_and_reopens(agent_module, repos, tmp_path, monkeypatch):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    server = _FakeServer(busy_polls=2)
+    server.install(agent)
+    agent.apply(_request(agent))
+    assert (checkout / "server" / "main.py").read_text() == "v2"
+    assert server.door_calls[0] is False and server.door_calls[-1] is True
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True and "server" in last["message"]
+    assert not os.path.exists(os.path.join(agent.update_dir, "request.json"))
+    assert any("Waiting for 1 run(s)" in line for line in last["log"])
+
+
+def test_a_request_withdrawn_while_runs_finish_changes_nothing(agent_module, repos, tmp_path, monkeypatch):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    server = _FakeServer(busy_polls=1000)
+    server.install(agent)
+    request = _request(agent)
+
+    real_in_flight = agent.in_flight
+
+    def withdraw_then_report():
+        os.remove(os.path.join(agent.update_dir, "request.json"))
+        return real_in_flight()
+    agent.in_flight = withdraw_then_report
+    agent.apply(request)
+    assert (checkout / "server" / "main.py").read_text() == "v1"
+    assert server.door_calls[-1] is True
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "Withdrawn" in last["message"]
+
+
+def test_an_image_change_is_refused_without_closing_the_door(agent_module, repos, tmp_path):
+    writer, checkout = repos
+    _commit(writer, {"docker/Dockerfile": "FROM x"}, "UPDATE: image")
+    agent = _agent(agent_module, checkout, tmp_path)
+    server = _FakeServer()
+    server.install(agent)
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "image" in last["message"]
+    assert False not in server.door_calls
+    assert not os.path.exists(checkout / "docker" / "Dockerfile")
+
+
+def test_a_failed_restart_still_reopens_the_door(agent_module, repos, tmp_path, monkeypatch):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    agent = _agent(agent_module, checkout, tmp_path, restart_cmd="false")
+    server = _FakeServer()
+    server.install(agent)
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "restart failed" in last["message"]
+    assert server.door_calls[-1] is True
+
+
+def _manifest_repo(tmp_path):
+    repo = tmp_path / "tools-lib"
+    (repo / "scripts").mkdir(parents=True)
+    engine = os.path.join(_SCRIPTS, "fetch_data.py")
+    (repo / "scripts" / "fetch_data.py").write_text(open(engine).read())
+    (repo / "scripts" / "data-manifest.yml").write_text(
+        "tools:\n"
+        "  AMASSS:\n"
+        "    models:\n"
+        "      - name: weights.zip\n"
+        "        dest: AMASSS_Models\n"
+        "        url: https://example.invalid/w.zip\n"
+        "        size: 1000\n"
+        "        extract: true\n"
+        "    testfiles:\n"
+        "      - name: scan.nii.gz\n"
+        "        url: https://example.invalid/scan.nii.gz\n"
+        "        size: 20\n")
+    return repo
+
+
+def test_the_survey_says_which_manifest_entries_are_on_disk(agent_module, tmp_path):
+    repo = _manifest_repo(tmp_path)
+    data = tmp_path / "DATA"
+    (data / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    summary = agent_module.data_summary(str(repo), str(data))
+    entries = {e["name"]: e for e in summary["tools"]["AMASSS"]["entries"]}
+    assert entries["AMASSS_Models"]["present"] is True and entries["AMASSS_Models"]["kind"] == "models"
+    assert entries["scan.nii.gz"]["present"] is False and entries["scan.nii.gz"]["size"] == 20
+
+
+def test_a_data_request_runs_the_download_for_that_tool_only(agent_module, repos, tmp_path):
+    _writer, checkout = repos
+    repo = _manifest_repo(tmp_path)
+    agent = _agent(agent_module, checkout, tmp_path, tools_repo=str(repo))
+    os.makedirs(agent.update_dir, exist_ok=True)
+    agent.apply_data({"id": "d1", "kind": "data", "tool": "AMASSS", "force": False})
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    # example.invalid cannot be reached, so the download fails -- and says so,
+    # with the engine's own output in the log.
+    assert last["kind"] == "data" and last["tool"] == "AMASSS" and last["ok"] is False
+    assert any("AMASSS" in line for line in last["log"])
+
+
+def test_only_installed_tools_with_something_not_current_are_refreshed(agent_module, tmp_path):
+    repo = _manifest_repo(tmp_path)
+    data = tmp_path / "DATA"
+    summary = agent_module.data_summary(str(repo), str(data))
+    assert summary["refresh"] == [], "a tool with nothing on disk was never installed here"
+    (data / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    summary = agent_module.data_summary(str(repo), str(data))
+    assert summary["refresh"] == ["AMASSS"], "its test file was added to the manifest since"
+    entries = {e["name"]: e["state"] for e in summary["tools"]["AMASSS"]["entries"]}
+    assert entries == {"AMASSS_Models": "current", "scan.nii.gz": "missing"}
+
+
+def _split_repo(tmp_path):
+    repo = tmp_path / "split-lib"
+    (repo / "scripts").mkdir(parents=True)
+    engine = os.path.join(_SCRIPTS, "fetch_data.py")
+    (repo / "scripts" / "fetch_data.py").write_text(open(engine).read())
+    (repo / "scripts" / "data-manifest.yml").write_text(
+        "tools:\n"
+        "  AREG:\n"
+        "    testfiles:\n"
+        "      - name: cohort.zip\n"
+        "        dest: PAIR/PAIR_cohort\n"
+        "        split: PAIR\n"
+        "        url: https://example.invalid/cohort.zip\n"
+        "        sha256: " + "0" * 64 + "\n"
+        "        extract: true\n")
+    return repo
+
+
+def test_an_entry_missing_one_of_its_split_views_is_refreshed(agent_module, tmp_path):
+    """Found on a deployment: a manifest gave present archives a `split`, and
+    with every archive on disk nothing read as stale. No update built the
+    views, the panel's download button stayed disabled, and the pickers scoped
+    to them listed nothing."""
+    repo = _split_repo(tmp_path)
+    data = tmp_path / "DATA"
+    cohort = data / "AREG" / "testfiles" / "PAIR" / "PAIR_cohort"
+    (cohort / "T1").mkdir(parents=True)
+    (cohort / "T2").mkdir()
+    (data / "AREG" / "testfiles" / "PAIR_T1" / "PAIR_cohort").mkdir(parents=True)
+
+    summary = agent_module.data_summary(str(repo), str(data))
+    assert summary["tools"]["AREG"]["entries"][0]["state"] == "outdated"
+    assert summary["refresh"] == ["AREG"]
+
+    (data / "AREG" / "testfiles" / "PAIR_T2" / "PAIR_cohort").mkdir(parents=True)
+    summary = agent_module.data_summary(str(repo), str(data))
+    assert summary["tools"]["AREG"]["entries"][0]["state"] == "current"
+    assert summary["refresh"] == []
+
+
+def test_a_request_for_all_data_with_nothing_stale_downloads_nothing(agent_module, repos, tmp_path):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path, tools_repo=str(_manifest_repo(tmp_path)))
+    os.makedirs(agent.update_dir, exist_ok=True)
+    agent.fetch_data = lambda tools, force=False: pytest.fail("nothing to download")
+    agent.apply_data({"id": "d2", "kind": "data", "tool": "all"})
+    assert _last(agent)["ok"] is True and "already up to date" in _last(agent)["message"]
+
+
+def test_a_request_for_all_data_downloads_every_stale_tool(agent_module, repos, tmp_path):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path, tools_repo=str(_manifest_repo(tmp_path)))
+    (tmp_path / "DATA" / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    os.makedirs(agent.update_dir, exist_ok=True)
+    asked = []
+    agent.fetch_data = lambda tools, force=False: (asked.append(tools), (True, "done"))[1]
+    agent.apply_data({"id": "d3", "kind": "data", "tool": "all"})
+    assert asked == [["AMASSS"]] and _last(agent)["ok"] is True
+
+
+def test_a_change_to_a_shared_package_rebuilds_every_environment_that_copies_it(agent_module, repos):
+    """A package installed from a folder of the library is a COPY in each
+    dependent environment: changing it must reinstall it there."""
+    writer, checkout = repos
+    _commit(writer, {
+        "tools/Shared/common/pyproject.toml": "[project]\nname = 'shared-common'\n",
+        "tools/User/pyproject.toml": "[project]\nname='user'\n[tool.uv.sources]\n"
+                                     "shared-common = { path = \"../Shared/common\" }\n",
+    }, "ADD: a shared package")
+    agent_module.git(str(checkout), ["pull", "-q", "--ff-only"])
+    _commit(writer, {"tools/Shared/common/src/x.py": "v2"}, "FIX: shared")
+    changes = agent_module.inspect(str(checkout), "tools")["changes"]
+    assert "tools/User" in changes["environments"]
+    assert changes["reinstall"] == {"tools/User": ["shared-common"]}
+    assert {t["tool"]: t["environment"] for t in changes["tools"]}["User"] is True
+
+
+def test_a_rebuilt_environment_keeps_its_extras(agent_module):
+    """A sync without them removes what an extra installed: Crown_Seg's
+    segmentation engine went that way, and AREG IOS refused raw scans."""
+    assert "--all-extras" in agent_module.SYNC_COMMAND
+    assert "--frozen" in agent_module.SYNC_COMMAND
+
+
+# ---------------------------------------------------------------------------
+# SADT_AUTO_UPDATE=apply: the agent files the request itself
+# ---------------------------------------------------------------------------
+
+def _behind(agent_module, repos, tmp_path, monkeypatch, mode):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    monkeypatch.setenv("SADT_AUTO_UPDATE", mode)
+    agent = _agent(agent_module, checkout, tmp_path)
+    agent.survey()
+    return agent, writer, checkout
+
+
+def test_apply_files_an_update_for_what_the_survey_found(agent_module, repos, tmp_path, monkeypatch):
+    agent, _writer, _checkout = _behind(agent_module, repos, tmp_path, monkeypatch, "apply")
+    request = agent.auto_request()
+    assert request["target"] == "all" and request["auto"] is True
+    assert request["targets"] == [f"server:{agent.server['target']}"]
+
+
+@pytest.mark.parametrize("mode", ["off", "notify", "", "sometimes"])
+def test_nothing_is_filed_unless_the_mode_is_apply(agent_module, repos, tmp_path, monkeypatch, mode):
+    agent, _writer, _checkout = _behind(agent_module, repos, tmp_path, monkeypatch, mode)
+    assert agent.auto_request() is None
+
+
+def test_an_up_to_date_deployment_files_nothing(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    monkeypatch.setenv("SADT_AUTO_UPDATE", "apply")
+    agent = _agent(agent_module, checkout, tmp_path)
+    agent.survey()
+    assert agent.auto_request() is None
+
+
+def test_a_checkout_a_pull_would_refuse_is_left_alone(agent_module, repos, tmp_path, monkeypatch):
+    agent, _writer, checkout = _behind(agent_module, repos, tmp_path, monkeypatch, "apply")
+    (checkout / "server" / "main.py").write_text("edited by hand")
+    agent.survey(fetch=False)
+    assert agent.auto_request() is None
+
+
+def test_a_failed_update_waits_for_the_branch_to_move(agent_module, repos, tmp_path, monkeypatch):
+    agent, writer, _checkout = _behind(agent_module, repos, tmp_path, monkeypatch, "apply")
+    agent._auto_failed = agent.auto_request()["targets"]
+    assert agent.auto_request() is None
+    _commit(writer, {"server/main.py": "v3"}, "FIX: y")
+    agent.survey()
+    assert agent.auto_request() is not None
+
+
+def test_an_automatic_update_closes_the_door_before_it_waits(agent_module, repos, tmp_path, monkeypatch):
+    """Waiting for an idle moment first never ends on a server clients keep
+    busy: the door closes, the runs in flight finish, then the pull."""
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent, _writer, checkout = _behind(agent_module, repos, tmp_path, monkeypatch, "apply")
+    server = _FakeServer(busy_polls=2)
+    server.install(agent)
+    request = agent.auto_request()
+    os.makedirs(agent.update_dir, exist_ok=True)
+    with open(os.path.join(agent.update_dir, "request.json"), "w") as handle:
+        json.dump(request, handle)
+    agent.apply(request)
+    assert server.door_calls[0] is False and server.door_calls[-1] is True
+    assert (checkout / "server" / "main.py").read_text() == "v2"
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True and any("Waiting for 1 run(s)" in line for line in last["log"])
+
+
+# ---------------------------------------------------------------------------
+# Images: a deployment that runs a tool library (and its server) as images
+# ---------------------------------------------------------------------------
+
+TOOLS_IMAGE = "ghcr.io/lab/sadt-visor-tools:latest"
+SOURCE = "https://github.com/lab/SADT-VISOR"
+
+
+class _Registry:
+    """The registry and GitHub, as image_release answers them."""
+
+    def __init__(self, agent_module, monkeypatch, local_digest="sha256:aaa", remote="sha256:aaa",
+                 present=True, labels=None):
+        self.local = {"present": present, "digest": local_digest, "labels": labels if labels is not None else {
+            "org.opencontainers.image.version": "tools-2026.10.12-1",
+            "org.opencontainers.image.revision": "1111111aaaa",
+            "org.opencontainers.image.source": SOURCE}}
+        self.remote = remote
+        self.github_calls = 0
+        release = agent_module.image_release
+        monkeypatch.setattr(release, "local_image", lambda image: dict(self.local))
+        monkeypatch.setattr(release, "remote_digest", lambda image: self.remote)
+
+        def latest(source, prefix):
+            self.github_calls += 1
+            assert (source, prefix) == (SOURCE, "tools-")
+            return {"tag": "tools-2026.10.13-1", "revision": "2222222bbbb"}
+
+        def compare(source, base, head):
+            return {"behind": 2, "paths": ["tools/AMASSS/src/a.py", "tools/AREG/AREG_CBCT/uv.lock"],
+                    "commits": [{"sha": "2222222bb", "subject": "FIX: amasss", "author": "t", "at": None},
+                                {"sha": "3333333cc", "subject": "UPDATE: areg deps", "author": "t", "at": None}]}
+
+        monkeypatch.setattr(release, "latest_release", latest)
+        monkeypatch.setattr(release, "compare", compare)
+
+
+def test_a_current_tools_image_has_nothing_waiting(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch)
+    info = agent_module.inspect_image(TOOLS_IMAGE, "tools")
+    assert info["error"] == "" and info["behind"] == 0
+    assert (info["branch"], info["local"]) == ("latest", "tools-2026.10.12-1")
+    assert "1111111aa" in info["current"]["subject"]
+
+
+def test_a_new_digest_lists_the_release_its_commits_and_its_tools(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    info = agent_module.inspect_image(TOOLS_IMAGE, "tools")
+    assert info["behind"] == 2 and info["target"] == "tools-2026.10.13-1"
+    assert [c["subject"] for c in info["commits"]] == ["FIX: amasss", "UPDATE: areg deps"]
+    assert {t["tool"] for t in info["changes"]["tools"]} == {"AMASSS", "AREG"}
+    assert info["changes"]["action"] == agent_module.RECREATE
+    assert agent_module.blockers(info) == []
+
+
+def test_github_is_asked_once_per_published_digest(agent_module, monkeypatch):
+    """The registry is asked every survey; GitHub's anonymous limit is 60 an
+    hour, so it is asked only when the digest moves."""
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    cache = {}
+    for _ in range(5):
+        agent_module.inspect_image(TOOLS_IMAGE, "tools", True, cache)
+    assert registry.github_calls == 1
+    registry.remote = "sha256:ccc"
+    agent_module.inspect_image(TOOLS_IMAGE, "tools", True, cache)
+    assert registry.github_calls == 2
+
+
+def test_an_image_built_here_is_not_followed(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch, local_digest="")
+    info = agent_module.inspect_image(TOOLS_IMAGE, "tools")
+    assert "built on this machine" in info["error"] and info["behind"] == 0
+
+
+def test_an_unreachable_registry_is_a_warning_not_an_update(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch, remote="")
+    info = agent_module.inspect_image(TOOLS_IMAGE, "tools")
+    assert info["behind"] == 0 and info["error"] == "" and "registry" in info["warning"]
+
+
+def test_a_missing_image_is_reported(agent_module, monkeypatch):
+    _Registry(agent_module, monkeypatch, present=False)
+    assert "not on this machine" in agent_module.inspect_image(TOOLS_IMAGE, "tools")["error"]
+
+
+def test_a_tools_image_update_drains_pulls_recreates_and_reopens(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    server = _FakeServer(busy_polls=1)
+    server.install(agent)
+    pulled = []
+
+    def pull(image, digest=""):
+        pulled.append((image, digest))
+        registry.local["digest"] = registry.remote
+        return True
+
+    agent.pull_image = pull
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True and "tools to tools-2026.10.13-1" in last["message"]
+    # The digest the survey compared, not whatever the tag names by then.
+    assert pulled == [(TOOLS_IMAGE, "sha256:bbb")]
+    assert server.door_calls[0] is False and server.door_calls[-1] is True
+
+
+def test_the_image_an_update_replaced_is_removed_once_the_server_answers(agent_module, repos, tmp_path,
+                                                                        monkeypatch):
+    _writer, checkout = repos
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    _FakeServer().install(agent)
+    ids = {TOOLS_IMAGE: "sha256:" + "a" * 64}
+    removed = []
+    agent.image_id = lambda image: ids[image]
+
+    def pull(image, digest=""):
+        ids[image] = "sha256:" + "b" * 64
+        registry.local["digest"] = registry.remote
+        return True
+
+    agent.pull_image = pull
+    monkeypatch.setattr(agent_module.subprocess, "run", lambda cmd, **kw: (
+        removed.append(cmd) or subprocess.CompletedProcess(cmd, 0, "", "")))
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True
+    assert ["docker", "image", "rm", "sha256:" + "a" * 64] in removed
+    assert not any("--force" in cmd or "prune" in cmd for cmd in removed)
+    assert any("Removed the previous" in line for line in last["log"])
+
+
+def test_nothing_is_removed_when_the_server_does_not_come_back(agent_module, repos, tmp_path, monkeypatch):
+    """The old image is the way back until the new one has answered."""
+    _writer, checkout = repos
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    _FakeServer().install(agent)
+    ids = {TOOLS_IMAGE: "sha256:" + "a" * 64}
+    removed = []
+    agent.image_id = lambda image: ids[image]
+    agent.healthy = lambda: False
+    agent.args.health_timeout = 0
+    agent.drop_replaced = lambda replaced: removed.append(replaced)
+
+    def pull(image, digest=""):
+        ids[image] = "sha256:" + "b" * 64
+        registry.local["digest"] = registry.remote
+        return True
+
+    agent.pull_image = pull
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and removed == []
+
+
+def test_an_image_that_did_not_change_is_not_removed(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    agent.image_id = lambda image: "sha256:" + "a" * 64
+    calls = []
+    monkeypatch.setattr(agent_module.subprocess, "run", lambda *a, **k: calls.append(a))
+    agent.drop_replaced({TOOLS_IMAGE: "sha256:" + "a" * 64, "gone": ""})
+    assert calls == []
+
+
+def test_a_failed_image_pull_restarts_nothing_and_reopens(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE, restart_cmd="exit 1")
+    server = _FakeServer()
+    server.install(agent)
+    agent.pull_image = lambda image, digest="": False
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "Nothing was restarted" in last["message"]
+    assert server.door_calls[-1] is True
+
+
+def test_a_server_commit_needing_an_image_waits_for_the_published_one(agent_module, repos, tmp_path,
+                                                                     monkeypatch):
+    """Refused while the registry still serves the old server image; applied --
+    code pulled AND image pulled -- once the new one is published."""
+    writer, checkout = repos
+    _commit(writer, {"docker/server.Dockerfile": "FROM y"}, "UPDATE: server image")
+    registry = _Registry(agent_module, monkeypatch, remote="sha256:aaa")
+    agent = _agent(agent_module, checkout, tmp_path, server_image="ghcr.io/lab/visor-serve:deploy")
+    server = _FakeServer()
+    server.install(agent)
+    agent.survey()
+    assert any("waiting for the server image" in r for r in agent_module.blockers(agent.server))
+
+    registry.remote = "sha256:bbb"
+    pulled = []
+    agent.pull_image = lambda image, digest="": pulled.append((image, digest)) or True
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True
+    assert (checkout / "docker" / "server.Dockerfile").read_text() == "FROM y"
+    assert pulled == [("ghcr.io/lab/visor-serve:deploy", "sha256:bbb")]
+
+
+def test_apply_mode_files_an_update_for_a_new_tools_image(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    _Registry(agent_module, monkeypatch, remote="sha256:bbb")
+    monkeypatch.setenv("SADT_AUTO_UPDATE", "apply")
+    agent = _agent(agent_module, checkout, tmp_path, tools_image=TOOLS_IMAGE)
+    agent.survey()
+    request = agent.auto_request()
+    assert request["auto"] is True and request["targets"] == ["tools:tools-2026.10.13-1"]
+
+
+def test_a_run_without_a_run_id_still_holds_the_update(agent_module, repos, tmp_path):
+    """A client sending no X-Run-Id is absent from /status's runs; admission
+    still holds it, and recreating the container would kill it mid-run."""
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path)
+    answers = iter([{"runs": [], "admission": {"running": 2, "waiting": 0}},
+                    {"runs": [], "admission": {"running": 0, "waiting": 0}}])
+    agent._api = lambda path, payload=None, method=None, timeout=10: next(answers)
+    assert len(agent.in_flight()) == 2
+    assert agent.in_flight() == []
+
+
+def test_the_door_stays_shut_while_a_step_runs_silent(agent_module, repos, tmp_path, monkeypatch):
+    """A pull that prints nothing for minutes must not let the lease lapse:
+    the keeper renews it on its own clock."""
+    _writer, checkout = repos
+    monkeypatch.setattr(agent_module, "DOOR_LEASE_SECONDS", 0.3)
+    agent = _agent(agent_module, checkout, tmp_path)
+    renewals = []
+    agent.door = lambda accepting, reason="": renewals.append(accepting)
+    released = agent.hold_door()
+    import time as _time
+    _time.sleep(0.5)
+    released.set()
+    count = len(renewals)
+    _time.sleep(0.3)
+    assert count >= 3 and set(renewals) == {False}
+    assert len(renewals) == count, "the keeper stops once released"
+
+
+def test_a_run_that_slipped_in_is_waited_for_before_the_restart(agent_module, repos, tmp_path, monkeypatch):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    server = _FakeServer()
+    server.install(agent)
+    answers = iter([[], [{"tool": "AREG_CBCT", "state": "running"}], []])
+    agent.in_flight = lambda: next(answers)
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is True
+    assert any("Before restarting: waiting for 1 run(s): AREG_CBCT" in line for line in last["log"])
+
+
+# ---------------------------------------------------------------------------
+# The smoke test after an update
+# ---------------------------------------------------------------------------
+
+def _updated_agent(agent_module, repos, tmp_path, monkeypatch, smoke=None):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    if smoke is not None:
+        os.makedirs(agent.update_dir, exist_ok=True)
+        with open(os.path.join(agent.update_dir, "smoke.json"), "w") as handle:
+            handle.write(smoke if isinstance(smoke, str) else json.dumps(smoke))
+    server = _FakeServer()
+    server.install(agent)
+    return agent, server
+
+
+def _last(agent):
+    return json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+
+
+def test_no_smoke_file_means_no_smoke_test(agent_module, repos, tmp_path, monkeypatch):
+    agent, _server = _updated_agent(agent_module, repos, tmp_path, monkeypatch)
+    agent._post_run = lambda *a: pytest.fail("nothing to check")
+    agent.apply(_request(agent))
+    assert _last(agent)["ok"] is True and "Smoke" not in _last(agent)["message"]
+
+
+def test_each_check_runs_after_the_door_reopens_and_is_reported(agent_module, repos, tmp_path, monkeypatch):
+    smoke = [{"tool": "Fast", "form": {"input": "a"}, "label": "fast tool"},
+             {"tool": "Broken", "form": {}}]
+    agent, server = _updated_agent(agent_module, repos, tmp_path, monkeypatch, smoke)
+    calls = []
+
+    def post(tool, form, timeout):
+        calls.append((tool, form, server.door_calls[-1]))
+        return (200, "") if tool == "Fast" else (500, "Tool execution failed.")
+
+    agent._post_run = post
+    agent.apply(_request(agent))
+    last = _last(agent)
+    assert [c[0] for c in calls] == ["Fast", "Broken"]
+    assert all(door_open for _tool, _form, door_open in calls), "the door is open while it checks"
+    assert last["ok"] is True, "the update itself was applied"
+    assert "Smoke test FAILED for 1 of 2: Broken (Tool execution failed.)" in last["message"]
+    assert [entry["ok"] for entry in last["smoke"]] == [True, False]
+
+
+def test_an_update_then_refreshes_the_data_with_the_door_open(agent_module, repos, tmp_path, monkeypatch):
+    smoke = [{"tool": "Fast", "form": {}}]
+    agent, server = _updated_agent(agent_module, repos, tmp_path, monkeypatch, smoke)
+    agent.args.tools_repo = str(_manifest_repo(tmp_path))
+    (tmp_path / "DATA" / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    order = []
+
+    def fetch(tools, force=False):
+        order.append(("data", tools, server.door_calls[-1]))
+        return True, "done"
+
+    agent.fetch_data = fetch
+    agent._post_run = lambda tool, form, timeout: (order.append(("smoke", tool, server.door_calls[-1])), (200, ""))[1]
+    agent.apply(_request(agent))
+    assert order == [("data", ["AMASSS"], True), ("smoke", "Fast", True)], "data first, door open"
+    assert "Models and test files: brought up to date for AMASSS." in _last(agent)["message"]
+
+
+def test_a_failed_data_refresh_does_not_undo_the_update(agent_module, repos, tmp_path, monkeypatch):
+    agent, _server = _updated_agent(agent_module, repos, tmp_path, monkeypatch)
+    agent.args.tools_repo = str(_manifest_repo(tmp_path))
+    (tmp_path / "DATA" / "AMASSS" / "models" / "AMASSS_Models").mkdir(parents=True)
+    agent.fetch_data = lambda tools, force=False: (False, "Some of the data of AMASSS could not be downloaded.")
+    agent.apply(_request(agent))
+    last = _last(agent)
+    assert last["ok"] is True and "could not be downloaded" in last["message"]
+
+
+def test_an_update_with_every_tool_current_downloads_nothing(agent_module, repos, tmp_path, monkeypatch):
+    agent, _server = _updated_agent(agent_module, repos, tmp_path, monkeypatch)
+    agent.args.tools_repo = str(_manifest_repo(tmp_path))
+    agent.fetch_data = lambda tools, force=False: pytest.fail("nothing installed, nothing to refresh")
+    agent.apply(_request(agent))
+    assert _last(agent)["ok"] is True and "Models and test files" not in _last(agent)["message"]
+
+
+def test_a_malformed_smoke_file_is_ignored(agent_module, repos, tmp_path, monkeypatch):
+    agent, _server = _updated_agent(agent_module, repos, tmp_path, monkeypatch, smoke="{not json")
+    agent._post_run = lambda *a: pytest.fail("nothing to check")
+    agent.apply(_request(agent))
+    assert _last(agent)["ok"] is True
+
+
+def test_a_check_posts_its_form_with_a_run_id(agent_module, repos, tmp_path, monkeypatch):
+    """Against a real HTTP server: the fields arrive as multipart, the run
+    carries an id (so the next update waits for it), and a refusal's detail
+    is what the report says."""
+    import http.server
+    import threading
+
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            seen.update(path=self.path, run_id=self.headers.get("X-Run-Id"), body=body.decode())
+            status = 200 if self.path.endswith("/Good") else 422
+            payload = b"result bytes" if status == 200 else json.dumps({"detail": "no such input"}).encode()
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *args):
+            pass
+
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    # Over TLS, as the real server is: the agent refuses http:// outright and
+    # verifies against the public authorities only. The test alone makes its
+    # throwaway certificate one of those, through the standard SSL_CERT_FILE.
+    cert, key = str(tmp_path / "cert.pem"), str(tmp_path / "key.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                    "-nodes", "-days", "1", "-subj", "/CN=test",
+                    "-addext", "subjectAltName=IP:127.0.0.1",
+                    "-addext", "basicConstraints=critical,CA:FALSE",
+                    "-keyout", key, "-out", cert],
+                   check=True, capture_output=True)
+    monkeypatch.setenv("SSL_CERT_FILE", cert)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    httpd.socket = context.wrap_socket(httpd.socket, server_side=True)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        _writer, checkout = repos
+        agent = _agent(agent_module, checkout, tmp_path, url=f"https://127.0.0.1:{httpd.server_port}")
+        assert agent._post_run("Good", {"scans": "test.nii.gz"}, 10) == (200, "")
+        assert seen["path"] == "/run/Good" and seen["run_id"]
+        assert 'name="scans"' in seen["body"] and "test.nii.gz" in seen["body"]
+        assert agent._post_run("Bad", {}, 10) == (422, "no such input")
+    finally:
+        httpd.shutdown()
+
+
+def test_a_pull_is_pinned_to_the_digest_that_was_compared(agent_module):
+    pinned = agent_module._pinned
+    assert pinned("ghcr.io/lab/tools:deploy", "sha256:abc") == "ghcr.io/lab/tools@sha256:abc"
+    assert pinned("localhost:5000/tools:deploy", "sha256:abc") == "localhost:5000/tools@sha256:abc"
+    assert pinned("ghcr.io/lab/tools", "sha256:abc") == "ghcr.io/lab/tools@sha256:abc"
+    assert pinned("ghcr.io/lab/tools:deploy", "") == "ghcr.io/lab/tools:deploy"
+
+
+def test_the_release_classifier_is_read_from_head_not_the_working_tree(agent_module):
+    """server/ is writable from the container; what the agent executes must be
+    what the operator committed."""
+    import subprocess as sp
+    root = agent_module.REPO_ROOT
+    if not os.path.exists(os.path.join(root, ".git")):
+        pytest.skip("no git checkout mounted here")
+    committed = sp.run(["git", "-C", root, "show", "HEAD:server/wire/release_diff.py"],
+                       capture_output=True, text=True, check=True).stdout
+    assert agent_module._release_diff_source() == committed
+    assert agent_module.release_diff.__file__.startswith("<HEAD:")
+
+
+def test_the_door_is_closed_with_the_admin_token_not_the_api_token(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path, admin_token="adm")
+    sent = []
+
+    class _Answer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    monkeypatch.setattr(agent_module.server_ctl, "server_urlopen",
+                        lambda request, timeout=None: sent.append(request) or _Answer())
+    assert agent.door(False, "updating") is None
+    request = sent[0]
+    assert request.full_url.endswith("/maintenance") and request.get_method() == "POST"
+    assert request.get_header("X-admin-token") == "adm"
+    assert request.get_header("Authorization") is None, "the API token must not travel with it"
+    assert json.loads(request.data)["accepting"] is False
+
+
+def test_with_no_admin_token_the_door_cannot_close(agent_module, repos, tmp_path):
+    _writer, checkout = repos
+    agent = _agent(agent_module, checkout, tmp_path)
+    assert "ADMIN_TOKEN" in agent.door(False)
+
+
+def test_a_server_that_refuses_the_door_is_not_updated(agent_module, repos, tmp_path, monkeypatch):
+    """403: the server has no ADMIN_TOKEN. Restarting it without holding the
+    door would kill whatever run it admits meanwhile."""
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    agent = _agent(agent_module, checkout, tmp_path, admin_token="adm", restart_cmd="exit 1")
+    server = _FakeServer()
+    server.install(agent)
+    agent.door = lambda accepting, reason="": server.door_calls.append(accepting) or (
+        None if accepting else "the server has no ADMIN_TOKEN set, so it cannot be closed to new runs")
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "ADMIN_TOKEN" in last["message"]
+    assert (checkout / "server" / "main.py").read_text() != "v2", "nothing may be pulled"
+
+
+def test_a_door_that_never_closes_stops_the_update_before_the_pull(agent_module, repos, tmp_path, monkeypatch):
+    writer, checkout = repos
+    _commit(writer, {"server/main.py": "v2"}, "FIX: x")
+    agent = _agent(agent_module, checkout, tmp_path, admin_token="adm", restart_cmd="exit 1")
+    server = _FakeServer()
+    server.install(agent)
+    agent.door = lambda accepting, reason="": None if accepting else agent_module.DOOR_UNREACHABLE
+    agent.apply(_request(agent))
+    last = json.load(open(os.path.join(agent.update_dir, "status.json")))["last"]
+    assert last["ok"] is False and "Nothing was changed" in last["message"]
+    assert (checkout / "server" / "main.py").read_text() != "v2"
+
+
+def test_a_server_that_stays_down_does_not_hold_the_restart_for_ever(agent_module, repos, tmp_path, monkeypatch):
+    """An update can take the running server down before the container that
+    would bring it back is recreated; waiting for an answer then never ends."""
+    _writer, checkout = repos
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    agent.in_flight = lambda: None
+    agent.wait_idle("Before restarting", unreachable_grace=0)
+    assert any("has not answered" in line for line in agent.log_lines)
+
+
+def test_a_server_with_a_run_in_flight_is_still_waited_for(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    monkeypatch.setattr(agent_module, "REQUEST_POLL_SECONDS", 0)
+    agent = _agent(agent_module, checkout, tmp_path)
+    answers = iter([[{"tool": "ASO"}], [{"tool": "ASO"}], []])
+    seen = []
+    agent.in_flight = lambda: seen.append(1) or next(answers)
+    agent.wait_idle("Before restarting", unreachable_grace=0)
+    assert len(seen) == 3
+
+
+def test_the_agent_notices_that_its_own_code_changed(agent_module, repos, tmp_path, monkeypatch):
+    _writer, checkout = repos
+    script = tmp_path / "update_agent.py"
+    script.write_text("v1")
+    monkeypatch.setattr(agent_module, "__file__", str(script))
+    agent = _agent(agent_module, checkout, tmp_path)
+    assert agent._code_changed() is False
+    os.utime(script, ns=(1, 1))
+    assert agent._code_changed() is True

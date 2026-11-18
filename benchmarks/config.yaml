@@ -204,9 +204,9 @@ tools:
       # Zero of the seven exist in it and the server answers 422. The Frankfurt
       # reference defines exactly those seven.
       reference: {kind: model, name: CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane}
-      # Required by Fully-Automated CBCT: the bundle ALI_CBCT predicts with.
-      # This one holds exactly the seven landmarks the reference is built on.
-      landmark_model: {kind: model, name: CBCT_landmark_models}
+      # No `landmark_model`: Fully-Automated CBCT asks ALI_CBCT for the landmarks
+      # and that tool finds its own weights. ASO no longer hosts a landmark
+      # bundle (`landmark_model` is opted out in deployment.toml).
     data_slug: ASO
     local:
       folder: ASO

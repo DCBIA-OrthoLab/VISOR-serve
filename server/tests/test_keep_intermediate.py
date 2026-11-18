@@ -116,22 +116,35 @@ def test_the_tool_may_name_the_check_box_for_what_it_produces(tmp_path):
         supervisor=True,
         calls=["ALI_CBCT"],
         injected_layout={"keep_intermediate": {
-            "label": "Steps to keep",
+            "label": "Landmark steps",
             "option_help": {"ALI_CBCT": "The landmarks the prediction placed."},
         }},
     )
 
     spec = tool.arguments["keep_intermediate"]
-    assert spec.label == "Steps to keep"
+    assert spec.label == "Landmark steps"
     assert spec.option_help == {"ALI_CBCT": "The landmarks the prediction placed."}
+
+
+def test_a_note_declared_by_the_tool_reaches_its_argument(tmp_path):
+    """One visible line under the label. An argument declaring none has none,
+    so the published shape of every other argument is unchanged."""
+    tool = _tool(tmp_path, arguments={
+        "scans": {"type": "path"},
+        "outputs": {"type": "list[str]", "required": False, "default": [],
+                    "choices": ["T1 scan"],
+                    "note": "Saved beside the result."},
+    })
+    assert tool.arguments["outputs"].note == "Saved beside the result."
+    assert tool.arguments["scans"].note is None
 
 
 def test_without_a_layout_the_generic_wording_stands(tmp_path):
     spec = _tool(tmp_path, supervisor=True, calls=["Leaf"]).arguments["keep_intermediate"]
-    assert spec.label == "Steps to keep"
-    assert spec.section == "Intermediate results", (
-        "a section of its own: this decides what comes back, which is not a knob "
-        "on how the run is computed"
+    assert spec.label == "Raw intermediate files"
+    assert spec.section == "Quality control", (
+        "beside the stops: what a step produced is for checking the chain, and "
+        "the tool's own outputs are what a reader takes away"
     )
 
 

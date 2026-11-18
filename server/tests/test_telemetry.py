@@ -1,0 +1,400 @@
+"""What `/admin-panel` is drawn from, and the two rules it must not break.
+
+The page itself is a string of HTML and cannot usefully be asserted on. What
+CAN be asserted is everything underneath it: the samplers in `telemetry.py`,
+the ledger they keep, and the shape of `GET /admin-panel.json` that the
+diagram reads. So that is what these cover.
+
+Two of them are not shape tests but rules, and they are the reason this file
+exists at all:
+
+* **No argument VALUE ever reaches the ledger.** A value is a path and a path
+  is a patient's file name. `record_run_inputs` takes names only, and the test
+  below passes it a dict to prove that what lands is the keys.
+* **An unavailable reading is `None`, never `0`.** The page draws `None`
+  hatched and `0` as an empty tank, and "empty" reads as "idle" -- which is a
+  claim about a machine nobody measured.
+"""
+
+import json
+import os
+import time
+
+import pytest
+from fastapi.testclient import TestClient
+
+import telemetry
+from config import settings
+from main import app
+
+client = TestClient(app)
+AUTH = {"Authorization": f"Bearer {settings.API_TOKEN}"}
+
+
+def _panel():
+    """The admin token, read when a request is made: tests set it per test."""
+    return {"X-Admin-Token": settings.ADMIN_TOKEN}
+
+
+@pytest.fixture(autouse=True)
+def _clean_telemetry():
+    """Each test starts from a server that has measured nothing."""
+    telemetry.reset()
+    yield
+    telemetry.reset()
+
+
+# ---------------------------------------------------------------------------
+# Sampling
+# ---------------------------------------------------------------------------
+
+def test_the_first_cpu_reading_is_none_because_there_is_no_interval_yet():
+    """A percentage is a delta. With one sample there is nothing to subtract.
+
+    Answering 0 would be a lie a reader cannot detect, and answering the
+    machine's lifetime average would be a different lie.
+    """
+    assert telemetry.cpu_percent() is None
+
+
+def test_the_second_cpu_reading_is_a_percentage():
+    telemetry.cpu_percent()
+    value = telemetry.cpu_percent()
+    # None is still legitimate here: two calls can land inside one jiffy.
+    assert value is None or 0.0 <= value <= 100.0
+
+
+def test_ram_reports_available_rather_than_free():
+    """MemAvailable, not MemFree: a server that has just written a 2 GB result
+    has almost no free memory and is under no memory pressure at all."""
+    reading = telemetry.ram()
+    if reading is None:  # no /proc on this platform
+        return
+    assert reading["total"] > 0
+    assert 0 <= reading["available"] <= reading["total"]
+    assert reading["used"] == reading["total"] - reading["available"]
+
+
+def test_a_directory_that_does_not_exist_reports_absent_not_zero(tmp_path):
+    missing = str(tmp_path / "nowhere")
+    report = telemetry.disk({"gone": missing})
+    assert report["gone"]["exists"] is False
+    assert report["gone"]["used_here"] is None
+
+
+def test_disk_counts_what_is_under_the_path(tmp_path):
+    (tmp_path / "blob").write_bytes(b"x" * 20000)
+    report = telemetry.disk({"here": str(tmp_path)})
+    assert report["here"]["exists"] is True
+    assert report["here"]["used_here"] >= 20000
+    assert report["here"]["total"] > 0
+
+
+def _stats_under(monkeypatch, root):
+    """Count `os.stat` calls on paths under `root` -- not `root` itself, which
+    the report still checks exists -- made on this thread only."""
+    import threading
+    calls, here, real = [], threading.get_ident(), os.stat
+
+    def counted(path, *args, **kwargs):
+        if threading.get_ident() == here and str(path).startswith(str(root) + os.sep):
+            calls.append(path)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", counted)
+    return calls
+
+
+def test_a_tree_is_walked_once_per_half_minute_not_once_per_poll(tmp_path, monkeypatch):
+    """The panel polls every two seconds, and each poll walked TEMP_DIR and
+    DATA_DIR -- up to 40 000 files each -- to say how much they held."""
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    for index in range(200):
+        (tree / f"blob-{index}").write_bytes(b"x" * 100)
+    first = telemetry.disk({"here": str(tree)})["here"]["used_here"]
+
+    calls = _stats_under(monkeypatch, tree)
+    assert telemetry.disk({"here": str(tree)})["here"]["used_here"] == first
+    assert len(calls) == 0
+
+
+def test_a_tree_is_walked_again_once_its_figure_is_stale(tmp_path, monkeypatch):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "blob").write_bytes(b"x" * 20000)
+    before = telemetry.disk({"here": str(tree)})["here"]["used_here"]
+    (tree / "another").write_bytes(b"x" * 20000)
+    later = time.monotonic() + telemetry.TREE_BYTES_SECONDS + 1
+    monkeypatch.setattr(telemetry.time, "monotonic", lambda: later)
+    assert telemetry.disk({"here": str(tree)})["here"]["used_here"] >= before + 20000
+
+
+def test_in_flight_requests_count_up_and_back_down():
+    telemetry.request_started()
+    telemetry.request_started()
+    assert telemetry.inflight() == {"now": 2, "peak": 2}
+    telemetry.request_finished()
+    assert telemetry.inflight() == {"now": 1, "peak": 2}
+
+
+def test_in_flight_never_goes_negative():
+    """A double-decrement would otherwise make the gauge read below empty and
+    never recover, since the peak is taken from the same counter."""
+    telemetry.request_finished()
+    assert telemetry.inflight()["now"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The queue
+# ---------------------------------------------------------------------------
+
+def test_the_queue_is_ranked_by_total_wait_not_by_the_worst_one():
+    """The decision the page is built on. A tool that queues four seconds a
+    hundred times costs this server more than one that waited a minute once."""
+    for _ in range(10):
+        telemetry.record_admission("CLIC", 4.0, channels=1)
+    telemetry.record_admission("AMASSS", 30.0, channels=1)
+
+    ranked = telemetry.queue_history()["ranked"]
+    assert [row["tool"] for row in ranked] == ["CLIC", "AMASSS"]
+    assert ranked[0]["total_wait"] == 40.0
+    # The worst is kept beside it, because it is the one somebody felt.
+    assert ranked[1]["worst_wait"] == 30.0
+
+
+def test_a_run_that_did_not_wait_is_counted_but_not_called_queued():
+    telemetry.record_admission("Test_Tool", 0.0, channels=1)
+    row = telemetry.queue_history()["ranked"][0]
+    assert row["runs"] == 1
+    assert row["queued"] == 0
+
+
+def test_the_queue_log_is_bounded():
+    for index in range(telemetry.QUEUE_LOG_SIZE + 50):
+        telemetry.record_admission("CLIC", 0.0, channels=1)
+    history = telemetry.queue_history()
+    assert history["held"] == telemetry.QUEUE_LOG_SIZE
+
+
+def test_a_bad_admission_record_is_dropped_rather_than_raising():
+    """Telemetry must never fail a run. A record it cannot parse is one lost
+    row on a page, not an exception on the path of a cohort."""
+    telemetry.record_admission("CLIC", "not a number", channels=1)
+    assert telemetry.queue_history()["held"] == 0
+
+
+# ---------------------------------------------------------------------------
+# The ledger
+# ---------------------------------------------------------------------------
+
+def test_the_ledger_records_what_a_run_held_and_how_it_ended():
+    telemetry.record_run_start("run-a", "AMASSS")
+    telemetry.record_run_grant("run-a", channels=2, cpus=7,
+                               ram_bytes=1024, vram_bytes=2048, waited=4.25)
+    telemetry.record_run_inputs("run-a", 40, 999, ["scans", "model"])
+    telemetry.record_run_end("run-a", "done", "done")
+
+    record = telemetry.run_ledger()[0]
+    assert record["tool"] == "AMASSS"
+    assert (record["channels"], record["cpus"]) == (2, 7)
+    assert record["vram_bytes"] == 2048
+    assert record["files"] == 40
+    assert record["outcome"] == "done"
+    assert record["seconds"] is not None
+
+
+def _paused_run(run_id, worked, paused):
+    """A run that worked `worked` seconds around one pause of `paused`."""
+    telemetry.record_run_start(run_id, "AREG")
+    start = time.time() - worked - paused
+    spans = [
+        {"phase": "running", "start": start, "end": start + worked / 2},
+        {"phase": "paused", "start": start + worked / 2, "end": start + worked / 2 + paused},
+        {"phase": "running", "start": start + worked / 2 + paused, "end": start + worked + paused},
+    ]
+    with telemetry._ledger_lock:
+        telemetry._ledger[run_id]["started_at"] = start
+    telemetry.record_run_end(run_id, "done", "done", timeline={"spans": spans})
+    return telemetry.ledger_record(run_id)
+
+
+def test_a_pause_is_not_counted_in_the_time_a_run_took():
+    record = _paused_run("run-p", worked=120.0, paused=3000.0)
+    assert record["seconds"] == pytest.approx(120.0, abs=1.0)
+    assert record["paused_seconds"] == pytest.approx(3000.0, abs=1.0)
+
+
+def test_a_tool_mean_is_its_working_time_not_the_clinicians_pace():
+    _paused_run("run-p1", worked=100.0, paused=3000.0)
+    _paused_run("run-p2", worked=100.0, paused=0.0)
+    row = next(row for row in telemetry.tool_uptime() if row["tool"] == "AREG")
+    assert row["mean"] == pytest.approx(100.0, abs=1.0)
+
+
+def test_history_written_before_pauses_were_taken_out_is_corrected_on_read(tmp_path):
+    start = 1000.0
+    old = {"run_id": "old", "tool": "AREG", "started_at": start, "ended_at": start + 3100.0,
+           "seconds": 3100.0, "outcome": "done",
+           "spans": [{"phase": "running", "start": start, "end": start + 100.0},
+                     {"phase": "paused", "start": start + 100.0, "end": start + 3100.0}]}
+    (tmp_path / telemetry.HISTORY_FILE).write_text(json.dumps(old) + "\n")
+    telemetry.configure_history(str(tmp_path))
+    try:
+        record = telemetry.ledger_record("old")
+    finally:
+        telemetry.configure_history(None)
+    assert record["seconds"] == pytest.approx(100.0)
+    assert record["paused_seconds"] == pytest.approx(3000.0)
+
+
+def test_the_ledger_keeps_argument_names_and_never_their_values():
+    """The rule this whole page is constrained by. A value is a path, and a
+    path is the patient's."""
+    telemetry.record_run_start("run-b", "ALI_CBCT")
+    telemetry.record_run_inputs("run-b", 1, 10, {
+        "input": "/jobs/ab12/Smith_John_T1.nii.gz",
+        "landmarks": ["Ba", "S"],
+    })
+
+    record = telemetry.run_ledger()[0]
+    assert record["arguments"] == ["input", "landmarks"]
+    serialised = repr(record)
+    assert "Smith_John" not in serialised
+    assert ".nii.gz" not in serialised
+
+
+def test_the_ledger_is_bounded_and_keeps_the_newest():
+    for index in range(telemetry.LEDGER_SIZE + 20):
+        telemetry.record_run_start(f"run-{index}", "CLIC")
+    ledger = telemetry.run_ledger(limit=telemetry.LEDGER_SIZE + 50)
+    assert len(ledger) == telemetry.LEDGER_SIZE
+    assert ledger[0]["run_id"] == f"run-{telemetry.LEDGER_SIZE + 19}"
+
+
+def test_a_run_resumed_after_a_restart_keeps_its_name():
+    """A restart while a run waits at its checkpoint drops its record; the
+    grant after the resume used to make a blank one, listed under no tool."""
+    telemetry.record_run_resumed("run-r", "AREG", "a-workstation",
+                                 started_at=1000.0)
+    telemetry.record_run_grant("run-r", channels=1)
+    telemetry.record_run_end("run-r", "done", "done")
+
+    record = telemetry.run_ledger()[0]
+    assert record["tool"] == "AREG"
+    assert record["client"] == "a-workstation"
+    assert record["started_at"] == 1000.0
+    assert [row["tool"] for row in telemetry.tool_uptime()] == ["AREG"]
+
+
+def test_a_resume_does_not_rename_a_run_the_ledger_already_knows():
+    telemetry.record_run_start("run-k", "AREG", "first")
+    started = telemetry.run_ledger()[0]["started_at"]
+    telemetry.record_run_resumed("run-k", "ASO", "second",
+                                 started_at=started + 60)
+
+    record = telemetry.run_ledger()[0]
+    assert (record["tool"], record["client"]) == ("AREG", "first")
+    assert record["started_at"] == started
+
+
+def test_ending_a_run_nobody_started_is_ignored():
+    telemetry.record_run_end("never-seen", "done")
+    assert telemetry.run_ledger() == []
+
+
+# ---------------------------------------------------------------------------
+# Per-tool uptime
+# ---------------------------------------------------------------------------
+
+def test_uptime_sums_the_time_each_tool_occupied_the_server():
+    telemetry.record_run_start("u1", "AMASSS")
+    telemetry.record_run_end("u1", "done", "done")
+    telemetry.record_run_start("u2", "AMASSS")
+    telemetry.record_run_end("u2", "failed", "failed")
+    telemetry.record_run_start("u3", "CLIC")
+
+    rows = {row["tool"]: row for row in telemetry.tool_uptime()}
+    assert rows["AMASSS"]["runs"] == 2
+    assert rows["AMASSS"]["ok"] == 1
+    assert rows["AMASSS"]["failed"] == 1
+    assert rows["AMASSS"]["running"] == 0
+    # Still going: counted as in progress rather than left out until it ends.
+    assert rows["CLIC"]["running"] == 1
+    assert rows["CLIC"]["ok"] == 0
+
+
+def test_uptime_is_ordered_busiest_first():
+    telemetry.record_run_start("s1", "Quick")
+    telemetry.record_run_end("s1", "done")
+    telemetry.record_run_start("s2", "Slow")
+    ledger = telemetry._ledger  # noqa: SLF001 - reaching in to age a record
+    ledger["s2"]["started_at"] -= 600
+    telemetry.record_run_end("s2", "done")
+
+    assert [row["tool"] for row in telemetry.tool_uptime()][0] == "Slow"
+
+
+# ---------------------------------------------------------------------------
+# The endpoint the diagram reads
+# ---------------------------------------------------------------------------
+
+def test_server_debug_json_needs_the_token():
+    assert client.get("/admin-panel.json", headers=AUTH).status_code == 401
+
+
+def test_server_debug_json_carries_every_block_the_diagram_draws():
+    """The page reads these by name. A rename here is a blank panel there."""
+    payload = client.get("/admin-panel.json", headers=_panel()).json()
+    for key in ("budget", "admission", "card", "runs", "costs", "hardware",
+                "cpu_percent", "ram", "inflight", "queue", "ledger", "uptime",
+                "disk"):
+        assert key in payload, key
+    assert set(payload["queue"]) >= {"order", "ranked", "capacity", "held"}
+    assert set(payload["disk"]) == {"temp", "data"}
+
+
+def test_server_debug_json_agrees_with_status_on_what_both_report():
+    """They are one function plus samples, deliberately, so that two endpoints
+    can never disagree about the same number."""
+    status = client.get("/status", headers=AUTH).json()
+    debug = client.get("/admin-panel.json", headers=_panel()).json()
+    assert debug["budget"] == status["budget"]
+    assert debug["costs"] == status["costs"]
+
+
+def test_watching_the_server_is_not_counted_as_asking_it_for_work():
+    """The observer must not appear in its own observation.
+
+    The dashboard polls every two seconds, so counting its own request made the
+    chip read "1 request" on a completely idle machine -- a claim about load
+    that came entirely from the thing measuring the load.
+    """
+    telemetry.reset()
+    client.get("/admin-panel.json", headers=_panel())
+    client.get("/status", headers=AUTH)
+    client.get("/health")
+    assert telemetry.inflight() == {"now": 0, "peak": 0}
+
+
+def test_a_request_that_asks_for_something_is_counted():
+    """The other half: excluding the watchers must not exclude everything."""
+    telemetry.reset()
+    client.get("/tools")
+    assert telemetry.inflight()["peak"] == 1
+
+
+def test_the_debug_page_is_served_without_a_token_and_holds_none():
+    """The page is public; the readings are not. A token baked into the HTML
+    would hand every reader the key to the whole API."""
+    response = client.get("/admin-panel")
+    assert response.status_code == 200
+    assert settings.API_TOKEN not in response.text
+
+
+def test_the_debug_page_asks_for_nothing_over_the_network():
+    """This server runs where there is no internet. A remote stylesheet is a
+    broken page, not a degraded one."""
+    body = client.get("/admin-panel").text
+    for absent in ("http://", "https://", "//cdn", "<link"):
+        assert absent not in body, absent
