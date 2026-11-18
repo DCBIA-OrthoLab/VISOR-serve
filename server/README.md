@@ -966,8 +966,7 @@ published with every run, for the same reason.
 curl -X POST https://<name>.<tailnet>.ts.net/run/ASO \
   -H "Authorization: Bearer $API_TOKEN" \
   -F "modality=CBCT" -F "automation=Fully-Automated" \
-  -F "landmark_model=CBCT_landmark_models" \
-  -F "reference=CBCT_Gold_Occlusal_Midsagittal_Plane" \
+  -F "reference=CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane" \
   -F "input=@cohort.zip" --output result.zip
 ```
 

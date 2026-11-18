@@ -135,31 +135,23 @@ def test_listing_without_a_filter_shows_everything(fetch_data, manifest, capsys)
         assert key in printed, key
 
 
-def test_aso_and_ali_landmark_weights_come_from_different_publications(manifest):
-    """They are two trainings of the same landmarks, not two copies of one.
+def test_aso_stages_no_landmark_weights_of_its_own(manifest):
+    """ASO asks ALI_CBCT for the landmarks, and that tool predicts with its own
+    weights. A second set under DATA/ASO/ would be one nothing reads, and one
+    that silently differs from ALI's: they were two separate trainings, and the
+    old ASO one failed to find N and put Ba tens of millimetres off.
 
-    An earlier note in the manifest said they were the same and suggested
-    hard-linking one at the other to save disk. Measured 2026-09-10: every
-    checkpoint differs, at both scales, for every landmark compared. ASO's
-    published reference planes were built with ASO's weights, so swapping in
-    ALI's would move the landmarks a little, move the registration with them,
-    and produce oriented scans nobody could tell were wrong.
-
-    Pinned by SOURCE rather than by bytes, because the bytes are not in the
-    repository and this has to fail on a laptop with an empty DATA/.
+    Only the reference bundles are ASO's to stage.
     """
-    def urls(tool, prefix):
-        entries = manifest.get(tool, {}).get("models", [])
-        return {e["url"] for e in entries if str(e.get("dest", "")).startswith(prefix)}
+    models = manifest.get("ASO", {}).get("models", [])
+    dests = [str(entry.get("dest", "")) for entry in models]
 
-    aso = urls("ASO", "CBCT_landmark_models/")
-    ali = urls("ALI", "ALI_CBCT_Models/")
-    assert aso, "ASO declares no landmark weights"
-    assert ali, "ALI declares no landmark weights"
-    assert not (aso & ali), (
-        "ASO and ALI now share a landmark weight archive. They are separate "
-        "trainings; sharing one silently changes what ASO registers on."
+    assert not [d for d in dests if d.startswith("CBCT_landmark_models")], (
+        "ASO stages landmark weights again; Fully-Automated CBCT takes them from ALI_CBCT"
     )
+    for reference in ("CBCT_Gold_Frankfurt_Horizontal_Midsagittal_Plane",
+                      "CBCT_Gold_Occlusal_Midsagittal_Plane", "IOS_Gold_file"):
+        assert reference in dests, reference
 
 
 # ---------------------------------------------------------------------------
