@@ -281,8 +281,42 @@ def plan_for(name: str, tool_dir: str, config: dict, lock_lines: list) -> dict:
     }
 
 
+_SKIP_DIRS = {"__pycache__", ".git", ".venv", "build", "dist", ".pytest_cache", ".mypy_cache", ".ruff_cache"}
+
+
+def path_packages(requirements) -> list:
+    """The non-editable local packages of a plan's requirements (`sadt-areg-common`, `sadt-naming`).
+
+    split_requirements made them absolute directories. An editable one (`-e`)
+    is not listed: it is linked, so the venv always sees its current source.
+    """
+    return [line for line in requirements
+            if not line.startswith("-e ") and os.path.isabs(line) and os.path.isdir(line)]
+
+
+def _hash_tree(digest, root: str) -> None:
+    """Fold every source file under `root` (names and bytes, sorted) into `digest`."""
+    for folder, subfolders, files in os.walk(root):
+        subfolders[:] = sorted(d for d in subfolders if d not in _SKIP_DIRS and not d.endswith(".egg-info"))
+        for name in sorted(files):
+            if name.endswith((".pyc", ".pyo")):
+                continue
+            path = os.path.join(folder, name)
+            digest.update(os.path.relpath(path, root).encode("utf-8", "replace") + b"\0")
+            try:
+                with open(path, "rb") as handle:
+                    digest.update(handle.read())
+            except OSError:
+                digest.update(b"?")
+
+
 def fingerprint(plan: dict, tool_dir: str) -> str:
-    """Hash of everything the venv was built from, so a change anywhere rebuilds it."""
+    """Hash of everything the venv was built from, so a change anywhere rebuilds it.
+
+    The source of the non-editable path packages is part of it: uv builds those
+    into a wheel and caches it by directory, not by content, so a venv whose
+    lock and recipe did not move would otherwise keep a stale `common` forever.
+    """
     digest = hashlib.sha256()
     for name in ("pyproject.toml", "uv.lock"):
         with open(os.path.join(tool_dir, name), "rb") as handle:
@@ -291,6 +325,9 @@ def fingerprint(plan: dict, tool_dir: str) -> str:
                               ("torch", "pytorch3d", "llama_cpp", "extras", "python")},
                              sort_keys=True).encode())
     digest.update(json.dumps(plan["requirements"]).encode())
+    for package in path_packages(plan["requirements"]):
+        digest.update(b"\0path:" + package.encode())
+        _hash_tree(digest, package)
     return digest.hexdigest()
 
 
@@ -339,10 +376,12 @@ def install_one(uv: str, plan: dict, force: bool = False) -> dict:
     command = [uv, "venv", "--python", plan["python"] or "3.11", venv]
     _run(command, cwd=tool_dir)
 
-    if plan["requirements"]:
+    local = path_packages(plan["requirements"])
+    registry = [line for line in plan["requirements"] if line not in local]
+    if registry:
         with tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="visor-%s-" % plan["name"],
                                          delete=False, encoding="utf-8") as handle:
-            handle.write("\n".join(plan["requirements"]) + "\n")
+            handle.write("\n".join(registry) + "\n")
             requirements = handle.name
         try:
             # --no-deps: the export is the whole locked set, pinned. Letting uv
@@ -350,6 +389,11 @@ def install_one(uv: str, plan: dict, force: bool = False) -> dict:
             _run([uv, "pip", "install", "--python", python, "--no-deps", "-r", requirements], cwd=tool_dir)
         finally:
             os.unlink(requirements)
+    if local:
+        # --no-cache --reinstall: uv keys the wheel it built from a local directory on the
+        # directory, not on its files, so the cached one can predate the checkout.
+        _run([uv, "pip", "install", "--python", python, "--no-deps", "--reinstall", "--no-cache"] + local,
+             cwd=tool_dir)
 
     if plan["torch"]:
         specs = ["%s==%s" % (package, version) for package, version in plan["torch"].items()

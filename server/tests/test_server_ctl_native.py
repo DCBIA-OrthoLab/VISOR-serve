@@ -196,6 +196,58 @@ def test_the_fingerprint_moves_when_the_recipe_or_the_lock_does(tmp_path):
     assert tools.fingerprint(tools.plan_for("AMASSS", folder, _config(), _lock_for("AMASSS")), folder) != before
 
 
+def _tool_with_common(tmp_path):
+    folder = _make_tool(tmp_path, "AREG_CBCT")
+    common = tmp_path / "tools" / "common"
+    (common / "sadt_areg_common").mkdir(parents=True)
+    (common / "sadt_areg_common" / "__init__.py").write_text("X = 1\n")
+    return folder, str(common)
+
+
+def test_the_fingerprint_moves_when_a_path_package_source_does(tmp_path):
+    folder, common = _tool_with_common(tmp_path)
+    lock = ["numpy==2.3.2", common]
+    plan = lambda: tools.plan_for("AREG_CBCT", folder, _config(), lock)  # noqa: E731
+    before = tools.fingerprint(plan(), folder)
+    assert tools.fingerprint(plan(), folder) == before
+    # Bytecode and caches are not source.
+    os.makedirs(os.path.join(common, "sadt_areg_common", "__pycache__"))
+    with open(os.path.join(common, "sadt_areg_common", "__pycache__", "a.pyc"), "wb") as handle:
+        handle.write(b"x")
+    assert tools.fingerprint(plan(), folder) == before
+    with open(os.path.join(common, "sadt_areg_common", "__init__.py"), "a") as handle:
+        handle.write("def patient_folders(): ...\n")
+    changed = tools.fingerprint(plan(), folder)
+    assert changed != before
+    with open(os.path.join(common, "sadt_areg_common", "new.py"), "w") as handle:
+        handle.write("")
+    assert tools.fingerprint(plan(), folder) != changed
+
+
+def test_an_editable_path_package_is_not_hashed(tmp_path):
+    folder, common = _tool_with_common(tmp_path)
+    plan = tools.plan_for("AREG_CBCT", folder, _config(), ["-e " + common])
+    before = tools.fingerprint(plan, folder)
+    with open(os.path.join(common, "sadt_areg_common", "__init__.py"), "a") as handle:
+        handle.write("Y = 2\n")
+    assert tools.fingerprint(plan, folder) == before
+
+
+def test_a_path_package_is_reinstalled_from_source_never_from_the_uv_cache(tmp_path, monkeypatch):
+    folder, common = _tool_with_common(tmp_path)
+    plan = tools.plan_for("AREG_CBCT", folder, _config(), ["numpy==2.3.2", common])
+    calls = []
+    monkeypatch.setattr(tools, "_run", lambda command, cwd=None, env=None, attempts=2: calls.append(list(command)))
+    monkeypatch.setattr(tools, "verify_one", lambda uv, plan, config=None: {"pip_check_ok": False})
+    tools.install_one("uv", plan, force=True)
+    installs = [c for c in calls if c[1:3] == ["pip", "install"]]
+    local = [c for c in installs if common in c]
+    assert len(local) == 1
+    assert "--no-cache" in local[0] and "--reinstall" in local[0] and "--no-deps" in local[0]
+    # And the path package is not also sent through the cached requirements file.
+    assert all(common not in c for c in installs if c is not local[0])
+
+
 def test_discovery_follows_the_dockerfile_rule(tmp_path):
     _make_tool(tmp_path, "AMASSS")
     group = tmp_path / "tools" / "ALI"
