@@ -458,89 +458,23 @@ tools:
   # =========================================================================
   ASO:
     models:
-      # Landmark weights for Fully-Automated CBCT. ASO does not predict
-      # landmarks itself -- it asks the ALI tool for them, mid-run, through
-      # the supervisor the runner injects (`sup.run("ALI", ...)`).
+      # ASO holds no landmark weights. Fully-Automated CBCT asks the ALI_CBCT
+      # tool for the landmarks, mid-run, through the supervisor the runner
+      # injects (`sup.run("ALI_CBCT", ...)`), and that tool predicts with its own
+      # weights, the ones DATA/ALI/models/ holds. `landmark_model` is only an
+      # override naming one of THOSE bundles; the server no longer offers it
+      # from this folder (deployment.toml, [tools.ASO]).
       #
-      # They live under DATA/ASO/ because `landmark_model` is
-      # server_selectable on ASO's schema, and GET /tools/{tool}/data is
-      # per tool: the client's dropdown lists DATA/ASO/models/ and main.py
-      # resolves the name there before ASO ever runs.
+      # This block used to stage seven landmark bundles of its own
+      # (model.ASO.Ba, S, N, RPo, LPo, ROr and LOr, 758 MB, under
+      # CBCT_landmark_models/), a separate training published as
+      # lucanchling/ALI_CBCT models_v01. Nothing reads them since the landmarks
+      # come only from ALI, so they are no longer fetched. The archives stay
+      # attached to the data-2026.10.09-1 release; a server that already
+      # unpacked them can delete DATA/ASO/models/CBCT_landmark_models/.
       #
-      # These are NOT the weights DATA/ALI/models/ holds, and an earlier note
-      # here said they were -- inviting a `cp -al` that would have replaced them
-      # silently. Measured 2026-09-10: every checkpoint differs, at both scales,
-      # for every landmark compared (Ba, S, N, RPo). Two separate publications,
-      # two separate trainings of the same landmarks:
-      #
-      #     ASO   lucanchling/ALI_CBCT                models_v01
-      #     ALI   DCBIA-OrthoLab/SlicerAutomated...   v0.1-v2.0_models
-      #
-      # So DO NOT hard-link them, and do not deduplicate them. ASO's published
-      # reference planes were built with THESE weights; swapping in ALI's would
-      # move the landmarks a little, move the registration with them, and produce
-      # oriented scans nobody could tell were wrong -- every one of them
-      # plausible.
-      #
-      # Each tool keeps its own: ALI's predict for ALI, ASO's for ASO. That costs
-      # 782 MB and buys the only thing that matters here -- knowing which weights
-      # a result came from.
-      #
-      # Curated to the seven landmarks the published reference planes are
-      # built on (ASO's own defaults), not all 112: that is 758 MB instead of
-      # roughly 12 GB. Add a landmark here the day someone selects it.
-      # Verified 2026-07-31: each archive holds its scales at the root
-      # (0-3/<LM>_Net_0-3.pth, 1/<LM>_Net_1.pth), which is why `dest` nests
-      # them one level -- GetBrain keys on <LM>/<scale>/*.pth.
-      - name: Ba.zip
-        dest: CBCT_landmark_models/Ba
-        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.Ba.zip
-        release_name: model.ASO.Ba.zip
-        size: 108211992
-        extract: true
-        sha256: 10cde16f246434494d1846112a8104f44c16f6964498ccbbddea0bdff9421dc2
-      - name: S.zip
-        dest: CBCT_landmark_models/S
-        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.S.zip
-        release_name: model.ASO.S.zip
-        size: 108238247
-        extract: true
-        sha256: 925d3eb16322f82f25ba313d441b2b6f0a55e94640d810831657fefba6e9c458
-      - name: N.zip
-        dest: CBCT_landmark_models/N
-        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.N.zip
-        release_name: model.ASO.N.zip
-        size: 108237024
-        extract: true
-        sha256: 2b8f1d13c4c92e6fd34e4d0eb267b2f6a77c36f603184258311ae2051fd0f6f2
-      - name: RPo.zip
-        dest: CBCT_landmark_models/RPo
-        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.RPo.zip
-        release_name: model.ASO.RPo.zip
-        size: 108190441
-        extract: true
-        sha256: efb70ee9f7ff1082e57b77d4c60943ea97fd93a2b536b8fc42e00c309f8e11fe
-      - name: LPo.zip
-        dest: CBCT_landmark_models/LPo
-        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.LPo.zip
-        release_name: model.ASO.LPo.zip
-        size: 108189434
-        extract: true
-        sha256: 2357b2d7920ddb8b842ff020717b87d1dca442bfe8a2c719acd9b23882368d55
-      - name: ROr.zip
-        dest: CBCT_landmark_models/ROr
-        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.ROr.zip
-        release_name: model.ASO.ROr.zip
-        size: 108230408
-        extract: true
-        sha256: 11e36dea3674a534bc008b8bc9bd5f60164a6049373118ccaad107bd3a2362da
-      - name: LOr.zip
-        dest: CBCT_landmark_models/LOr
-        url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.LOr.zip
-        release_name: model.ASO.LOr.zip
-        size: 108211595
-        extract: true
-        sha256: ed8f7938300b3f50a57fdf147ce184ebe9d2f73cb00bf8ef91ed225abc991517
+      # What is left is data, not weights: the reference bundles the oriented
+      # scans are registered to.
       - name: Gold_file.zip
         dest: IOS_Gold_file
         url: https://github.com/DCBIA-OrthoLab/SADT-VISOR/releases/download/data-2026.10.09-1/model.ASO.IOS_Gold_file.zip
