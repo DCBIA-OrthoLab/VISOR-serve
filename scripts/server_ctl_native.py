@@ -505,6 +505,27 @@ def _wait_for_health(ctl, url: str, pid: int, timeout: int, tls=None) -> bool:
     return False
 
 
+def _launch_prerequisites(ctl, args):
+    """`(run-native.sh, tools checkout)` if a start can happen, else ServerCtlError. Changes nothing.
+
+    Shared by `up` and by `update` BEFORE it stops the old server, so a start
+    that cannot happen is refused while the old server is still serving.
+    """
+    script = os.path.join(_HERE, "run-native.sh")
+    if not os.path.isfile(script):
+        raise ctl.ServerCtlError(f"{script} is missing.")
+    if native_tools.find_uv() is None:
+        raise ctl.ServerCtlError(
+            "uv is not installed. It builds the server's and the tools' Python environments. "
+            "Install it from https://docs.astral.sh/uv/ and run this again.")
+    root = sadt_root(ctl, args)
+    if not os.path.isdir(os.path.join(root, "tools")):
+        raise ctl.ServerCtlError(
+            f"No SADT-VISOR checkout at {root} (no tools/ folder). Pass --tools-dir PATH; it is "
+            f"remembered in .env.")
+    return script, root
+
+
 def cmd_up(ctl, args) -> dict:
     live = running_server()
     port = args.port or (live or {}).get("port") or ctl.effective_port()
@@ -519,22 +540,11 @@ def cmd_up(ctl, args) -> dict:
         raise ctl.ServerCtlError(
             f"Something is already listening on port {port} of this machine, and it is not this "
             f"deployment's native server. Pick another with --port, or stop whatever holds it.")
-    script = os.path.join(_HERE, "run-native.sh")
-    if not os.path.isfile(script):
-        raise ctl.ServerCtlError(f"{script} is missing.")
-    if native_tools.find_uv() is None:
-        raise ctl.ServerCtlError(
-            "uv is not installed. It builds the server's and the tools' Python environments. "
-            "Install it from https://docs.astral.sh/uv/ and run this again.")
-    root = sadt_root(ctl, args)
-    if not os.path.isdir(os.path.join(root, "tools")):
-        raise ctl.ServerCtlError(
-            f"No SADT-VISOR checkout at {root} (no tools/ folder). Pass --tools-dir PATH; it is "
-            f"remembered in .env.")
+    script, root = _launch_prerequisites(ctl, args)
 
     ctl.ensure_data_dir()
     device = resolve_device(ctl, args)
-    token = ctl.ensure_env(SERVICE, args.bind, token=args.token, port=port)
+    token = ctl.ensure_env(SERVICE, args.bind, token=getattr(args, "token", None), port=port)
     ctl.write_env({"DEVICE": device, "SADT_TOOLS": root})
     remember_tls(ctl, args, tls)
     env_file = ctl.read_env()
@@ -628,6 +638,9 @@ def cmd_update(ctl, args) -> dict:
     with nothing new costs two git calls.
     """
     tls = tls_settings(ctl, args)
+    # What a relaunch needs, asked now: nothing below may stop the old server
+    # for a start that was never going to be allowed.
+    refuse_non_loopback(ctl, args)
     url = server_url(ctl, args)
     result = {"service": SERVICE, "url": url, "tls": tls_report(tls), "pulled": False, "tools_pulled": False,
               "venvs": [], "restarted": False, "healthy": False, "switched_branch": False}
@@ -672,9 +685,16 @@ def cmd_update(ctl, args) -> dict:
     changed = result["pulled"] or result["tools_pulled"] or any(r.get("action") == "built" for r in outcome["tools"])
     if live and (changed or args.force or tls_changed):
         ctl.log("Relaunching the native server so it sees what changed...")
+        _launch_prerequisites(ctl, args)
         cmd_down(ctl, args)
         args.port = live.get("port")
-        up = cmd_up(ctl, args)
+        try:
+            up = cmd_up(ctl, args)
+        except Exception as exc:  # noqa: BLE001 - whatever stopped the start, the operator must be told
+            raise ctl.ServerCtlError(
+                f"The old native server was stopped, and the new one did not start ({type(exc).__name__}: {exc}). "
+                f"Nothing is serving now. Fix the cause, then start it with: server_ctl.py up --native "
+                f"(log: {log_path()})") from exc
         result["restarted"] = True
         result["healthy"] = up["healthy"]
     elif live:

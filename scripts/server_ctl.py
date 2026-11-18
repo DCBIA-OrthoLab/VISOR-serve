@@ -2094,6 +2094,7 @@ def build_parser() -> argparse.ArgumentParser:
     # server listens, so it must carry the existing choice over rather than
     # quietly reimpose loopback. See ensure_env.
     update.add_argument("--bind", default=None, help="See 'up --bind'.")
+    update.add_argument("--token", help="Native backend: see 'up --token'.")
     update.add_argument("--force", action="store_true", help="Recreate even when nothing changed.")
     _add_tls_arguments(update)
     update.add_argument("--tool", action="append", help="Native backend: only rebuild this tool's venv.")
@@ -2221,6 +2222,9 @@ def main(argv=None) -> int:
         handler = server_ctl_native.HANDLERS[args.command]
         args.func = lambda a, _fn=handler[0]: _fn(sys.modules[__name__], a)
         args.printer = handler[1]
+    elif args.command == "update" and getattr(args, "token", None):
+        log("error: update --token belongs to the native backend (add --native).")
+        return 1
     elif getattr(args, "tls_cert", None) or getattr(args, "tls_key", None):
         log("error: --tls-cert/--tls-key belong to the native backend (add --native). "
             "The Docker deployment takes TLS_CERT_FILE/TLS_KEY_FILE from .env.")

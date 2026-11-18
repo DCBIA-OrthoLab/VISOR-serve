@@ -673,6 +673,97 @@ def test_a_changed_certificate_makes_update_relaunch(tmp_path, monkeypatch, envf
     assert result["tls"]["cert"] == new_cert and result["url"].startswith("https://127.0.0.1:")
 
 
+def _update_world(tmp_path, monkeypatch, envfile):
+    """A live server, a tools checkout, and recorders for what update does to the process."""
+    monkeypatch.setenv("VISOR_STATE_DIR", str(tmp_path / "state"))
+    sadt = tmp_path / "sadt"
+    (sadt / "tools").mkdir(parents=True)
+    os.makedirs(native.state_dir())
+    live = {"pid": os.getpid(), "port": 8000, "tls_sha": None}
+    calls = []
+    monkeypatch.setattr(native, "running_server", lambda: None if "down" in calls else live)
+    monkeypatch.setattr(native.native_tools, "find_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(native.native_tools, "run", lambda *a, **k: {"tools": [], "failed": []})
+    monkeypatch.setattr(ctl, "clone_status", lambda **k: {"is_git_repo": False, "checked_remote": False,
+                                                         "error": None, "dirty": False, "behind": 0})
+    monkeypatch.setattr(native, "cmd_down", lambda c, a: calls.append("down"))
+    # main() imports the backend by name: hand it the module under test.
+    monkeypatch.setitem(sys.modules, "server_ctl_native", native)
+    base = {"url": None, "branch": None, "tools_dir": str(sadt), "force": True, "tool": None,
+            "bind": None, "tls_cert": None, "tls_key": None}
+    return calls, base
+
+
+def _fake_launch(monkeypatch, started):
+    """Only the `bash run-native.sh` launch is faked; `ps` and the rest still run."""
+    real = subprocess.Popen
+
+    def popen(command, *a, **k):
+        if command and command[0] == "bash":
+            started.append(command)
+            return types.SimpleNamespace(pid=os.getpid())
+        return real(command, *a, **k)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+
+def test_update_native_through_the_real_parser_relaunches_without_a_token_argument(tmp_path, monkeypatch, envfile):
+    """The defect measured on the Mac: AttributeError 'token' after the old server was stopped."""
+    calls, _base = _update_world(tmp_path, monkeypatch, envfile)
+    started = []
+    _fake_launch(monkeypatch, started)
+    monkeypatch.setattr(native, "_wait_for_health", lambda *a, **k: True)
+    sadt = str(tmp_path / "sadt")
+    code = ctl.main(["--json", "update", "--native", "--force", "--tools-dir", sadt])
+    assert code == 0 and calls == ["down"] and len(started) == 1
+
+
+def test_update_takes_a_token_like_up_and_keeps_the_existing_one_without(tmp_path, monkeypatch, envfile):
+    parsed = ctl.build_parser().parse_args(["update", "--native", "--token", "abc"])
+    assert parsed.token == "abc"
+    assert ctl.build_parser().parse_args(["update", "--native"]).token is None
+    calls, _base = _update_world(tmp_path, monkeypatch, envfile)
+    _fake_launch(monkeypatch, [])
+    monkeypatch.setattr(native, "_wait_for_health", lambda *a, **k: True)
+    sadt = str(tmp_path / "sadt")
+    assert ctl.main(["update", "--native", "--force", "--tools-dir", sadt, "--token", "from-update"]) == 0
+    assert ctl.read_env()["API_TOKEN"] == "from-update"
+    assert ctl.main(["update", "--native", "--force", "--tools-dir", sadt]) == 0
+    assert ctl.read_env()["API_TOKEN"] == "from-update"
+
+
+def test_update_docker_refuses_a_token_it_would_ignore(monkeypatch):
+    monkeypatch.setattr(ctl, "cmd_update", lambda a: pytest.fail("ran"))
+    assert ctl.main(["update", "--token", "x"]) == 1
+
+
+@pytest.mark.parametrize("what", ["non-loopback bind", "no uv"])
+def test_update_refuses_a_relaunch_that_cannot_happen_before_stopping_the_old_server(
+        tmp_path, monkeypatch, envfile, what):
+    calls, base = _update_world(tmp_path, monkeypatch, envfile)
+    if what == "non-loopback bind":
+        base["bind"] = "0.0.0.0"
+    elif what == "no uv":
+        monkeypatch.setattr(native.native_tools, "find_uv", lambda: None)
+    monkeypatch.setattr(native, "cmd_up", lambda c, a: pytest.fail("started"))
+    with pytest.raises(ctl.ServerCtlError):
+        native.cmd_update(ctl, _args(**base))
+    assert calls == [], "the old server was stopped for a start that was refused"
+
+
+def test_update_says_clearly_when_the_old_server_is_stopped_and_the_new_one_cannot_start(
+        tmp_path, monkeypatch, envfile):
+    calls, base = _update_world(tmp_path, monkeypatch, envfile)
+
+    def boom(c, a):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(native, "cmd_up", boom)
+    with pytest.raises(ctl.ServerCtlError, match=r"old native server was stopped.*disk full.*up --native"):
+        native.cmd_update(ctl, _args(**base))
+    assert calls == ["down"]
+
+
 # ----------------------------------------------------------------------
 # The recipe: dependencies the server insists on, and the staged backbone
 # ----------------------------------------------------------------------
