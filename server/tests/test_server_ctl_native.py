@@ -689,6 +689,9 @@ def _update_world(tmp_path, monkeypatch, envfile):
     monkeypatch.setattr(native, "cmd_down", lambda c, a: calls.append("down"))
     # main() imports the backend by name: hand it the module under test.
     monkeypatch.setitem(sys.modules, "server_ctl_native", native)
+    # ...and main() reaches its own module through sys.modules[__name__], which another
+    # test file loading server_ctl under the same alias may have replaced.
+    monkeypatch.setitem(sys.modules, ctl.__name__, ctl)
     base = {"url": None, "branch": None, "tools_dir": str(sadt), "force": True, "tool": None,
             "bind": None, "tls_cert": None, "tls_key": None}
     return calls, base
