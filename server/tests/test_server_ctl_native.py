@@ -814,3 +814,31 @@ def test_a_reused_pid_with_the_right_words_but_another_start_time_is_not_ours(tm
             os.killpg(ours.pid, signal.SIGKILL)
         except OSError:
             pass
+
+
+@pytest.mark.skipif(shutil.which("ps") is None, reason="needs ps")
+def test_the_serve_py_command_line_run_native_sh_ends_in_is_ours_and_nothing_wider_is(tmp_path, monkeypatch):
+    # The state folder has a space in it on a Mac ("Application Support").
+    monkeypatch.setenv("VISOR_STATE_DIR", str(tmp_path / "Application Support" / "VISOR" / "native"))
+    os.makedirs(native.state_dir())
+    real = f"{native.state_dir()}/api-venv/bin/python serve.py --host 127.0.0.1 --port 18765"
+    ours = _decoy(real, tmp_path)
+    other_venv = _decoy("/usr/bin/python3 serve.py --host 127.0.0.1 --port 18765", tmp_path)
+    other_script = _decoy(f"{native.state_dir()}/api-venv/bin/python other.py --port 18765", tmp_path)
+    other_port = _decoy(f"{native.state_dir()}/api-venv/bin/python serve.py --host 127.0.0.1 --port 187650", tmp_path)
+    try:
+        time.sleep(0.3)
+        _write_pidfile(ours.pid, proc_start=native.process_start_time(ours.pid))
+        assert native.running_server() is not None
+        for decoy in (other_venv, other_script, other_port):
+            _write_pidfile(decoy.pid)
+            assert native.running_server() is None, "recognised a process that is not this instance's server"
+            native.cmd_down(ctl, _args())
+            assert decoy.poll() is None, "down killed a foreign process"
+        _write_pidfile(ours.pid)
+        assert native.cmd_down(ctl, _args())["was_running"] is True
+        ours.wait(timeout=10)
+    finally:
+        for proc in (ours, other_venv, other_script, other_port):
+            proc.kill()
+            proc.wait()

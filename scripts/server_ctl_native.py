@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import ssl
@@ -140,10 +141,24 @@ def process_start_time(pid: int):
     return " ".join(out.split()) or None
 
 
+def _is_serve_py_command(command: str) -> bool:
+    """The line run-native.sh ends in: `<state>/api-venv/bin/python serve.py --host H --port P`.
+
+    The interpreter must be THIS instance's API venv (a prefix match, since the
+    macOS state folder has a space in it), and `serve.py` must be one of the
+    words after it. Any other python running any other serve.py is not ours.
+    """
+    interpreter = os.path.join(state_dir(), "api-venv", "bin", "python")
+    if not command.startswith(interpreter):
+        return False
+    return re.search(r"(^|\s)serve\.py(\s|$)", command[len(interpreter):]) is not None
+
+
 def _looks_like_our_server(pid: int, info=None) -> bool:
     """Is `pid` the server of THIS instance, and not a process that reused the number?
 
-    The command line must be uvicorn `main:app` (or the `run-native.sh` of this
+    The command line must be `serve.py` run by this instance's API venv (or the older
+    uvicorn `main:app`, or the `run-native.sh` of this
     checkout, before its `exec`) AND name this instance: its state folder (the
     API venv lives there) and its port. When the pidfile recorded the start time,
     it must match too. A second VISOR server, a dev uvicorn or a shell that merely
@@ -160,14 +175,14 @@ def _looks_like_our_server(pid: int, info=None) -> bool:
     if command is None:
         return False
     script = os.path.join(_HERE, "run-native.sh")
-    exec_form = "uvicorn" in command and "main:app" in command
+    exec_form = ("uvicorn" in command and "main:app" in command) or _is_serve_py_command(command)
     if not exec_form and not (script in command and command.lstrip().startswith(("bash ", "/bin/bash ", "/usr/bin/bash "))):
         return False
     if exec_form:
         if state_dir() not in command:
             return False
         port = info.get("port")
-        if isinstance(port, int) and f"--port {port}" not in command:
+        if isinstance(port, int) and not re.search(rf"--port {port}(\s|$)", command):
             return False
     recorded = info.get("proc_start")
     return not recorded or process_start_time(pid) == recorded
