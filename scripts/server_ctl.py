@@ -35,6 +35,7 @@ import os
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -327,10 +328,18 @@ def write_env(updates: dict, path=ENV_PATH) -> None:
         for key, value in remaining.items():
             output.append(f"{key}={value}")
 
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write("\n".join(output).rstrip("\n") + "\n")
-    # The API token is in here. Owner-only, best effort: a filesystem without
-    # POSIX modes (a Windows bind mount) simply ignores it.
+    # The API token is in here. The file is created owner-only (mode 0600 passed
+    # to open(2), so there is no moment at the umask's 0644); an existing file is
+    # tightened before the token is written into it. A filesystem without POSIX
+    # modes (a Windows bind mount) simply ignores the mode.
+    text = "\n".join(output).rstrip("\n") + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        try:
+            os.fchmod(handle.fileno(), 0o600)
+        except (OSError, AttributeError):
+            pass
+        handle.write(text)
     try:
         os.chmod(path, 0o600)
     except OSError:
@@ -619,11 +628,17 @@ def port_in_use(port: int = DEFAULT_PORT, host: str = "127.0.0.1") -> bool:
         return False
 
 
-def health(url=None, timeout: float = 5.0) -> bool:
-    """GET /health. Never raises - an unreachable server just means "not up"."""
+def health(url=None, timeout: float = 5.0, cafile=None) -> bool:
+    """GET /health. Never raises - an unreachable server just means "not up".
+
+    `cafile` is the native backend's local TLS certificate: https is then
+    verified against that one file and nothing else (no system store, no
+    `verify=False`). Without it the call is what it always was.
+    """
     url = url or url_for()
     try:
-        with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as response:
+        context = ssl.create_default_context(cafile=cafile) if cafile else None
+        with urllib.request.urlopen(f"{url.rstrip('/')}/health", timeout=timeout, context=context) as response:
             if response.status != 200:
                 return False
             return json.loads(response.read().decode("utf-8")).get("status") == "ok"
@@ -1491,6 +1506,20 @@ def _print_catalog(data: dict) -> None:
               f"{_human(tool['size']):>10} total, {_human(tool['missing_size']):>10} to fetch")
 
 
+def _add_tls_arguments(sub) -> None:
+    sub.add_argument(
+        "--tls-cert", default=None,
+        help="Native backend: serve https with this PEM certificate (with --tls-key; loopback only). "
+             "Remembered in .env.")
+    sub.add_argument(
+        "--tls-key", default=None,
+        help="Native backend: the private key for --tls-cert. Must be owner-only (0600). "
+             "Remembered in .env as a path; its content is never read into a log.")
+    sub.add_argument(
+        "--no-tls", action="store_true",
+        help="Native backend: forget the remembered certificate and serve plain http again.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Start, update and provision this inference server.",
@@ -1500,6 +1529,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_common(sub, with_url=True):
+        sub.add_argument(
+            "--native", action="store_true",
+            help="Run the server as a plain process on this machine instead of in Docker "
+                 "(scripts/server_ctl_native.py). The default on macOS, where a container "
+                 "cannot reach the GPU. $VISOR_BACKEND=native|docker does the same.",
+        )
+        sub.add_argument(
+            "--tools-dir", default=None,
+            help="Native backend: the SADT-VISOR checkout to serve. Default: $SADT_TOOLS, "
+                 "then .env, then ../SADT-VISOR. Remembered in .env by `up`.",
+        )
         sub.add_argument(
             "--device", choices=("auto", "gpu", "cpu"), default="auto",
             help="Which compose service to drive. Default: gpu when docker can reach a card, "
@@ -1544,6 +1584,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     up.add_argument("--force-recreate", action="store_true", help="Recreate the container from scratch.")
     up.add_argument("--no-wait", dest="wait", action="store_false", help="Return without waiting for /health.")
+    _add_tls_arguments(up)
     up.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
     up.set_defaults(func=cmd_up, printer=None)
 
@@ -1554,6 +1595,8 @@ def build_parser() -> argparse.ArgumentParser:
     # quietly reimpose loopback. See ensure_env.
     update.add_argument("--bind", default=None, help="See 'up --bind'.")
     update.add_argument("--force", action="store_true", help="Recreate even when nothing changed.")
+    _add_tls_arguments(update)
+    update.add_argument("--tool", action="append", help="Native backend: only rebuild this tool's venv.")
     update.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
     update.set_defaults(func=cmd_update, printer=None)
 
@@ -1594,6 +1637,16 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("-n", "--lines", type=int, default=100)
     logs.set_defaults(func=cmd_logs, printer=None)
 
+    install = subparsers.add_parser(
+        "install-tools",
+        help="Native backend: build the tools' virtualenvs (the Mac recipe in native_tools.py).",
+    )
+    add_common(install, with_url=False)
+    install.add_argument("--tool", action="append", help="Only this tool (repeatable). Default: all.")
+    install.add_argument("--dry-run", action="store_true", help="Print the plan, install nothing.")
+    install.add_argument("--force", action="store_true", help="Rebuild even when a venv is current.")
+    install.set_defaults(func=None, printer=None, native=True)
+
     cat = subparsers.add_parser("catalog", help="Per tool: manifest size, and how much is already on disk.")
     cat.set_defaults(func=cmd_catalog, printer=_print_catalog)
 
@@ -1604,6 +1657,23 @@ def build_parser() -> argparse.ArgumentParser:
     models.set_defaults(func=cmd_models, printer=None)
 
     return parser
+
+
+_NATIVE_COMMANDS = ("status", "up", "update", "watch", "down", "logs", "install-tools")
+
+
+def _wants_native(args) -> bool:
+    """Native when asked (--native, $VISOR_BACKEND), or on macOS, where Docker cannot reach the GPU.
+
+    Linux and Windows keep Docker as the default: nothing here changes for them
+    unless someone passes the flag.
+    """
+    if getattr(args, "native", False):
+        return True
+    backend = os.environ.get("VISOR_BACKEND", "").lower()
+    if backend in ("native", "docker"):
+        return backend == "native"
+    return sys.platform == "darwin"
 
 
 def main(argv=None) -> int:
@@ -1617,6 +1687,23 @@ def main(argv=None) -> int:
             setattr(args, name, default)
     if getattr(args, "device", "auto") == "auto":
         args.device = None
+
+    # The native backend (no Docker) takes over a command only when asked, or on
+    # a Mac. Everything above and below this block is the Docker path, untouched,
+    # and a Docker deployment never imports the native modules.
+    if args.command in _NATIVE_COMMANDS and _wants_native(args):
+        if args.command == "watch":
+            log("error: 'watch' follows a Docker deployment; the native backend has no equivalent yet. "
+                "Use 'update --native' from a timer instead.")
+            return 1
+        import server_ctl_native  # noqa: PLC0415 - see above
+        handler = server_ctl_native.HANDLERS[args.command]
+        args.func = lambda a, _fn=handler[0]: _fn(sys.modules[__name__], a)
+        args.printer = handler[1]
+    elif getattr(args, "tls_cert", None) or getattr(args, "tls_key", None) or getattr(args, "no_tls", False):
+        log("error: --tls-cert/--tls-key/--no-tls belong to the native backend (add --native). "
+            "The Docker deployment serves plain http.")
+        return 1
 
     try:
         result = args.func(args)

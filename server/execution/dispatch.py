@@ -38,7 +38,7 @@ from typing import Any, Optional
 
 import file_utils
 import resources
-from execution import admission, concurrency, costs
+from execution import admission, concurrency, costs, mps_slot
 from base import ToolUnavailableError
 from config import settings
 from registry.deployment import deployment_config
@@ -252,6 +252,27 @@ def _log_grant(tool_name: str, cpus) -> None:
     if cpus and int(cpus) > int(share):
         logger.info("tool=%s granted %s cores (declared share %s; machine was idle)",
                     tool_name, int(cpus), int(share))
+
+
+@contextlib.contextmanager
+def _mps_exclusive(tool, params: dict, run_id: Optional[str]):
+    """The single Apple-GPU slot, for a run on `mps`; a no-op for every other run.
+
+    Taken BEFORE `_admitted`, so a second MPS run waits here and never holds
+    cores and memory in the budget while it does. See `execution/mps_slot.py`.
+    """
+    if not mps_slot.runs_on_mps(tool, params):
+        yield
+        return
+    cancelled = (lambda: bool(run_id) and runs.is_cancelled(run_id))
+    try:
+        with mps_slot.slot().hold(
+            is_cancelled=cancelled,
+            on_wait=lambda: runs.append(run_id, runs.PHASE_QUEUED_GPU),
+        ):
+            yield
+    except mps_slot.Cancelled as exc:
+        raise RunCancelled(str(exc))
 
 
 @contextlib.contextmanager
@@ -1169,7 +1190,8 @@ def dispatch(tool, params: dict, job_id: Optional[str] = None,
             ]
             exit_code = None
             try:
-                with _admitted(candidates, run_id) as grant:
+                with _mps_exclusive(tool, params, run_id), \
+                        _admitted(candidates, run_id) as grant:
                     cpu_grant, channels = grant
                     _raise_if_cancelled(run_id)
                     # Applied HERE rather than when the environment was built,

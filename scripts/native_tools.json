@@ -1,0 +1,58 @@
+{
+  "_comment": "Mac install recipe for the SADT tool venvs (see native_tools.py). Read by server_ctl.py update --native. Nothing here changes a tool's pyproject.toml or uv.lock: the Linux deployment keeps resolving from them untouched.",
+  "version": 1,
+  "indexes": {
+    "pytorch3d": "https://ImageMindAnalytics.github.io/pytorch3d-wheels/simple/",
+    "llama_cpp_metal": "https://abetlen.github.io/llama-cpp-python/whl/metal"
+  },
+  "default_torch": {"torch": "2.14.1", "torchvision": "0.29.1"},
+  "torch_by_tool": {
+    "_comment": "Tools not listed here and holding no torch in their lock get none. Tools whose lock holds torch and that are not listed get default_torch.",
+    "AMASSS": {"torch": "2.14.1"},
+    "Batch_Dental_Seg": {"torch": "2.14.1"},
+    "ALI_CBCT": {"torch": "2.14.1", "_why": "ALI_CBCT asks for >= 2.9 on MPS; on 2.8.0 the DenseNet needs the CPU fallback and runs 64 ms/step on MPS against 35 on CPU, on 2.14.1 15 ms."},
+    "AREG_CBCT": {"torch": "2.14.1"},
+    "CLIC": {"torch": "2.14.1", "torchvision": "0.29.1"},
+    "FlexReg": {"torch": "2.8.0", "_why": "CPU only (cuda() hard-coded). Kept on the locked version."}
+  },
+  "pytorch3d": {
+    "_why": "No MPS kernel exists. The only macOS arm64 binary on the index our pyprojects already use is a CPU universal2 wheel built against torch 2.8.0, so a tool that imports pytorch3d is held to torch 2.8.0 and torchvision 0.23.0. Building it from source against 2.14.1 is the alternative (see the report).",
+    "version": "0.7.9+pt280cpu",
+    "requires": {"torch": "2.8.0", "torchvision": "0.23.0"}
+  },
+  "pip_check_ignore": {
+    "_comment": "Requirements that cannot be met on macOS and that the tool does not need at run time. uv pip check lists them; they are reported but do not fail the build.",
+    "requires": ["triton"]
+  },
+  "extra_by_tool": {
+    "_comment": "Packages the Mac recipe adds on top of the lock.",
+    "ALI_IOS": ["embreex==4.4.0.post1"],
+    "AREG_IOS": ["embreex==4.4.0.post1"],
+    "Crown_Seg": ["embreex==4.4.0.post1"],
+    "DOCShapeAXI": ["embreex==4.4.0.post1"]
+  },
+  "metal_llama_cpp": {
+    "tools": ["CNE"],
+    "requirement": "llama-cpp-python==0.3.35"
+  },
+  "serve_requires": {
+    "_comment": "The server refuses to start a tool whose supervisor calls name a tool it does not serve (UnknownSupervisedCall: AREG_IOS calls ASO, ASO calls ALI_CBCT; measured on the Mac, phase 2). install-tools adds these, transitively, whenever the left-hand tool is asked for.",
+    "AREG_IOS": ["ASO"],
+    "ASO": ["ALI_CBCT"]
+  },
+  "backbones": {
+    "_comment": "Files a tool needs in the torch hub cache and refuses to download mid-request (patient data). Staged under <state>/torch_home/hub/checkpoints, which run-native.sh exports as TORCH_HOME. The sha256 is the full digest of the published file (its first 8 digits are the 355c32eb in the name); the file is checked after download and before it is put in place.",
+    "DOCShapeAXI": {
+      "file": "efficientnet-b0-355c32eb.pth",
+      "url": "https://github.com/lukemelas/EfficientNet-PyTorch/releases/download/1.0/efficientnet-b0-355c32eb.pth",
+      "sha256": "355c32ebf5c7b2e19ed8f926daea5b6d71c8744a49aab3148fc90775fbaac5a3",
+      "size": 21388428
+    }
+  },
+  "drop_from_lock": {
+    "_comment": "Locked requirements that name a CUDA build or exist only for CUDA. Dropped from the export; a Linux marker would have skipped most of them anyway, this makes it explicit.",
+    "names": ["torch", "torchvision", "torchaudio", "triton", "pytorch3d", "llama-cpp-python"],
+    "prefixes": ["nvidia-", "cuda-"],
+    "version_contains": ["+cu"]
+  }
+}

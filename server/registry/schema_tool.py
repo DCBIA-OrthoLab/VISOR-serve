@@ -38,10 +38,12 @@ import json
 import logging
 import os
 import subprocess
+import sys
 from typing import Any
 
 from base import (
     CHOICE_TYPE,
+    DEVICE_ARGUMENT,
     LIST_TYPE,
     MULTICHOICE_TYPE,
     PATH_TYPE,
@@ -816,6 +818,14 @@ class SchemaTool(Tool):
         IMPORTED is executed, and this one was never imported. There is no
         in-process path to fall back to.
         """
+        # Same rule as Tool.invoke (base.py): a caller who names no device gets the
+        # server's DEVICE, not the tool's declared default (`cuda`), which on a Mac
+        # silently ran the tool on the CPU and kept it out of the MPS slot. Applied
+        # on macOS only, so a Linux or Docker deployment behaves exactly as before.
+        if sys.platform == "darwin" and DEVICE_ARGUMENT in self.arguments and DEVICE_ARGUMENT not in args:
+            from config import settings as _settings
+            if _settings.DEVICE:
+                args = {**args, DEVICE_ARGUMENT: _settings.DEVICE}
         cleaned = self.validate(args)
         from execution.dispatch import dispatch
 
