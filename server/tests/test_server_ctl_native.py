@@ -765,6 +765,168 @@ def test_update_says_clearly_when_the_old_server_is_stopped_and_the_new_one_cann
 
 
 # ----------------------------------------------------------------------
+# Putting the managed tools clone on the requested branch
+# ----------------------------------------------------------------------
+
+def _git(cwd, *argv):
+    env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+               GIT_COMMITTER_EMAIL="t@t", GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+    done = subprocess.run(["git", "-C", str(cwd)] + list(argv), capture_output=True, text=True, env=env)
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip()
+
+
+def _commit(repo, name, text="x"):
+    (pathlib.Path(repo) / name).write_text(text)
+    _git(repo, "add", name)
+    _git(repo, "commit", "-q", "-m", name)
+
+
+@pytest.fixture
+def tools_remote(tmp_path):
+    """origin with main and feat/x; a clone of it at tmp/clone (the managed checkout, on main)."""
+    if not shutil.which("git"):
+        pytest.skip("git is not installed")
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "main")
+    _commit(seed, "a")
+    _git(seed, "checkout", "-q", "-b", "feat/x")
+    _commit(seed, "b")
+    _git(seed, "checkout", "-q", "main")
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(seed), str(origin)], check=True)
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
+    (clone / "tools").mkdir()
+    return types.SimpleNamespace(seed=seed, origin=origin, clone=clone)
+
+
+def _switch(repo, branch, url=None):
+    return native.switch_tools_branch(ctl, str(repo.clone), branch, url)
+
+
+def _branch(repo):
+    return _git(repo.clone, "rev-parse", "--abbrev-ref", "HEAD")
+
+
+def test_the_tools_clone_is_switched_to_the_requested_branch_and_tracks_it(tools_remote):
+    assert _branch(tools_remote) == "main"
+    assert _switch(tools_remote, "feat/x") is True
+    assert _branch(tools_remote) == "feat/x"
+    assert _git(tools_remote.clone, "rev-parse", "--abbrev-ref", "@{u}") == "origin/feat/x"
+    assert (tools_remote.clone / "b").exists()
+    assert _switch(tools_remote, "feat/x") is False  # already there
+    _git(tools_remote.clone, "rev-parse", "--verify", "main")  # the branch left is kept
+
+
+def test_a_branch_that_moved_upstream_is_fast_forwarded(tools_remote):
+    _switch(tools_remote, "feat/x")
+    _git(tools_remote.seed, "checkout", "-q", "feat/x")
+    _commit(tools_remote.seed, "c")
+    _git(tools_remote.seed, "push", "-q", str(tools_remote.origin), "feat/x")
+    assert _switch(tools_remote, "feat/x") is True
+    assert (tools_remote.clone / "c").exists()
+
+
+def test_a_dirty_tree_is_never_switched(tools_remote):
+    (tools_remote.clone / "a").write_text("edited")
+    with pytest.raises(ctl.ServerCtlError, match="uncommitted"):
+        _switch(tools_remote, "feat/x")
+    assert _branch(tools_remote) == "main" and (tools_remote.clone / "a").read_text() == "edited"
+
+
+def test_a_local_branch_with_commits_the_remote_lacks_is_not_touched(tools_remote):
+    _git(tools_remote.clone, "switch", "-q", "-c", "feat/x", "origin/main")
+    _commit(tools_remote.clone, "mine")
+    local = _git(tools_remote.clone, "rev-parse", "HEAD")
+    _git(tools_remote.clone, "switch", "-q", "main")
+    with pytest.raises(ctl.ServerCtlError, match="commits that .* lacks"):
+        _switch(tools_remote, "feat/x")
+    assert _branch(tools_remote) == "main"
+    assert _git(tools_remote.clone, "rev-parse", "feat/x") == local
+    # Already on it and diverged: refused too.
+    _git(tools_remote.clone, "switch", "-q", "feat/x")
+    with pytest.raises(ctl.ServerCtlError, match="diverged"):
+        _switch(tools_remote, "feat/x")
+
+
+def test_a_branch_missing_at_the_remote_is_refused_and_nothing_moves(tools_remote):
+    with pytest.raises(ctl.ServerCtlError, match="could not fetch|does not exist"):
+        _switch(tools_remote, "feat/nope")
+    assert _branch(tools_remote) == "main"
+
+
+def test_a_detached_head_holding_commits_no_branch_has_is_not_left(tools_remote):
+    _git(tools_remote.clone, "switch", "-q", "--detach")
+    _commit(tools_remote.clone, "orphan")
+    with pytest.raises(ctl.ServerCtlError, match="detached HEAD"):
+        _switch(tools_remote, "feat/x")
+
+
+def test_a_checkout_nested_in_another_repository_is_never_switched(tools_remote, tmp_path):
+    nested = tools_remote.clone / "inner"
+    nested.mkdir()
+    with pytest.raises(ctl.ServerCtlError, match="not the top folder"):
+        native.switch_tools_branch(ctl, str(nested), "feat/x")
+    assert _branch(tools_remote) == "main"
+
+
+@pytest.mark.parametrize("branch,url", [("-x", None), ("a..b", None), ("main", "ext::sh -c id"),
+                                        ("main", "-oProxyCommand=id"), ("main", "file:///etc"),
+                                        ("main", "/some/local/path")])
+def test_unusable_branch_names_and_urls_are_refused_before_any_git_call(tools_remote, monkeypatch, branch, url):
+    real = ctl._capture
+
+    def only_the_name_check(command, **kwargs):
+        if command[3] != "check-ref-format":
+            pytest.fail("git ran: %r" % (command,))
+        return real(command, **kwargs)
+
+    monkeypatch.setattr(ctl, "_capture", only_the_name_check)
+    with pytest.raises(ctl.ServerCtlError):
+        _switch(tools_remote, branch, url)
+
+
+def test_another_repository_is_fetched_into_its_own_ref_and_origin_is_left_alone(tools_remote, tmp_path, monkeypatch):
+    other = tmp_path / "other.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(tools_remote.seed), str(other)], check=True)
+    _git(tools_remote.seed, "checkout", "-q", "-b", "only-there")
+    _commit(tools_remote.seed, "z")
+    _git(tools_remote.seed, "push", "-q", str(other), "only-there")
+    monkeypatch.setattr(native, "_URL_PREFIXES", ("/",))  # a local path stands in for https in the test
+    before = _git(tools_remote.clone, "remote", "get-url", "origin")
+    assert _switch(tools_remote, "only-there", str(other)) is True
+    assert _branch(tools_remote) == "only-there" and (tools_remote.clone / "z").exists()
+    assert _git(tools_remote.clone, "remote", "get-url", "origin") == before
+    done = subprocess.run(["git", "-C", str(tools_remote.clone), "config", "--get", "branch.only-there.remote"],
+                          capture_output=True, text=True)
+    assert done.stdout.strip() == "", "a branch from another URL must not track origin"
+
+
+def test_update_refuses_a_tools_url_without_a_branch_and_a_switch_before_stopping_the_old_server(
+        tmp_path, monkeypatch, envfile, tools_remote):
+    calls, base = _update_world(tmp_path, monkeypatch, envfile)
+    base["tools_dir"] = str(tools_remote.clone)
+    monkeypatch.setattr(native, "cmd_up", lambda c, a: pytest.fail("started"))
+    with pytest.raises(ctl.ServerCtlError, match="needs --tools-branch"):
+        native.cmd_update(ctl, _args(tools_url="https://example.org/x.git", tools_branch=None, **base))
+    (tools_remote.clone / "a").write_text("edited")
+    with pytest.raises(ctl.ServerCtlError, match="uncommitted"):
+        native.cmd_update(ctl, _args(tools_url=None, tools_branch="feat/x", **base))
+    assert calls == []
+
+
+def test_update_switches_the_tools_clone_then_goes_on(tmp_path, monkeypatch, envfile, tools_remote):
+    calls, base = _update_world(tmp_path, monkeypatch, envfile)
+    base["tools_dir"] = str(tools_remote.clone)
+    monkeypatch.setattr(native, "cmd_up", lambda c, a: calls.append("up") or {"healthy": True})
+    result = native.cmd_update(ctl, _args(tools_url=None, tools_branch="feat/x", **base))
+    assert result["tools_switched"] is True and _branch(tools_remote) == "feat/x"
+    assert calls == ["down", "up"]
+
+
+# ----------------------------------------------------------------------
 # The recipe: dependencies the server insists on, and the staged backbone
 # ----------------------------------------------------------------------
 

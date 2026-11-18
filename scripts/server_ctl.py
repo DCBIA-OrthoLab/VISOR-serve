@@ -2095,6 +2095,13 @@ def build_parser() -> argparse.ArgumentParser:
     # quietly reimpose loopback. See ensure_env.
     update.add_argument("--bind", default=None, help="See 'up --bind'.")
     update.add_argument("--token", help="Native backend: see 'up --token'.")
+    update.add_argument(
+        "--tools-branch", default=None,
+        help="Native backend: put the tools checkout (--tools-dir) on this branch before building. "
+             "Refused, with nothing changed, if that would lose work. Default: leave it on its branch.")
+    update.add_argument(
+        "--tools-url", default=None,
+        help="Native backend: fetch --tools-branch from this repository instead of origin.")
     update.add_argument("--force", action="store_true", help="Recreate even when nothing changed.")
     _add_tls_arguments(update)
     update.add_argument("--tool", action="append", help="Native backend: only rebuild this tool's venv.")
@@ -2222,8 +2229,8 @@ def main(argv=None) -> int:
         handler = server_ctl_native.HANDLERS[args.command]
         args.func = lambda a, _fn=handler[0]: _fn(sys.modules[__name__], a)
         args.printer = handler[1]
-    elif args.command == "update" and getattr(args, "token", None):
-        log("error: update --token belongs to the native backend (add --native).")
+    elif args.command == "update" and any(getattr(args, name, None) for name in ("token", "tools_branch", "tools_url")):
+        log("error: update --token/--tools-branch/--tools-url belong to the native backend (add --native).")
         return 1
     elif getattr(args, "tls_cert", None) or getattr(args, "tls_key", None):
         log("error: --tls-cert/--tls-key belong to the native backend (add --native). "

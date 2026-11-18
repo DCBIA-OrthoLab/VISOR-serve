@@ -667,7 +667,15 @@ def cmd_update(ctl, args) -> dict:
     root = sadt_root(ctl, args)
     if not os.path.isdir(os.path.join(root, "tools")):
         raise ctl.ServerCtlError(f"No SADT-VISOR checkout at {root}. Pass --tools-dir PATH.")
-    if os.path.isdir(os.path.join(root, ".git")) or os.path.isfile(os.path.join(root, ".git")):
+    is_checkout = os.path.isdir(os.path.join(root, ".git")) or os.path.isfile(os.path.join(root, ".git"))
+    wanted_branch, wanted_url = getattr(args, "tools_branch", None), getattr(args, "tools_url", None)
+    if wanted_url and not wanted_branch:
+        raise ctl.ServerCtlError("--tools-url needs --tools-branch: say which branch of that repository to serve.")
+    if wanted_branch and not is_checkout:
+        raise ctl.ServerCtlError(f"--tools-branch was given but {root} is not a git checkout: nothing to switch.")
+    if is_checkout:
+        if wanted_branch:
+            result["tools_switched"] = switch_tools_branch(ctl, root, wanted_branch, wanted_url)
         result["tools_pulled"] = _pull_tools(ctl, root)
 
     ctl.write_env({"SADT_TOOLS": root})
@@ -700,6 +708,95 @@ def cmd_update(ctl, args) -> dict:
     elif live:
         result["healthy"] = _health(ctl, url, tls)
     return result
+
+
+_URL_PREFIXES = ("https://", "ssh://", "git@")
+
+
+def switch_tools_branch(ctl, root: str, branch: str, url=None) -> bool:
+    """Put the managed tools clone `root` on `branch` of `url` (origin when None). True if HEAD moved.
+
+    Refuses, with nothing changed, rather than lose anything: a dirty tree, a
+    detached HEAD whose commits no branch holds, a local branch of that name
+    that has commits the remote one lacks (or that has diverged), a branch that
+    does not exist at that URL. Only ever runs git inside `root`, and refuses
+    when `root` is not the top of its own repository (so a checkout nested in
+    another project is never switched). The branch we leave keeps its commits.
+    """
+    def git(*arguments, timeout=300):
+        return ctl._capture(["git", "-C", root] + list(arguments), timeout=timeout)
+
+    def refuse(message):
+        raise ctl.ServerCtlError(f"Tools checkout {root}: {message}")
+
+    if not branch or branch.startswith("-") or git("check-ref-format", "--branch", branch)[0] != 0:
+        refuse(f"{branch!r} is not a usable branch name.")
+    if url is not None and (not url.startswith(_URL_PREFIXES) or "::" in url):
+        refuse(f"{url!r} is not an https://, ssh:// or git@ repository address.")
+    rc, top, _err = git("rev-parse", "--show-toplevel")
+    if rc != 0 or os.path.realpath(top) != os.path.realpath(root):
+        refuse("it is not the top folder of its own git repository; leaving it alone.")
+
+    rc, origin_url, _err = git("remote", "get-url", "origin")
+    from_origin = url is None or (rc == 0 and url.rstrip("/").removesuffix(".git") == origin_url.rstrip("/").removesuffix(".git"))
+    if from_origin:
+        source, target = "origin", f"refs/remotes/origin/{branch}"
+        fetch = ["fetch", "--quiet", "origin", f"+refs/heads/{branch}:{target}"]
+    else:
+        source, target = url, f"refs/remotes/visor-requested/{branch}"
+        fetch = ["fetch", "--quiet", "--", url, f"+refs/heads/{branch}:{target}"]
+    rc, _out, err = git(*fetch)
+    if rc != 0:
+        refuse(f"could not fetch branch {branch!r} from {source}: {err or 'git refused'}.")
+    rc, want, _err = git("rev-parse", "--verify", "--quiet", target + "^{commit}")
+    if rc != 0:
+        refuse(f"branch {branch!r} does not exist at {source}.")
+
+    def is_ancestor(older, newer):
+        return git("merge-base", "--is-ancestor", older, newer)[0] == 0
+
+    _rc, current, _err = git("rev-parse", "--abbrev-ref", "HEAD")
+    _rc, head, _err = git("rev-parse", "HEAD")
+    dirty = bool(git("status", "--porcelain")[1])
+
+    if current == branch:
+        if head == want or is_ancestor(want, head):
+            ctl.log(f"The tools checkout is on '{branch}' already, at or ahead of {source}.")
+            return False
+        if not is_ancestor(head, want):
+            refuse(f"'{branch}' has diverged from {source}: it has commits the remote branch lacks. "
+                   f"Merge or rebase it by hand.")
+        if dirty:
+            refuse(f"'{branch}' is behind {source} but the tree has uncommitted changes. Commit or discard them.")
+        if git("merge", "--ff-only", want)[0] != 0:
+            refuse("the fast-forward failed.")
+        ctl.log(f"Fast-forwarded the tools checkout's '{branch}' to {want[:9]}.")
+        return True
+
+    if dirty:
+        refuse(f"it is on '{current}' and '{branch}' was asked for, but the tree has uncommitted "
+               f"changes. Commit or discard them, then update again.")
+    if current == "HEAD" and not git("for-each-ref", "--contains", "HEAD", "refs/heads", "refs/remotes", "refs/tags")[1]:
+        refuse("it is on a detached HEAD whose commits no branch holds: switching would lose them. "
+               "Create a branch there first.")
+    ctl.log(f"Switching the tools checkout from '{current}' to '{branch}' ({source})...")
+    if git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}")[0] == 0:
+        _rc, local, _err = git("rev-parse", f"refs/heads/{branch}")
+        if local != want and not is_ancestor(local, want):
+            refuse(f"the local branch '{branch}' has commits that {source} lacks (or has diverged): "
+                   f"not touching it. Merge or rebase it by hand.")
+        rc, _out, err = git("switch", branch)
+        if rc != 0:
+            refuse(f"git switch refused: {err}")
+        if local != want and git("merge", "--ff-only", want)[0] != 0:
+            refuse("the fast-forward failed.")
+    else:
+        command = ["switch", "-c", branch, "--track", target] if from_origin else \
+                  ["switch", "-c", branch, "--no-track", target]
+        rc, _out, err = git(*command)
+        if rc != 0:
+            refuse(f"git switch refused: {err}")
+    return True
 
 
 def _pull_tools(ctl, root: str) -> bool:
