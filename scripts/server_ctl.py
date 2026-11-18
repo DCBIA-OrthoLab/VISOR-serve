@@ -30,8 +30,10 @@ Two conventions the GUI depends on:
 
 import argparse
 import getpass
+import http.client
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -428,6 +430,57 @@ def pinned_context(cafile: str) -> ssl.SSLContext:
     return context
 
 
+def _pem_certificates(cafile: str) -> list:
+    """The DER bytes of every certificate in a PEM file (the pinned file holds one)."""
+    with open(cafile, encoding="ascii", errors="replace") as handle:
+        text = handle.read()
+    found = []
+    for block in re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", text, re.S):
+        found.append(ssl.PEM_cert_to_DER_cert(block))
+    return found
+
+
+def pinned_get(url: str, timeout: float, cafile: str):
+    """`(status, body)` of a GET to this server's own loopback URL, pinned on `cafile`.
+
+    With `ssl.VERIFY_X509_PARTIAL_CHAIN` (OpenSSL 1.1+/3, so every current
+    Python) this is plain verification against that file: `pinned_context`.
+
+    Without it (macOS's /usr/bin/python3 is 3.9 on LibreSSL, and a self-signed
+    leaf cannot be a trust anchor there) the chain check cannot be asked for,
+    so the pin is made exact instead: ONE connection, whose handshake proves
+    the server holds the key of the certificate it presents (that is TLS, with
+    or without a chain check), and the presented certificate must be
+    byte-for-byte one the pinned file holds. A certificate that is merely valid,
+    or issued by anyone, is refused. Only the validity dates go unchecked, and
+    the certificate is the operator's own file on this machine.
+    """
+    if getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0):
+        with urllib.request.urlopen(  # nosec B310 - this server's own loopback URL
+                url, timeout=timeout, context=pinned_context(cafile)) as response:
+            return response.status, response.read()
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("pinned_get speaks https only")
+    pinned = _pem_certificates(cafile)
+    if not pinned:
+        raise ValueError("the pinned file holds no certificate")
+    # No chain to verify (see above): the comparison below is the verification.
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=timeout, context=context)
+    try:
+        connection.connect()
+        if connection.sock.getpeercert(binary_form=True) not in pinned:
+            raise ssl.SSLError("the server's certificate is not the pinned one")
+        connection.request("GET", (parsed.path or "/") + ("?" + parsed.query if parsed.query else ""))
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
 def server_urlopen(target, timeout: float):
     """`urllib.request.urlopen` for this server: HTTPS, verified (tls_context)."""
     url = target.full_url if isinstance(target, urllib.request.Request) else target
@@ -708,11 +761,9 @@ def health(url=None, timeout: float = 5.0, cafile=None) -> bool:
         target = f"{url.rstrip('/')}/health"
         if cafile:
             # Native backend: the pinned local certificate, nothing else.
-            opened = urllib.request.urlopen(  # nosec B310 - this server's own loopback URL
-                target, timeout=timeout, context=pinned_context(cafile))
-        else:
-            opened = server_urlopen(target, timeout=timeout)
-        with opened as response:
+            status, body = pinned_get(target, timeout, cafile)
+            return status == 200 and json.loads(body.decode("utf-8")).get("status") == "ok"
+        with server_urlopen(target, timeout=timeout) as response:
             if response.status != 200:
                 return False
             return json.loads(response.read().decode("utf-8")).get("status") == "ok"

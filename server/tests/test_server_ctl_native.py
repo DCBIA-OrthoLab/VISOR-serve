@@ -842,3 +842,72 @@ def test_the_serve_py_command_line_run_native_sh_ends_in_is_ours_and_nothing_wid
         for proc in (ours, other_venv, other_script, other_port):
             proc.kill()
             proc.wait()
+
+
+# ----------------------------------------------------------------------
+# The health probe on a TLS stack without VERIFY_X509_PARTIAL_CHAIN (macOS /usr/bin/python3)
+# ----------------------------------------------------------------------
+
+def _stack_without_the_flag(monkeypatch):
+    """LibreSSL 2.8 (macOS /usr/bin/python3): no flag, and a pinned self-signed leaf anchors no chain.
+
+    OpenSSL 3 would accept that leaf on its own, so the second half is simulated: a
+    context built from a cafile on that stack trusts nothing it was handed.
+    """
+    import ssl as _ssl
+
+    monkeypatch.delattr(_ssl, "VERIFY_X509_PARTIAL_CHAIN", raising=False)
+    monkeypatch.setattr(ctl, "pinned_context", lambda cafile: _ssl.create_default_context(cafile=os.devnull))
+
+
+def _https_health_server(cert, key):
+    import http.server
+    import ssl as _ssl
+    import threading
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            body = b'{"status": "ok"}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    context = _ssl.SSLContext(_ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, "https://127.0.0.1:%d" % server.server_address[1]
+
+
+@pytest.mark.parametrize("flag", [True, False], ids=["with-partial-chain", "without-partial-chain"])
+def test_the_probe_accepts_the_pinned_certificate_and_refuses_any_other(tmp_path, monkeypatch, flag):
+    import ssl as _ssl
+
+    if flag and not hasattr(_ssl, "VERIFY_X509_PARTIAL_CHAIN"):
+        pytest.skip("this interpreter has no such flag")
+    if not flag:
+        _stack_without_the_flag(monkeypatch)
+    cert, key = _make_cert(tmp_path, "served")
+    other, _other_key = _make_cert(tmp_path, "other")
+    server, url = _https_health_server(cert, key)
+    try:
+        assert ctl.health(url, cafile=cert) is True
+        assert ctl.health(url, cafile=other) is False, "a certificate that is not the served one was accepted"
+    finally:
+        server.shutdown()
+
+
+def test_without_the_flag_a_server_with_another_certificate_is_refused_even_for_the_same_name(tmp_path, monkeypatch):
+    _stack_without_the_flag(monkeypatch)
+    pinned, _k = _make_cert(tmp_path, "pinned")
+    impostor, impostor_key = _make_cert(tmp_path, "impostor")  # same subject and names, other key
+    server, url = _https_health_server(impostor, impostor_key)
+    try:
+        assert ctl.health(url, cafile=pinned) is False
+    finally:
+        server.shutdown()
