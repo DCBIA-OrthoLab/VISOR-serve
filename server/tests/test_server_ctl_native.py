@@ -1279,3 +1279,133 @@ def test_credentials_in_a_tools_url_never_reach_a_message(tools_remote):
     with pytest.raises(ctl.ServerCtlError) as raised:
         _switch(tools_remote, "main", "ftp://user:SECRET@host/x.git")
     assert "SECRET" not in str(raised.value)
+
+
+# ----------------------------------------------------------------------
+# `up` is idempotent over our own server, as Docker's is
+# ----------------------------------------------------------------------
+
+@pytest.fixture
+def up_world(tmp_path, monkeypatch, envfile):
+    """`up --native` with a launcher that starts a real process wearing run-native.sh's command line."""
+    if shutil.which("ps") is None:
+        pytest.skip("needs ps")
+    monkeypatch.setenv("VISOR_STATE_DIR", str(tmp_path / "Application Support" / "native"))
+    os.makedirs(native.state_dir())
+    sadt = tmp_path / "sadt"
+    (sadt / "tools").mkdir(parents=True)
+    spawned = []
+    health = {"answers": True}
+    real = subprocess.Popen
+
+    def popen(command, *a, **k):
+        if command and command[0] == "bash" and len(command) == 2:
+            if world.fail_launch:
+                raise OSError("no fork")
+            port = k["env"]["HOST_PORT"]
+            proc = _decoy(f"{native.state_dir()}/api-venv/bin/python serve.py --host 127.0.0.1 --port {port}", tmp_path)
+            time.sleep(0.3)
+            spawned.append(proc)
+            return proc
+        return real(command, *a, **k)
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setattr(native.native_tools, "find_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(native, "_wait_for_health", lambda *a, **k: True)
+    monkeypatch.setattr(native, "_health", lambda ctl_, url, tls, **k: health["answers"])
+    busy = {"ports": set()}
+    monkeypatch.setattr(ctl, "port_in_use", lambda port: port in busy["ports"])
+    monkeypatch.setattr(native, "TERM_GRACE_SECONDS", 3)
+    world = types.SimpleNamespace(spawned=spawned, health=health, busy=busy, sadt=str(sadt), tmp=tmp_path,
+                                  fail_launch=False)
+
+    def args(**extra):
+        base = {"bind": None, "tls_cert": None, "tls_key": None, "port": None, "token": None, "wait": True,
+                "timeout": 5, "device": None, "tools_dir": str(sadt), "url": None}
+        base.update(extra)
+        return _args(**base)
+
+    world.args = args
+    yield world
+    for proc in spawned:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        proc.wait()
+
+
+TOKEN_A, TOKEN_B = "A" * 30, "B" * 30
+
+
+def test_up_twice_leaves_the_server_alone_and_says_so(up_world):
+    first = native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+    again = native.cmd_up(ctl, up_world.args())
+    assert len(up_world.spawned) == 1 and again["pid"] == first["pid"]
+    assert again["already_running"] is True and again["restarted"] is False
+    assert "Stop it first" not in json.dumps(again)
+    assert again["token"] == TOKEN_A and again["url"] == first["url"] and again["healthy"] is True
+    # The same token and port restated change nothing either.
+    third = native.cmd_up(ctl, up_world.args(token=TOKEN_A, port=int(first["url"].rsplit(":", 1)[1])))
+    assert third["pid"] == first["pid"] and len(up_world.spawned) == 1
+
+
+def test_the_idempotent_result_has_the_shape_of_a_fresh_up(up_world):
+    first = native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+    again = native.cmd_up(ctl, up_world.args())
+    assert set(again) - {"already_running", "restarted"} == set(first)
+    assert again["tls"] == first["tls"] and again["tls"]["enabled"] is True
+
+
+def test_up_with_another_token_restarts_and_the_new_token_is_served(up_world):
+    first = native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+    again = native.cmd_up(ctl, up_world.args(token=TOKEN_B))
+    assert again["restarted"] is True and again["pid"] != first["pid"] and again["token"] == TOKEN_B
+    assert up_world.spawned[0].poll() is not None, "the old server was not stopped"
+    assert ctl.read_env()["API_TOKEN"] == TOKEN_B
+
+
+def test_up_with_another_certificate_pair_restarts(up_world):
+    cert, key = _make_cert(up_world.tmp, "one")
+    other, other_key = _make_cert(up_world.tmp, "two")
+    first = native.cmd_up(ctl, up_world.args(tls_cert=cert, tls_key=key))
+    same = native.cmd_up(ctl, up_world.args(tls_cert=cert, tls_key=key))
+    assert same["pid"] == first["pid"] and same["restarted"] is False
+    changed = native.cmd_up(ctl, up_world.args(tls_cert=other, tls_key=other_key))
+    assert changed["restarted"] is True and changed["pid"] != first["pid"]
+    assert changed["tls"]["cert"] == other
+
+
+def test_up_restarts_when_the_running_server_does_not_answer(up_world):
+    first = native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+    up_world.health["answers"] = False
+    again = native.cmd_up(ctl, up_world.args())
+    assert again["restarted"] is True and again["pid"] != first["pid"]
+
+
+def test_up_never_stops_a_foreign_process_holding_the_port(up_world):
+    foreign = _decoy("/usr/bin/python3 -m http.server 8000", up_world.tmp)
+    try:
+        time.sleep(0.3)
+        up_world.busy["ports"].add(8000)
+        _write_pidfile(foreign.pid, port=8000)  # a pidfile that points at it does not make it ours
+        with pytest.raises(ctl.ServerCtlError, match="Something is already listening on port 8000"):
+            native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+        assert foreign.poll() is None and up_world.spawned == []
+    finally:
+        foreign.kill()
+        foreign.wait()
+
+
+def test_down_then_up_still_starts_a_fresh_server(up_world):
+    first = native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+    assert native.cmd_down(ctl, _args())["was_running"] is True
+    again = native.cmd_up(ctl, up_world.args())
+    assert "already_running" not in again and again["pid"] != first["pid"]
+
+
+def test_a_start_that_fails_after_the_stop_says_so_and_how_to_start_it(up_world):
+    native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+    up_world.fail_launch = True
+    with pytest.raises(ctl.ServerCtlError, match=r"old native server was stopped.*no fork.*up --native"):
+        native.cmd_up(ctl, up_world.args(token=TOKEN_B))

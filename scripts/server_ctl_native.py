@@ -539,6 +539,70 @@ def check_token(ctl, token) -> None:
             "(no space, line break or control character).")
 
 
+def _differences(ctl, args, live, tls) -> list:
+    """What `up` was asked for that the running server of ours was not started with."""
+    found = []
+    if args.port and args.port != live.get("port"):
+        found.append("another port")
+    if live.get("tls_sha") != cert_digest(tls):
+        found.append("another certificate")
+    wanted = getattr(args, "token", None)
+    stored = ctl.read_env().get("API_TOKEN")
+    if not stored or (wanted and wanted != stored):
+        found.append("another token")
+    if getattr(args, "device", None) and resolve_device(ctl, args) != live.get("device"):
+        found.append("another device")
+    if getattr(args, "tools_dir", None) and sadt_root(ctl, args) != live.get("tools"):
+        found.append("another tools checkout")
+    return found
+
+
+def _up_over_our_server(ctl, args, live, tls) -> dict:
+    """`up` while our own server runs: idempotent, as Docker's is.
+
+    Nothing asked differs and /health answers: report the running server, touch
+    nothing. Otherwise relaunch it the way `update` does. A process that is not
+    ours never gets here (running_server checks its identity), so none is ever stopped.
+    """
+    port = live.get("port")
+    differences = _differences(ctl, args, live, tls)
+    url = server_url(ctl, args, port)
+    if not differences and _health(ctl, url, tls):
+        ctl.log(f"The native server is already running (pid {live['pid']}, port {port}) with this configuration; left alone.")
+        root = sadt_root(ctl, args)
+        missing = sorted(name for name, present in venv_report(root).items() if not present) \
+            if os.path.isdir(os.path.join(root, "tools")) else []
+        return {
+            "service": SERVICE, "url": url, "tls": tls_report(tls), "healthy": True,
+            "pid": live["pid"], "device": live.get("device"), "token": ctl.read_env().get("API_TOKEN"),
+            "log": log_path(), "data_dir": ctl.data_dir(), "tools_without_venv": missing,
+            "already_running": True, "restarted": False,
+        }
+    ctl.log("The native server is running but " + (", ".join(differences) if differences
+                                                   else "does not answer /health") + ": relaunching it.")
+    up = _relaunch(ctl, args, live)
+    up.update({"already_running": True, "restarted": True})
+    return up
+
+
+def _relaunch(ctl, args, live) -> dict:
+    """Stop our running server and start it again, in the order that cannot strand the operator.
+
+    Everything a start needs is checked first; if the start still fails once the
+    old server is stopped, the error says so and how to start it by hand.
+    """
+    _launch_prerequisites(ctl, args)
+    cmd_down(ctl, args)
+    args.port = args.port or live.get("port")
+    try:
+        return cmd_up(ctl, args)
+    except Exception as exc:  # noqa: BLE001 - whatever stopped the start, the operator must be told
+        raise ctl.ServerCtlError(
+            f"The old native server was stopped, and the new one did not start ({type(exc).__name__}: {exc}). "
+            f"Nothing is serving now. Fix the cause, then start it with: server_ctl.py up --native "
+            f"(log: {log_path()})") from exc
+
+
 def cmd_up(ctl, args) -> dict:
     check_token(ctl, getattr(args, "token", None))
     live = running_server()
@@ -547,9 +611,7 @@ def cmd_up(ctl, args) -> dict:
     refuse_non_loopback(ctl, args)
     tls = tls_settings(ctl, args)
     if live:
-        raise ctl.ServerCtlError(
-            f"The native server is already running (pid {live['pid']}, port {live.get('port')}). "
-            f"Stop it first with: server_ctl.py down --native")
+        return _up_over_our_server(ctl, args, live, tls)
     if ctl.port_in_use(port):
         raise ctl.ServerCtlError(
             f"Something is already listening on port {port} of this machine, and it is not this "
@@ -714,16 +776,8 @@ def cmd_update(ctl, args) -> dict:
     changed = result["pulled"] or result["tools_pulled"] or any(r.get("action") == "built" for r in outcome["tools"])
     if live and (changed or args.force or tls_changed or token_changed):
         ctl.log("Relaunching the native server so it sees what changed...")
-        _launch_prerequisites(ctl, args)
-        cmd_down(ctl, args)
         args.port = live.get("port")
-        try:
-            up = cmd_up(ctl, args)
-        except Exception as exc:  # noqa: BLE001 - whatever stopped the start, the operator must be told
-            raise ctl.ServerCtlError(
-                f"The old native server was stopped, and the new one did not start ({type(exc).__name__}: {exc}). "
-                f"Nothing is serving now. Fix the cause, then start it with: server_ctl.py up --native "
-                f"(log: {log_path()})") from exc
+        up = _relaunch(ctl, args, live)
         result["restarted"] = True
         result["healthy"] = up["healthy"]
     elif live:
