@@ -99,7 +99,7 @@ def read_pidfile():
 def _ps_rows():
     """`[(pid, ppid, pgid, command)]` for every process. `ps` is on both Linux and macOS."""
     try:
-        done = subprocess.run(["ps", "-axo", "pid=,ppid=,pgid=,command="], stdout=subprocess.PIPE,
+        done = subprocess.run(["ps", "-ww", "-axo", "pid=,ppid=,pgid=,command="], stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, text=True, timeout=15)
     except (OSError, subprocess.SubprocessError):
         return []
@@ -526,7 +526,21 @@ def _launch_prerequisites(ctl, args):
     return script, root
 
 
+TOKEN_MIN_LENGTH = 24  # serve.py refuses a shorter API_TOKEN, after the old server would be stopped
+
+
+def check_token(ctl, token) -> None:
+    """A `--token` serve.py will accept and `.env` can hold on one line, or ServerCtlError. Never echoes it."""
+    if token is None:
+        return
+    if len(token) < TOKEN_MIN_LENGTH or not re.fullmatch(r"[A-Za-z0-9_\-.~+/=]+", token):
+        raise ctl.ServerCtlError(
+            f"--token must be at least {TOKEN_MIN_LENGTH} characters, using letters, digits and _-.~+/= only "
+            "(no space, line break or control character).")
+
+
 def cmd_up(ctl, args) -> dict:
+    check_token(ctl, getattr(args, "token", None))
     live = running_server()
     port = args.port or (live or {}).get("port") or ctl.effective_port()
     # Checked before anything is written: a refused TLS request leaves .env as it was.
@@ -637,6 +651,7 @@ def cmd_update(ctl, args) -> dict:
     inputs (pyproject, lock, recipe) did not move is left alone, so an update
     with nothing new costs two git calls.
     """
+    check_token(ctl, getattr(args, "token", None))
     tls = tls_settings(ctl, args)
     # What a relaunch needs, asked now: nothing below may stop the old server
     # for a start that was never going to be allowed.
@@ -679,6 +694,12 @@ def cmd_update(ctl, args) -> dict:
         result["tools_pulled"] = _pull_tools(ctl, root)
 
     ctl.write_env({"SADT_TOOLS": root})
+    wanted_token = getattr(args, "token", None)
+    token_changed = bool(wanted_token) and wanted_token != ctl.read_env().get("API_TOKEN")
+    if token_changed:
+        # Written even when nothing else asks for a relaunch: a rotated token that is
+        # only kept in memory of this command would leave the old one in force.
+        ctl.write_env({"API_TOKEN": wanted_token})
     live = running_server()
     # The running process serves the certificate it started with: a different
     # one (or a renewed file at the same path) needs a relaunch to take effect.
@@ -691,7 +712,7 @@ def cmd_update(ctl, args) -> dict:
 
     live = running_server()
     changed = result["pulled"] or result["tools_pulled"] or any(r.get("action") == "built" for r in outcome["tools"])
-    if live and (changed or args.force or tls_changed):
+    if live and (changed or args.force or tls_changed or token_changed):
         ctl.log("Relaunching the native server so it sees what changed...")
         _launch_prerequisites(ctl, args)
         cmd_down(ctl, args)
@@ -711,6 +732,18 @@ def cmd_update(ctl, args) -> dict:
 
 
 _URL_PREFIXES = ("https://", "ssh://", "git@")
+# `git switch` needs git 2.23; `--no-overwrite-ignore` is on `switch` and `merge` from then on.
+# An older git is refused rather than run without the protection.
+_OLD_GIT = "git 2.23 or newer is required (git switch --no-overwrite-ignore)"
+
+
+def _OLD_GIT_HINT_IF(err: str) -> str:
+    return f" ({_OLD_GIT})" if "overwrite-ignore" in (err or "") and "unknown option" in (err or "") else ""
+
+
+def _mask(text: str) -> str:
+    """Hide the credentials of any URL in `text` (https://user:SECRET@host becomes https://***@host)."""
+    return re.sub(r"//[^/@\s]*@", "//***@", text or "")
 
 
 def switch_tools_branch(ctl, root: str, branch: str, url=None) -> bool:
@@ -727,12 +760,12 @@ def switch_tools_branch(ctl, root: str, branch: str, url=None) -> bool:
         return ctl._capture(["git", "-C", root] + list(arguments), timeout=timeout)
 
     def refuse(message):
-        raise ctl.ServerCtlError(f"Tools checkout {root}: {message}")
+        raise ctl.ServerCtlError(f"Tools checkout {root}: {_mask(message)}" + _OLD_GIT_HINT_IF(message))
 
     if not branch or branch.startswith("-") or git("check-ref-format", "--branch", branch)[0] != 0:
         refuse(f"{branch!r} is not a usable branch name.")
     if url is not None and (not url.startswith(_URL_PREFIXES) or "::" in url):
-        refuse(f"{url!r} is not an https://, ssh:// or git@ repository address.")
+        refuse(f"{_mask(url)!r} is not an https://, ssh:// or git@ repository address.")
     rc, top, _err = git("rev-parse", "--show-toplevel")
     if rc != 0 or os.path.realpath(top) != os.path.realpath(root):
         refuse("it is not the top folder of its own git repository; leaving it alone.")
@@ -743,7 +776,7 @@ def switch_tools_branch(ctl, root: str, branch: str, url=None) -> bool:
         source, target = "origin", f"refs/remotes/origin/{branch}"
         fetch = ["fetch", "--quiet", "origin", f"+refs/heads/{branch}:{target}"]
     else:
-        source, target = url, f"refs/remotes/visor-requested/{branch}"
+        source, target = _mask(url), f"refs/remotes/visor-requested/{branch}"
         fetch = ["fetch", "--quiet", "--", url, f"+refs/heads/{branch}:{target}"]
     rc, _out, err = git(*fetch)
     if rc != 0:
@@ -768,7 +801,7 @@ def switch_tools_branch(ctl, root: str, branch: str, url=None) -> bool:
                    f"Merge or rebase it by hand.")
         if dirty:
             refuse(f"'{branch}' is behind {source} but the tree has uncommitted changes. Commit or discard them.")
-        if git("merge", "--ff-only", want)[0] != 0:
+        if git("merge", "--no-overwrite-ignore", "--ff-only", want)[0] != 0:
             refuse("the fast-forward failed.")
         ctl.log(f"Fast-forwarded the tools checkout's '{branch}' to {want[:9]}.")
         return True
@@ -785,14 +818,14 @@ def switch_tools_branch(ctl, root: str, branch: str, url=None) -> bool:
         if local != want and not is_ancestor(local, want):
             refuse(f"the local branch '{branch}' has commits that {source} lacks (or has diverged): "
                    f"not touching it. Merge or rebase it by hand.")
-        rc, _out, err = git("switch", branch)
+        rc, _out, err = git("switch", "--no-overwrite-ignore", branch)
         if rc != 0:
             refuse(f"git switch refused: {err}")
-        if local != want and git("merge", "--ff-only", want)[0] != 0:
+        if local != want and git("merge", "--no-overwrite-ignore", "--ff-only", want)[0] != 0:
             refuse("the fast-forward failed.")
     else:
-        command = ["switch", "-c", branch, "--track", target] if from_origin else \
-                  ["switch", "-c", branch, "--no-track", target]
+        command = ["switch", "--no-overwrite-ignore", "-c", branch, "--track", target] if from_origin else \
+                  ["switch", "--no-overwrite-ignore", "-c", branch, "--no-track", target]
         rc, _out, err = git(*command)
         if rc != 0:
             refuse(f"git switch refused: {err}")
@@ -810,7 +843,7 @@ def _pull_tools(ctl, root: str) -> bool:
         return False
     rc, _out, err = git("fetch", "--quiet", "origin")
     if rc != 0:
-        ctl.log(f"Could not fetch {root}: {err}")
+        ctl.log(f"Could not fetch {root}: {_mask(err)}")
         return False
     rc, counts, _err = git("rev-list", "--left-right", "--count", "HEAD...@{u}")
     behind = int(counts.split()[1]) if rc == 0 and len(counts.split()) == 2 else 0
@@ -820,7 +853,12 @@ def _pull_tools(ctl, root: str) -> bool:
     if dirty:
         ctl.log(f"The tools checkout has uncommitted changes and is {behind} commit(s) behind: not pulling over them.")
         return False
-    return ctl._stream(["git", "-C", root, "pull", "--ff-only"]) == 0
+    # fetch is done above: merge (not pull, which has no such option) so an ignored local file
+    # (downloaded weights) that the new commits track is refused, not overwritten.
+    rc, _out, err = git("merge", "--no-overwrite-ignore", "--ff-only", "@{u}")
+    if rc != 0:
+        ctl.log(f"Not fast-forwarding the tools checkout: {_mask(err) or 'git refused'}" + _OLD_GIT_HINT_IF(err))
+    return rc == 0
 
 
 def cmd_install_tools(ctl, args) -> dict:

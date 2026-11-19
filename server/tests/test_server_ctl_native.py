@@ -723,16 +723,16 @@ def test_update_native_through_the_real_parser_relaunches_without_a_token_argume
 
 def test_update_takes_a_token_like_up_and_keeps_the_existing_one_without(tmp_path, monkeypatch, envfile):
     parsed = ctl.build_parser().parse_args(["update", "--native", "--token", "abc"])
-    assert parsed.token == "abc"
+    assert parsed.token == "abc"  # the parser takes it; native.check_token judges it
     assert ctl.build_parser().parse_args(["update", "--native"]).token is None
     calls, _base = _update_world(tmp_path, monkeypatch, envfile)
     _fake_launch(monkeypatch, [])
     monkeypatch.setattr(native, "_wait_for_health", lambda *a, **k: True)
     sadt = str(tmp_path / "sadt")
-    assert ctl.main(["update", "--native", "--force", "--tools-dir", sadt, "--token", "from-update"]) == 0
-    assert ctl.read_env()["API_TOKEN"] == "from-update"
+    assert ctl.main(["update", "--native", "--force", "--tools-dir", sadt, "--token", "from-update" + "x" * 20]) == 0
+    assert ctl.read_env()["API_TOKEN"] == "from-update" + "x" * 20
     assert ctl.main(["update", "--native", "--force", "--tools-dir", sadt]) == 0
-    assert ctl.read_env()["API_TOKEN"] == "from-update"
+    assert ctl.read_env()["API_TOKEN"] == "from-update" + "x" * 20
 
 
 def test_update_docker_refuses_a_token_it_would_ignore(monkeypatch):
@@ -1167,3 +1167,113 @@ def test_without_the_flag_a_server_with_another_certificate_is_refused_even_for_
         assert ctl.health(url, cafile=pinned) is False
     finally:
         server.shutdown()
+
+
+# ----------------------------------------------------------------------
+# Audit follow-ups: token rotation, ignored files, ps width, token and URL hygiene
+# ----------------------------------------------------------------------
+
+def test_update_with_a_new_token_writes_it_and_relaunches_without_force(tmp_path, monkeypatch, envfile):
+    calls, base = _update_world(tmp_path, monkeypatch, envfile)
+    base["force"] = False
+    ctl.write_env({"API_TOKEN": "OLD" * 10})
+    monkeypatch.setattr(native, "cmd_up", lambda c, a: calls.append("up") or {"healthy": True})
+    new = "N" * 30
+    quiet = native.cmd_update(ctl, _args(token=None, **base))
+    assert quiet["restarted"] is False and calls == []
+    result = native.cmd_update(ctl, _args(token=new, **base))
+    assert ctl.read_env()["API_TOKEN"] == new
+    assert result["restarted"] is True and calls == ["down", "up"]
+
+
+def test_update_with_a_new_token_and_no_live_server_still_stores_it(tmp_path, monkeypatch, envfile):
+    calls, base = _update_world(tmp_path, monkeypatch, envfile)
+    base["force"] = False
+    monkeypatch.setattr(native, "running_server", lambda: None)
+    native.cmd_update(ctl, _args(token="T" * 30, **base))
+    assert ctl.read_env()["API_TOKEN"] == "T" * 30 and calls == []
+
+
+@pytest.mark.parametrize("token", ["abc", "a" * 23, "a" * 30 + "\nSADT_TOOLS=/evil", "a" * 30 + " b", "a" * 29 + "\x00"])
+def test_a_bad_token_is_refused_before_the_old_server_is_stopped_or_env_written(tmp_path, monkeypatch, envfile, token):
+    calls, base = _update_world(tmp_path, monkeypatch, envfile)
+    with pytest.raises(ctl.ServerCtlError, match="--token must be") as raised:
+        native.cmd_update(ctl, _args(token=token, **base))
+    assert token not in str(raised.value)
+    assert calls == [] and not os.path.exists(envfile)
+    with pytest.raises(ctl.ServerCtlError, match="--token must be"):
+        native.cmd_up(ctl, _args(token=token, bind=None, tls_cert=None, tls_key=None, port=None))
+    assert not os.path.exists(envfile)
+
+
+def test_a_file_git_ignores_is_never_overwritten_by_a_switch_or_a_pull(tools_remote):
+    seed, clone = tools_remote.seed, tools_remote.clone
+    _git(clone, "config", "core.excludesFile", os.devnull)
+    (clone / ".gitignore").write_text("weights/\n")
+    _git(clone, "add", ".gitignore")
+    _git(clone, "commit", "-q", "-m", "ignore weights")
+    _git(clone, "push", "-q", "origin", "main")
+    (clone / "weights").mkdir()
+    (clone / "weights" / "model.bin").write_text("MINE")
+    # A branch that tracks that very path.
+    _git(seed, "pull", "-q", str(tools_remote.origin), "main")
+    _git(seed, "checkout", "-q", "-b", "hostile")
+    (seed / "weights").mkdir()
+    (seed / "weights" / "model.bin").write_text("THEIRS")
+    _git(seed, "add", "-f", "weights/model.bin")
+    _git(seed, "commit", "-q", "-m", "tracks weights")
+    _git(seed, "push", "-q", str(tools_remote.origin), "hostile")
+    with pytest.raises(ctl.ServerCtlError, match="overwritten|git switch refused"):
+        _switch(tools_remote, "hostile")
+    assert (clone / "weights" / "model.bin").read_text() == "MINE" and _branch(tools_remote) == "main"
+    # The pull path: main moves to track it too.
+    _git(seed, "checkout", "-q", "main")
+    (seed / "weights").mkdir(exist_ok=True)
+    (seed / "weights" / "model.bin").write_text("THEIRS")
+    _git(seed, "add", "-f", "weights/model.bin")
+    _git(seed, "commit", "-q", "-m", "main tracks weights")
+    _git(seed, "push", "-q", str(tools_remote.origin), "main")
+    assert native._pull_tools(ctl, str(clone)) is False
+    assert (clone / "weights" / "model.bin").read_text() == "MINE"
+
+
+def test_a_git_without_the_option_is_refused_with_the_version_it_needs(tools_remote, monkeypatch):
+    real = ctl._capture
+
+    def old_git(command, **kwargs):
+        if "--no-overwrite-ignore" in command:
+            return 129, "", "error: unknown option `no-overwrite-ignore'"
+        return real(command, **kwargs)
+
+    monkeypatch.setattr(ctl, "_capture", old_git)
+    with pytest.raises(ctl.ServerCtlError, match="git 2.23 or newer"):
+        _switch(tools_remote, "feat/x")
+    assert _branch(tools_remote) == "main"
+
+
+@pytest.mark.skipif(shutil.which("ps") is None, reason="needs ps")
+def test_the_server_is_recognised_even_when_columns_would_truncate_ps(tmp_path, monkeypatch):
+    monkeypatch.setenv("COLUMNS", "80")
+    monkeypatch.setenv("VISOR_STATE_DIR", str(tmp_path / "Application Support" / "VISOR" / "native"))
+    os.makedirs(native.state_dir())
+    words = f"{native.state_dir()}/api-venv/bin/python serve.py --host 127.0.0.1 --port 18765"
+    assert len(words) > 80
+    ours = _decoy(words, tmp_path)
+    try:
+        time.sleep(0.3)
+        _write_pidfile(ours.pid, proc_start=native.process_start_time(ours.pid))
+        assert native.running_server() is not None
+        assert native.cmd_down(ctl, _args())["was_running"] is True
+        ours.wait(timeout=10)
+    finally:
+        ours.kill()
+        ours.wait()
+
+
+def test_credentials_in_a_tools_url_never_reach_a_message(tools_remote):
+    with pytest.raises(ctl.ServerCtlError) as raised:
+        _switch(tools_remote, "main", "https://user:SECRET@127.0.0.1:1/x.git")
+    assert "SECRET" not in str(raised.value) and "could not fetch" in str(raised.value)
+    with pytest.raises(ctl.ServerCtlError) as raised:
+        _switch(tools_remote, "main", "ftp://user:SECRET@host/x.git")
+    assert "SECRET" not in str(raised.value)
