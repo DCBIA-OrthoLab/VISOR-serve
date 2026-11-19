@@ -24,6 +24,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass, field
 from typing import Optional
@@ -47,6 +48,9 @@ _MEMINFO = "/proc/meminfo"
 _V1_UNLIMITED = 1 << 62
 
 _NVIDIA_SMI_TIMEOUT_SECONDS = 5.0
+# macOS has neither /proc nor a cgroup: the host memory is one sysctl.
+_SYSCTL = "/usr/sbin/sysctl"
+_SYSCTL_TIMEOUT_SECONDS = 5.0
 _VRAM_QUERY = ["--query-gpu=memory.total,memory.free", "--format=csv,noheader,nounits"]
 
 _UNITS = {
@@ -175,7 +179,46 @@ def detect_ram_bytes() -> Optional[int]:
                     return int(entry.split()[1]) * 1024
     except (OSError, IndexError, ValueError):
         pass
-    return None
+    return _darwin_ram_bytes()
+
+
+def _darwin_ram_bytes() -> Optional[int]:
+    """Host memory on macOS, which is also what the GPU draws from.
+
+    Reached only when no cgroup and no /proc/meminfo answered, so on Linux it
+    changes nothing: the `sys.platform` guard returns None, exactly what the
+    caller returned before this existed.
+
+    Apple silicon has ONE pool of memory for the CPU and the GPU. There is no
+    separate VRAM to detect, which is why `detect_vram_bytes` stays None on a
+    Mac and the RAM budget below is the number that bounds MPS runs too.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        completed = subprocess.run(
+            [_SYSCTL, "-n", "hw.memsize"],
+            capture_output=True,
+            text=True,
+            timeout=_SYSCTL_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            return None
+        return int(completed.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
+def _platform_detected() -> dict:
+    """Extra facts about this machine, for the banner. Empty off macOS.
+
+    `torch.mps.recommended_max_memory()` (37.4 GiB on a 48 GiB M4 Max, measured)
+    cannot be read here: this process has no torch. A tool's runner reads it and
+    writes it into result.json (`mps_recommended_max_bytes`).
+    """
+    if sys.platform != "darwin":
+        return {}
+    return {"unified_memory_bytes": _darwin_ram_bytes()}
 
 
 def detect_vram_bytes() -> tuple:
@@ -327,6 +370,7 @@ def resolve(config) -> Allocation:
             "ram_bytes": ram_found,
             "vram_total_bytes": vram_total,
             "vram_free_bytes": vram_free,
+            **_platform_detected(),
         },
         sources={
             "cpus": cpu_source,
@@ -396,6 +440,10 @@ def banner(allocation: Allocation) -> str:
             allocation.expected_clients, allocation.max_parallel_jobs
         ),
     ]
+    if found.get("unified_memory_bytes"):
+        lines.insert(2, "  unified       {} shared by the CPU and the GPU (no separate "
+                        "VRAM budget; the ram budget bounds both)".format(
+                            _gib(found.get("unified_memory_bytes"))))
     lines.append(
         "  admission    what each run was measured to need, at the width it was "
         "granted; a tool with no measured cost runs alone"

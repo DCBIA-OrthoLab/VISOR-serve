@@ -30,8 +30,10 @@ Two conventions the GUI depends on:
 
 import argparse
 import getpass
+import http.client
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -414,6 +416,71 @@ def tls_context(url: str) -> ssl.SSLContext:
     return ssl.create_default_context()
 
 
+def pinned_context(cafile: str) -> ssl.SSLContext:
+    """Native backend: trust `cafile` alone, the certificate the server really serves.
+
+    The same context as `tls.loopback_context` in server/tls.py (pinned file, no
+    host name check, partial chains), repeated here because that module imports
+    the server's settings (pydantic) and this script is standard library only.
+    test_server_ctl_native.py asserts the two stay equal.
+    """
+    context = ssl.create_default_context(cafile=cafile)
+    context.check_hostname = False
+    context.verify_flags |= getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+    return context
+
+
+def _pem_certificates(cafile: str) -> list:
+    """The DER bytes of every certificate in a PEM file (the pinned file holds one)."""
+    with open(cafile, encoding="ascii", errors="replace") as handle:
+        text = handle.read()
+    found = []
+    for block in re.findall(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", text, re.S):
+        found.append(ssl.PEM_cert_to_DER_cert(block))
+    return found
+
+
+def pinned_get(url: str, timeout: float, cafile: str):
+    """`(status, body)` of a GET to this server's own loopback URL, pinned on `cafile`.
+
+    With `ssl.VERIFY_X509_PARTIAL_CHAIN` (OpenSSL 1.1+/3, so every current
+    Python) this is plain verification against that file: `pinned_context`.
+
+    Without it (macOS's /usr/bin/python3 is 3.9 on LibreSSL, and a self-signed
+    leaf cannot be a trust anchor there) the chain check cannot be asked for,
+    so the pin is made exact instead: ONE connection, whose handshake proves
+    the server holds the key of the certificate it presents (that is TLS, with
+    or without a chain check), and the presented certificate must be
+    byte-for-byte one the pinned file holds. A certificate that is merely valid,
+    or issued by anyone, is refused. Only the validity dates go unchecked, and
+    the certificate is the operator's own file on this machine.
+    """
+    if getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0):
+        with urllib.request.urlopen(  # nosec B310 - this server's own loopback URL
+                url, timeout=timeout, context=pinned_context(cafile)) as response:
+            return response.status, response.read()
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ValueError("pinned_get speaks https only")
+    pinned = _pem_certificates(cafile)
+    if not pinned:
+        raise ValueError("the pinned file holds no certificate")
+    # No chain to verify (see above): the comparison below is the verification.
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    connection = http.client.HTTPSConnection(parsed.hostname, parsed.port or 443, timeout=timeout, context=context)
+    try:
+        connection.connect()
+        if connection.sock.getpeercert(binary_form=True) not in pinned:
+            raise ssl.SSLError("the server's certificate is not the pinned one")
+        connection.request("GET", (parsed.path or "/") + ("?" + parsed.query if parsed.query else ""))
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
 def server_urlopen(target, timeout: float):
     """`urllib.request.urlopen` for this server: HTTPS, verified (tls_context)."""
     url = target.full_url if isinstance(target, urllib.request.Request) else target
@@ -680,13 +747,23 @@ def port_in_use(port: int = DEFAULT_PORT, host: str = "127.0.0.1") -> bool:
         return False
 
 
-def health(url=None, timeout: float = 5.0) -> bool:
-    """GET /health. Never raises - an unreachable server just means "not up"."""
+def health(url=None, timeout: float = 5.0, cafile=None) -> bool:
+    """GET /health. Never raises - an unreachable server just means "not up".
+
+    `cafile` is the native backend's local TLS certificate: https is then
+    verified against that one file and nothing else (no system store, no
+    `verify=False`). Without it the call is what it always was.
+    """
     url = url or url_for()
     if not url:
         return False
     try:
-        with server_urlopen(f"{url.rstrip('/')}/health", timeout=timeout) as response:
+        target = f"{url.rstrip('/')}/health"
+        if cafile:
+            # Native backend: the pinned local certificate, nothing else.
+            status, body = pinned_get(target, timeout, cafile)
+            return status == 200 and json.loads(body.decode("utf-8")).get("status") == "ok"
+        with server_urlopen(target, timeout=timeout) as response:
             if response.status != 200:
                 return False
             return json.loads(response.read().decode("utf-8")).get("status") == "ok"
@@ -1927,6 +2004,17 @@ def _print_catalog(data: dict) -> None:
               f"{_human(tool['size']):>10} total, {_human(tool['missing_size']):>10} to fetch")
 
 
+def _add_tls_arguments(sub) -> None:
+    sub.add_argument(
+        "--tls-cert", default=None,
+        help="Native backend: serve this PEM certificate (with --tls-key; loopback only) instead of "
+             "the one the server generates. Remembered in .env as TLS_CERT_FILE.")
+    sub.add_argument(
+        "--tls-key", default=None,
+        help="Native backend: the private key for --tls-cert. Must be owner-only (0600). "
+             "Remembered in .env as TLS_KEY_FILE, a path; its content is never read into a log.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Start, update and provision this inference server.",
@@ -1936,6 +2024,17 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_common(sub, with_url=True):
+        sub.add_argument(
+            "--native", action="store_true",
+            help="Run the server as a plain process on this machine instead of in Docker "
+                 "(scripts/server_ctl_native.py). The default on macOS, where a container "
+                 "cannot reach the GPU. $VISOR_BACKEND=native|docker does the same.",
+        )
+        sub.add_argument(
+            "--tools-dir", default=None,
+            help="Native backend: the SADT-VISOR checkout to serve. Default: $SADT_TOOLS, "
+                 "then .env, then ../SADT-VISOR. Remembered in .env by `up`.",
+        )
         sub.add_argument(
             "--device", choices=("auto", "gpu", "cpu"), default="auto",
             help="Which compose service to drive. Default: gpu when docker can reach a card, "
@@ -1984,6 +2083,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     up.add_argument("--force-recreate", action="store_true", help="Recreate the container from scratch.")
     up.add_argument("--no-wait", dest="wait", action="store_false", help="Return without waiting for /health.")
+    _add_tls_arguments(up)
     up.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
     up.add_argument("--no-agent", action="store_true", help="Do not start the update agent.")
     up.set_defaults(func=_with_agent(cmd_up), printer=None)
@@ -1994,7 +2094,17 @@ def build_parser() -> argparse.ArgumentParser:
     # server listens, so it must carry the existing choice over rather than
     # quietly reimpose loopback. See ensure_env.
     update.add_argument("--bind", default=None, help="See 'up --bind'.")
+    update.add_argument("--token", help="Native backend: see 'up --token'.")
+    update.add_argument(
+        "--tools-branch", default=None,
+        help="Native backend: put the tools checkout (--tools-dir) on this branch before building. "
+             "Refused, with nothing changed, if that would lose work. Default: leave it on its branch.")
+    update.add_argument(
+        "--tools-url", default=None,
+        help="Native backend: fetch --tools-branch from this repository instead of origin.")
     update.add_argument("--force", action="store_true", help="Recreate even when nothing changed.")
+    _add_tls_arguments(update)
+    update.add_argument("--tool", action="append", help="Native backend: only rebuild this tool's venv.")
     update.add_argument("--timeout", type=int, default=DEFAULT_STARTUP_TIMEOUT, help="Seconds to wait for /health.")
     update.add_argument("--no-agent", action="store_true", help="Do not start the update agent.")
     update.set_defaults(func=_with_agent(cmd_update), printer=None)
@@ -2056,6 +2166,16 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("-n", "--lines", type=int, default=100)
     logs.set_defaults(func=cmd_logs, printer=None)
 
+    install = subparsers.add_parser(
+        "install-tools",
+        help="Native backend: build the tools' virtualenvs (the Mac recipe in native_tools.py).",
+    )
+    add_common(install, with_url=False)
+    install.add_argument("--tool", action="append", help="Only this tool (repeatable). Default: all.")
+    install.add_argument("--dry-run", action="store_true", help="Print the plan, install nothing.")
+    install.add_argument("--force", action="store_true", help="Rebuild even when a venv is current.")
+    install.set_defaults(func=None, printer=None, native=True)
+
     cat = subparsers.add_parser("catalog", help="Per tool: manifest size, and how much is already on disk.")
     cat.set_defaults(func=cmd_catalog, printer=_print_catalog)
 
@@ -2066,6 +2186,23 @@ def build_parser() -> argparse.ArgumentParser:
     models.set_defaults(func=cmd_models, printer=None)
 
     return parser
+
+
+_NATIVE_COMMANDS = ("status", "up", "update", "watch", "down", "logs", "install-tools")
+
+
+def _wants_native(args) -> bool:
+    """Native when asked (--native, $VISOR_BACKEND), or on macOS, where Docker cannot reach the GPU.
+
+    Linux and Windows keep Docker as the default: nothing here changes for them
+    unless someone passes the flag.
+    """
+    if getattr(args, "native", False):
+        return True
+    backend = os.environ.get("VISOR_BACKEND", "").lower()
+    if backend in ("native", "docker"):
+        return backend == "native"
+    return sys.platform == "darwin"
 
 
 def main(argv=None) -> int:
@@ -2080,12 +2217,33 @@ def main(argv=None) -> int:
     if getattr(args, "device", "auto") == "auto":
         args.device = None
 
+    # The native backend (no Docker) takes over a command only when asked, or on
+    # a Mac. Everything above and below this block is the Docker path, untouched,
+    # and a Docker deployment never imports the native modules.
+    if args.command in _NATIVE_COMMANDS and _wants_native(args):
+        if args.command == "watch":
+            log("error: 'watch' follows a Docker deployment; the native backend has no equivalent yet. "
+                "Use 'update --native' from a timer instead.")
+            return 1
+        import server_ctl_native  # noqa: PLC0415 - see above
+        handler = server_ctl_native.HANDLERS[args.command]
+        args.func = lambda a, _fn=handler[0]: _fn(sys.modules[__name__], a)
+        args.printer = handler[1]
+    elif args.command == "update" and any(getattr(args, name, None) for name in ("token", "tools_branch", "tools_url")):
+        log("error: update --token/--tools-branch/--tools-url belong to the native backend (add --native).")
+        return 1
+    elif getattr(args, "tls_cert", None) or getattr(args, "tls_key", None):
+        log("error: --tls-cert/--tls-key belong to the native backend (add --native). "
+            "The Docker deployment takes TLS_CERT_FILE/TLS_KEY_FILE from .env.")
+        return 1
+
     try:
         result = args.func(args)
     except ServerCtlError as exc:
         log(f"error: {exc}")
         if args.json:
-            print(json.dumps({"error": str(exc)}, indent=2))
+            # `details` (native backend only): stable fields a panel can read without parsing the text.
+            print(json.dumps({"error": str(exc), **(getattr(exc, "details", None) or {})}, indent=2))
         return 1
     except Exception as exc:  # noqa: BLE001 - deliberate, see below
         # An UNEXPECTED failure must still travel. Letting it escape printed a

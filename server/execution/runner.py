@@ -459,6 +459,21 @@ def _jsonable(value):
     )
 
 
+def _ps_cpu_seconds(text: str):
+    """`ps` CPU time (`[[dd-]hh:]mm:ss[.ff]`) in seconds, or None if unreadable."""
+    try:
+        days = 0
+        if "-" in text:
+            head, text = text.split("-", 1)
+            days = int(head)
+        seconds = 0.0
+        for part in text.split(":"):
+            seconds = seconds * 60 + float(part)
+        return days * 86400 + seconds
+    except ValueError:
+        return None
+
+
 class _TreeSampler:
     """High-water mark of what this run's whole PROCESS GROUP holds.
 
@@ -506,6 +521,10 @@ class _TreeSampler:
         # Once the per-process listing has answered even once, it is the better
         # figure and the fallback is never mixed into it.
         self._per_process_worked = False
+        # macOS only: {pid: (rss_bytes, cpu_seconds)} from the last `ps`, for
+        # a platform with no /proc. None everywhere else, which is what keeps
+        # every Linux code path below on its own branch.
+        self._ps_snapshot = None
         self._stop = threading.Event()
         self._thread = None
         # Nested calls admitted as runs of their own. Their processes share
@@ -535,6 +554,8 @@ class _TreeSampler:
         try:
             entries = os.listdir("/proc")
         except OSError:
+            if sys.platform == "darwin":
+                return self._group_from_ps(mine)
             return set()  # not Linux, or /proc not mounted
         group, children = set(), {}
         for entry in entries:
@@ -555,6 +576,41 @@ class _TreeSampler:
             found -= _subtree(pid, children)
         return found
 
+    def _group_from_ps(self, mine: int) -> set:
+        """macOS: this run's process group, with memory and CPU time, from `ps`.
+
+        One call lists every process (`pid pgid rss time`), so the three figures
+        the /proc path reads in three places come from one snapshot that
+        `_rss` and `_cpu_ticks` then read back. Same group rule as the /proc
+        path: `dispatch` starts the tool with `start_new_session=True`.
+        """
+        try:
+            done = subprocess.run(
+                ["/bin/ps", "-axo", "pid=,pgid=,rss=,time="],
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return set()
+        if done.returncode != 0:
+            return set()
+        snapshot = {}
+        for line in done.stdout.decode("utf-8", "replace").splitlines():
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            try:
+                pid, pgid, rss_kb = int(fields[0]), int(fields[1]), int(fields[2])
+            except ValueError:
+                continue
+            if pgid != mine:
+                continue
+            seconds = _ps_cpu_seconds(fields[3])
+            if seconds is None:
+                continue
+            snapshot[pid] = (rss_kb * 1024, seconds)
+        self._ps_snapshot = snapshot
+        return set(snapshot)
+
     def _cpu_ticks(self, pids) -> int:
         """Total CPU time this group has burned, in clock ticks.
 
@@ -563,6 +619,9 @@ class _TreeSampler:
         busy -- the number the cost table has never had, and whose absence is
         why a run reserving ten cores could occupy fifty.
         """
+        if self._ps_snapshot is not None:
+            return int(sum(self._ps_snapshot.get(pid, (0, 0.0))[1] for pid in pids)
+                       * self._ticks_per_second)
         total = 0
         for pid in pids:
             try:
@@ -576,6 +635,8 @@ class _TreeSampler:
         return total
 
     def _rss(self, pids) -> int:
+        if self._ps_snapshot is not None:
+            return sum(self._ps_snapshot.get(pid, (0, 0.0))[0] for pid in pids)
         page = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
         total = 0
         for pid in pids:
@@ -760,7 +821,7 @@ def _peak_vram_bytes():
         return None
     try:
         if not torch.cuda.is_available():
-            return None
+            return _peak_mps_bytes(torch)
         # RESERVED, not allocated. The caching allocator keeps what it has taken
         # from the driver instead of giving it back, so the card is short of
         # `reserved` while `allocated` reports only what the tool was holding at
@@ -773,6 +834,51 @@ def _peak_vram_bytes():
             int(torch.cuda.max_memory_allocated()),
         )
     except Exception:  # noqa: BLE001 - see above
+        return None
+
+
+def _peak_mps_bytes(torch):
+    """What this process holds on the Apple GPU, or None. macOS only.
+
+    Reached only when CUDA is absent, and the platform guard returns None on
+    anything but a Mac, so a CPU-only Linux deployment reads exactly what it
+    read before (None).
+
+    This is NOT a high-water mark: torch's MPS allocator has no `max_*`
+    counter. `driver_allocated_memory()` is what the allocator has taken from
+    Metal and keeps cached, so read after the run it is close to the peak, the
+    same way `max_memory_reserved` is on CUDA. Measured on torch 2.8.0 and
+    2.14.1: 475 kB idle, 3.8 GB after one 128^3 nnU-Net forward.
+    """
+    if sys.platform != "darwin":
+        return None
+    backend = getattr(torch.backends, "mps", None)
+    if backend is None or not backend.is_available():
+        return None
+    return max(
+        int(torch.mps.driver_allocated_memory()),
+        int(torch.mps.current_allocated_memory()),
+    )
+
+
+def _mps_recommended_max_bytes():
+    """`torch.mps.recommended_max_memory()`, or None. macOS only, and only if torch ran here.
+
+    The one figure the API process cannot read, since it has no torch. Written
+    into result.json so a deployment can see how much of the unified memory
+    Metal will let a process wire (37.4 GiB of 48 GiB, measured).
+    """
+    if sys.platform != "darwin":
+        return None
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return None
+    try:
+        backend = getattr(torch.backends, "mps", None)
+        if backend is None or not backend.is_available():
+            return None
+        return int(torch.mps.recommended_max_memory())
+    except Exception:  # noqa: BLE001 - instrumentation never fails a run
         return None
 
 
@@ -1184,6 +1290,9 @@ def _measurements() -> dict:
             _child_vram_source == VRAM_FROM_CARD:
         source = VRAM_FROM_CARD
     measured[VRAM_SOURCE_KEY] = source
+    mps_ceiling = _mps_recommended_max_bytes()
+    if mps_ceiling:
+        measured["mps_recommended_max_bytes"] = mps_ceiling
     # How many cores the run actually kept busy. Nothing measured this before,
     # and its absence is why a run that reserved ten cores could occupy fifty:
     # ALI_CBCT at eight channels filled 51.7 of 56 while admission believed it
