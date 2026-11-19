@@ -687,6 +687,8 @@ def _update_world(tmp_path, monkeypatch, envfile):
     monkeypatch.setattr(ctl, "clone_status", lambda **k: {"is_git_repo": False, "checked_remote": False,
                                                          "error": None, "dirty": False, "behind": 0})
     monkeypatch.setattr(native, "cmd_down", lambda c, a: calls.append("down"))
+    # Whatever listens on 8000 of the machine running the tests is not the subject here.
+    monkeypatch.setattr(ctl, "port_in_use", lambda port: False)
     # main() imports the backend by name: hand it the module under test.
     monkeypatch.setitem(sys.modules, "server_ctl_native", native)
     # ...and main() reaches its own module through sys.modules[__name__], which another
