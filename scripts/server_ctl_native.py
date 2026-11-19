@@ -539,6 +539,69 @@ def check_token(ctl, token) -> None:
             "(no space, line break or control character).")
 
 
+def adopt_running_server(ctl):
+    """The pidfile entry of a server of THIS instance that runs without a (valid) pidfile, or None.
+
+    Same identity as `_looks_like_our_server`: this instance's API venv
+    interpreter running `serve.py`, with a `--port`. Exactly one such process is
+    adopted (two is a state nobody should guess at), and nothing else ever is.
+    The pidfile is rewritten with what `.env` says it was started with.
+    """
+    found = []
+    for pid, _ppid, _pgid, command in _ps_rows():
+        if not _is_serve_py_command(command):
+            continue
+        match = re.search(r"--port (\d+)(\s|$)", command)
+        if match and pid != os.getpid() and pid_alive(pid):
+            found.append((pid, int(match.group(1))))
+    if len(found) != 1:
+        return None
+    pid, port = found[0]
+    env = ctl.read_env()
+    remembered = (env.get("TLS_CERT_FILE"), env.get("TLS_KEY_FILE"))
+    try:
+        tls = validate_tls(*remembered) if all(remembered) else None
+    except _Error:
+        return None
+    info = {"pid": pid, "port": port, "device": env.get("DEVICE") or default_device(),
+            "tools": env.get("SADT_TOOLS"), "started": None, "log": log_path(), "tls": True,
+            "tls_sha": cert_digest(tls), "proc_start": process_start_time(pid), "adopted": True}
+    os.makedirs(state_dir(), exist_ok=True)
+    with open(pidfile_path(), "w", encoding="utf-8") as handle:
+        json.dump(info, handle)
+    ctl.log(f"Adopted the running native server (pid {pid}, port {port}): its pidfile was missing or stale.")
+    return info
+
+
+def port_owner(port: int):
+    """`{"pid", "command"}` of what listens on `port` (abbreviated command, never its arguments), or None."""
+    if not shutil.which("lsof"):
+        return None
+    try:
+        out = subprocess.run(["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-Fpc"],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    pid = command = None
+    for line in out.splitlines():
+        if line.startswith("p") and pid is None:
+            pid = int(line[1:]) if line[1:].isdigit() else None
+        elif line.startswith("c") and command is None:
+            command = line[1:][:32]
+    return {"pid": pid, "command": command} if pid and command else None
+
+
+def _port_in_use_error(ctl, port):
+    owner = port_owner(port)
+    who = f"{owner['command']} (pid {owner['pid']})" if owner else "another program"
+    error = ctl.ServerCtlError(
+        f"Port {port} is already used by {who}, and it is not this deployment's native server. "
+        f"Quit that program, or serve on another port: pass --port N to `server_ctl.py up --native`, "
+        f"or give the SlicerCloud server panel another port, then start again.")
+    error.details = {"error_code": "port_in_use", "port": port, "port_owner": owner}
+    return error
+
+
 def _differences(ctl, args, live, tls) -> list:
     """What `up` was asked for that the running server of ours was not started with."""
     found = []
@@ -552,34 +615,50 @@ def _differences(ctl, args, live, tls) -> list:
         found.append("another token")
     if getattr(args, "device", None) and resolve_device(ctl, args) != live.get("device"):
         found.append("another device")
-    if getattr(args, "tools_dir", None) and sadt_root(ctl, args) != live.get("tools"):
+    if getattr(args, "tools_dir", None) and live.get("tools") and sadt_root(ctl, args) != live.get("tools"):
         found.append("another tools checkout")
     return found
+
+
+def _up_report(ctl, args, live, tls, url, healthy: bool) -> dict:
+    root = sadt_root(ctl, args)
+    missing = sorted(name for name, present in venv_report(root).items() if not present) \
+        if os.path.isdir(os.path.join(root, "tools")) else []
+    return {
+        "service": SERVICE, "url": url, "tls": tls_report(tls), "healthy": healthy,
+        "pid": live["pid"], "device": live.get("device"), "token": ctl.read_env().get("API_TOKEN"),
+        "log": log_path(), "data_dir": ctl.data_dir(), "tools_without_venv": missing,
+        "already_running": True, "restarted": False,
+    }
 
 
 def _up_over_our_server(ctl, args, live, tls) -> dict:
     """`up` while our own server runs: idempotent, as Docker's is.
 
     Nothing asked differs and /health answers: report the running server, touch
-    nothing. Otherwise relaunch it the way `update` does. A process that is not
-    ours never gets here (running_server checks its identity), so none is ever stopped.
+    nothing. A server that does not answer YET is starting (23 tools take up to
+    a minute, and the port is bound last): it is waited for, never stopped, up
+    to the usual startup delay; only a dead process, or one still mute after
+    that delay, is relaunched, as is any difference in what was asked. A process
+    that is not ours never gets here (running_server checks its identity).
     """
     port = live.get("port")
     differences = _differences(ctl, args, live, tls)
     url = server_url(ctl, args, port)
-    if not differences and _health(ctl, url, tls):
-        ctl.log(f"The native server is already running (pid {live['pid']}, port {port}) with this configuration; left alone.")
-        root = sadt_root(ctl, args)
-        missing = sorted(name for name, present in venv_report(root).items() if not present) \
-            if os.path.isdir(os.path.join(root, "tools")) else []
-        return {
-            "service": SERVICE, "url": url, "tls": tls_report(tls), "healthy": True,
-            "pid": live["pid"], "device": live.get("device"), "token": ctl.read_env().get("API_TOKEN"),
-            "log": log_path(), "data_dir": ctl.data_dir(), "tools_without_venv": missing,
-            "already_running": True, "restarted": False,
-        }
-    ctl.log("The native server is running but " + (", ".join(differences) if differences
-                                                   else "does not answer /health") + ": relaunching it.")
+    if not differences:
+        if _health(ctl, url, tls):
+            ctl.log(f"The native server is already running (pid {live['pid']}, port {port}) with this configuration; left alone.")
+            return _up_report(ctl, args, live, tls, url, True)
+        if not args.wait:
+            ctl.log(f"The native server (pid {live['pid']}) is not answering yet; not waiting, not touching it.")
+            return _up_report(ctl, args, live, tls, url, False)
+        ctl.log(f"The native server (pid {live['pid']}) is still starting; waiting for it instead of restarting it.")
+        if _wait_for_health(ctl, url, live["pid"], args.timeout, tls):
+            return _up_report(ctl, args, live, tls, url, True)
+        ctl.log("It did not come up: relaunching it.")
+        differences = ["no answer"]
+    else:
+        ctl.log("The native server is running but " + ", ".join(differences) + ": relaunching it.")
     up = _relaunch(ctl, args, live)
     up.update({"already_running": True, "restarted": True})
     return up
@@ -606,16 +685,15 @@ def _relaunch(ctl, args, live) -> dict:
 def cmd_up(ctl, args) -> dict:
     check_token(ctl, getattr(args, "token", None))
     live = running_server()
-    port = args.port or (live or {}).get("port") or ctl.effective_port()
     # Checked before anything is written: a refused TLS request leaves .env as it was.
     refuse_non_loopback(ctl, args)
     tls = tls_settings(ctl, args)
+    live = live or adopt_running_server(ctl)
+    port = args.port or (live or {}).get("port") or ctl.effective_port()
     if live:
         return _up_over_our_server(ctl, args, live, tls)
     if ctl.port_in_use(port):
-        raise ctl.ServerCtlError(
-            f"Something is already listening on port {port} of this machine, and it is not this "
-            f"deployment's native server. Pick another with --port, or stop whatever holds it.")
+        raise _port_in_use_error(ctl, port)
     script, root = _launch_prerequisites(ctl, args)
 
     ctl.ensure_data_dir()

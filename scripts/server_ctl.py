@@ -2242,7 +2242,8 @@ def main(argv=None) -> int:
     except ServerCtlError as exc:
         log(f"error: {exc}")
         if args.json:
-            print(json.dumps({"error": str(exc)}, indent=2))
+            # `details` (native backend only): stable fields a panel can read without parsing the text.
+            print(json.dumps({"error": str(exc), **(getattr(exc, "details", None) or {})}, indent=2))
         return 1
     except Exception as exc:  # noqa: BLE001 - deliberate, see below
         # An UNEXPECTED failure must still travel. Letting it escape printed a

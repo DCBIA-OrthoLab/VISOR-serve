@@ -1311,13 +1311,15 @@ def up_world(tmp_path, monkeypatch, envfile):
 
     monkeypatch.setattr(subprocess, "Popen", popen)
     monkeypatch.setattr(native.native_tools, "find_uv", lambda: "/usr/bin/uv")
+    real_wait = native._wait_for_health
     monkeypatch.setattr(native, "_wait_for_health", lambda *a, **k: True)
-    monkeypatch.setattr(native, "_health", lambda ctl_, url, tls, **k: health["answers"])
+    monkeypatch.setattr(native, "_health", lambda ctl_, url, tls, **k: health["answers"]() if callable(health["answers"]) else health["answers"])
+    monkeypatch.setattr(native, "port_owner", lambda port: None)
     busy = {"ports": set()}
     monkeypatch.setattr(ctl, "port_in_use", lambda port: port in busy["ports"])
     monkeypatch.setattr(native, "TERM_GRACE_SECONDS", 3)
     world = types.SimpleNamespace(spawned=spawned, health=health, busy=busy, sadt=str(sadt), tmp=tmp_path,
-                                  fail_launch=False)
+                                  fail_launch=False, real_wait=real_wait, monkeypatch=monkeypatch)
 
     def args(**extra):
         base = {"bind": None, "tls_cert": None, "tls_key": None, "port": None, "token": None, "wait": True,
@@ -1376,11 +1378,42 @@ def test_up_with_another_certificate_pair_restarts(up_world):
     assert changed["tls"]["cert"] == other
 
 
-def test_up_restarts_when_the_running_server_does_not_answer(up_world):
+def test_a_second_up_waits_for_a_server_still_starting_and_never_restarts_it(up_world):
+    first = native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+    up_world.monkeypatch.setattr(native, "_wait_for_health", up_world.real_wait)
+    answers = iter([False, False, False, True])
+    up_world.health["answers"] = lambda: next(answers, True)
+    up_world.monkeypatch.setattr(ctl, "HEALTH_POLL_SECONDS", 0.05)
+    up_world.monkeypatch.setattr(native.time, "sleep", lambda s_: None)
+    again = native.cmd_up(ctl, up_world.args(timeout=30))
+    assert again["pid"] == first["pid"] and len(up_world.spawned) == 1
+    assert again["already_running"] is True and again["restarted"] is False and again["healthy"] is True
+    assert up_world.spawned[0].poll() is None, "the starting server was killed"
+
+
+def test_a_second_up_with_no_wait_leaves_a_starting_server_alone(up_world):
     first = native.cmd_up(ctl, up_world.args(token=TOKEN_A))
     up_world.health["answers"] = False
-    again = native.cmd_up(ctl, up_world.args())
+    again = native.cmd_up(ctl, up_world.args(wait=False))
+    assert again["pid"] == first["pid"] and again["healthy"] is False and again["restarted"] is False
+    assert up_world.spawned[0].poll() is None
+
+
+def test_a_server_that_never_answers_is_relaunched_after_the_full_delay(up_world):
+    first = native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+    up_world.monkeypatch.setattr(native, "_wait_for_health", up_world.real_wait)
+    up_world.health["answers"] = False
+    again = native.cmd_up(ctl, up_world.args(timeout=1))
     assert again["restarted"] is True and again["pid"] != first["pid"]
+    assert up_world.spawned[0].poll() is not None
+
+
+def test_a_dead_server_is_simply_started_again(up_world):
+    first = native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+    os.killpg(first["pid"], signal.SIGKILL)
+    up_world.spawned[0].wait()
+    again = native.cmd_up(ctl, up_world.args())
+    assert again["pid"] != first["pid"] and len(up_world.spawned) == 2
 
 
 def test_up_never_stops_a_foreign_process_holding_the_port(up_world):
@@ -1389,7 +1422,7 @@ def test_up_never_stops_a_foreign_process_holding_the_port(up_world):
         time.sleep(0.3)
         up_world.busy["ports"].add(8000)
         _write_pidfile(foreign.pid, port=8000)  # a pidfile that points at it does not make it ours
-        with pytest.raises(ctl.ServerCtlError, match="Something is already listening on port 8000"):
+        with pytest.raises(ctl.ServerCtlError, match="Port 8000 is already used"):
             native.cmd_up(ctl, up_world.args(token=TOKEN_A))
         assert foreign.poll() is None and up_world.spawned == []
     finally:
@@ -1409,3 +1442,75 @@ def test_a_start_that_fails_after_the_stop_says_so_and_how_to_start_it(up_world)
     up_world.fail_launch = True
     with pytest.raises(ctl.ServerCtlError, match=r"old native server was stopped.*no fork.*up --native"):
         native.cmd_up(ctl, up_world.args(token=TOKEN_B))
+
+
+def test_the_port_error_names_the_owner_and_carries_stable_fields(up_world, monkeypatch, capsys):
+    foreign = _decoy("/usr/bin/python3 -m http.server 8000", up_world.tmp)
+    try:
+        time.sleep(0.2)
+        up_world.busy["ports"].add(8000)
+        monkeypatch.setattr(native, "port_owner", lambda port: {"pid": foreign.pid, "command": "Python"})
+        with pytest.raises(ctl.ServerCtlError) as raised:
+            native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+        text = str(raised.value)
+        assert "Python" in text and str(foreign.pid) in text and "--port" in text and "Slicer" in text
+        assert raised.value.details == {"error_code": "port_in_use", "port": 8000,
+                                        "port_owner": {"pid": foreign.pid, "command": "Python"}}
+        # and through main(): the JSON carries them next to the text
+        monkeypatch.setitem(sys.modules, "server_ctl_native", native)
+        monkeypatch.setitem(sys.modules, ctl.__name__, ctl)
+        assert ctl.main(["--json", "up", "--native", "--tools-dir", up_world.sadt, "--token", TOKEN_A]) == 1
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["error_code"] == "port_in_use" and payload["port"] == 8000 and "error" in payload
+        assert foreign.poll() is None
+    finally:
+        foreign.kill()
+        foreign.wait()
+
+
+def test_port_owner_gives_an_abbreviated_command_and_a_pid_and_degrades_without_lsof(monkeypatch):
+    class Done:
+        stdout = "p4242\ncPython-with-a-very-long-command-name-that-is-cut-short\nn*:8000\n"
+
+    monkeypatch.setattr(shutil, "which", lambda name: "/usr/sbin/lsof")
+    monkeypatch.setattr(subprocess, "run", lambda command, **k: (
+        pytest.fail("arguments requested") if "-Fpc" not in command else Done()))
+    owner = native.port_owner(8000)
+    assert owner["pid"] == 4242 and len(owner["command"]) <= 32
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    assert native.port_owner(8000) is None
+
+
+@pytest.mark.skipif(shutil.which("ps") is None, reason="needs ps")
+def test_a_server_of_this_instance_without_a_pidfile_is_adopted_and_nothing_else_is(up_world, monkeypatch):
+    ours_line = f"{native.state_dir()}/api-venv/bin/python serve.py --host 127.0.0.1 --port 8000"
+    other_state = str(up_world.tmp / "elsewhere")
+    decoys = [_decoy("/usr/bin/python3 serve.py --host 127.0.0.1 --port 8000", up_world.tmp),
+              _decoy(f"{native.state_dir()}/api-venv/bin/python other.py --port 8000", up_world.tmp),
+              _decoy(f"{other_state}/api-venv/bin/python serve.py --host 127.0.0.1 --port 8000", up_world.tmp)]
+    try:
+        time.sleep(0.3)
+        up_world.busy["ports"].add(8000)
+        assert not os.path.exists(native.pidfile_path())
+        with pytest.raises(ctl.ServerCtlError, match="Port 8000 is already used"):
+            native.cmd_up(ctl, up_world.args(token=TOKEN_A))
+        assert not os.path.exists(native.pidfile_path()), "a pidfile was written for a process that is not ours"
+        assert all(d.poll() is None for d in decoys) and up_world.spawned == []
+        real = _decoy(ours_line, up_world.tmp)
+        try:
+            time.sleep(0.3)
+            ctl.write_env({"API_TOKEN": TOKEN_A})
+            again = native.cmd_up(ctl, up_world.args())
+            assert again["pid"] == real.pid and again["already_running"] is True and again["restarted"] is False
+            assert up_world.spawned == [] and real.poll() is None
+            info = native.read_pidfile()
+            assert info["pid"] == real.pid and info["port"] == 8000 and info["proc_start"]
+            assert native.running_server() is not None
+            assert all(d.poll() is None for d in decoys)
+        finally:
+            real.kill()
+            real.wait()
+    finally:
+        for d in decoys:
+            d.kill()
+            d.wait()
